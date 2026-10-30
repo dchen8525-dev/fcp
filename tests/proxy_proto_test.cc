@@ -479,6 +479,9 @@ void TestHttpResponseBytes() {
        "HTTP/1.1 405 Method Not Allowed\r\nAllow: CONNECT\r\nConnection: close\r\n\r\n"},
       {HttpReply::kRequestHeaderTooLarge,
        "HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\n\r\n"},
+      // 502 is the answer to a tunnel the server refused, so it is the only
+      // status a correctly parsed CONNECT can be followed by.
+      {HttpReply::kBadGateway, "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n"},
   };
   for (const Case& c : cases) {
     const size_t n = fcp::http_write_response(out, sizeof(out), c.reply);

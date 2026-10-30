@@ -461,6 +461,44 @@ void TestZeroWindowProbeUnblocks() {
   CHECK_EQ(f.sa().in_flight(), 0u);
 }
 
+// A reader that has stopped taking bytes must bound the writer's memory.
+// pump() turns the pending queue into segments whether or not the peer's window
+// has released them, so the room a writer is offered has to be measured against
+// every byte still unacknowledged: counting only what reached the wire leaves the
+// unsent segments invisible and the queue growing for as long as the host writes.
+void TestStalledReaderBoundsTheSendQueue() {
+  Fixture f;
+  const size_t window = f.cfg().send_window_bytes;
+  const std::vector<uint8_t> src = MakeBytes(8 * window, 7);
+  size_t off = 0;
+  size_t worst_backlog = 0;
+  for (int round = 0; round < 400; ++round) {
+    if (f.sa().can_write() && off < src.size()) {
+      off += f.sa().write(src.data() + off, src.size() - off);
+    }
+    f.tick(25);
+    // B's host has taken nothing, so everything it has received is still its
+    // stream's delivery debt. That is what closes the advertised window.
+    f.sb().set_delivery_pending(f.b().delivered.size());
+    const size_t backlog = off - f.b().delivered.size();
+    if (backlog > worst_backlog) {
+      worst_backlog = backlog;
+    }
+  }
+  CHECK(off > 0u);
+  CHECK(worst_backlog <= window);
+  // The stall is still in force: not even half the stream got through.
+  CHECK(off < src.size());
+  CHECK(f.b().delivered.size() < src.size());
+
+  // Unstick it: the rest goes out and the whole stream arrives, in order.
+  f.sb().set_delivery_pending(0);
+  const std::vector<uint8_t> tail(src.begin() + static_cast<std::ptrdiff_t>(off), src.end());
+  CHECK_EQ(f.push(kA, tail), tail.size());
+  f.drain();
+  CHECK(f.b().delivered == src);
+}
+
 // The ack that closes a repaired hole also pops clean segments: the round is
 // ambiguous, so no RTT sample may be taken from it.
 void TestKarnDropsAmbiguousSamples() {
@@ -682,6 +720,7 @@ int main() {
   TestDupAndOverlapTrimming();
   TestReceiverBufferCapAndRwnd();
   TestZeroWindowProbeUnblocks();
+  TestStalledReaderBoundsTheSendQueue();
   TestKarnDropsAmbiguousSamples();
   TestRtoFiresWhenPeerStopsAcking();
   TestHalfCloseThenPeerClose();

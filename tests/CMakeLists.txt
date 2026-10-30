@@ -23,6 +23,7 @@ set(FCP_TEST_NAMES
   stream_e2e_test
   prewarm_test
   proxy_proto_test
+  proxy_engine_test
   e2e_test
   soak_test
   adv_test
@@ -33,6 +34,11 @@ foreach(name IN LISTS FCP_TEST_NAMES)
   target_link_libraries(fcp_${name} PRIVATE fcp)
   add_test(NAME ${name} COMMAND fcp_${name})
 endforeach()
+
+# The proxy engine lives under apps/ as a library of its own rather than in
+# libfcp, because it is the socket-free half the Qt client also links; its test
+# is the only one that needs that target (docs/FCP_M2_PROXY.md §6).
+target_link_libraries(fcp_proxy_engine_test PRIVATE fcp_proxy_core)
 
 # Loopback UDP sockets need Winsock on Windows. The soak test runs for 8s of
 # simulated time in the default configuration; the C3 acceptance run uses

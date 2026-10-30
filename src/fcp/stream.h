@@ -110,6 +110,14 @@ class Stream {
   CloseReason reason() const { return reason_; }
   bool closed() const { return state_ == StreamState::kClosed; }
 
+  // Bytes already delivered to the host that it has not taken back yet -- a
+  // local socket whose send buffer is full, a target that is not reading. The
+  // receive buffer has to hold them too, so the count is subtracted from the
+  // advertised window and a stalled reader closes the sender's window instead
+  // of growing this buffer without bound.
+  void set_delivery_pending(size_t bytes) { delivery_pending_ = bytes; }
+  size_t delivery_pending() const { return delivery_pending_; }
+
   // Diagnostics for the proxy stats line / GUI table.
   uint64_t bytes_queued() const { return bytes_queued_; }
   uint64_t bytes_acked() const { return bytes_acked_; }
@@ -183,6 +191,7 @@ class Stream {
 
   std::deque<RcvChunk> oob_;         // sorted, disjoint, offset >= rcv_nxt_
   size_t oob_bytes_ = 0;
+  size_t delivery_pending_ = 0;      // bytes the host has not taken back yet
   uint32_t rcv_nxt_ = 0;             // bytes delivered to the app
   bool peer_fin_ = false;
   uint32_t peer_fin_at_ = 0;         // offset where the peer's data ends

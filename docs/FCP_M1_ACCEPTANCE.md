@@ -393,3 +393,92 @@ GCC（`-Wall -Wextra -Wpedantic`）额外暴露 2 个仅 Linux 可见的测试�
 | 峰值 / 累计 | 下载 21.31 Mbps、上传 19.49 Mbps，各 16.2 MB | `up_bytes=16965600 down_bytes=16963200` |
 
 构建与回归：`build_app.bat release` 与 `build_app.bat debug` 均通过并部署 Qt 运行时（exe 可独立启动）；库侧 Windows Debug/Release ctest 仍 20/20。界面按 1325×900 截图核对过三视图、实时曲线与结果卡（截图脚本为一次性验证工具，未入库）。未覆盖项：高 DPI/多显示器缩放、真实 WAN 下的 GUI 长稳、异常断线的重连策略（当前只报"会合超时/握手失败"，不自动重试）。
+
+## 18. M2 代理引擎与 CLI 双端（`apps/fcp-proxy`，2026-10-30）
+
+### 18.1 构建与门禁
+
+| 配置 | 命令 | 结果 |
+|---|---|---|
+| Windows Debug | `build.bat Debug` | ctest **25/25**，2.33 s |
+| Windows Release | `build.bat Release` | ctest **25/25**，0.57 s |
+| CLI（独立构建目录） | `build/proxy-check` + `-DFCP_BUILD_PROXY=ON` | `fcp-proxy-client.exe` / `fcp-proxy-server.exe` 均通过 |
+
+`FCP_BUILD_PROXY` 在 preset 里仍默认 OFF；`apps/fcp-proxy` 现在由
+`FCP_BUILD_PROXY OR FCP_BUILD_APP OR FCP_BUILD_TESTS` 决定是否配置，这样
+`fcp_proxy_core`（引擎，无 socket）与 `proxy_engine_test` 恒进门禁，而反应堆与两个
+`main_*` 只在显式开 CLI 时编。
+
+### 18.2 `tests/proxy_engine_test.cc`（T31b，9 场景）
+
+双端各一个 `ProxyEngine`、中间内存管道对拷 datagram、25 ms/tick 虚拟时钟，逐场景断言：
+
+| 场景 | 钉住的不变式 |
+|---|---|
+| `socks5_round_trip` | 问候回 `05 00`；IPv4 目标以**裸 4 字节**进 OPEN；隧道字节双向一致；请求后多余的 10 B 一个不吃 |
+| `http_connect_round_trip` | `CONNECT host:port` → `HTTP/1.1 200 `；authority 落成 `kAtypDomain` |
+| `open_error_maps_to_the_local_reply` | 5 组 `OpenError → SOCKS rep`（0x05/0x04/0x06/0x08/0x02）与 HTTP 侧 502；**一条隧道只拒一次**（迟到的 `on_dial_result(ok)` 不改写已发的 `open_failed`） |
+| `malformed_local_requests` | 无共同方法 `05 FF`、UDP ASSOCIATE→`0x07`、 bogus ATYP→`0x08`、非 CONNECT 方法→405、缺端口→400 |
+| `backpressure_closes_the_window` | 目标侧拒收 >60/120 轮；总推入量 `≤ rcv_buf + 2×send_window`；解除限制后逐字节有序全量交付 |
+| `salt_routing_and_replay_binding` | 同 salt 换源地址 → `salt_clash=1` 且立刻关；2 字节短 stub → `unknown_salt=1`，不建会话 |
+| `short_connections_leave_no_state_behind` | 20 条短连接后双端 `live=0`、`established=20`、预热缓存各 1 条 |
+| `dial_timeout_and_grace_clock` | 无应答拨号 → `0x06` + 服务端理由"the peer stopped acknowledging"；应用 socket 卡死 → "the application socket stopped taking bytes" |
+| `session_limits` | `max_sessions=2`：客户端第 3 条本地连接 `over_limit=1` 且由宿主直接关（不排队）；服务端第 3 个入站 HELLO 根本不建会话（`live=2`），客户端只能等满握手超时——服务端丢了这笔生意而非用协议报文拒绝，这是诚实的结果 |
+
+### 18.3 由引擎测试逼出的两个真实缺陷
+
+两处都**过了 CLI 回环联调**（活着的会话总会确认一次，队列还没无限堆积就结了尾），是
+socket-free 驱动把它们逼出来的：
+
+1. **`Stream::send_space()` 计量口径错**（`src/fcp/stream.cc`）：原按
+   `in_flight_ + tx_pending_`。`pump()` 把待发字节切成段是无条件的，被对端窗口挡住的那批
+   段既不在 `in_flight_` 也不在 `tx_pending_`，写侧因此一直被通知"还有空间"。缺陷表现：
+   `backpressure_closes_the_window` 报 `pushed=409600 refused=0 pending=21810`（发送队列
+   无上限堆积）。改为 `bytes_queued_ - bytes_acked_`（"已写未确认"）后，每连接每侧内存
+   上界回到 `send_window_bytes + rcv_buf_bytes`。同一个缺陷还让 Debug 全量回归跑到
+   136 s（发送侧不看窗口的循环在虚拟时钟里要 tick 成千上万次；配合把测试自身的
+   32 轮/400 步预算收紧到 8 轮，`proxy_engine_test` 单例降到 ~60 ms），门禁总时长随之
+   落到 2.4 s。
+   回归守卫：`tests/stream_test.cc` 新增 `TestStalledReaderBoundsTheSendQueue`（读者只
+   `set_delivery_pending` 不放行 → 积压恒 `≤ window` 且 `write()` 最终开始返 0；解除后
+   全量按序交付）。
+2. **`ProxyEngine::on_tick` 的 grace 截止读不到**（`apps/fcp-proxy/engine.cc:248`）：
+   `kDialing && now >= dial_deadline` 分支在会话已被判死（`closing`）后仍每 tick 赢下
+   `else if`，于是 `flush_deadline_ms` 永不被读，服务端 `live` 卡在 1 直到 idle 超时。
+   加 `!closing` 守卫，`dial_timeout_and_grace_clock` 的 `live` 断言随即转绿。
+
+### 18.4 回环端到端（T32 的本地半边，`build/proxy-live/suite.sh`，git 忽略）
+
+| # | 检查 | 结果 |
+|---|---|---|
+| 1 | `curl --socks5` 普通 GET（IP 目标） | `code=200` |
+| 2 | `/big` 5400 B 直连 vs 代理 | `cmp` **逐字节一致**（`big.proxy` 5400 B） |
+| 3 | `/huge` 2 MiB 直连 vs 代理 | `cmp` **逐字节一致**（2097152 B），`t=0.366 s` — 即 18.3① 改口的关键回归风险点 |
+| 4 | `/slow` 分块流（41 chunk） | `chunks=41`、318 B 完整 |
+| 5 | `--proxy http://` CONNECT + TLS | `code=200`、577 B |
+| 6 | 目标拒绝（closed 端口） | `curl exit=97`（SOCKS5 无法建到目标），`t=2.087 s` |
+| 7 | 20 串行 + 10 并发 | 串行失败 0、并发 `ok=10/10` |
+
+服务端收尾统计：`stats 12.0s live=0 up=36 tunnels=35 tx=2195686B rx=100472B
+bad_entry=0 refused=1 hs_failed=0 reset=0 idle=0 clash=0 over=0 unknown=0`——会话表零泄漏、
+零 salt 冲突、零越限，`tunnels=35` 与 `refused=1` 恰与第 6 项对上。
+
+### 18.5 Windows 被拒 connect 的 2.05 s 是 OS 行为（实测，非缺陷）
+
+第 6 项的 2.087 s 拆了三条独立路径实测（回环打向 closed 端口）：
+
+| 路径 | 观测 |
+|---|---|
+| 非阻塞 `connect()` + `select` 异常集 | ~2047 ms |
+| `WSAEventSelect(FD_CONNECT)` 等事件 | ~2047 ms |
+| **阻塞** `connect()` 直接计时 | ~2047 ms |
+
+三条同值 ⇒ 这 2 s 由 Windows TCP 栈自身决定（Linux 立即返回 `ECONNREFUSED`），代理侧只占
+~0.1 s。真正可修且已修的是**通知位置**：Winsock 把失败的 connect 报在 `exceptfds` 而非
+`writefds`，漏查会把"目标拒绝"退化成等满 5 s 拨号超时并给出错的 SOCKS 应答码。已入
+`docs/FCP_M2_PROXY.md` §7 第 9 条。
+
+### 18.6 未覆盖项
+
+WAN 半边（对测试 VPS 的 `curl --socks5` HTTP/HTTPS、T33 预热 A/B、Linux × Debug/Release
+25 项目录回归）属任务 #22；GUI 代理页与 Qt 侧适配器属 #23。

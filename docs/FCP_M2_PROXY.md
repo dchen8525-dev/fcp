@@ -139,6 +139,11 @@ FCP 侧的既有分工保持不变：Session 负责信封、RS/FEC、结算、FE
 - 服务端收包路径：解信封需要 salt → 先读明文 salt 查 `SessionTable`，未知名则用
   "待建会话"路径（新 salt 的首包按 HELLO 处理，握手成功后才入表）。HELLO/HELLO_ACK
   是 oob 帧（#25），因此未认证包不会进 FEC 路径。
+  落地口径（`ProxyEngine`）：服务端不预知 salt，连接表就是 `by_salt_`（8B 明文 salt →
+  conn）与 `by_conn_` 双索引；首次见到的 salt 直接建 `Conn` 并**采用该 salt** 作为会话
+  salt（`create_server_conn`），因此"待建会话"与"已建会话"在引擎里是同一张表，没有第三条
+  路径。salt 已在表但源地址不同 → 记 `salt_clash` 并立刻关（信封用的是同一把密钥，认证
+  挡不住第四方重放，这里是唯一能 enforce 绑定的地方）。
 - 会话生命周期与 TCP 连接一一对应：连接关闭即 `SessionTable::remove()`，
   不留悬挂会话。服务端另有 `--max-sessions`（默认 256）与空闲回收。
 
@@ -167,7 +172,10 @@ FCP 侧的既有分工保持不变：Session 负责信封、RS/FEC、结算、FE
 解析 `CONNECT host:port HTTP/1.x` + 头部直到 `\r\n\r\n`（头部总量上限 8 KiB，超限
 `431`/关闭）；成功回 `HTTP/1.1 200 Connection Established\r\n\r\n`。非 CONNECT 方法回
 `405`，其余坏形回 `400`，两个错误响应都带 `Connection: close`；响应体是常量、不含任何对端
-输入，因此没有头注入面。TLS over CONNECT 与 SOCKS5 之后的流量都是裸字节，本层不解析。
+输入，因此没有头注入面。隧道被服务端拒绝时（头部早已收齐、`200` 还没发出）回 `502`
+（`HttpReply::kBadGateway`，同样 `Connection: close`）——`400/405/431` 只能答请求本身，
+`502` 是这条链路上唯一在"请求合法之后"才可能的失败。TLS over CONNECT 与 SOCKS5 之后的
+流量都是裸字节，本层不解析。
 
 口径补充（`tests/proxy_proto_test.cc` 逐条钉住）：
 
@@ -199,7 +207,9 @@ OPEN_ERR = 7；端口同样是网络序，`port = 0` 既编不出也解不出。
 1 refused（策略）、2 dns、3 target timeout、4 not supported（atyp 未知）、5 too many
 sessions。`OPEN_OK` 之后双向都是裸字节。`OpenError → Socks5Rep` 的映射放在同一层
 （`socks5_rep_for_open_error`），客户端只转发：refused→`0x05`、dns→`0x04`、
-timeout→`0x06`、not supported→`0x08`、too many→`0x02`。服务端解析用可注入的 `Resolver`
+timeout→`0x06`、not supported→`0x08`、too many→`0x02`；HTTP 监听侧五种 code 一律回
+`502`（`4xx` 已经用完了，且失败原因确实来自上游）。**一条隧道只拒一次**：`OPEN_ERR` 发出
+后即使迟到的 `on_dial_result(ok)` 到达也不改写结论。服务端解析用可注入的 `Resolver`
 接口（CLI 用工作线程，Qt 用 `QHostInfo`），解析超时 5s。
 
 ## 5. 链路参数预热
@@ -241,7 +251,8 @@ timeout→`0x06`、not supported→`0x08`、too many→`0x02`。服务端解析�
 表满时先清过期项再写、全满则拒收新键）、`apply_prewarm` 的独立性与 no-op、
 以及会话侧"新会话第一个集合就带 parity，且不需要任何 FECSTAT 上报"这一条正面证据
 （`k=3` seed 下单符号集合按 `k_eff = ceil(k·n/D)` 缩到 1 个 parity，仍完成重建）。
-T33（同链路 20 条短连接的开/关对比）要等 `apps/fcp-proxy` 落地，属 #22 的联调范围。
+T33（同链路 20 条短连接的开/关对比）的两个开关都已就位（默认开、`--no-prewarm` 关），
+剩下的是在真实 WAN 上跑一遍，属 #22 的联调范围。
 
 ## 6. 模块与文件
 
@@ -251,8 +262,15 @@ T33（同链路 20 条短连接的开/关对比）要等 `apps/fcp-proxy` 落地
 | `src/fcp/prewarm.h/.cc` | `PeerProfile` / `PrewarmCache` / `apply_prewarm`（§5） | 仅 std、`session.h`、`stream.h` |
 | `src/fcp/proxy_proto.h/.cc` | SOCKS5 / HTTP CONNECT / OPEN 编解码（纯函数） | 仅 std |
 | `tests/stream_test.cc`、`tests/prewarm_test.cc`、`tests/proxy_proto_test.cc` | 单测，注册进 ctest 门禁 | — |
-| `apps/fcp-proxy/` | `ProxyEngine`（连接表 + salt 路由 + tick + 预热缓存）、跨平台 select 反应堆、`main_client.cc`、`main_server.cc`；`FCP_BUILD_PROXY` 默认 OFF | `fcp` |
-| `apps/fcp-client/` | 代理页 + Qt 侧适配器（`QTcpServer`/`QUdpSocket`/`QHostInfo` 驱动同一引擎） | `fcp`、Qt Widgets/Network |
+| `apps/fcp-proxy/engine.h/.cc` → `fcp_proxy_core` | `ProxyEngine`（连接表 + salt 路由 + tick + 预热缓存）。**无 socket、无真实时钟**：宿主以 `Host` 回调注入收发与 DNS，时间全部由 `now_ms` 参数传入，因此 ctest 能直接驱动它 | `fcp` |
+| `apps/fcp-proxy/reactor.h/.cc`、`cli.h/.cc`、`main_client.cc`、`main_server.cc` | 跨平台 select 反应堆（含 Windows 非阻塞 connect 的 `exceptfds` 语义）、共用参数解析、CLI 双端入口 | `fcp_proxy_core`、`ws2_32`(Win) |
+| `tests/proxy_engine_test.cc` | 引擎级 socket-free 场景（9 个：SOCKS5/HTTP 往返、`OPEN_ERR → 本地应答`映射、畸形入口、背压、salt 路由与重放绑定、短连接无残留、拨号超时与 grace 钟、会话上限） | `fcp_proxy_core` |
+| `apps/fcp-client/` | 代理页 + Qt 侧适配器（`QTcpServer`/`QUdpSocket`/`QHostInfo` 驱动同一引擎） | `fcp_proxy_core`、Qt Widgets/Network |
+
+`fcp_proxy_core` 是独立静态库且在 `FCP_BUILD_PROXY`（默认 OFF）之外：Qt 客户端只链接引擎、
+不需要 CLI 的两个可执行文件，而门禁必须能在不开 `FCP_BUILD_PROXY` 时跑到引擎。反应堆与
+`main_*` 才受该开关约束（根 `CMakeLists.txt` 用 `FCP_BUILD_PROXY OR FCP_BUILD_APP OR
+FCP_BUILD_TESTS` 决定是否进入 `apps/fcp-proxy`）。
 
 ## 7. 已知边界（明确不做，写在这里以免被当成缺陷）
 
@@ -271,6 +289,32 @@ T33（同链路 20 条短连接的开/关对比）要等 `apps/fcp-proxy` 落地
    多路复用方案；预热只缓解 k/RTT 冷启动，不消除握手往返。
 7. **单线程引擎**：CLI 与 GUI 都在一个循环里跑全部会话，吞吐天花板与 §16 的
    VPS 单线程结论一致。
+8. **缓冲全归引擎，`send_space()` 数的是"已写未确认"**：`Stream` 的发送配额是
+   `bytes_queued_ - bytes_acked_`，不是 `in_flight_ + tx_pending_`。原因是 `pump()`
+   把待发送字节切成段是**无条件**的，被对端窗口挡住的那批段既不在 `in_flight_` 也不在
+   `tx_pending_`——旧口径对它们完全失明，写侧会一直被通知"还有空间"，于是慢读者能把
+   发送队列撑到无上限。改后的代价是窗口关闭时 `write()` 直接返回较少字节，宿主必须
+   重排队（反应堆用 `wants_local_read()`/`wants_target_read()` 表达这件事）。定死的上界：
+   每条连接每侧内存 ≈ `send_window_bytes + rcv_buf_bytes`，`tests/proxy_engine_test.cc`
+   的 `backpressure_closes_the_window` 与 `tests/stream_test.cc` 的
+   `TestStalledReaderBoundsTheSendQueue` 一起守这条不变式。
+9. **Windows 被拒绝的 connect 只走 `exceptfds`，而且要 ~2.05 s 才报**：非阻塞
+   `connect()` 失败在 Winsock 里不进 `writefds`，必须查异常集（`reactor.cc` 已处理，
+   否则拒绝目标会从 `OPEN_ERR 1`→SOCKS `0x05` 退化成等满拨号超时）。而"多久报出来"是
+   Windows TCP 栈自己的：实测回环上打向 closed 端口，`select` 异常集、
+   `WSAEventSelect(FD_CONNECT)`、甚至**阻塞** `connect()` 三条路径都是 2047ms 上下，
+   Linux 则立即返回 `ECONNREFUSED`。因此 CLI 联调里"拒绝目标 2.087s"是 OS 开销，
+   代理侧只占 ~0.1s，不是缺陷、也修不动。
+10. **grace 钟只在有进展时滑动**：`on_tick()` 里 `progress_of()`（已确认 + 已交付 +
+    应用已收）变了才重新计时，时钟到点才关会话，理由按 `app_in`/`to_stream` 是否非空
+    分成"应用 socket 不再收字节"与"对端不再确认"。这条钟只在 `only_if_idle` 时装一次，
+    且判超时的 `kDialing` 分支必须带 `!closing` 守卫——否则已被拨号截止判死的隧道每 tick
+    都赢下第一个 `else if`，grace 截止永远不会被读到，服务端会话会一路活到 idle 超时。
+11. **宿主回调不得重入引擎**：`Host` 的回调只允许标记 `Phase::kDone` 并把 id 压进
+    `reap_ids_`（关闭）或 `dial_queue_`（待拨号），真正的销毁与 `host_.dial` 发起统一在
+    `reap()` 里做（`in_reap_`/`in_flush_dials_` 双守卫；`flush_dials()` 按 id 逆序、
+    逐个重新 `find()` 并跳过 `closing` 与非 `kDialing` 的会话，因为队列存 id 正是为了
+    防 `Conn` 在这段行走中失效）。写新宿主（Qt 适配器）时这是第一条要遵守的规则。
 
 ## 8. 验收线（新增 T28–T33）
 
@@ -280,6 +324,7 @@ T33（同链路 20 条短连接的开/关对比）要等 `apps/fcp-proxy` 落地
 | T29 | Stream 单元：累积 ACK + RTO 重传 + SACK 补洞（含 FEC 不可修洞） | 全部补齐；Karn 规则不产生污染样本；同一洞不重复补 |
 | T30 | Stream × Session：`e2e_link.h` 随机与 burst 丢包注入 | 零错序零丢失；`on_rtt_sample` 有真实样本；恒等式零违例 |
 | T31 | 代理协议：SOCKS5/HTTP/OPEN 分支与越界输入 | 错误码正确、拒绝畸形、无 OOB 读 |
+| T31b | `ProxyEngine`（无 socket、虚拟时钟）：往返、`OPEN_ERR → 本地应答`、背压、salt 路由与重放、清理、超时 | 隧道级不变式成立；每连接内存受窗口与 rwnd 约束；会话表与预热缓存零残留 |
 | T32 | 端到端：回环 + WAN 下 `curl --socks5`（HTTP 与 HTTPS 目标） | 内容一致、吞吐与 FCP 统计自洽、会话表无泄漏 |
 | T33 | 预热收益：同链路连续 20 条短连接，预热开/关对比 | 首周期 k 冷启动消除，累计 parity 开销与有效吞吐可量化 |
 
@@ -289,7 +334,20 @@ RS 预算、半关闭、200KB 持续流）覆盖，§5 的预热由 `tests/prewa
 T31 由 `tests/proxy_proto_test.cc`（18 场景：SOCKS5 问候/请求/应答与 0xFF/0x07/0x08 分支、
 HTTP 的 200/400/405/431 与 authority 各种形态（含方括号 IPv6、255B 主机名、8 KiB 预算）、
 OPEN 三种报文的往返与全部拒绝分支、`OpenError → Socks5Rep` 映射；每条报文都按"逐字节截断"
-再解一遍，短读必须是短读、消费长度必须为 0）覆盖；四者都在 `build.bat` 的 ctest 门内
-（Windows Debug/Release 各 24/24）。T30 用的回环载体沿用
+再解一遍，短读必须是短读、消费长度必须为 0）覆盖，T31b 由
+`tests/proxy_engine_test.cc`（9 场景，客户端与服务端各一个 `ProxyEngine`，中间用内存管道
+对拷 datagram，虚拟时钟 25ms/tick）覆盖；五者都在 `build.bat` 的 ctest 门内
+（Windows Debug/Release 各 25/25，Debug 2.33s / Release 0.57s）。
+`proxy_engine_test` 同时是 §7 第 8、10 两条不变式的守卫：`backpressure_closes_the_window`
+在真实 `send_space()` 口径错的时候报 `pushed=409600 refused=0`（即无上限堆积），
+`dial_timeout_and_grace_clock` 在 grace 分支不可达的时候让服务端 `live` 永远停在 1——
+两个缺陷都是后被这个 socket-free 驱动逼出来的——CLI 回环联调把它们掩盖了（活着的会话
+总会确认一次，队列还没来得及无限堆积就结了尾）。T30 用的回环载体沿用
 `tests/e2e_link.h` 的 UDP socket 对，但其 `UdpSocket` 现在把 `SO_RCVBUF` 提到 1MiB——
 默认 8KiB 在窗口级突发下会溢出，那部分丢失不进注入器计数，注入模型就不再"已知"了。
+
+T32 的回环半边已在 `build/proxy-live/suite.sh`（git 忽略的临时目录）跑通七项：普通 GET、
+`/big` 与 2MiB `/huge` 的 `cmp` 逐字节一致、分块 `/slow`、HTTP CONNECT + TLS、拒绝目标、
+20 条串行 + 10 条并发；服务端收尾统计 `live=0 up=36 tunnels=35 refused=1 hs_failed=0
+clash=0 over=0 unknown=0`，2MiB 传输 `t=0.366s`。WAN 半边（对测试 VPS）与 T33 的预热
+A/B 属于任务 #22，尚未收口。

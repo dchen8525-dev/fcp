@@ -137,14 +137,17 @@ enum class HttpParse {
   kHeadTooLarge,
 };
 
-// The four bodies this proxy ever sends back on the HTTP listener. Nothing in
-// them is built from peer input, so a reply cannot become a header-injection
-// vector.
+// The five bodies this proxy ever sends back on the HTTP listener. The first
+// four answer the request itself; 502 answers a tunnel the server refused,
+// which is the only thing that can fail after the head was already accepted.
+// Nothing in them is built from peer input, so a reply cannot become a
+// header-injection vector.
 enum class HttpReply : uint16_t {
   kEstablished = 200,           // "HTTP/1.1 200 Connection Established"
   kBadRequest = 400,
   kMethodNotAllowed = 405,
   kRequestHeaderTooLarge = 431,
+  kBadGateway = 502,            // OPEN_ERR: the remote end refused the tunnel
 };
 
 // Parses `CONNECT host:port HTTP/1.x` plus headers up to CRLFCRLF. The target is

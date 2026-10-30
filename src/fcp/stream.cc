@@ -51,7 +51,12 @@ size_t Stream::send_space() const {
   if (state_ == StreamState::kClosed) {
     return 0;
   }
-  const size_t used = in_flight_ + tx_pending_.size();
+  // Everything written and not yet acknowledged -- not in_flight_ plus the
+  // pending queue. pump() turns pending into segments regardless of the peer's
+  // window, and a segment that the window has not released is neither in_flight_
+  // nor pending, so the old measure was blind to exactly the bytes a stalled
+  // reader accumulates: the writer kept being told it had room.
+  const size_t used = bytes_queued_ > bytes_acked_ ? bytes_queued_ - bytes_acked_ : 0;
   return cfg_.send_window_bytes > used ? cfg_.send_window_bytes - used : 0;
 }
 
@@ -223,7 +228,10 @@ void Stream::emit_rst(uint8_t code) {
 }
 
 size_t Stream::rwnd_out() const {
-  return cfg_.rcv_buf_bytes > oob_bytes_ ? cfg_.rcv_buf_bytes - oob_bytes_ : 0;
+  // Both the out-of-order buffer and whatever the host has not accepted yet are
+  // still this stream's memory, so both count against the advertised window.
+  const size_t used = oob_bytes_ + delivery_pending_;
+  return cfg_.rcv_buf_bytes > used ? cfg_.rcv_buf_bytes - used : 0;
 }
 
 uint32_t Stream::cum_out() const {

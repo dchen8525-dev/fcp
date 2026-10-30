@@ -95,6 +95,8 @@ constexpr char kHttpMethodNotAllowed[] =
     "HTTP/1.1 405 Method Not Allowed\r\nAllow: CONNECT\r\nConnection: close\r\n\r\n";
 constexpr char kHttpHeadTooLarge[] =
     "HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\n\r\n";
+constexpr char kHttpBadGateway[] =
+    "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n";
 
 bool write_bytes(uint8_t* out, size_t cap, const char* text) {
   const size_t n = std::strlen(text);
@@ -420,6 +422,8 @@ size_t http_write_response(uint8_t* out, size_t cap, HttpReply reply) {
                  : 0;
     case HttpReply::kRequestHeaderTooLarge:
       return write_bytes(out, cap, kHttpHeadTooLarge) ? sizeof(kHttpHeadTooLarge) - 1 : 0;
+    case HttpReply::kBadGateway:
+      return write_bytes(out, cap, kHttpBadGateway) ? sizeof(kHttpBadGateway) - 1 : 0;
   }
   return 0;
 }

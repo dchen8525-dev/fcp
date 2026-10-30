@@ -15,6 +15,7 @@ endif()
 option(FCP_BUILD_TESTS "Build FCP tests" ON)
 option(FCP_BUILD_TOOLS "Build FCP tools (benchmark harness)" ON)
 option(FCP_BUILD_APP "Build the Qt desktop client" OFF)
+option(FCP_BUILD_PROXY "Build the FCP proxy CLI (client and server)" OFF)
 
 add_library(fcp
   src/fcp/gf256.cc
@@ -63,6 +64,13 @@ endif()
 
 if(FCP_BUILD_TOOLS)
   add_subdirectory(tools)
+endif()
+
+# The socket-free engine is a library of its own: the Qt client links it even
+# when the CLI executables are not configured (apps/fcp-proxy/CMakeLists.txt),
+# and ctest drives it directly -- so it is built whenever tests or an app are.
+if(FCP_BUILD_PROXY OR FCP_BUILD_APP OR FCP_BUILD_TESTS)
+  add_subdirectory(apps/fcp-proxy)
 endif()
 
 if(FCP_BUILD_APP)

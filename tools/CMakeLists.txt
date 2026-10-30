@@ -1,0 +1,5 @@
+add_executable(fcp_bench fcp_bench.cc)
+target_link_libraries(fcp_bench PRIVATE fcp)
+if(WIN32)
+  target_link_libraries(fcp_bench PRIVATE ws2_32)
+endif()

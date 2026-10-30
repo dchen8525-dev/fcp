@@ -1,0 +1,336 @@
+#include "fcp/strategy.h"
+
+#include "test_util.h"
+
+namespace {
+
+fcp::FecstatPacket Report(uint32_t set_id, uint32_t expected, uint32_t rx_orig,
+                          uint32_t sets_expected = 10, uint32_t k_unknown = 0) {
+  fcp::FecstatPacket p{};
+  p.accounted_through_set_id = set_id;
+  p.data_expected = expected;
+  p.data_rx_orig = rx_orig;
+  p.sets_expected = sets_expected;
+  p.sets_k_unknown = k_unknown;
+  return p;
+}
+
+// A 1000-packet interval with the given loss.
+fcp::FecstatPacket LossReport(uint32_t set_id, double loss) {
+  const uint32_t rx = 1000 - static_cast<uint32_t>(loss * 1000.0 + 0.5);
+  return Report(set_id, 1000, rx);
+}
+
+void Feed(fcp::FecStrategy* st, uint32_t* set_id, double loss, bool queued = false) {
+  st->on_report(LossReport(++*set_id, loss), queued);
+}
+
+// ON at 20% (k = 4) then five clean reports -> OFF.
+void DriveToOff(fcp::FecStrategy* st, uint32_t* set_id) {
+  Feed(st, set_id, 0.20);
+  for (int i = 0; i < 5; ++i) {
+    Feed(st, set_id, 0.002);
+  }
+  CHECK(st->state() == fcp::FecState::kOff);
+  CHECK_EQ(st->k(), 0);
+}
+
+void TestOffToOn() {
+  fcp::FecStrategy st;
+  CHECK(st.state() == fcp::FecState::kOff);
+  CHECK_EQ(st.k(), 0);
+
+  uint32_t id = 0;
+  Feed(&st, &id, 0.02);
+  CHECK(st.state() == fcp::FecState::kOn);
+  CHECK_EQ(st.k(), 1);
+
+  fcp::FecStrategy st2;
+  id = 0;
+  Feed(&st2, &id, 0.20);
+  CHECK(st2.state() == fcp::FecState::kOn);
+  CHECK_EQ(st2.k(), 4);  // no per-report step limit on entry
+
+  fcp::FecStrategy st3;
+  id = 0;
+  Feed(&st3, &id, 0.10);
+  CHECK_EQ(st3.k(), 2);
+}
+
+void TestTwoReportEntry() {
+  fcp::FecStrategy st;
+  uint32_t id = 0;
+  Feed(&st, &id, 0.009);
+  CHECK(st.state() == fcp::FecState::kOff);
+  Feed(&st, &id, 0.009);
+  CHECK(st.state() == fcp::FecState::kOn);
+  CHECK_EQ(st.k(), 1);
+
+  // A dip below 0.8% restarts the count.
+  fcp::FecStrategy st2;
+  id = 0;
+  Feed(&st2, &id, 0.009);
+  Feed(&st2, &id, 0.007);
+  Feed(&st2, &id, 0.009);
+  CHECK(st2.state() == fcp::FecState::kOff);
+  Feed(&st2, &id, 0.009);
+  CHECK(st2.state() == fcp::FecState::kOn);
+}
+
+void TestPerReportStep() {
+  fcp::FecStrategy st;
+  uint32_t id = 0;
+  Feed(&st, &id, 0.20);  // k = 4
+  CHECK_EQ(st.k(), 4);
+  Feed(&st, &id, 0.02);
+  CHECK_EQ(st.k(), 3);
+  Feed(&st, &id, 0.02);
+  CHECK_EQ(st.k(), 2);
+  Feed(&st, &id, 0.02);
+  CHECK_EQ(st.k(), 1);
+  Feed(&st, &id, 0.02);
+  CHECK_EQ(st.k(), 1);
+
+  // Increase is also capped at one per report.
+  fcp::FecStrategy st2;
+  id = 0;
+  Feed(&st2, &id, 0.02);  // k = 1
+  Feed(&st2, &id, 0.20);
+  CHECK_EQ(st2.k(), 2);
+  Feed(&st2, &id, 0.20);
+  CHECK_EQ(st2.k(), 3);
+}
+
+void TestQueuedGuard() {
+  fcp::FecStrategy st;
+  uint32_t id = 0;
+  Feed(&st, &id, 0.20);  // k = 4
+  Feed(&st, &id, 0.20, true);
+  CHECK_EQ(st.k(), 4);  // 1 queued report: no grow, target equal
+  Feed(&st, &id, 0.20, true);
+  CHECK_EQ(st.k(), 4);
+  Feed(&st, &id, 0.20, true);
+  CHECK_EQ(st.k(), 3);  // 3 queued reports: forced k - 1
+
+  // A report without queueing resets the streak.
+  Feed(&st, &id, 0.20);
+  CHECK_EQ(st.k(), 4);
+  Feed(&st, &id, 0.20, true);
+  Feed(&st, &id, 0.20, true);
+  CHECK_EQ(st.k(), 4);
+  Feed(&st, &id, 0.20, true);
+  CHECK_EQ(st.k(), 3);
+
+  // Decreasing while queued is allowed (only growth is blocked).
+  fcp::FecStrategy st2;
+  id = 0;
+  Feed(&st2, &id, 0.20);  // k = 4
+  Feed(&st2, &id, 0.02, true);
+  CHECK_EQ(st2.k(), 3);
+
+  // The floor is 1.
+  fcp::FecStrategy st3;
+  id = 0;
+  Feed(&st3, &id, 0.02);  // k = 1
+  for (int i = 0; i < 5; ++i) {
+    Feed(&st3, &id, 0.02, true);
+  }
+  CHECK_EQ(st3.k(), 1);
+  CHECK(st3.state() == fcp::FecState::kOn);
+}
+
+void TestCleanStreak() {
+  fcp::FecStrategy st;
+  uint32_t id = 0;
+  Feed(&st, &id, 0.10);  // k = 2
+  for (int i = 0; i < 4; ++i) {
+    Feed(&st, &id, 0.002);
+  }
+  CHECK(st.state() == fcp::FecState::kOn);
+  CHECK_EQ(st.k(), 1);
+  Feed(&st, &id, 0.002);
+  CHECK(st.state() == fcp::FecState::kOff);
+  CHECK_EQ(st.k(), 0);
+
+  // A non-clean report resets the streak.
+  fcp::FecStrategy st2;
+  id = 0;
+  Feed(&st2, &id, 0.10);
+  for (int i = 0; i < 4; ++i) {
+    Feed(&st2, &id, 0.002);
+  }
+  Feed(&st2, &id, 0.010);
+  for (int i = 0; i < 4; ++i) {
+    Feed(&st2, &id, 0.002);
+  }
+  CHECK(st2.state() == fcp::FecState::kOn);
+  Feed(&st2, &id, 0.002);
+  CHECK(st2.state() == fcp::FecState::kOff);
+}
+
+void TestCooldown() {
+  fcp::FecStrategy st;
+  uint32_t id = 0;
+  DriveToOff(&st, &id);
+  for (int i = 0; i < 3; ++i) {
+    Feed(&st, &id, 0.02);
+    CHECK(st.state() == fcp::FecState::kOff);
+  }
+  Feed(&st, &id, 0.02);
+  CHECK(st.state() == fcp::FecState::kOn);
+
+  // >= 4.5% bypasses the cooldown.
+  fcp::FecStrategy st2;
+  id = 0;
+  DriveToOff(&st2, &id);
+  Feed(&st2, &id, 0.05);
+  CHECK(st2.state() == fcp::FecState::kOn);
+  CHECK_EQ(st2.k(), 1);
+
+  // The 0.8% two-report path also waits out the cooldown.
+  fcp::FecStrategy st3;
+  id = 0;
+  DriveToOff(&st3, &id);
+  Feed(&st3, &id, 0.009);
+  Feed(&st3, &id, 0.009);
+  Feed(&st3, &id, 0.009);
+  CHECK(st3.state() == fcp::FecState::kOff);
+  Feed(&st3, &id, 0.009);
+  CHECK(st3.state() == fcp::FecState::kOff);  // first report after cooldown
+  Feed(&st3, &id, 0.009);
+  CHECK(st3.state() == fcp::FecState::kOn);
+}
+
+void TestUntrustedSample() {
+  fcp::FecStrategy st;
+  uint32_t id = 0;
+  // 31/300 > 10%: gate closed, even at 20% loss.
+  st.on_report(Report(++id, 1000, 800, 300, 31), false);
+  CHECK(st.state() == fcp::FecState::kOff);
+  CHECK_EQ(st.untrusted_reports(), 1u);
+  CHECK(st.last_loss() == 0.0);
+
+  // Exactly 10% is still trusted.
+  st.on_report(Report(++id, 1000, 800, 300, 30), false);
+  CHECK(st.state() == fcp::FecState::kOn);
+  CHECK_EQ(st.k(), 4);
+
+  // sets_expected = 0 with any unknown set is untrusted (denominator floor 1).
+  fcp::FecStrategy st2;
+  id = 0;
+  st2.on_report(Report(++id, 1000, 800, 0, 1), false);
+  CHECK(st2.state() == fcp::FecState::kOff);
+  CHECK_EQ(st2.untrusted_reports(), 1u);
+}
+
+void TestSmallSample() {
+  fcp::FecStrategy st;
+  uint32_t id = 0;
+  st.on_report(Report(++id, 255, 100), false);
+  CHECK(st.state() == fcp::FecState::kOff);
+  CHECK_EQ(st.small_sample_reports(), 1u);
+  st.on_report(Report(++id, 256, 200), false);
+  CHECK(st.state() == fcp::FecState::kOn);
+  CHECK_EQ(st.k(), 4);
+}
+
+void TestStaleReport() {
+  fcp::FecStrategy st;
+  // accounted_through_set_id starts at 0 and is valid.
+  st.on_report(Report(0, 1000, 980, 10, 0), false);
+  CHECK(st.state() == fcp::FecState::kOn);
+  CHECK_EQ(st.k(), 1);
+
+  // Same key: ignored, even though the payload says 0% loss.
+  st.on_report(Report(0, 1000, 1000, 10, 0), false);
+  CHECK_EQ(st.stale_reports(), 1u);
+  CHECK_EQ(st.k(), 1);
+  CHECK(st.state() == fcp::FecState::kOn);
+
+  // Smaller key: ignored as well.
+  st.on_report(Report(0, 1000, 500, 10, 0), false);
+  CHECK_EQ(st.stale_reports(), 2u);
+  CHECK_EQ(st.k(), 1);
+
+  // Newer key: processed (0% loss counts toward the clean streak).
+  st.on_report(Report(1, 1000, 1000, 10, 0), false);
+  CHECK_EQ(st.state(), fcp::FecState::kOn);
+  CHECK_EQ(st.k(), 1);
+}
+
+void TestPinned() {
+  fcp::FecStrategyConfig cfg;
+  cfg.pinned_k = 2;
+  fcp::FecStrategy st(cfg);
+  CHECK(st.pinned());
+  CHECK(st.state() == fcp::FecState::kOn);
+  CHECK_EQ(st.k(), 2);
+
+  uint32_t id = 0;
+  for (int i = 0; i < 10; ++i) {
+    Feed(&st, &id, 0.50);
+  }
+  CHECK_EQ(st.k(), 2);
+  CHECK(st.state() == fcp::FecState::kOn);
+  for (int i = 0; i < 10; ++i) {
+    Feed(&st, &id, 0.0);
+  }
+  CHECK_EQ(st.k(), 2);
+  CHECK(st.state() == fcp::FecState::kOn);
+
+  fcp::FecStrategyConfig off_cfg;
+  off_cfg.pinned_k = 0;
+  fcp::FecStrategy st2(off_cfg);
+  CHECK(st2.pinned());
+  CHECK_EQ(st2.k(), 0);
+  id = 0;
+  Feed(&st2, &id, 0.20);
+  CHECK_EQ(st2.k(), 0);
+  CHECK(st2.state() == fcp::FecState::kOff);
+
+  fcp::FecStrategyConfig big_cfg;
+  big_cfg.pinned_k = 9;
+  fcp::FecStrategy st3(big_cfg);
+  CHECK_EQ(st3.k(), fcp::kDefaultPmax);  // clamped to p_max, not just 3 bits
+
+  fcp::FecStrategyConfig six_cfg;
+  six_cfg.p_max = 6;
+  six_cfg.pinned_k = 9;
+  fcp::FecStrategy st4(six_cfg);
+  CHECK_EQ(st4.k(), 6);
+}
+
+void TestKInvariant() {
+  // While ON, k never leaves 1..Pmax.
+  fcp::FecStrategy st;
+  uint32_t id = 0;
+  Feed(&st, &id, 0.30);
+  for (int i = 0; i < 200; ++i) {
+    const double loss = (i % 7 == 0) ? 0.0005 : ((i * 37) % 1000) / 4000.0;
+    // Cycle queued/unqueue to exercise both branches.
+    st.on_report(LossReport(++id, loss), (i % 5) == 0);
+    if (st.state() == fcp::FecState::kOn) {
+      CHECK(st.k() >= 1);
+      CHECK(st.k() <= fcp::kDefaultPmax);
+    } else {
+      CHECK_EQ(st.k(), 0);
+    }
+  }
+}
+
+}  // namespace
+
+int main() {
+  TestOffToOn();
+  TestTwoReportEntry();
+  TestPerReportStep();
+  TestQueuedGuard();
+  TestCleanStreak();
+  TestCooldown();
+  TestUntrustedSample();
+  TestSmallSample();
+  TestStaleReport();
+  TestPinned();
+  TestKInvariant();
+  return fcp_test::finish();
+}

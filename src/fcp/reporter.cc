@@ -1,0 +1,147 @@
+#include "fcp/reporter.h"
+
+#include <algorithm>
+#include <cstring>
+#include <utility>
+
+namespace fcp {
+namespace {
+
+uint16_t percentile(const std::vector<uint16_t>& sorted, unsigned pct) {
+  if (sorted.empty()) {
+    return 0;
+  }
+  // Nearest rank: ceil(pct * n / 100), clamped to [1, n].
+  size_t rank = (static_cast<size_t>(pct) * sorted.size() + 99) / 100;
+  rank = std::clamp<size_t>(rank, 1, sorted.size());
+  return sorted[rank - 1];
+}
+
+}  // namespace
+
+FcpReporter::FcpReporter(FcpSettle* settle, SendFn send)
+    : settle_(settle), send_(std::move(send)) {}
+
+void FcpReporter::set_salt(const uint8_t salt[8]) {
+  std::memcpy(salt_, salt, sizeof(salt_));
+}
+
+void FcpReporter::add_auth_fail(uint32_t count) { auth_fail_ += count; }
+void FcpReporter::add_struct_fail(uint32_t count) { struct_fail_ += count; }
+void FcpReporter::add_data_bytes(uint32_t bytes) { data_bytes_ += bytes; }
+void FcpReporter::add_parity_bytes(uint32_t bytes) { parity_bytes_ += bytes; }
+
+void FcpReporter::record_repair_latency(uint32_t ms) {
+  repair_lat_.push_back(static_cast<uint16_t>(std::min<uint32_t>(ms, 0xFFFF)));
+}
+
+bool FcpReporter::has_content() const {
+  if (auth_fail_ != 0 || struct_fail_ != 0 || data_bytes_ != 0 || parity_bytes_ != 0 ||
+      !repair_lat_.empty()) {
+    return true;
+  }
+  if (settle_ == nullptr) {
+    return false;
+  }
+  const SettleCounters& c = settle_->counters();
+  return c.sets_expected != 0 || c.data_expected != 0 || c.data_delivered != 0 ||
+         c.parity_rx != 0 || c.sets_k_unknown != 0 || c.sets_tail_dropped != 0 ||
+         c.late_dup != 0 || c.data_late_rx != 0 || c.data_recovered_late != 0;
+}
+
+bool FcpReporter::on_tick(int64_t now_ms) {
+  if (!have_last_) {
+    last_report_ms_ = now_ms;
+    have_last_ = true;
+    return false;
+  }
+  const int64_t elapsed = now_ms - last_report_ms_;
+
+  const uint32_t expected =
+      settle_ != nullptr ? settle_->counters().data_expected : 0;
+  const bool due = elapsed >= kFecstatMinIntervalMs && expected >= kFecstatMinSamples;
+  if (due) {
+    last_forced_ = false;
+    report(now_ms, elapsed);
+    return true;
+  }
+  if (elapsed >= kFecstatMaxIntervalMs && has_content()) {
+    last_forced_ = true;
+    report(now_ms, elapsed);
+    return true;
+  }
+  return false;
+}
+
+void FcpReporter::report(int64_t now_ms, int64_t elapsed_ms) {
+  FecstatPacket packet = MakeFecstatPacket(salt_);
+  packet.flg = kFlgDirection;
+  packet.interval_ms =
+      static_cast<uint16_t>(std::min<int64_t>(elapsed_ms, kFecstatMaxIntervalMs));
+
+  std::vector<uint16_t> sorted;
+  if (!repair_lat_.empty()) {
+    sorted = repair_lat_;
+    std::sort(sorted.begin(), sorted.end());
+  }
+  packet.repair_lat_p50_ms = percentile(sorted, 50);
+  packet.repair_lat_p95_ms = percentile(sorted, 95);
+
+  packet.auth_fail = auth_fail_;
+  packet.struct_fail = struct_fail_;
+  packet.data_bytes_rx = data_bytes_;
+  packet.parity_bytes_rx = parity_bytes_;
+
+  if (settle_ != nullptr) {
+    const SettleCounters& c = settle_->counters();
+    if (c.sets_tail_dropped > 0) {
+      packet.flg |= kFlgTailDropped;
+    }
+    if (c.data_recovered_late > 0) {
+      packet.flg |= kFlgLateRecovery;
+    }
+    packet.accounted_through_set_id = settle_->accounted_through_set_id();
+    packet.sets_expected = c.sets_expected;
+    packet.data_expected = c.data_expected;
+    packet.data_rx_orig = c.data_rx_orig;
+    packet.data_recovered_dl = c.data_recovered_dl;
+    packet.data_recovered_late = c.data_recovered_late;
+    packet.data_delivered = c.data_delivered;
+    packet.parity_rx = c.parity_rx;
+    packet.parity_expected = c.parity_expected;
+    packet.sets_k_unknown = c.sets_k_unknown;
+    packet.sets_full = c.sets_full;
+    packet.late_dup = c.late_dup;
+    packet.sets_tail_dropped = c.sets_tail_dropped;
+    packet.data_late_rx = c.data_late_rx;
+    packet.sets_partial = c.sets_partial;
+  }
+
+  uint8_t wire[kFecstatLen];
+  encode_fecstat(packet, wire);
+  if (send_) {
+    // #28⑤ (F3): FECSTAT travels over an oob datagram that is never
+    // retransmitted, so one lost copy would blind the peer's strategy for a
+    // full report period ("no FECSTAT for 3 periods" -> keep k). The 128-byte
+    // report is sent twice; the receiver's monotonic key classifies the copy
+    // as kDuplicate and ignores it (spec §14.15).
+    send_(wire, sizeof(wire));
+    send_(wire, sizeof(wire));
+  }
+  ++reports_;
+  last_report_ms_ = now_ms;
+  reset_interval();
+}
+
+void FcpReporter::reset_interval() {
+  auth_fail_ = 0;
+  struct_fail_ = 0;
+  data_bytes_ = 0;
+  parity_bytes_ = 0;
+  repair_lat_.clear();
+  if (settle_ != nullptr) {
+    settle_->reset_interval();
+  }
+}
+
+}  // namespace fcp

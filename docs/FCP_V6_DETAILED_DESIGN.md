@@ -1,0 +1,608 @@
+# FCP v6 详细设计（M1 实现基线）
+
+> 依据：`docs/FCP_PROTOCOL_V6.md`（五轮评审定稿 + 2026-10-30 文档审查勘误，规格附录 C #22）。
+> 规格回答"协议是什么"，本文回答"代码怎么写"。所有章节号 `§n` 均指规格。
+> **附录 A 是规格勘误表**：设计按勘误后的行为实现；#1–#8 已回改规格（均为局部修改，不动线格式），
+> #9–#11 为 2026-10-30 文档审查新增、#12 为同日对抗分析新增、#13 为设计分叉裁定（control→oob），
+> 规格已同步（附录 C #22–#25）。
+> **实现语言约束：C++20**（`CMAKE_CXX_STANDARD 20`，关闭编译器扩展）；本文所有接口按 C++20 编写。
+
+---
+
+## 1. 范围
+
+**做（M1）**：线格式编解码、RS 编解码、集合状态机（发送/接收）、`T_flush` 空闲闭合、`k_eff` 缩放、
+结算器与墓碑、FECSTAT 编解码与上报节奏、`k_for` 策略状态机、HELLO/ACK 握手、加密信封、MTU 断言、
+T1–T23 测试（T23 为 #25 握手 oob 化回归）。
+
+**不做（M1）**：`deadline` 统计（M2）、字节预算与 `R(k)` 模型（M3）、KCP 行为改动（M4）、
+滑动窗口 FEC、大小分桶、非对称 D:P。
+
+---
+
+## 2. 模块划分
+
+```text
+            ┌────────────────────────────────────────────┐
+            │                Session（每会话单线程）        │
+            │                                            │
+ KCP ──输出──▶ fcp_frame_tx ──▶ fcp_rs(encode) ──┐       │
+            │       │ oob(HELLO/ACK，#25)         │       │
+            │       ▼                            ▼       │
+            │  fcp_handshake            fcp_envelope ──▶ UDP
+            │       ▲                            ▲       │
+            │       │                            │       │
+ KCP ◀─输入── fcp_frame_rx ◀── fcp_rs(decode) ───┘       │
+            │   │   │                                    │
+            │   │   └──▶ fcp_settle ──▶ fcp_fecstat ─────▶ (oob 发送)
+            │   │              │                          │
+            │   └──────────────┼──────────────────────────│◀── UDP 收包（先过 envelope）
+            │                  ▼                          │
+            │            fcp_strategy（读 FECSTAT，写 k）  │
+            └────────────────────────────────────────────┘
+```
+
+| 模块 | 职责 | 对外接口 |
+|---|---|---|
+| `fcp_envelope` | salt/nonce/tag、AES-GCM 加解密、IV 展开 | `seal(pkt)` / `open(pkt)` |
+| `fcp_frame_tx` | 加头、集合组装、`T_flush`、`k_eff`、闭合 | `on_kcp_output(seg)` |
+| `fcp_frame_rx` | 分流、置位、`n` 判定、交付、重建触发 | `on_datagram(pkt)` |
+| `fcp_rs` | 柯西系统码编解码、零扩展 | `encode()` / `decode()` |
+| `fcp_settle` | eligible/accounted 判定、计数累加、墓碑 | `tick(now)` |
+| `fcp_fecstat` | 128B 报文编解码、上报节奏 | `maybe_report(now)` |
+| `fcp_strategy` | OFF/ON 状态机、`k_for`、护栏 | `on_report(stat)` |
+| `fcp_handshake` | HELLO/ACK（oob，#25）、caps 校验、超时、幂等 | `start()` / `on_oob(sym)` |
+
+**线程模型**：每会话一个逻辑线程。UDP 收包线程按 salt 哈希分发到会话队列；会话线程串行处理
+收包、KCP 回调、定时器。模块间无锁。定时器源：`T_flush` 检查挂在每次发包后 + 25ms 轮询；
+结算 tick 25ms；FECSTAT 定时 2s。
+
+---
+
+## 3. 常量与配置
+
+```cpp
+// 编译期常量（与规格 §3/§4.6 对应，static_assert 锁死）
+constexpr uint8_t  kDefaultD      = 10;
+constexpr uint8_t  kDefaultP      = 3;
+constexpr uint8_t  kPmax          = 4;    // 默认值；--fec-parity-max 允许 5..7（#26④），字段硬上限 7
+constexpr uint16_t kDefaultMtu    = 1400;
+constexpr size_t   kSaltLen       = 8;
+constexpr size_t   kNonceLen      = 8;    // 线上；IV 展开后 12
+constexpr size_t   kTagLen        = 12;
+constexpr size_t   kHdrLen        = 6;
+constexpr size_t   kEnvelopeOvh   = kSaltLen + kNonceLen + kTagLen;  // 28
+constexpr size_t   kMaxS          = 256;  // D + P ≤ 256
+constexpr uint32_t kMaxActiveSets = 256;
+constexpr uint64_t kNonceLimit    = 1ull << 32;  // #26①：GCM 块预算终止线
+constexpr size_t   kReplayWindow  = 256;  // #26③：每方向重放窗口（原 64）
+
+// 运行时配置（CLI）
+struct FcpConfig {
+  uint8_t  d = kDefaultD;
+  uint8_t  p = kDefaultP;
+  uint16_t mtu = kDefaultMtu;
+  int      parity_pinned = -1;        // --fec-parity-pinned，-1 表示自动
+  uint8_t  parity_max = 4;            // --fec-parity-max，允许 5..7（#26④），协商时参与 P' 计算
+  double   target_recovery = 0.80;    // M3 可配；M1 恒 0.80
+};
+```
+
+MTU 断言（§4.6，IPv4 与 IPv6 各算一遍，`static_assert` + 启动时运行时校验）：
+
+```text
+data   wire = 36 + payload        parity wire = 34 + symbol_max
+IPv4/M=1400: payload_max = 1336, symbol_max = 1338, MSS = 1312
+IPv6/M=1400: payload_max = 1316, symbol_max = 1318, MSS = 1292
+约束：wire + ip_hlen + 8 ≤ mtu，违者启动即 fail（不许硬编码推导值）
+```
+
+---
+
+## 4. 线格式编解码
+
+### 4.1 信封（`fcp_envelope`）
+
+```text
+偏移 0   : salt[8]        会话常量
+偏移 8   : nonce_ctr[8]   单调计数器，小端，每包 +1（每方向独立，从 0 起——#24①）
+偏移 16  : 明文 = fec_hdr(6) | symbol
+尾部     : tag[12]
+
+IV(12B) = counter(8, LE) | direction(1) | 0x00 × 3
+direction: c2s = 0x01，s2c = 0x02（会话角色决定，不上线）
+```
+
+- 发送：`nonce_ctr` 用 `uint64_t`，到 `2^32` 主动断连（#26①：GCM 块预算终止线——满尺寸包约 84 块，
+  2^32 包 ≈ 2^36.1 块 < SP 800-38D 的 2^39−256；原 2^48 超预算 6.5 万倍）。
+- **会话密钥按会话派生（#28①，P0，已落地·任务 F1）**：会话密钥不再是配置 PSK 本身，
+  而是 `session_key = AES128-Encrypt(PSK, salt(8) ‖ 0x00×8)`（salt 为线上明文，每会话新鲜）。
+  依据：IV = `counter|dir|0×3` 只依赖计数器与方向，若直接用 PSK，同一 PSK 的任意两会话
+  （重连/多客户端共用配置）方向密钥相同、计数器都从 0 起 → GCM (key, IV) 跨会话重用
+  （规格 §6.0）。修复零线上改动，两端各自本地计算；**已实现：`derive_session_key`（`envelope.cc`）+ 构造函数重接，T27
+  （`envelope_test TestSessionKeyDerivation`）绿**。
+- **方向密钥（#26②，M1 强制）**：`derive_direction_keys(session_key)` 按 SP 800-108 计数器 KDF
+  （AES-128 作 PRF，label `fcp-c2`/`fcp-s2`，恰 16 字节输入块）派生 `send_key_`/`recv_key_`；
+  seal 用 send_key、open 用 recv_key。ikm = session_key（#28① 前 ikm 实为配置 PSK）。
+  派生确定性由 envelope_test 断言。
+- 接收：`open()` 失败 → `auth_fail += 1`，报文**就地丢弃**，不分类、不进 RS、不触碰集合状态。
+  `nonce_ctr ≥ 2^32` 的报文在进 GCM 前直接拒收（协议违规，非重放候选）。
+- 重放窗口（#23③，#26③ 放宽）：每方向一个 **256 槽**滑动位图（`recv_seen_`，与 IPsec 反重放同构）
+  ——以前见最高 `nonce_ctr` 为基准，前跳接受并滑动（跳距 ≥256 则重置）、窗口内未见接受并置位、
+  已见或落后超窗拒收。UDP 重排由窗口吸收，不要求严格单调；被拒重放计 `auth_fail`。256 槽位图
+  每方向 32 字节，按 1312 B MSS 实际覆盖约 **13–19 Mbps × 200ms** 的 BDP（#28② 勘误：#26③ 原
+  "覆盖 25 Mbps × 200ms"算错，25 Mbps × 200ms ≈ 476 包 > 256）；更高 BDP 留 M2 自适应窗口
+  （64 槽在 100 Mbps × 200ms 下会被突发重排击穿，误拒伪装丢包推高 `pre_repair_loss`，闭环自激）。
+- 会话查找：服务端以 `salt[8]` 为键查会话表；新 salt 与在线会话冲突 → 拒绝并日志（§14.7）。
+- tag 长度 12：GCM 封装按 12 字节截断/校验 tag（T0 决策 2 为内置实现；原文写 OpenSSL
+  `EVP_CTRL_GCM_SET_TAG`/`GET_TAG` 是早期方案残留，#23⑩ 清理）。
+
+### 4.2 FEC 头（6 字节）
+
+```cpp
+struct FcpHdr {
+  uint32_t set_id;   // LE
+  uint8_t  index;    // data: 0..n-1；parity: n + j
+  uint8_t  type_k;   // (k<<5) | (j<<2) | type
+  // type: 0=data 1=parity 2=oob（3 未定义：#25 后 HELLO/ACK 走 oob，2 位字段的 3 无含义，收到按 struct_fail 丢弃）
+};
+inline uint8_t pack_type_k(uint8_t k, uint8_t j, uint8_t type) {
+  return (k << 5) | (j << 2) | type;
+}
+bool parse_hdr(const uint8_t* p, size_t len, FcpHdr* out);  // len ≥ 6
+//   type = type_k & 0x03; j = (type_k >> 2) & 0x07; k = type_k >> 5
+```
+
+**校验顺序**（每条失败即 drop；顺序即 §4.5 伪码顺序）：
+
+1. `index ≥ S` → malformed；
+2. `type==data && index ≥ D` → malformed；
+3. `type==parity && j ≥ k` → malformed；
+4. parity：`n = index − j`，`n < 1 || n > D` → malformed；
+5. `type==data && n_known && index ≥ n` → malformed（与 parity 给出的 n 冲突）。
+
+### 4.3 FECSTAT（128 字节，`fcp_fecstat`）
+
+结构体 + 编译期偏移断言：
+
+```cpp
+struct FecstatPacket {          // 全部小端
+  char     magic[16];           // "FCP_FECSTAT_V6\0\0"
+  uint8_t  session_salt[8];
+  uint8_t  ver;                 // = 6
+  uint8_t  flg;                 // bit0=方向(1=你→我) bit1=有被丢弃集合 bit2=有迟到恢复
+  uint16_t interval_ms;
+  uint32_t accounted_through_set_id;
+  uint32_t sets_expected;
+  uint32_t data_expected;        // Σ n_used
+  uint32_t data_rx_orig;
+  uint32_t data_recovered_dl;
+  uint32_t data_recovered_late;
+  uint32_t data_delivered;
+  uint32_t parity_rx;
+  uint32_t parity_expected;      // Σk 计划值（上界）
+  uint32_t sets_k_unknown;
+  uint32_t sets_full;
+  uint32_t auth_fail;
+  uint32_t late_dup;
+  uint32_t struct_fail;
+  uint16_t repair_lat_p50_ms;
+  uint16_t repair_lat_p95_ms;
+  uint32_t data_bytes_rx;
+  uint32_t parity_bytes_rx;
+  uint32_t sets_tail_dropped;
+  uint32_t data_late_rx;
+  uint32_t sets_partial;
+  uint32_t reserved[5];          // 108..124
+};
+static_assert(sizeof(FecstatPacket) == 128);
+static_assert(offsetof(FecstatPacket, ver) == 24);
+static_assert(offsetof(FecstatPacket, accounted_through_set_id) == 28);
+static_assert(offsetof(FecstatPacket, reserved) == 108);
+```
+
+**校验**：长度 == 128 → magic 逐字节 → `session_salt` == 本会话 salt → `ver == 6`；
+任一失败丢弃并计 `fecstat_dropped`（原因分四类：`bad_length|bad_magic|bad_salt|bad_ver`）。
+`accounted_through_set_id` 不晚于上次已用值（**按 §14.5 半窗判据比较**，F4/#23⑦）→ 整条忽略（单调键，`fecstat_stale += 1`）。
+
+---
+
+## 5. 发送路径（`fcp_frame_tx`）
+
+### 5.1 状态
+
+```cpp
+struct FcpTxSet {
+  uint32_t set_id;
+  uint8_t  n;            // 已放入 data 数，0..D
+  uint8_t  k;            // 计划值，集合开始时锁定
+  size_t   symbol_max;   // max(2 + payload_len)
+  uint64_t t_last;       // 最后一次放入 data 的时刻（ms）
+};
+```
+
+### 5.2 主流程
+
+```text
+on_kcp_output(seg):                           # KCP 输出已无控制消息（HELLO/ACK 走 oob，#25）
+  if tx.n == 0:                               # 新集合开始
+      tx.k = strategy.current_k()             # 计划值锁定，集合内不变
+      tx.symbol_max = 0
+
+  idx = tx.n
+  sym = len16(seg.len + 2) | seg              # len = 2 + payload_len
+  tx.symbol_max = max(tx.symbol_max, sym.size())
+  cache_symbol(idx, sym)                      # 供闭合时编码
+  emit_data(tx.set_id, idx, pack_type_k(tx.k, 0, 0), sym)
+  tx.n += 1; tx.t_last = now()
+
+  if tx.n == D: close_set()
+  arm_flush_check()                           # 每次发包后重置 T_flush 计时
+
+poll_25ms():
+  if tx.n ≥ 1 && now() − tx.t_last ≥ T_flush: close_set()
+```
+
+**握手包不再经 KCP 输出（#25，取代勘误 #9/#22①/#23① 的判定机制）**：HELLO/ACK 由握手层经 oob
+通道发送（type=2，规格 §4.7），重传由握手指数退避定时器承担（300/600/1200ms，#27①）、Established 即停。KCP 输出路径上
+**不存在任何内容分类**——magic 前缀/在途登记/注销规则（勘误 #9、#22①、#23①）整体作废（记录保留）；
+payload 撞 magic、重发判定、握手自锁等问题失去存在前提。
+
+### 5.3 闭合与 k_eff
+
+```text
+close_set():
+  k_eff = 0
+  if tx.k ≥ 1: k_eff = min(tx.k, max(1, ceil(tx.k * tx.n / D)))
+  if k_eff ≥ 1:
+      parities = fcp_rs::encode(cached[0..n), n, k, symbol_max)   # 算满 k 条
+      for j in 0..k_eff-1:
+          emit_parity(tx.set_id, n + j, pack_type_k(tx.k, j, 1), parities[j])
+  release cached symbols
+  tx.set_id += 1; tx.n = 0
+```
+
+`T_flush = clamp(RTT, 25ms, 200ms)`，RTT 取 KCP 的 `srtt`（初值 200ms）。
+
+### 5.4 RS 编码契约（`fcp_rs`）——勘误 #1 落地点
+
+生成矩阵只依赖 `(n, k)`，**不依赖 `k_eff`**：
+
+- 系统柯西矩阵 `G = [ I_n | C ]`，`C[r][c] = 1 / (x_r ⊕ y_c)`，
+  `x_r = r`（r < k）、`y_c = k + c`（GF(2^8)，保证 `x_r ⊕ y_c ≠ 0` 且任意子式非零；
+  原稿写 `256 + c`，在 GF(2^8) 中等价于 `c`，与 `x_r` 撞位——勘误 #8）。
+  两端用同一公式现场构造，**不传矩阵**。
+- 发送端：对 `n` 个零扩展到 `symbol_max` 的 data symbol 算**全部 k 条** parity，只发前 `k_eff` 条。
+- 接收端：按收到的 `(n, k)` 构造同一个 `G`；未发送的 `k − k_eff` 条 parity 按幽灵擦除处理（§6.3）。
+  发得少只是冗余额度变少，不影响矩阵一致性。
+- GF(2^8)：生成多项式 `0x11D`（与 ISA-L/kcp-go 一致），log/exp 查表（启动时构建 256 项）。
+
+```cpp
+// data[n] 均 symbol_max 长（已零扩展），输出 parity[k] 全部 k 条
+void encode(const uint8_t* const* data, size_t n, size_t k,
+            size_t symbol_max, uint8_t** parity_out);
+// symbols: 收到的填指针、擦除位（含幽灵 parity）填 nullptr；要求收到数 ≥ n
+bool decode(uint8_t** symbols, size_t code_len, size_t n,
+            const std::vector<size_t>& erasures, size_t symbol_max);
+```
+
+### 5.5 MTU
+
+发送前断言：`36 + payload ≤ mtu − 28`、`34 + symbol_max ≤ mtu − 28`。
+KCP 的 `mss` 在握手完成后设置：`mss = payload_max − 24`（IPv4/M=1400 → 1312）。
+
+---
+
+## 6. 接收路径（`fcp_frame_rx`）
+
+### 6.1 状态
+
+**勘误 #2 落地点**：原始到达与重建交付用**两个独立位图**，结算各数各的，不共享一个 `mark()`。
+
+```cpp
+struct FcpRxSet {
+  uint32_t set_id;
+  std::array<uint8_t*, kMaxS> symbols;   // 收到即存，nullptr 未到
+  uint16_t symbol_len[kMaxS];
+  size_t   rx_count;                     // data+parity 收到总数
+  std::bitset<kMaxS> orig_mask;          // 原始 data 到达
+  std::bitset<kMaxS> recov_mask;         // 重建成功
+  std::bitset<kMaxS> parity_mask;        // parity 到达
+  uint8_t  k;        bool k_known;       // 计划值，任一分片可得
+  uint8_t  n;        bool n_known;       // 只能由 parity 给出
+  uint8_t  max_data_index;
+  bool     saw_parity;                   // eligible 凭证之一
+  uint64_t t_first;  SetPhase phase;     // Active/Eligible/Accounted/Tombstone
+  uint64_t tombstone_until;
+  uint32_t decode_attempts;
+  std::bitset<kMaxS> decoded_once;       // 每个缺失位只重建交付一次
+};
+```
+
+KCP sn 去重表（会话级）：滑动窗口位图 4096 项，键 `sn mod 4096`，带时间戳淘汰；
+重复 → `late_dup += 1`（结算后首见则 `data_late_rx += 1`），不重复交付。
+payload 不足以容纳 KCP sn 的短段**绕过**去重窗口、逐次交付——否则它们会共享同一槽位，
+首段之后的所有短段被静默吞掉。
+
+### 6.2 主流程
+
+```text
+on_datagram(pkt):
+  if !envelope.open(pkt): auth_fail += 1; return
+  if len(明文) > kHdrLen + symbol_max上限: struct_fail; return   # 认证后超 MTU 预算（实现单列 pre_struct_fail；#23⑤）
+  parse_hdr → hdr, symbol
+  if type == oob:     oob_dispatch(symbol); return   # 按 magic 分派：FECSTAT/KEEPALIVE/HELLO/HELLO_ACK（#25）
+  if type ∉ {data, parity, oob}: struct_fail; return  # 2 位字段；3 未定义（#25 取消）
+
+  if hdr.set_id 早于 anchor − kMaxActiveSets: stale += 1; return
+  set = get_or_create(hdr.set_id)          # t_first = now()（新建时）
+  按 §4.2 的 1–5 项校验，失败 → struct_fail / malformed 计数；return
+
+  if type == data:
+      if symbol_len != len16(symbol): struct_fail; return
+      note_k(hdr.k)                    # 与已记录 k 冲突 → struct_fail（#23④）
+      orig_mask.set(idx); max_data_index = max(...)
+      if sn_first_time(kcp_sn_of(sym)): deliver_to_kcp(sym[2..])   # 立即交付
+      store_symbol(idx, sym)
+  else:  # parity
+      note_k(hdr.k)                    # k 冲突同上（#23④）
+      n_new = hdr.index − hdr.j
+      if n_known && n_new != n: struct_fail; return
+      n = n_new; n_known = true; saw_parity = true
+      parity_mask.set(idx)
+      store_symbol(idx, sym)
+
+  try_decode(set)
+```
+
+### 6.3 重建（`try_decode`）
+
+```text
+try_decode(set):
+  if !set.n_known: return                    # 无 parity → 码长未知，不重建（§4.5）
+  if rx_count < set.n: return                # 片数不够，等下一片再触发
+  if set.decoded_once 全覆盖 data 范围: return
+
+  missing_data = (~orig & ~recov) & data_range(0..n)
+  if missing_data.empty(): return
+  if missing_data.count() > k: return        # 超出冗余能力，等 KCP 重传（永不重试更多）
+
+  erasures = missing_data ∪ 缺失的 parity 位（含幽灵：j ∈ [k_eff, k)，见勘误 #1）
+  decode(symbols, n+k, n, erasures, symbol_max)
+  成功后逐个检查结构（len 合法、尾零扩展全 0）：
+      通过 → recov_mask.set(i); deliver_to_kcp(去重后); decoded_once.set(i)
+      失败 → struct_fail += 1; decoded_once.set(i)     # 不重试
+  decode_attempts += 1
+```
+
+修复时延统计：`t_repair = now − set.t_first`，收敛进本区间 p50/p95
+（简单实现：本区间全部样本存 `std::vector<uint32_t>`，上报时 nth_element 取分位后清空）。
+
+---
+
+## 7. 结算器（`fcp_settle`）
+
+**勘误 #3 落地点**：整组全丢按 `sets_k_unknown` 计数，**不进 `data_expected`**——
+它的真实 `n` 未知（可能是 1，也可能是 10），按 `D` 记账会把稀疏流的丢包率抬高 3~4 倍。
+样本不可信判定一并给出：
+
+```text
+tick_25ms(now):
+  for set in active_sets:
+    if set.phase == Active:
+        eligible = saw_parity 或 存在 set_id' > set.set_id 且已见过其分片
+        if eligible: set.phase = Eligible
+        elif now − t_first ≥ 1s:                  # 未闭合即停滞
+            tail_dropped += 1; free(set)          # 不进 expected（含 k=0 空闲闭合尾组）
+
+    if set.phase == Eligible && now − t_first ≥ late_guard:
+        accounted(set); set.phase = Accounted
+
+  for set in tombstones:
+    if now ≥ tombstone_until: free(set)
+```
+
+`accounted(set)`（每集合一次）：
+
+```text
+if set 有任何分片:
+    n_used = set.n_known ? set.n : (max_data_index + 1)
+    sets_expected   += 1
+    data_expected   += n_used
+    data_rx_orig    += (orig_mask & data_range(0..n_used)).count()   # 勘误 #2：不含重建
+    parity_rx       += parity_mask.count()
+    data_recovered_dl += recov_mask & data_range(0..n_used)          # 重建单独计
+    sets_full       += ((orig | recov) & data_range(0..n_used)).count() == n_used
+    if n_used < D: sets_partial += 1
+    if k > 0: parity_expected += k       # 计划值上界（k_eff 不上线）
+else:
+    sets_k_unknown += 1                  # 勘误 #3：不计 expected
+```
+
+**样本可信门**（喂给策略前）：
+`sets_k_unknown / max(1, sets_expected) > 0.10` → 本区间标记 `untrusted`，
+策略保持 `k` 不动（只记录，不驱动状态机）；恢复可信后自动继续。
+
+墓碑：结算后保留 `clamp(2×RTT, 200ms, 1s)`。期内迟到 data 首次交付 → `data_late_rx`（sn 去重后）；
+重复 → `late_dup`；迟到 parity 重建成功 → `data_recovered_late`，且**不回填**任何结算计数。
+尾丢集合（`tail_dropped`，不进 expected）的已交付数计入本地诊断字段 `tail_delivered`（不占 128B
+线格式），供 §7.1 校验项右端加回——否则 k=0 尾组必然打破该断言（第二轮 F5、#23②）。
+
+---
+
+## 8. FECSTAT 上报（`fcp_fecstat`）
+
+```text
+maybe_report(now):
+  interval_full = now − last_report ≥ 60_000          # 强制门
+  if now − last_report ≥ 2_000 && data_expected ≥ 256:
+      send(fecstat_encode(区间计数)); reset_counters(); last_report = now
+  elif interval_full && (有数据或任何非零计数):
+      send(...); reset_counters(); last_report = now   # interval_ms 如实填
+```
+
+- 只统计**已 accounted** 的集合；区间内计数器在 reset 时整体清零。
+- `flg.bit1`：区间内发生 `tail_dropped`；`flg.bit2`：发生 `data_recovered_late`。
+- 修复时延 p50/p95 在编码前从样本向量取分位。
+- 接收对端 FECSTAT 的处理在**策略模块**（§9）；FECSTAT 丢弃分类见 §4.3。
+
+---
+
+## 9. 策略（`fcp_strategy`）
+
+**勘误 #5/#6 落地点**：所有"连续 N 个报告"按**报告数**计，不按时间计；时间语义只体现在
+`interval_ms` 上。OFF/ON 状态机：
+
+```text
+on_report(stat):
+  if stat.accounted_through_set_id ≤ last_used: return      # 已在 fecstat 层拦，双保险
+  last_used = stat.accounted_through_set_id
+
+  if !trusted(stat):                     # 勘误 #3 的样本门
+      log("FEC sample untrusted: k_unknown=N"); return   # 不驱动状态机
+
+  if stat.data_expected < 256:            # 规格 §8 样本规则（60s 强制上报）
+      log("FEC sample too small: expected=N"); return    # 只记日志，不动状态机
+
+  loss = (stat.data_expected − stat.data_rx_orig) / stat.data_expected
+
+  case OFF:
+      if loss ≥ 0.015: enter_ON(k_for(loss))
+      elif loss ≥ 0.008: consec_ge_08 += 1; if consec_ge_08 ≥ 2: enter_ON(k_for(loss))
+      else: consec_ge_08 = 0
+
+  case ON:
+      k_target = k_for(loss)
+      if queued(srtt − min_rtt ≥ 40ms):      # 护栏
+          no_grow = true; queued_streak += 1
+          if queued_streak ≥ 3: k = max(1, k − 1)
+      else:
+          queued_streak = 0
+          if !no_grow: k = clamp(k ± limit(k, k_target, ±1))   # 每报告 ±1
+      clean_streak = (loss < 0.003) ? clean_streak + 1 : 0
+      if clean_streak ≥ 5: enter_OFF()
+      # 防抖：OFF 后 3 报告内 loss < 0.045 不再开启
+
+  case pin: return                          # --fec-parity-pinned，完全绕过
+
+k_for(loss):                                # 目标修复率 0.80（M3 可配）
+  for k in 1..P:
+      if binom_cdf(k, D+k, loss) ≥ 0.80: return k
+  return P
+```
+
+护栏澄清：`no_grow` 仅在排队的那一个报告周期内禁止**上调**；下调（含护栏强降）不受限。
+样本门澄清：不可信区间与 `data_expected < 256` 的区间都**不消耗**冷却/连续计数，`k` 保持不变。
+
+无 FECSTAT（连续 3 个区间，按本地 2s/60s 时钟估计）→ 保持 `k`，WARNING 一次。
+
+---
+
+## 10. 握手（`fcp_handshake`）
+
+```text
+状态: Idle → HelloSent → Established / Failed
+
+start():        schedule_hello(); state = HelloSent
+on_tick():      HelloSent 且 now ≥ next_retry:
+                  if retries ≥ 3: ERROR("V3 no ACK after 3 tries"); 断连
+                  else: oob.send(HELLO); retries += 1; next_retry = now + 300ms × 2^retries   # 退避：300/600/1200（#27①）
+on_oob(sym): 按 HELLO / HELLO_ACK 分派；重复 HELLO 重发 ACK（幂等协商；此前 ACK 可能已丢），重复 ACK 吞掉
+
+协商（两侧对称）:
+  校验 caps: ver==1、data ≥ 1、parity ≤ 7、data + parity ≤ 256（u16 中间量！勘误 #7）、
+  flags bit4..7==0（#23⑧），违者 ERROR
+  D' = min(两端 D)；P' = min(两端 P)；flags' = 两端 &
+  !flags'.bit0 || !flags'.bit1 → ERROR（成帧与 FECSTAT 强制）
+  P' == 0 → FRAMED_STATS（不建 RS）；否则 FRAMED_REPAIR（按 (D', P') 建 codec）
+
+Established 时动作:
+  frame_tx.mss = payload_max − 24
+  勘误 #4：协商完成前只放行 oob（握手报文）；data 段缓存
+  （上限默认 **512 段 / 512KB，经 `SessionConfig.handshake_cache_*` 可配置**，#28③/F2；超限或握手失败 → 丢弃并 ERROR，缓存随握手结果落盘或释放）
+```
+
+- HELLO/ACK 经 oob 发送（#25）：每次发送（含重发）都是独立 oob 报文；重传由握手层定时器承担
+  （`on_tick` **指数退避 300/600/1200ms**，#27①：握手阶段无 RTT 样本，固定 900ms 总预算在
+  RTT > 450ms 链路上会"ACK 未到先判死"；Established 即停），无 KCP 残留重传窗口；独占段/内容分类断言删除。
+- ~~在途消息登记~~（勘误 #9/#23①）：随 #25 oob 化**作废**——成帧层不再需要任何握手状态。
+- 双方同时发 HELLO：各自收到对端 HELLO 即回 ACK，协商一次；重复 HELLO 重发 ACK，重复 ACK 吞掉。
+  本端 HELLO 重传由握手定时器承担、Established 即停，不存在"Established 后的 KCP 残留重传"窗口。
+
+---
+
+## 11. 日志（规格 §10）
+
+```text
+FCP v6 negotiated: data=10 parity=3 pmax=4 flags=framed,stats (peer V3)
+FECSTAT sets=1250 expect=10000 rx=9850 rec=60 late=40 lost=50 pre=15000ppm usable=9000ppm -> k=2 state=ON
+FEC off: pre<0.30% for 5 reports (last 0.20%)
+FEC pinned: k=2 (operator)
+FECSTAT dropped: reason=stale count=1
+FEC sample untrusted: k_unknown=40/300 (>10%)
+FEC handshake failed: V3 no ACK after 3 tries (peer=<addr>)
+```
+
+`lost = data_expected − data_rx_orig − data_recovered_dl − data_late_rx`（**完全未收到**的包数；
+可用损失 = lost + late = expected − rx − rec），`pre/usable` 用 ppm 避免 0.9% 被取整成 1%。
+日志数字必须满足：`rx + rec + lost + late = expect`（实现自检断言，开发期开启）。
+
+---
+
+## 12. 测试计划（对齐规格 §13 T1–T27）
+
+| # | 用例 | 关键断言（新增/修订部分） |
+|---|---|---|
+| T1 | FECSTAT golden | 128B、偏移断言、单调键拒收；`interval_ms ≤ 60000` |
+| T2 | MTU 断言 | IPv4/IPv6 × {1400, 极值}；`static_assert` 编译期失败样例 |
+| T3 | k=0 无丢失 | 无 parity；`data_rx_orig == data_expected`；`pre = 0` |
+| T4 | k=P 单片丢失 | 最大分片丢失可恢复；`data_rx_orig` **不含**重建项（勘误 #2） |
+| T5 | parity 全丢 | 计划值 k 记账；不重建；`sets_k_unknown == 1`（若整组全丢） |
+| T6 | 整组全丢 | **只计 `sets_k_unknown`，不进 expected**（勘误 #3）；不虚增丢包率 |
+| T7 | sn 去重 | `data_delivered` 每 sn +1；重建/重传撞车只交付一次 |
+| T8 | auth_fail 注入 | 不分类、不触碰集合 |
+| T9 | struct_fail | 伪造 len / n 冲突 / j ≥ k 全部拦截 |
+| T10 | FRAMED_STATS | 无 RS、无 parity、统计正确、`k ≡ 0` |
+| T11 | 握手失败 | 3 次超时 ERROR；caps 违规（u16 校验）拒绝 |
+| T12 | 闭合三路径 | 满组 / 空闲 / 异常退出各自计数正确 |
+| T13 | 迟到记账 | `data_late_rx` 首次交付、`late_dup` 重复 |
+| T14 | oob 不占槽 | `data_expected == D × sets_expected`（无提前闭合时） |
+| T15 | 区间自适应 | ≥256 包驱动；60s 强制上报（`interval_ms ≈ 60000`） |
+| T16 | 头字段编码 | `(k<<5)\|(j<<2)\|type` 编解码 golden；j≥k、n 越界拒收 |
+| T17 | 空闲闭合 + k_eff | 3 包后停 300ms：`n=3`、发 `min(k, max(1, ceil(k·3/10)))` 条、**解码仍可成功**（勘误 #1） |
+| T18 | n 由 parity 给出 | `(12,2)→10`、`(6,1)→5`；冲突 `struct_fail`；无 parity 不重建 |
+| T19 | 信封 28B | 空明文 wire=28；IV 本地展开；tag 12；MSS 1312；**方向密钥隔离（#26②）：c2s 密文用 s2c 密钥必失败** |
+| T20 | k_for 反解 | 2/5/10/15/20/25% → 1/1/2/3/4/4；20% 不回落到 3 |
+| T21 | 握手期 data 缓存 | 握手完成前 data 段不上线；完成后按序补发（勘误 #4） |
+| T22 | 幽灵 parity | k_eff < k 时解码成功且 parity_expected 记账为计划值 k |
+| T23 | 握手通道 oob 化回归 | KCP 输出路径无内容分类分支；HELLO/ACK 以 type=2 上线、`set_id/index=0`；以 `FCP_HELLO_V3` 开头的用户段按 data 正常进集合（结构性保证）；type=3 未定义、按 struct_fail 丢弃；HELLO 重传由握手定时器承担、Established 后停止（#25） |
+| T24 | 重放窗口 256 槽 | 跨度 ≤256 的乱序全收；重放/落后超窗拒收 `auth_fail+1`；边界 255 收、256 拒（#26③；envelope_test + adv_test R1.4） |
+| T25 | 终止线 + 方向密钥派生 | `nonce_ctr ≥ 2^32` 封包/收包双向拒绝（#26①）；`derive_direction_keys` 确定性、两方向互异、异于原始会话密钥（envelope_test TestDirectionKeyIsolation） |
+| T26 | 握手重传退避（#27①） | 重传间隔 300→600→1200ms 递增（`next_retry_ms` 序列）；ACK 在任意退避阶段到达即停；3 个 HELLO 后 ERROR；RTT=500ms 仿真握手成功（固定 900ms 预算下必失败）；重复 HELLO 仍重发 ACK（幂等不受退避影响）——已落地：`handshake_test TestRetryBackoff`/`TestTimeout`、adv R9.4、session `TestHandshakeTimeout` |
+| T27 | 会话密钥按会话派生（#28①） | 同 PSK 不同 salt → `session_key` 互异；同 PSK 同 salt → 两端派生逐字节一致；方向密钥从 session_key 派生；旧方案（密钥=PSK）手工报文拒收——已落地：`envelope_test TestSessionKeyDerivation`（TestRecvNonceLimit 同步） |
+
+T6/T17/T21/T22 是勘误的直接回归；golden 数据全部由参考实现生成后**冻结**进仓库。
+
+---
+
+## 附录 A：规格勘误表（#1–#8 为详细设计阶段 review，已回改规格；#9–#11 为 2026-10-30 文档审查新增）
+
+| # | 位置 | 规格现状 | 问题 | 设计采用的行为 |
+|---|---|---|---|---|
+| 1 | §4.4 "RS 码长是 n+k_eff" | 码长随 k_eff 变 | 两端矩阵不一致，提前闭合组全部解不出来 | 码长恒为 `n+k`（计划值）；只少**发**，不少**算** |
+| 2 | §4.5/§5.2 `mark()` 共享 | 一份位图 | 重建包同时计入 rx_orig 和 recovered，`usable_loss` 被重复扣减 | `orig_mask` / `recov_mask` 分离 |
+| 3 | §5.2 整组全丢按 D 记账 | `data_expected += D` | 稀疏流（n=1）全丢时丢包率虚高 3~4 倍（20%→71%），方向错 | 只计 `sets_k_unknown`；占比 >10% 时样本标记不可信，策略不动 |
+| 4 | §6.1 握手期 data | 未定义 | 协商前 D 未定，data 进集合会错位 | 协商前只放行 control；data 缓存（64 段/64KB 上限） |
+| 5 | §10 日志样例 | `lost=90` | `10000−9850−60=90` 漏了 recovered 的口径，数字对不上 | 样例改为 `late=40 lost=150`，并给自检恒等式（后被 #10 再勘：`lost=150` 亦错，应为 50） |
+| 6 | §8 "连续 5 个报告（约 10s）" | 时间换算错误 | 60s 区间下是 5~300s | 删掉"约 10s"，明确按报告数计 |
+| 7 | §6.2 caps 校验 | u8 校验 | `data+parity ≤ 256` 在 u8 上会回绕 | 用 u16 中间量校验 |
+| 8 | §4.3/§4.4 柯西矩阵 `y_c = 256 + c` | 域元素 `256` 未定义 | GF(2^8) 中 `256 ≡ 0`，`y_c` 退化成 `c`，与 `x_r = r` 重叠，矩阵不再 MDS | `y_c = k + c`（与 `x_r = r` 不相交；n+k ≤ 256 时成立） |
+| 9 | §4.4/#13 control 判定 | "前缀命中 + `len ≥ 16`" | 任意以 `FCP_HELLO_V3` 开头的用户段被当 control 吞掉；KCP 收不到该 sn 无限重传且每次重传继续命中 → dead_link 断连，全程零计数（静默） | 判定改为与握手层**在途登记**整段字节相等；HELLO/ACK 同一条注销规则（KCP 确认或 `max(3×srtt,2s)` 兜底，#23① 再勘：不得依赖确认附着于 HELLO_ACK 段）；重发命中性质不变；新增 T23。**#25 后本条机制整体作废**（HELLO/ACK 改走 oob，无内容分类；记录保留） |
+| 10 | §10/§11 lost 口径 | 规格公式 `expect − rx − rec`；设计样例 `lost=150` | 公式/样例/恒等式三处互相矛盾；实现按 `expect − rx − rec − late` | 统一为 `lost = expect − rx − rec − late`（完全未收到），样例 `lost=50`，恒等式 `rx+rec+lost+late=expect` |
+| 11 | §7.1 慢链路 60s + 256 门 | "让每秒几个包的链路开 FEC" | 256/60s ≈ 4.3 包/s 是机制下限，更慢链路每个强制区间仍 <256，永不开 FEC，表述超出能力 | 澄清下限 ~4.3 包/s、更慢链路保持只观测；是否放大强制间隔/单列慢链路样本门列入规格 §14.8 待标定 |
+| 12 | 2026-10-30 对抗分析（规格附录 C #23①–⑩） | #9 的 HELLO 注销残留假设（#25 后作废）；§7.1 校验项被 k=0 尾组打破；重放策略未定义；k 冲突、认证后超 MTU、容量兜底、单调键半窗、caps ver/保留位与实现脱节；§4.1/§12.1 残留 OpenSSL 表述（T0 决策 2 为内置实现）；慢集合边界未记录 | 注销规则统一（KCP 确认或 `max(3×srtt,2s)` 兜底）；§7.1 校验项补 `tail_delivered`；§4.1 增 64 槽重放窗口；§4.5 补 k 冲突/超 MTU 拒收/容量兜底；§7.1 半窗注明；caps 清单补全；OpenSSL 残留清理；§5.2 边界入档 |
+| 13 | 2026-10-30 设计分叉（规格 #25） | control 走 KCP 需 TX 侧内容分类，是 #6/#13/第一轮 #8/#9/#22①/#23① 全部缺陷的根源；唯一收益（复用 KCP 重传）与握手层自带 3×300ms 定时器冗余；AEAD 保护不依赖 KCP | HELLO/ACK 改走 oob（type=2）：HELLO magic 补齐 16B（线上 16→20B、ACK 不变）、type=3 取消（未定义，收到按 struct_fail 丢弃）、删除内容分类/登记/注销机制、握手层自管重传；§2/§5.2/§6.2/§10/§12 同步 |
+| 14 | 2026-10-30 网络协议评审（规格 #27） | 握手固定 3×300ms：总预算 900ms，RTT > 450ms 链路（卫星/跨洲）会"ACK 未到先判死"——链路正常、握手失败；握手阶段无 RTT 样本，`max(3×srtt,…)` 不可用 | 重传间隔指数退避 300/600/1200ms（总等待 ~2.1s，覆盖 RTT ≤ ~700ms；§5.2/§10/§12 T26）；虚假重传由"重复 HELLO 必须重发 ACK"幂等兜底。`k_for` i.i.d. 假设、拥塞冗余正反馈、无 PMTU 发现三项边界入档规格 §14.10–14.12，设计不变 |
+| 15 | 2026-10-30 第二轮对抗复查（规格 #28） | P0：规格原文"salt 是 KDF 熵源"与实现不符——`derive_direction_keys` 只用配置 PSK，salt 未参与任何派生，同一 PSK 的两会话方向密钥相同、IV 从 0 重叠 → GCM (key, IV) 跨会话重用（多客户端共用 PSK 部署下可互相解密/伪造）；且重放窗口 256 槽覆盖数字算错（13–19 Mbps，非 25 Mbps） | §6.0 新增密钥来源与信任模型：`session_key = AES128(PSK, salt‖0×8)` 按会话派生（零线上改动，**实现待落地·任务 F1，T27 随之**）；§4.1 salt 职责与重放窗口覆盖更正；握手缓存溢出×退避、late_guard 上限口径、FECSTAT 无重传、短连接盲区四项入档规格 §14.13–14.16；**F2/F3 已落地**：缓存默认 512 段/512KB 可配置、FECSTAT 连发两份 + `kDuplicate`（`fecstat_dup` 计数） |
+
+规格回改后，勘误表保留在本设计文档里作为决策记录；规格附录 C 以对应条目指向本表（#1–#8 → 附录 C #21，#9–#11 → 附录 C #22）。

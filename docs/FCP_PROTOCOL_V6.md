@@ -1,0 +1,965 @@
+# FCP 协议规格（v6）
+
+**FCP = FEC Control Protocol**：在 KCP 之上做分片纠删（Reed-Solomon shard set）与闭环自适应冗余
+（默认不发 parity，接收端回传丢包率驱动发送端加冗余）。
+
+> 状态：**设计定稿（M1 实现基线）**，未实现。
+> 替代：v5（`新建文本文档.txt`）。v6 只保留 v5 中被实测/推理支持的部分，
+> 删除了结算器、64 位序号、epoch、caps MAC、线上填充等被判定为过重的机制。
+> 变更逐条对照见附录 B。
+> 修订：2026-10-29 五轮评审定稿（含详细设计阶段勘误）——**不兼容 V1/V2/v5**（无历史负担，握手失败即断连）、
+> HELLO/ACK 统一成帧（type=3，不占槽位）、FEC 恒开（无 `--fec off`）、新增 `data_late_rx`、
+> `k` 由 data/parity 共同携带、区间自适应（≥2s 且 ≥256 包，上限 60s）、**每组可不满 `D`**（空闲超时闭合，
+> `k_eff` 等比缩放但码长恒为 `n+k`）、**parity 自带序号 `j`（`n = index − j`）**、**策略按 80% 修复率反解**、
+> **默认几何 `D=10, P=3`**、**加密信封 8/8/12（28B）**、**orig/recov 位图分离**、
+> **整组全丢不进 expected**、**协商前 data 缓存**。
+> 逐条见附录 C（25 条）；实现行为以 `FCP_V6_DETAILED_DESIGN.md` 为准。
+> 修订：2026-10-30 文档审查——**control 判定收紧为"在途消息整段字节相等"**（修 payload 撞 magic
+> 的静默断连洞，#22①）、`lost` 口径三处统一（#22②）、§12.1 RS 接口勘误（#22③）、
+> 慢链路 FEC 开启下限澄清并列入 §14.8（#22④）、若干数字与表述修正（#22⑤）。
+> 修订：2026-10-30 对抗分析——HELLO/ACK 注销规则统一为"KCP 确认或 max(3×srtt,2s) 兜底"（#23①）、
+> §7.1 校验项补尾丢豁免（#23②）、§4.1 新增重放窗口（#23③）、§4.5 补 k 冲突与超 MTU 拒收（#23④⑤）、
+> 与第二轮实现修复对齐 3 处（#23⑥⑦⑧）、慢集合已知边界（#23⑨）、OpenSSL 残留清理（#23⑩）。
+> 修订：2026-10-30 合理性复查（#24）——§4.1 salt 职责更正、方向密钥加固列入 §14.9；
+> 修订：2026-10-30 设计分叉裁定（#25）：**HELLO/ACK 改走 oob（type=2）**，删除 TX 侧内容分类与
+> 在途登记（#22①/#23① 的机制部分作废，记录保留）；`type=3` 取消，不再定义。
+> 修订：2026-10-30 网络专家审查（#26）——**GCM 块预算超限：会话终止线 2^48 → 2^32 包/方向**（P0，
+> §4.1/§14.7，原值超 NIST SP 800-38D 块预算约 6.5 万倍）；**方向密钥从 M2 建议提前到 M1 采纳**
+>（#24② → 强制，§14.9）；**重放窗口 64 → 256 槽**（高 BDP 链路防自激，§4.1，T24）；
+> **`--fec-parity-max` 允许 5..7**（Pmax=4 仅为默认，§8/§12.1）。
+> 修订：2026-10-30 网络协议评审（#27）——**握手重传固定 300ms 改为指数退避 300/600/1200ms**（#27①，
+> §6.2/§4.4/§12.1，新增 T26：原 900ms 总预算在 RTT > 450ms 链路上会"ACK 未到先判死"；
+> 握手阶段无 RTT 样本，不能套用 `max(3×srtt,…)` 口径）；**`k_for` 的 i.i.d. 假设、拥塞冗余正反馈、
+> 无 PMTU 发现**三项未实测边界入档（#27②，§8/§14.10–14.12）。#26 已落地的重放窗口 256、
+> 方向密钥 M1 强制、2^32 终止线、Pmax 5..7 本轮复核确认（实现与测试均在），无改动。
+> 修订：2026-10-30 第二轮对抗复查（#28）——**P0：会话密钥必须按会话派生 `session_key = AES128(PSK, salt‖0×8)`**
+> （#28①，§6.0/§14.7：规格原文"salt 是 KDF 熵源"在实现中不成立，salt 未参与任何密钥派生，
+> 同一 PSK 的任意两会话派生出相同方向密钥，IV 每会话从 0 起 → GCM (key, IV) 跨会话重用，
+> 多客户端共用 PSK 的部署下可互相解密；修复零线上改动，**已落地（任务 F1，envelope derive_session_key + T27，Debug/Release 20/20）**）；
+> **重放窗口覆盖数字勘误**：256 槽实际覆盖 ≈13–19 Mbps × 200ms，原"25 Mbps"算错（#28②，§4.1）；
+> **握手协商前缓存溢出与退避的交互入档**（#28③，§14.13）；**late_guard/墓碑上限与 #27① 高 RTT
+> 口径不一致入档**（#28④，§14.14）；**FECSTAT 自身无重传入档**（#28⑤，§14.15）；
+> **短生命周期流自适应盲区入档**（#28⑥，§14.16）。
+> 正文中的 "FEC" 指协议内的纠删机制、"FECSTAT" 指其状态报文，二者随协议名沿用，不再改称呼。
+
+## 0. 决策记录
+
+| # | 决策 | 结论 |
+|---|---|---|
+| ① | 是否成帧 | **恒成帧**：每个报文带 6 字节 FEC 头，FEC 不可关闭（满尺寸报文 +0.44%，纯 ACK 等小报文约 +10%） |
+| ② | 丢包信号 | **接收端测量、oob 回传**（FECSTAT），发送端据此决定冗余 |
+| ③ | 冗余判据 | 修复前 data 丢包率 + 字节预算（M1 只用丢包率；预算/恢复概率模型进 M3） |
+| ④ | `D`/`P` 是否运行时变化 | 否，握手协商后会话内固定 |
+| ⑤ | 集合标识 | 头部直接写 `set_id(u32) + index(u8)`，**不用扁平 seqid**，无除法、无 paws |
+| ⑥ | RS 编码域 | FEC 头在域外；线上**自然长度**；`symbol_max` 由 parity 报文携带，接收端零扩展 |
+| ⑦ | 控制消息 | 需与流数据保序的（FIN）走 KCP；**握手（HELLO/ACK）与遥测（FECSTAT/KEEPALIVE）走 oob**（#25）——握手无保序需求：协商前 data 全部进缓存 |
+| ⑧ | `P'=0` | **FRAMED_STATS**：成帧 + 统计，永不发 parity（"能测不能修"） |
+| ⑨ | M1 范围 | 成帧 + FECSTAT + `k_for` 反解 + 简单滞回；参数先钉死，实测后再上控制器（修复率目标可配，M3 换成模型） |
+| ⑩ | 协议命名 | **FCP**（FEC Control Protocol）；线格式中的 magic 统一 `FCP_*`，magic 字段固定 **16 字节、ASCII、NUL 填充**（该 16 字节宽度只约束 §4.7 的 oob 载荷；HELLO/ACK 的 `FCP_*` 是定长消息前缀，不受此限） |
+| ⑪ | 历史兼容 | **不兼容** V1/V2/v5：无历史负担，V3 握手失败即 ERROR 断连，无降级路径 |
+| ⑫ | 报文分流 | 所有报文统一成帧；HELLO/ACK 走 **oob（type=2）**（#25），**不占 index、不进集合、不计数**；接收端仅凭 type 分流，type 字段为 2 位，`type=3` 取消未定义（收到按 struct_fail 丢弃） |
+| ⑬ | 迟到交付 | 结算后首次交付的迟到原始 data 计 `data_late_rx`（独立计数，不与 recovered_late 混记） |
+| ⑭ | `k` 的传递 | `k` 在**集合开始时**锁定，data 与 parity 都携带（头里的计划值）；消除"没发"与"全丢"的歧义 |
+| ⑮ | 组可不满 | 每组的实际数据数 `n ≤ D`；`n == D` 或空闲 `T_flush` 都闭合发 parity；`k_eff` 按 `n/D` 等比缩放（至少 1 条） |
+| ⑯ | 默认几何 | **`D=10, P=3, S=13`**（与 kcptun/kcp-go 默认 10+3 同口径）；`Pmax=4` 保留为上限，`k` 仍由策略给出 |
+| ⑰ | 加密信封 | **`salt(8) │ nonce(8) │ ct │ tag(12)`**，共 28 字节；IV 由 `counter+方向+0×3` 本地展开，方向不进线上；不兼容旧 16/12/16 信封 |
+| ⑱ | `n` 怎么传 | **parity 自带序号 `j`**（头里 3 位），`n = index − j`：收到任一条 parity 即精确，不靠推导 |
+| ⑲ | `k` 怎么定 | 按**单组修复率 ≥ 80%** 反解（`k_for`），不再均值配平；20% 丢包给 4 条而不是 3 条 |
+
+---
+
+## 1. 目标与非目标
+
+**目标**
+
+1. 默认不付冗余开销，同时在**每个报文**上都带可测的集合序号，使丢包测量与 KCP 重传解耦。
+2. 丢包率高时自动开启 parity，且能按损失比例给出最少够用的 `k`。
+3. 反馈低延迟、不被数据队列阻塞。
+4. 线格式一次冻结，后续只加策略不改字节。
+
+**非目标（本版）**
+
+- KCP 内部的 per-segment 延迟重传协作（M4）。
+- 滑动窗口 FEC、按大小分桶、非对称 D:P（M4+）。
+- 抗主动降级的加密协商（HELLO/ACK 已在 AEAD 内，不再额外加 MAC）。
+
+---
+
+## 2. 术语
+
+| 符号 | 含义 |
+|---|---|
+| `D` / `P` / `S` | data / parity / `S = D + P`，会话内固定；默认 `D=10, P=3`，`P ≤ P'`（协商值；本端上限 `--fec-parity-max`，默认 4，允许 5..7，字段硬上限 7） |
+| `k` | 本集合**计划**的 parity 数（集合开始时锁定，随每个 data/parity 上线），`0 ≤ k ≤ P` |
+| `k_eff` | 本集合**实际发出**的 parity 数：满组时 `k_eff = k`，提前闭合的组按 `n/D` 等比缩放（至少 1） |
+| `n` | 本集合实际装入的 data 数，`1 ≤ n ≤ D`（空闲闭合时 `n < D`） |
+| `j` | parity 在组内的序号，`0..k_eff-1`；parity 的 `index = n + j`，故 `n = index − j` |
+| `set_id` | 集合编号（u32，发送端每完成一个集合 +1） |
+| `index` | 集合内分片下标（u8），`0..n-1` 为 data，`n..n+k_eff-1` 为已发 parity |
+| `symbol` | RS 编码单元 = AEAD 明文去掉 6 字节头之后的部分 |
+| `symbol_max` | 本集合所有 data 的 `2 + payload_len` 的最大值 |
+| accounted set | 已结算的集合（见 §5.2），其 data 计入 expected |
+| pre_repair_loss | `(data_expected − data_rx_orig) / data_expected` |
+| usable_loss | `(data_expected − data_rx_orig − data_recovered_dl) / data_expected` |
+
+---
+
+## 3. 会话模式
+
+| 模式 | 触发 | 成帧 | FECSTAT | RS | 策略 |
+|---|---|---|---|---|---|
+| `FRAMED_REPAIR` | V3 协商成功，`P' ≥ 1`，flags.bit0/bit1 | 始终 | 双向 | 有 | §8 |
+| `FRAMED_STATS` | V3 协商成功，`P' = 0` | 始终 | 双向 | 无（`k ≡ 0`） | 只观测 |
+
+- **FEC 不可关闭**：没有 `--fec off`，线上不存在裸 KCP 报文；所有报文一律成帧（§4.1）。
+- `k = 0` **不是**模式：`FRAMED_REPAIR` 下 `k=0` 是策略状态 `NO_PROTECTION`，仍发 FECSTAT，可随时恢复。
+- `FRAMED_STATS` 下 `k ≡ 0`（结构性），`NO_PROTECTION` 恒成立；用于"对端没有 RS、但想共享丢包测量"的场景（例如只实现统计的轻量端）。
+- 不存在 `LEGACY`：本协议不兼容 V1/V2/v5；V3 握手失败即连接失败（§6.2）。
+
+---
+
+## 4. 线格式
+
+### 4.1 UDP 报文封装
+
+```text
+ +-----------+-----------+--------------------------------+---------+
+ | salt (8)  | nonce (8) | AEAD 明文                       | tag 12  |
+ +-----------+-----------+--------------------------------+---------+
+                       ^ 偏移 16 = FEC_CRYPTO_RESERVE
+
+ AEAD 明文 = fec_hdr(6) | symbol
+```
+
+- `salt` / `nonce` / `tag` 由加密层负责，FEC 层只处理 `fec_hdr | symbol`。
+- 头位于 AEAD 明文起始处（偏移 16），即被认证、被加密。
+- **加密信封固定 28 字节开销**（`8 + 8 + 12`；原来的 `16 + 12 + 16` 是 44 字节，省 16）。
+- **线上 nonce 只有 8 字节计数器**；AES-GCM 要求的 12 字节 IV 由接收端本地展开：
+  `IV = counter(8, LE) | direction(1) | 0x00 × 3`。`direction` 由会话角色决定（c2s / s2c），
+  不进线上（每包恒定，重发无意义）。
+- **tag 为 12 字节**（GCM 96 位，NIST SP 800-38D 允许的最短公开值）：伪造成功概率 `2^-96`，
+  在单次会话生命周期内不可达。不得再截短到 64/32 位（那需要严格的调用次数上限，不适用于公网代理）。
+- **salt 为 8 字节**：服务端会话查找键 + **会话密钥派生输入**（#28①：会话密钥按会话派生
+  `session_key = AES128(PSK, salt ‖ 0×8)`，见 §6.0——规格此前虽写"salt 是 KDF 熵源"，
+  实现已按 #28① 派生（`derive_session_key`），缺口已消除）。见 §14.7 的安全余量说明。
+  `nonce` 计数器**每方向独立、从 0 起**（#24①：原文"三合一"把计数器起值也算作 salt 的职责，
+  与实现不符——实现为 `send_nonce_(0)`，salt 不参与计数器起值）。
+- **重放窗口（#23③，#26 放宽到 256）**：重放有效密文不需要密钥，AEAD 拦不住重放。接收端**每方向**维护
+  **256 槽滑动窗口**（与 IPsec 反重放同构）：以已见最高 `nonce_ctr` 为基准，前跳则接受并滑动/重置
+  窗口，窗口内未见过的接受并置位，已见过的或落后超过窗口宽度的拒收——UDP 重排由窗口吸收，
+  不要求严格单调。被拒重放与认证失败同记 `auth_fail`（不分类）。已知代价：单方向在途乱序/丢失
+  超过 256 包时，迟到的合法包会被误拒（`nonce` 严格递增、无重用，误拒只损失交付，KCP 重传兜底）。
+  64 槽在 100 Mbps × 200ms RTT（在途约 1900 包）下会被突发重排周期性击穿，误拒伪装成丢包推高
+  `pre_repair_loss`、把 `k` 顶上去，形成"用 FEC 冗余修自己重放窗口"的自激（#26）；
+  256 槽位图每方向仅 32 字节，按同一算法实际覆盖约 **13–19 Mbps × 200ms** 的 BDP
+  （256 × 1312 B ≈ 336 KB；#28② 勘误：#26④ 原写"覆盖 25 Mbps × 200ms"算错，25 Mbps × 200ms
+  ≈ 476 包 > 256），更高 BDP 用 M2 自适应窗口。
+
+### 4.2 FEC 头（6 字节，冻结）
+
+```text
+ offset size field   说明
+ 0      4    set_id  u32 小端
+ 4      1    index   0..S-1：data 为 `0..n-1`；parity 为 `n + j`
+ 5      1    type_k  低 2 位 type：0=data 1=parity 2=oob（3 未定义：2 位字段仍可编码此值，#25 后无含义，收到按 struct_fail 丢弃）
+                     bit2-4  j：仅 parity 有效，本片在组内的序号 `0..k_eff-1`（其余填 0）
+                     bit5-7  k：本集合**计划**的 parity 数（0..7，集合开始时锁定；oob 填 0）
+```
+
+编码：`type_k = (k << 5) | (j << 2) | type`；解析：`type = type_k & 0x03`、`j = (type_k >> 2) & 0x07`、
+`k = type_k >> 5`、`is_parity(type_k) = ((type_k & 0x03) == 1)`。
+
+- 约束：**`S = D + P ≤ 256`**（index u8）、**`P ≤ 7`**（k 占 3 位）、**`j ≤ 7`**（占 3 位，故 `Pmax ≤ 7`）；
+  握手校验 `D' ≥ 1`（§6.2）。当前默认 `Pmax=4`，余量充足；若将来需要 `P > 7`，头字段必须重排版。
+- **每组实际数据数 `n` 可以小于 `D`**：满组时 `n = D`；流量稀疏时按空闲超时提前闭合（§4.4），`n < D`。
+  约束恒为 `1 ≤ n ≤ D`，因此 `index < S` 自动成立。
+- **`n` 由 parity 直接给出，不再靠推导**：parity 的下标恒为 `n + j`，因此 `n = index − j`。
+  收到**任意一条** parity 就能精确得到 `n`——不需要"最小下标 / 最大下标"夹逼，也没有收敛失败的情形。
+  `n` 不写进 data 头：发 data 的那一刻本组还没闭合，`n` 尚不存在（§4.4）。
+- **`k` 是计划值，不是实际发出数**：data 与 parity 填同一个 `k`（集合开始时锁定）。提前闭合的组实际只发
+  `k_eff ≤ k` 条（§4.4），但 `k_eff` 不上线——接收端按 `k` 记账时 `parity_expected` 是**上界**，
+  只影响诊断口径（偏悲观方向，安全）；精确的 `k_eff` 只有发送端自己知道。
+- "未发"与"丢失"（parity 侧）：已发 parity 的下标必落在 `n..n+k_eff-1`。由于 `k_eff` 不上线，
+  接收端无法把"提前闭合组少发的那几条"与"丢失"分开，`parity_*` 因此只是诊断量（见上一条）；
+  这不影响 data 侧的任何统计与重建。data 侧没有这个问题：data 下标恒为 `0..n-1`，`n` 已知。
+- 唯一剩余的未知是**整组全丢**（一个分片都没收到）：`n`、`k` 都无从得知，不计入 `expected`，
+  计 `sets_k_unknown`（诊断）。
+- 头比 v5 的 `seqid(4)+type(2)` 少 1 字节，且**不再需要 seqid → set_id/index 的除法**。
+
+### 4.3 symbol 与 RS 编码域（冻结）
+
+```text
+ data   symbol = len(2) | payload              len = 2 + payload_len，因此 symbol 长度 == len
+ parity symbol = RS 输出                        长度恰为 symbol_max（无 len 字段）
+
+ symbol_max = max over 本集合所有 data 的 symbol 长度 = max(2 + payload_len)
+```
+
+- **FEC 头不在 RS 域内**。域内只有 `len|payload`，因此：
+  - data 报文按自然长度上线，短包（例如 32 字节的纯 ACK）不会被放大；
+  - parity 报文长度恒为 `16 + 6 + symbol_max + 12`（即 §4.6 的 `H_clear + H_hdr + H_tag`），
+    等于"本集合最大 data 报文"的长度，不会超过 MTU 预算；
+  - 重建结果自带 `len`，接收端据此截断，不会产生长度歧义。
+- 发送端编码前必须把每条 data symbol **零扩展到 `symbol_max`** 再算 parity（否则接收端零扩展的对齐假设不成立）。
+- **一个 FEC symbol 恰好承载一个 KCP segment**：禁止把多个 segment 合并进一个 UDP 报文，KCP 输出回调按 segment 逐次调用成帧层。MSS 推导（§4.6）与 KCP sn 去重都依赖这条（原 `type=3` 打标依赖已随 #25 oob 化取消）。
+- 为什么不需要线上填充：`symbol_max` 由 parity 报文自身携带（任何一条 parity 的 symbol 长度就是
+  `symbol_max`），接收端只要收到 ≥1 条 parity 就能把其余 symbol 零扩展到正确长度；`k=0` 时无需重建。
+
+### 4.4 发送
+
+```text
+集合开始（n == 0）时: k = 策略给出的下一个值    # 集合内锁定，不再变化
+每发一个 KCP 输出报文:                       # KCP 输出已无控制消息（HELLO/ACK 走 oob，#25）
+  hdr = { set_id, index = n, type_k = (k << 5) | 0 }     # j = 0；data 也带计划值 k
+  symbol = len(2) | payload          len = 2 + payload_len
+  emit(salt|nonce|AEAD(hdr|symbol)|tag)
+  n += 1; t_last = now
+  if n == D: close_set()                             # 满组：立即闭合
+
+空闲检查（每次发包后 + 定时轮询）:
+  if n >= 1 and now - t_last >= T_flush: close_set()  # 未满也闭合，n 就此定死
+
+close_set():
+  k_eff = 0 if k == 0 else min(k, max(1, ceil(k × n / D)))   # 小包组按比例少发
+  if k_eff >= 1:
+     for j in 0..k_eff-1:            # 只发前 k_eff 个，不发的下标永不出现
+         hdr = { set_id, index = n + j, type_k = (k << 5) | (j << 2) | 1 }
+         emit(salt|nonce|AEAD(hdr|parity_symbol[j])|tag)
+  set_id += 1; n = 0
+```
+
+- `T_flush = clamp(1 × RTT, 25ms, 200ms)`，从**最后一次放入 data** 起算；`n = 0` 时不触发。
+  25ms 下限远大于正常突发流里的单包间隔（5 Mbit/s 下约 2.2ms，`D=10` 满组约 22ms），
+  不会把满组打断；200ms 上限保证链路停顿时不拖太久。
+- 满组时 `n = D` 且 `k_eff = k`，parity 下标 = `D + j`，与"固定 D"的旧定义**逐字节一致**；只有提前闭合的组不同。
+- **`k_eff` 只为提前闭合的组生效**：按 `n/D` 等比缩放，最少 1 条。没有这条，一组只装 2 个包就得背 3 个
+  满尺寸 parity（`symbol_max` 量级），冗余比 150%~300%；缩放后 `n=2` 只发 1 条。满组恒为 `k_eff = k`。
+- **RS 码长是 `n + k`（计划值），不是 `D + P`，也不随 `k_eff` 变**：parity 按本组实际 `n` 个 data
+  symbol（零扩展到 `symbol_max`）计算**全部 `k` 条**，只发送前 `k_eff` 条。生成矩阵由 `(n, k)`
+  唯一确定、两端各自按同一公式构造（不传矩阵）——若码长随 `k_eff` 变，接收端不知道实际发了几条，
+  两端矩阵不一致，提前闭合的组一个都解不出来。未发送的 `k − k_eff` 条 parity 是"幽灵擦除"，
+  解码时照样标为擦除位即可，只是冗余额度变少。
+- oob 报文（含 HELLO/ACK，#25）**不占 `index`、不参与 `symbol_max`、不计入 `data_expected`/`parity_*`**，
+  接收端在分流阶段直接 `return`，不触碰任何集合状态（§4.5）。否则一个握手包会让该集合永久缺一片，
+  `pre_repair_loss` 虚高 1/D（`D=10` 时 10%），足以把 `k` 直接顶到 `P`。
+- **握手消息不再经 KCP 输出（#25，取代 #22①/#23① 的判定机制）**：HELLO/ACK 由握手层经 oob 通道
+  发送（type=2，§4.7），成帧层的 KCP 输出路径**不存在任何内容分类**。此前为内联 control 设计的
+  "magic 前缀 / 在途登记"机制（#6 占槽位误报、#13 重发判定、第一轮 #8 握手自锁、#22① payload
+  撞 magic 静默断连、#23① 注销时机假设）**整体删除**——这些问题失去存在前提，无需任何替代机制。
+  重传由握手层指数退避定时器承担（300/600/1200ms，#27①，§6.2），Established 即停，无 KCP 残留重传窗口；
+  AEAD 保护不依赖 KCP（oob 同在信封内）。
+- `len(2)` 前缀**只用于 data**：它的唯一用途是零扩展与重构后还原真实长度，只有进 RS 域的类型需要；
+  oob 不参与 RS，长度由报文自身确定（magic + 定长校验，§4.7）。
+- 跳过 parity（`k=0`）**不需要移动任何序号**：直接 `set_id += 1`；提前闭合时同样成立。
+- `k` 的最小生效单位是"下一个**开始的**集合"（集合开始时锁死，集合内不变）；改变 `k` 不需要任何握手。
+- 未发出的 parity 下标（`index ≥ n + k`）永不出现；满组时即 `index ≥ D + k`，与旧定义一致。
+
+### 4.5 接收与重建
+
+```text
+on_datagram(pkt):
+  if !aead_ok(pkt): auth_fail += 1; return          # 不分类、不进 RS
+  if len(明文) > H_hdr + symbol_max上限: struct_fail += 1; return   # 认证后超 MTU 预算（§4.6 推导；#23⑤）
+  hdr, symbol = parse(pkt)
+  if hdr.type == oob: handle_oob(symbol); return     # set_id/index 忽略；按 magic 分派
+                                                     # FECSTAT/KEEPALIVE/HELLO/HELLO_ACK（#25）
+  if hdr.type ∉ {data, parity, oob}: struct_fail += 1; return   # 2 位字段；3 未定义（#25 取消）
+
+  # 窗口锚点 = 本端已见最大 set_id（回绕按 §14.5 半窗判据）
+  if hdr.set_id 早于锚点 − max_active_sets: drop (stale)
+  index = hdr.index; set = sets[hdr.set_id]
+  if index >= S: drop (malformed)
+  if type == data and index >= D: drop (malformed)     # n ≤ D，故仍成立
+  # parity 无需预先知道 n：n 由 index − j 反推并就地校验（见下）
+
+  if type == data:
+     set.note_k(hdr.k)                              # 计划值，全组一致
+     if symbol.size() != len(symbol[0..1]): drop (framing mismatch)
+     if set.n_known() and index >= set.n: drop (malformed)   # data 下标恒 < n
+     set.note_data_index(index)                      # 维护 max_data_index
+     if !set.orig_bit(index): set.orig_mark(index); deliver_to_kcp_once(symbol)
+     else: late_dup += 1
+     set.store_symbol(index, symbol)                # 供重建
+     try_decode(set)
+  else:                                             # parity
+     if hdr.j >= hdr.k: drop (malformed)             # j 必须落在 0..k-1
+     n = index − hdr.j                               # n 由片内信息直接给出
+     if n < 1 or n > D: drop (malformed)
+     set.set_n(n)                                    # 与已记录的 n 冲突 → struct_fail
+     set.note_k(hdr.k)
+     set.store_symbol(index, symbol)
+     try_decode(set)
+
+try_decode(set):
+  if !set.n_known(): return             # 一条 parity 都没收到：n 只有下界，码长不确定 → 不修复
+  if set.symbols < set.n: return
+  if set.recov_bit 覆盖全部缺失 data: return          # 每个缺失位只重建交付一次
+  missing = (~orig_mask & ~recov_mask) & data_range(0..n)
+  if missing.count() > k: return                     # 超出冗余能力，等 KCP 重传
+  erasures = missing ∪ 缺失的 parity 位（含幽灵 parity：j ∈ [k_eff, k) 不存在，见 §4.4）
+  maxlen = max over 已收 symbol 的长度（含 parity；parity 即 symbol_max）
+  zero-extend 所有 symbol 到 maxlen
+  RS decode（码长 n + k，矩阵由 (n,k) 确定，§4.4）→ 缺失的 data 下标
+  for 缺失下标 i:
+      s = 重建出的 symbol（长度 maxlen）
+      len = s[0] | s[1]<<8
+      if len < 2 or len > maxlen:               struct_fail += 1; continue
+      if s[len..maxlen) 非全 0:                  struct_fail += 1; continue
+      set.recov_mark(i); data_delivered_once(s[2..len])   # 记 recov_mask，不记 orig
+```
+
+- **原始 data 立即交付，绝不为等待集合完成而延迟。**
+- **`n` 由 parity 直接给出，不再靠上下界推导**：parity 下标恒为 `n + j`，因此 `n = index − j`。
+
+```text
+收到 parity(index=12, j=2) → n = 10      收到 parity(index=10, j=0) → n = 10
+收到 parity(index=11, j=1) → n = 10      收到 parity(index= 6, j=1) → n = 5（提前闭合组）
+```
+
+  任意一条 parity 就够，不需要收齐、不存在收敛失败。以前那套 `n_low/n_high` 夹逼规则和它的 4% 残余
+  已经删除。
+- **一条 parity 都没收到时**，`n` 只能取 `max_data_index + 1`（下界）。它可能偏小——编号最大的那个 data
+  恰好就是丢的那个时，这次丢失从账上消失。`data_expected` 因此只会被低估，不会虚高（方向安全，
+  不会把 `k` 顶满）；代价是系统性少报约 1 个百分点（`D=10`、真实丢包 10% 时测得约 9%，见 §7.2）。
+- **`n` 未知时不做重建**（RS 码长必须是 `n`，用错的 `n` 解出来是垃圾）：这类组只交付已到的 data
+  并照常计数，丢失由 KCP 重传兜底。发生条件退化为"整组 parity 全丢"，概率 `p^k`
+  （`p=0.2, k=3` 时 0.8%，此前按上下界推导约 4%）。
+- **一致性校验**：两条 parity 给出不同的 `n`、或 data 下标 ≥ 已知的 `n` → 该片计 `struct_fail` 并丢弃。
+  同一集合内出现**不同的计划 `k`** 同样 `struct_fail`（`k` 在集合开始时锁定、全组一致，#23④；
+  实现按 `note_k` 冲突即拒）。
+- 为什么 `n` 不写进 data 头：**发第 1 个 data 时，本组会不会在 3 个就停手还没决定**（要等 `n == D`
+  或 `T_flush` 超时）。data 是"知道 `n` 之前"发的，parity 是"知道 `n` 之后"发的，所以 `n` 只能由
+  parity 承担。若想在 data 里带 `n`，唯一办法是取消空闲闭合、恒满 `D` 才闭合——那会退回"稀疏流量
+  整组无冗余且永不结算"，收益为负。
+- **计数在结算时一次性按位图统计**（§5.2），到达路径只置位；**原始到达与重建成功分两张位图**
+  （`orig_mask` / `recov_mask`）：`data_rx_orig` 只数前者、`data_recovered_dl` 只数后者——若共用一张
+  位图，重建的包会同时进两个计数器，`usable_loss = expected − rx_orig − recovered` 把同一批包扣两遍。
+  "结算后才到的 data"同理会把本区间 `data_rx_orig` 抬高而 `data_expected` 记在上一区间，破坏
+  `data_rx_orig ≤ data_expected`。迟到帧计入 `late_dup` / `data_late_rx` / `data_recovered_late`（§5.3）。
+- 重建的 data **没有逐片 AEAD 验证**：安全性依赖"所有输入分片均已通过 AEAD + 发送端诚实"，
+  与"恶意发送端可构造任意 data"等价，不扩大威胁面（v5 的这条结论沿用）。
+- 结构校验失败只计 `struct_fail` 并丢弃，不交付。
+- 解码触发：**每条新分片（未存过的 index）到达触发一次**（每集合天然 ≤ `S` 次，不需要时间限流；
+  重复分片不重复解码）。不能按"每秒 N 次"限流——一集合内 data+parity 最多触发 `S` 次，
+  限流会挡掉"凑够片数后的关键一次解码"。
+- 容量：`max_active_sets = 256`，**墓碑（已结算集合）优先于容量淘汰**——容量只淘汰未结算的集合
+  （最老优先），确实超限时计 `tail_dropped`；**若全部已处墓碑态，则淘汰最老的墓碑以守住硬上限**
+  （认证对端在两次结算 tick 之间灌入新 `set_id` 不得撑爆内存，#23⑥/第二轮 F3）。64 太小：
+  8 Mbit/s 下 `D=10` 约 50–78 个集合/s，会把 1s 墓碑里的集合挤掉，迟到修复能力归零。
+
+### 4.6 MTU 预算
+
+```text
+M          = path_mtu（配置项，默认 1400）
+H_ip       = 20 (IPv4) / 40 (IPv6)
+H_udp      = 8
+H_clear    = 8 + 8 = 16
+H_hdr      = 6
+H_len      = 2
+H_tag      = 12
+
+data   wire = H_clear + H_hdr + H_len + payload + H_tag = 36 + payload
+parity wire = H_clear + H_hdr + symbol_max   + H_tag = 34 + symbol_max
+约束：data/parity/oob 的 wire + H_ip + H_udp ≤ M
+```
+
+| 场景 | `payload_max`（KCP 单报文含 24B 头） | `symbol_max` 上限 | MSS |
+|---|---|---|---|
+| IPv4, M=1400 | 1336 | 1338 | 1312 |
+| IPv6, M=1400 | 1316 | 1318 | 1292 |
+
+- 两者在最大报文处相等（`symbol_max = 2 + payload_max`），因此"data 不超"与"parity 不超"是同一条约束。
+- 满尺寸报文的线路效率 `1312 / 1400 = 93.7%`（信封收紧前是 92.6%）。
+- 实现中必须用**断言**检查（`static_assert` 对默认值 + 运行时校验对 `--mtu`），不允许硬编码任何推导值。
+
+### 4.7 oob 报文
+
+```text
+hdr    = { set_id = 0, index = 0, type_k = 0x02 }
+symbol = magic(16) | 定长载荷
+```
+
+- **magic 是固定 16 字节、ASCII、NUL 填充**的字段（例如 `"FCP_FECSTAT_V6"` 占 14 字节 + 2 个 0x00）。
+  固定宽度让字段偏移与协议名解耦：改名或升版本都不会移动任何 offset，比较时整 16 字节精确比对。
+- 不占用 `set_id/index`、不进 RS 集合、不计入任何丢包统计。
+- 长度精确校验（16 + 定长载荷）；未知 magic 丢弃并计数。
+- 已定义：`FCP_FECSTAT_V6`（§7）、`FCP_KEEPALIVE_V1`（保活，幂等可丢）、
+  `FCP_HELLO_V3` / `FCP_HELLO_ACK_V3`（握手，§6.1；HELLO 的 magic 为 12 字节 ASCII + 4×0x00
+  补齐 16 字节约定，#25）。
+
+---
+
+## 5. 集合生命周期
+
+### 5.1 发送端
+
+每集合状态：`n`（已放入的 data 数）、`t_last`（最后一次放入 data 的时间）、`symbol_max`、`k`（在集合开始时确定）。
+发送端不保存已发集合的历史（无重传、无 tombstone 需求）。
+闭合条件只有两个：`n == D`（满组）或 `now - t_last ≥ T_flush`（空闲）；闭合时按 `k_eff` 发 parity
+（满组 `k_eff = k`，提前闭合按 `n/D` 缩放）然后 `set_id += 1`。`k_eff` 只影响发送，不上线（§4.2）。
+
+### 5.2 接收端结算（v6 的核心简化）
+
+结算分两个条件，**必须同时满足**，否则会把"发到一半的集合"或"重排迟到"误判成丢包：
+
+```text
+eligible(set)  :  收到过任何 set_id' > set_id 的分片
+                  OR 收到本集合的 parity 分片
+                  # parity 只在 close_set() 里发（§4.4），它的出现就是"已闭合"的凭证。
+                  # 只靠第一条会让空闲闭合的尾组永远等不到下一个 set_id——流一停就不结算了。
+
+accounted(set) :  eligible(set) 且 (now - t_first_seen ≥ late_guard)
+                  # late_guard = clamp(1 × RTT, 100ms, 500ms)，用于吸收跨集合边界的重排。
+```
+
+- **未 eligible 的集合不参与 expected**：发送端还没闭合它（还在往里放数据），不是丢失。
+  这类集合在 `t_first_seen + 1s` 后丢弃状态（**固定 1s**，不随 RTT 缩放——走到这一步即意味着发送端
+  停滞，无需精细计时；2026-10-30 与设计/实现对齐，原文误写为 `max_tombstone`），只计 `tail_dropped`（诊断），
+  **不进入 `data_expected`**。两种来源：发送端异常退出（真的没闭合）；`k = 0` 的空闲闭合尾组
+  （闭合了但没有 parity 这个凭证，见下面的"尾部结算"）。
+- 结算时对该集合做一次累加：
+
+```text
+n_used = n_known ? n : (max_data_index + 1)  # 无 parity 时取下界（§4.5）；下界只会少算
+sets_expected        += 1
+data_expected        += n_used              # 满组时 n_used = D
+data_rx_orig         += popcount(orig_mask & data_range(0..n_used))   # 只数原始到达
+parity_rx            += popcount(parity_mask)
+data_recovered_dl    += popcount(recov_mask & data_range(0..n_used))  # 只数重建成功
+sets_full            += popcount((orig_mask | recov_mask) & data_range(0..n_used)) == n_used
+if n_used < D:       sets_partial += 1      # 提前闭合的组（诊断）
+if 收到过任何分片:
+     if k > 0:       parity_expected += k   # 计划值；提前闭合组实际发得更少 → 上界（诊断）
+else:                sets_k_unknown += 1    # 整组全丢：n 与 k 都无从得知
+```
+
+> `n_used ≤ n_true` 恒成立，因此 `data_rx_orig ≤ data_expected` 不会被打破（丢包率只会被低估，不会虚高）。
+> `orig_mask` / `recov_mask` 分离（§4.5）：`data_rx_orig` 与 `data_recovered_dl` 各数各的，
+> `usable_loss = expected − rx_orig − recovered` 不会把同一批包扣两遍。
+> `parity_expected` 用计划值 `k` 而非实际 `k_eff`，因此是**上界**：`parity_rx ≤ parity_expected` 仍然成立，
+> 但 `parity_loss` 在提前闭合的组上偏悲观。该字段只做诊断，精确值在发送端手里。
+
+- **整组全丢**（一个分片都没见到）：发送端完成了该组（产生了更高的 `set_id`），接收端只看到编号跳变。
+  该组**不进入 `data_expected`**，只计 `sets_k_unknown`——它的真实 `n` 未知（可能是 1 也可能是 10），
+  按 `D` 记账会把稀疏流的丢包率抬高数倍（例：125 组全为 `n=1`、其中 25 组全丢：真实丢包
+  25/125 = 20%，按 D 记账 `data_expected = 100×1 + 25×10 = 350`、`rx = 100`，算出 250/350 ≈ 71%），
+  方向完全错误。`t_first_seen` 取**跳变观测时刻**，`late_guard` 从该时刻起算；
+  不进 `parity_expected`。
+
+  > **样本可信门**：本区间 `sets_k_unknown / max(1, sets_expected) > 10%` 时，该区间 FECSTAT 标记为
+  > 不可信——策略**保持 `k` 不动**（只记录日志，不驱动状态机），恢复可信后自动继续。
+  > 整组全丢本身属极端丢包，此时任何基于均值的 `k` 计算都没有意义。
+- **尾部结算**：流停止时最后一组由**发送端的空闲超时**闭合（§4.4）。因为 `eligible` 认 parity 作为闭合凭证，
+  `k ≥ 1` 的尾组在自己的 parity 到达时就能结算，不必等后续流量。**`k = 0` 的尾组没有任何凭证**——
+  流就此停住时它会落在 `tail_dropped`（不误报，但也进不了 `expected`）；这类组本来就没有冗余可统计，
+  属已知边界。
+- **已知边界（#23⑨）：慢发送者可把集合开过 1s**。`T_flush` 上限 200ms 下，10 个包以 ~199ms 间隔
+  进同一集合是合法流（集合可开 ~1.8s）；接收端 `t_first + 1s` 的停滞判定会把一个**仍活跃**的集合
+  tail_drop，其后到达的分片重建该集合并拆分记账（该组 `pre_repair_loss` 虚高、`sets_partial` 多计一次）。
+  方向为低估 `expected`、少报丢包，诊断量受损但不污染策略——不要当 bug 修；若要消除，需把停滞判据
+  从定时改为"有新分片即续期"（M2 再议）。
+- `deadline` 不是独立机制：`accounted` 时刻就是"期限内"的判据；结算后仍可被迟到 parity 修复，
+  只计 `data_recovered_late`（诊断，不参与策略）。
+
+### 5.3 迟到与墓碑
+
+- 结算后的集合进入墓碑，持续 `max_tombstone = clamp(2 × RTT, 200ms, 1s)`。
+- 墓碑期内：迟到 data **首次交付**计 `data_late_rx`（§7.1），同一 sn 的重复交付计 `late_dup`；
+  迟到 parity 仍可触发重建，成功计 `data_recovered_late`。结算后到达的 parity 不计入
+  `parity_rx`（parity_expected/parity_rx 已在结算时按位图定账）。
+- 墓碑结束：释放集合状态；未恢复的 data 已在结算时计为丢失。
+- KCP 重传与 FEC 重建可能产生同一 KCP sn 的两份数据：**统一由 KCP sn 去重，`data_delivered` 每 sn 只加 1**。
+
+---
+
+## 6. 握手与协商
+
+### 6.0 密钥来源与信任模型（#28①）
+
+HELLO/ACK 全部在 AEAD 信封内（§6.1），因此**密钥先于握手存在**——本协议是**静态 PSK 模型**，
+没有密钥交换。该模型及其边界必须写明：
+
+```text
+PSK         = 运维配置的 16 字节预共享密钥（两端一致，带外分发；SessionConfig.key）
+session_key = AES128-Encrypt(PSK, salt(8) ‖ 0x00×8)     # 每会话派生，salt 为线上明文（§4.1）
+key_c2s     = KDF(session_key, label="fcp-c2", L=128)   # §14.9，SP 800-108，现状不变
+key_s2c     = KDF(session_key, label="fcp-s2", L=128)
+```
+
+- **为什么 session_key 必须按会话派生（P0 依据）**：IV = `counter(8) | dir(1) | 0×3`（§4.1），
+  只依赖计数器与方向；若直接用 PSK 当会话密钥，则**同一 PSK 的任意两个会话**（不同 salt、
+  不同时间重连、或不同客户端实例共用一份配置——此类代理的常见多用户部署形态）派生出
+  **完全相同的方向密钥**，且计数器每会话从 0 起，IV 空间完全重叠 → GCM (key, IV) 对跨会话重用：
+  知道任一会话明文的攻击者（例如共用配置的另一客户端的合法用户）可恢复 keystream 解密另一会话
+  同计数器位置的流量，并可借已知明文对恢复 GHASH 认证密钥 H、进而伪造报文。
+  把 salt 混入派生后，密钥互异仅依赖"salt 不同"，而服务端已有的在线 salt 查重（§14.7）保证并发会话
+  密钥互异；时序上的重用要求 64 位 salt 撞车（概率 `N²/2^65`，已被接受的余量）。
+  **实现状态（任务 F1，已落地）**：`envelope.h` 新增 `derive_session_key`，构造函数按上式先派生
+  `session_key` 再派生方向密钥；零线上改动：两端各自本地计算，不增字节、不碰握手。
+- **无前向保密（明确接受的取舍）**：PSK 泄露 → 该 PSK 下所有会话（含历史记录）可解——
+  因为没有 DH/ECDHE。v6 不引入密钥交换（与"删掉过重机制"的定位一致）；若将来要 PFS，须在 caps
+  保留位（bit4..7，§6.2）里加 key-exchange 能力位走 #26 式前向兼容闸门，不能悄悄改。
+- **PSK 轮换是运维职责**：换 PSK 即换部署；会话内的密钥生命周期由 2^32 终止线（§14.7）兜底，
+  超限断连重连，重连即新 salt → 新 session_key。
+- **重放旧 HELLO 不构成威胁**：HELLO 在 AEAD 内，伪造需 PSK；重放的历史报文会因 salt 查找失败
+  或 nonce 重放窗口（§4.1）被拒。握手不泄露任何密钥材料，无降级路径（决策⑪）。
+
+### 6.1 报文
+
+```text
+HELLO_V3     = "FCP_HELLO_V3\0\0\0\0"(16) || caps(4)  # 共 20 字节（#25：magic 补齐 16 字节 oob 约定）
+HELLO_ACK_V3 = "FCP_HELLO_ACK_V3"(16)     || caps(4)  # 共 20 字节
+
+caps = ver(u8)=1 | data(u8) | parity(u8) | flags(u8)
+  flags bit0 支持成帧
+        bit1 支持 FECSTAT
+        bit2 支持按集合调整 k
+        bit3 支持 deadline 统计（M2 起）
+        bit4..7 必须为 0
+```
+
+- HELLO/ACK 作为 **oob 报文**发送（type=2，#25），同样在 AEAD 信封内：不设 `caps_mac`，也没有 epoch。
+  重传由握手层重传定时器承担（§6.2），不经 KCP。
+- HELLO/ACK **带 FEC 头，`type = 2`（oob）**：从第一个报文起统一成帧，接收端仅凭 type 分流，
+  不存在"裸报文还是成帧报文"的解析歧义。
+- oob 的 `symbol` = `magic(16) | caps(4)`（§4.7 约定）；`set_id`/`index` 填 0（被忽略）；
+  不占 `index`、不进集合、不参与 `symbol_max`、不计入任何统计（§4.4）。
+
+### 6.2 协商
+
+```text
+校验 caps（用 **u16 中间量**比较，u8 相加会回绕）：ver == 1、data ≥ 1、parity ≤ 7、
+(u16)data + (u16)parity ≤ 256、flags bit4..7 == 0（保留位非零 = 未知能力，拒之，#23⑧），
+违反则 ERROR 断连
+D' = min(本端 D, 对端 D)
+P' = min(本端 P, 对端 P)
+flags' = 本端 & 对端
+if (!flags'.bit0 || !flags'.bit1):  ERROR 断连（成帧与 FECSTAT 均为强制能力）
+elif P' < 1:                       FRAMED_STATS
+else:                              FRAMED_REPAIR
+```
+
+- 两侧在握手完成后立即按 `(D', P')` 建编解码器（`FRAMED_STATS` 不建 RS，只保留成帧层）。
+- **协商完成前只允许 oob（握手报文）上线**：`D` 要等 HELLO/ACK 交换完才定，握手期间若 KCP 推出业务 data，
+  成帧层没有 `D` 可按——按本端 `D` 分组、对端按 `D'`（取 min）解，两者不等就整体错位。
+  因此成帧层在 `HelloSent` 状态下把 data 段**缓存**（上限默认 **512 段 / 512KB、可按会话配置**，
+  #28③/F2：原 64 段 / 64KB 在 8 Mbit/s 下 ~80ms 即填满，退避拉长握手期后"慢握手+快发送"叠加会
+  误杀连接；512/512KB 缓冲 ~0.5s 满速数据，覆盖 RTT ≤ ~500ms 握手档；重 BDP 链路经
+  `SessionConfig` 调大。超限或握手失败 → 丢弃并 ERROR，保持响亮失败），协商完成后按序补发进集合。
+  握手 oob 不受缓存限制（HELLO/ACK 本身要在协商前通过）。
+- 两端可**同时**发送 HELLO；收到 HELLO 即回 ACK。重复 HELLO 幂等但**必须重发 ACK**（此前的 ACK
+  可能已丢失，不重发会让对端在 3 次超时后断连）；重复 ACK 与其余多余报文吞掉（协商只进行一次）。
+- 初始 `k`：`0`，或 `--fec-parity-pinned K`（`0..P`）。
+- V3 超时与重传（#27①）：重传间隔**指数退避 300ms → 600ms → 1200ms**（三次超时间隔），连同首发
+  共 3 个 HELLO（与既定 3 次上限一致），总等待约 2.1s；仍无应答则**连接失败**，打 **ERROR**
+  （响亮失败；本协议不兼容旧版本，无降级路径）。依据：握手阶段没有任何 RTT 样本，不能套用
+  `max(3×srtt,…)` 口径；固定 300ms×3 的 900ms 总预算在 RTT > 450ms 的链路（卫星/跨洲）上会出现
+  "链路正常但 ACK 未到先判死"的假失败；退避后虚假重传仍会在 ACK 到达时停止（重复 HELLO 幂等
+  且必须重发 ACK，见上条），代价可忽略。
+- `flags'.bit1 == 0` 不存在（直接断连）；FECSTAT 仅在 `FRAMED_*` 模式下发送。
+
+---
+
+## 7. FECSTAT v6（oob，128 字节冻结）
+
+### 7.1 布局
+
+```text
+ offset size type   field                      说明
+ 0      16   char   magic                      "FCP_FECSTAT_V6"（14 字节 + 2×0x00，固定 16）
+ 16     8    u8[8]  session_salt               与会话 salt 一致（§4.1）
+ 24     1    u8     ver                        = 6
+ 25     1    u8     flg                        bit0=1（描述"你→我"方向）; bit1=本区间有未完成集合被丢弃; bit2=有迟到恢复
+ 26     2    u16le  interval_ms                ≤ 60000
+ 28     4    u32le  accounted_through_set_id   本报告覆盖到的最大 set_id（单调键）
+ 32     4    u32le  sets_expected              已结算集合数
+ 36     4    u32le  data_expected              Σn（满组集合贡献 D，提前闭合的贡献 n）
+ 40     4    u32le  data_rx_orig               实收原始 data 数
+ 44     4    u32le  data_recovered_dl          结算前由 FEC 恢复的 data 数
+ 48     4    u32le  data_recovered_late        结算后恢复的 data 数（诊断）
+ 52     4    u32le  data_delivered             唯一交付 KCP 的 data 数（校验项）
+ 56     4    u32le  parity_rx                  实收 parity 数
+ 60     4    u32le  parity_expected            Σk（计划值上界；整组全丢的集合不计）
+ 64     4    u32le  sets_k_unknown              整组全丢、`k` 不可知的集合数（诊断）
+ 68     4    u32le  sets_full                  全部 data 到齐的集合数
+ 72     4    u32le  auth_fail                  认证失败分片数（不分类）
+ 76     4    u32le  late_dup                   迟到/重复的原始 data 数
+ 80     4    u32le  struct_fail                重建结构校验失败数
+ 84     2    u16le  repair_lat_p50_ms          首个分片→重建成功的中位时延
+ 86     2    u16le  repair_lat_p95_ms          p95（封顶 65535）
+ 88     4    u32le  data_bytes_rx              实收 data 字节（含 FEC 头与 AEAD tag）
+ 92     4    u32le  parity_bytes_rx            实收 parity 字节（含 FEC 头与 AEAD tag）
+ 96     4    u32le  sets_tail_dropped           未结算集合被丢弃数（停滞 >1s 未闭合、或 k=0 尾组无凭证；诊断，不进 expected）
+ 100    4    u32le  data_late_rx               结算后首次交付的迟到原始 data 数（诊断）
+ 104    4    u32le  sets_partial               提前闭合（`n < D`）的集合数（诊断）
+ 108    4    u32le  reserved0 = 0
+ 112    4    u32le  reserved1 = 0
+ 116    4    u32le  reserved2 = 0
+ 120    4    u32le  reserved3 = 0
+ 124    4    u32le  reserved4 = 0
+```
+
+- 长度必须精确 128；magic 必须逐 16 字节等于 `"FCP_FECSTAT_V6"` + 2×0x00，salt（8 字节）/ ver 校验；
+  否则丢弃并计数（oob 不进隧道，无污染风险）。
+- **所有计数字段均为"本区间"口径**：每个报告周期清零重计；唯一会话级字段是
+  `accounted_through_set_id`（单调键）。u32 计数无回绕风险。
+- 所有 u32 字段都落在 4 字节边界上：`16(magic) + 8(salt) + 4(ver|flg|interval) = 28`，天然对齐。
+- **单调键是 `accounted_through_set_id`**：发送端忽略不晚于上次使用值（**按 §14.5 半窗判据比较**，
+  覆盖 u32 回绕，#23⑦）的报告，不需要单独的 `report_seq`。
+- 不携带发送端计数（`data_sent/parity_sent` 由发送端自己统计），避免把两个方向混在一个报文里。
+- 发送节奏与区间定义：**距上次上报 ≥ 2s 且 `data_expected ≥ 256`** 才驱动状态机；样本不足则继续累积，
+  **上限 60s 强制上报**（`interval_ms` 如实填写，上限 60000）。强制间隔从 10s 放大到 60s，把"能攒够
+  256 样本"的链路下限从 ~26 包/s 降到 ~4.3 包/s；**再慢的链路（< 4.3 包/s）每个强制区间仍 < 256，
+  状态机不会被驱动，保持只观测**——是否按速率进一步放大强制间隔、或对慢链路单列样本门，见 §14.8。
+  空闲方向不发（未完成的尾部集合只计 `tail_dropped`）。
+  256 个 data 包是让 0.8% 阈值有 ≥2 个包的分辨率；`D=10` 时约 26 个集合。
+- 校验项（实现断言）：`data_delivered ≤ data_rx_orig + data_recovered_dl + data_recovered_late + data_late_rx`，
+  `data_rx_orig ≤ data_expected`，`parity_rx ≤ parity_expected`（`parity_expected` 用计划值 `k`，
+  是上界，故成立；见 §4.2）。`data_delivered` 一项须把**尾丢集合（`tail_dropped`，不进 expected）的
+  已交付数**（本地诊断量 `tail_delivered`，不占 128B 线格式）加回右端——k=0 尾组的分片已交付但无处
+  入账，不加回则规格自身允许的行为必然打破该断言（#23②；实现见第二轮 F5）。
+
+### 7.2 口径
+
+| 指标 | 定义 | 用途 |
+|---|---|---|
+| `pre_repair_loss` | `(data_expected − data_rx_orig) / data_expected` | **策略输入**（parity 能修的就是这部分） |
+| `usable_loss` | `(data_expected − data_rx_orig − data_recovered_dl) / data_expected` | 日志、与 KCP 重传对照 |
+| `deadline_miss_rate` | `1 − data_recovered_dl / (data_recovered_dl + 未恢复)` | M2 起用于恢复概率模型 |
+| `set_full_rate` | `sets_full / sets_expected` | 诊断 |
+| `sets_k_unknown` | 整组全丢、`k` 不可知的集合数 | 诊断（极端丢包时提示样本不可信） |
+| `sets_partial` | 提前闭合（`n < D`）的集合数 | 诊断（稀疏流量下 `data_expected` 的样本质量） |
+| `parity_loss` | `(parity_expected − parity_rx) / parity_expected` | 诊断（冗余通道自身的丢包） |
+| `data_late_rx` | 结算后首次交付的迟到原始 data 数 | 诊断 |
+| 集合成功率 | `(sets_full + 完全修复的集合) / sets_expected` | 诊断 |
+
+- `auth_fail` 不参与 data/parity 分类，因此不会污染丢包率。
+- `data_recovered_late` / `data_late_rx` 只诊断，不进策略输入。
+- `parity_loss` 在 `parity_expected == 0`（整区间 `k` 全为 0）时无定义，按 0 处理并跳过。
+- **`pre_repair_loss` 有系统性低报，约 10% 相对**：没有 parity 的组，`n_used` 只能取 `max_data_index + 1`，
+  编号最大的 data 恰好是丢的那个时，这次丢失从账上消失。实测（`D=10`，独立丢包）：
+  真实 10% → 测得 9.0%；真实 20% → 测得 18.0%。方向安全（低估不会把 `k` 顶满），
+  但**不要拿它做绝对精度评估**——绝对真值只有发送端有（它自己知道每组发了几个）。
+  `FRAMED_STATS` 模式 `k ≡ 0`，这个偏差是永久的。
+
+---
+
+## 8. 冗余策略（M1）
+
+每端点、每方向一个实例；输入是最新 FECSTAT 的 `pre_repair_loss`；输出是下一个**开始的**集合的 `k`
+（集合开始时锁定，`k` 随该集合的每个 data/parity 报文上线）。
+
+```text
+状态 OFF（k = 0，默认）
+  → ON : 单报告 loss ≥ 1.5%，或连续 2 个报告均 ≥ 0.8%
+         进入 ON 时立即 k = k_for(loss)                     # 不受下面 ±1 限制
+状态 ON
+  每报告 : k_target = k_for(loss)
+          k = limit_change(k, k_target, ±1)                 # 稳态限速，防振荡
+  → OFF : 连续 5 个报告 loss < 0.3%                  # 按**报告数**计，不按时间计：
+                                                     # 区间 2s~60s 自适应，5 报告 = 10s~300s
+防抖   : 关闭后 3 个报告内不再开启，除非 loss ≥ 4.5%
+护栏   : 窗口策略报告排队（srtt − min_rtt ≥ 40ms）时不得增加 k；
+          连续 3 个报告仍排队则 k −= 1（下限 1）
+固定   : --fec-parity-pinned K 直接锁定，绕过上述逻辑
+无报告 : 连续 3 个报告周期无 FECSTAT（有发送时）→ 保持 k，WARNING 一次
+样本   : 上报区间 data_expected < 256（60s 上限强制上报）→ 只更新日志，不改状态机
+
+k_for(loss) = min{ k ∈ 1..P : Pr(本组丢包数 ≤ k | 码长 D+k, 丢包率 loss) ≥ 0.80 }
+              无解时取 P
+```
+
+- **不再按均值配平**（旧的 `k = ceil(loss × S)`）：那条公式只保证"平均配得上"，实测 20% 丢包下
+  `k=3` 单组修复率只有 **74.7%**，4 个组里 1 个救不回来、只能等 KCP 重传（多一个 RTT）。
+  改成反解"修复率 ≥ 8 成"：
+
+| 丢包率 | `k_for` | 单组修复率 | 旧均值公式 |
+|---|---|---|---|
+| 2% | 1 | 98.0% | 1 |
+| 5% | 1 | 89.8% | 1 |
+| 10% | 2 | 88.9% | 2 |
+| 15% | **3** | 88.2% | 2（仅 73.6%） |
+| 20% | **4** | 87.0% | 3（仅 74.7%） |
+| 25% | 4 | 74.2% | 4 |
+
+- 两条公式**只在 13%~24% 区间不同**（15% 时 2 → 3，20% 时 3 → 4），低丢包区完全一致，
+  所以 0.8%/1.5% 阈值附近的开销没有变化。
+- 已知边界（#27②，§14.10）：`k_for` 按二项分布反解，隐含"组内丢包相互独立"。真实链路的突发丢包
+  （Gilbert–Elliott）下，一次长度 > k 的突发即可击穿单组（`D=10, k=4` 时 5 连丢不可修），
+  实测单组修复率会低于上表（丢包率均值不变、尾部变差）。M1 验收以 burst 注入实测
+  （见 M1 验收文档），突发检测（M3，§12.2）为结构性正解。
+- 实现用二项分布累积概率直接算（`k ≤ 7`，一次策略 tick 只算一次，开销可忽略）；浮点比较阈值 0.80，
+  边界值的抖动只影响多/少一个 parity，不影响正确性。
+- 已知边界：`Pmax=4` 在 ≥25% 丢包时不够（74.2%）。**`--fec-parity-max` 允许配置 5..7（#26）**——
+  头字段 `k` 占 3 位，上限本来就是 7；4 只是默认值不是协议上限。跨洲高丢包链路建议 5（25% 时
+  修复率 81.4%）。配置超过协商结果 `P'` 时按 `P'` 生效（P′=min 两端）。
+- `S = D + P` 已从策略里消失：码长按 `D + k` 算，不再需要满编值。集合内 `k` 仍由策略锁定，全组一致。
+- **FEC 控制器只输出 `k`，不参与降速**；降速与排队由 KCP/窗口策略负责。
+
+---
+
+## 9. 与 KCP / 窗口 / RTO 的关系
+
+| 策略 | 输入 | 边界 |
+|---|---|---|
+| FEC 冗余（本文） | `pre_repair_loss`（FECSTAT） | 只决定 `k` |
+| 发送窗口 | srtt / min_rtt / 队列深度 | 向 §8 提供"排队"护栏 |
+| RTO 下限 | `usable_loss`（KCP 自己的 ACK gap / RTO） | 只关心真正落到 KCP 的丢包（M2 起接入；M1 不改 KCP） |
+
+- 三者不共享状态机，只有"护栏"这一条单向只读耦合。
+- M1 不改 KCP 任何行为（不改 RTO、不延迟重传）：FEC 恢复与 KCP 重传并存，靠 KCP sn 去重。
+- 禁止"为了等 FEC 而全局拉长 RTO"。
+
+---
+
+## 10. 日志与统计
+
+```text
+FCP v6 negotiated: data=10 parity=3 pmax=4 flags=framed,stats (peer V3)
+FECSTAT sets=1250 expect=10000 rx=9850 rec=60 late=40 lost=50 pre=15000ppm usable=9000ppm -> k=2 state=ON
+FEC off: pre<0.30% for 5 reports (last 0.20%)
+FEC pinned: k=2 (operator)
+FECSTAT dropped: reason=stale|bad_length|bad_salt|bad_ver count=1
+FEC sample untrusted: k_unknown=40/300 (>10%)
+FEC handshake failed: V3 no ACK after 3 tries (peer=<addr>)
+```
+
+- `lost = expect − rx − rec − late`（**完全未收到**的包数；墓碑期内迟到的 `late` 从"未收到"里单独
+  分出，否则恒等式不成立）。样例自检：`9850 + 60 + 50 = 9960 = 10000 − 40`，即"已记账的 9960 个包
+  中有 40 个在墓碑期内迟到交付"。三个口径互相咬合：`pre = rec + lost + late`（150 = 60+50+40）、
+  `usable = lost + late`（90 = 50+40），与样例的 `pre=15000ppm usable=9000ppm` 一致。
+  实现必须内置这条恒等式断言（开发期开启）：`rx + rec + lost + late = expect`。
+- `pre/usable` 用 **ppm**（百万分比）打印，避免 0.9% 被取整成 1% 造成对账困惑。
+
+`stats ...` 行末尾追加（不影响既有 grep）：
+
+```text
+fec_mode=<repair|stats> fec_k=<0..P> fec_pre_ppm=<n> fec_usable_ppm=<n>
+fecstat_rx=<n> fecstat_stale=<n> fec_auth_fail=<n> fec_struct_fail=<n>
+```
+
+---
+
+## 11. 兼容矩阵
+
+| 客户端 | 服务端 | 模式 | 成帧 | FECSTAT | RS | 策略 |
+|---|---|---|---|---|---|---|
+| 两端均为本协议 V3 | `P' ≥ 1` | `FRAMED_REPAIR` | 始终 | 双向 | 有 | §8 |
+| 两端均为本协议 V3 | `P' = 0` | `FRAMED_STATS` | 始终 | 双向 | 无 | 只观测 |
+| 任一端为 V1/V2/v5 | — | **不支持** | — | — | — | 连接失败（ERROR），无降级 |
+
+**硬约束**：不存在"关掉 FEC"的配置，线上不存在裸 KCP 报文，所有模式一律成帧。
+Android CPP_REMOTE 等旧端必须升级到本协议 V3，否则连接失败。
+
+---
+
+## 12. 实现清单与阶段
+
+### 12.1 代码改动
+
+| 位置 | 改动 |
+|---|---|
+| 库（FEC） | 头部改为 `set_id+index+type_k`（`j`/`k` 各 3 位）；`Encode(data[], n, k, symbol_max, out)`——按**计划值 k** 算满 k 条 parity（码长恒 `n+k`，勘误 #21①；`k_eff` 只由成帧层决定发送前几条，不进矩阵）；`symbol_max` 由调用方按集合跟踪；`Decode` 返回重建结果与每集合统计；**允许 P=0 时完全不建 codec** |
+| 代理（成帧层） | **恒成帧**（无开关）；**一 symbol 严格对应一 KCP segment（禁止合并多段）**；oob 收发（含 HELLO/ACK 分派，#25）且不占槽位；集合状态机（`n`/`t_last`/`k`/`k_eff`/`symbol_max`）；空闲超时闭合 + `k_eff` 缩放；接收端 `n = index − j`；FECSTAT 编解码；按集合结算与墓碑；KCP sn 去重 |
+| 代理（策略） | §8 状态机 + CLI（`--fec-parity-pinned`、`--fec-parity-max`（5..7，默认 4，#26）、`--fec-budget`（M3）、`--fec-target-recovery`（M3）） |
+| 代理（握手） | HELLO_V3/ACK_V3（oob，type=2，自管指数退避重传 300/600/1200ms（#27①）、Established 即停）、caps 校验（`D'≥1`、`P'≤7`、u16 下 `D'+P'≤256`、ver/保留位）、**协商前 data 缓存**、超时断连（不降级）、模式决定（#25：删除在途登记/内容分类） |
+| 代理（加密层） | 信封改为 `salt(8) │ nonce_counter(8) │ ct │ tag(12)`；IV 本地展开 `counter(8 LE) │ dir(1) │ 0×3`（方向不进线上）；**会话密钥按会话派生 `session_key = AES128(PSK, salt‖0×8)`（#28①，P0，已落地·任务 F1）**；**方向密钥 SP 800-108 KDF 派生 `key_c2s`/`key_s2c`（#26 强制，M1 双密钥，无过渡）**；**发送侧 `nonce_ctr ≥ 2^32` 主动断连（#26 块预算终止线）**；**接收侧重放窗口 256 槽/方向（#26）**；GCM tag 长度设为 12（T0 决策 2 为内置 AES-GCM 实现，#23⑩ 清理 OpenSSL EVP 表述残留）；salt 8 字节，与实际会话查找键同步收窄 |
+| 配置 | MTU 预算断言（IPv4/IPv6、默认值与 `--mtu` 覆盖） |
+
+### 12.2 阶段
+
+| 阶段 | 内容 | 验收 |
+|---|---|---|
+| **M1** | 线格式（头/`j`/自然长度/零扩展）、集合状态机（含 `T_flush` 与 `k_eff`）、FECSTAT、按集合结算、§8 状态机（`k_for` 反解）、MTU 断言 | §13 全绿；在真实链路跑出 `k` 的开关与吞吐对照 |
+| **M2** | 观测增强：`deadline` 统计、修复时延、字节预算上报、离线重放工具 | 统计数据与离线重放一致 |
+| **M3** | 完整控制器：`R(k)` 模型、字节预算、三态、突发检测 | 在 5%/10%/20% 与 Gilbert–Elliott 下 k 稳定、预算不超 |
+| **M4** | 可选：KCP per-segment 延迟重传、滑动窗口 FEC、大小分桶、非对称 D:P | 按需 |
+
+---
+
+## 13. 测试矩阵（M1 必测）
+
+| # | 用例 | 断言 |
+|---|---|---|
+| T1 | FECSTAT 128 字节 golden | 逐字段偏移/类型/单位；长度/ magic / salt / ver 校验；`≤ accounted_through_set_id` 的报告被忽略 |
+| T2 | MTU 断言 | IPv4/IPv6、`M=1400` 与 `--mtu` 极值下，data / parity / oob 报文均不超预算 |
+| T3 | `k=0` 无丢失 | 线上无 parity；`data_expected` 精确；`pre_repair_loss=0` |
+| T4 | `k=P` 单分片丢失 | 恢复成功且字节精确；**最大分片丢失**同样可恢复（验证 `symbol_max` 来自 parity）；`data_rx_orig` **不含**重建项、`data_recovered_dl` 含（两张位图分离，§4.5/§5.2） |
+| T5 | 整组 parity 全丢 | `k` 由 data 分片得知（计划值），`parity_expected = k`、`parity_rx = 0`；`pre_repair_loss` 不受影响；该组 `n` 未知故不重建，缺失由 KCP 重传兜底 |
+| T6 | 整组全丢 | `set_id` 跳变结算：**只计 `sets_k_unknown+1`，不进 `data_expected`**；占比 >10% 时本区间标记不可信、策略 `k` 不动（§5.2 样本可信门） |
+| T7 | 原始 data 与重建 data 同一 sn | `data_delivered` 只 +1（KCP sn 去重） |
+| T8 | 认证失败注入 | 不进 RS、不污染 data/parity 分类，只 `auth_fail+1` |
+| T9 | 结构校验失败 | 伪造非法 `len`/非零填充 → `struct_fail+1`，不交付 |
+| T10 | `P'=0`（FRAMED_STATS） | 无 RS、无 parity，统计仍正确；`k≡0` |
+| T11 | V3 超时 / 非法 caps | 连接失败 ERROR，不静默、不降级；caps 违反 `D'≥1`、`D'+P'≤256`（u16 校验）或 `P'≤7` 被拒绝 |
+| T12 | 闭合的三种路径 | 满组闭合：`data_expected += D`，`sets_partial` 不变；空闲超时闭合：`n < D` 且 `data_expected += n`、`sets_partial+1`、parity 下标从 `n` 开始；发送端异常退出（未闭合）：不进入 expected，`tail_dropped+1` |
+| T13 | 迟到交付记账 | 结算后墓碑期内到达的原始 data：首次交付计 `data_late_rx`、重复计 `late_dup`，`data_delivered` 不变量成立 |
+| T14 | oob 不占槽位 | 握手（oob）前后集合的 `index` 连续；无提前闭合时 `data_expected = D × sets_expected`；握手期间的集合 `sets_full` 正常 |
+| T15 | 区间自适应 | 低速率下区间自动拉长，`interval_ms` 如实上报；**满 60s 即使 `data_expected < 256` 也强制上报一次**（`interval_ms ≈ 60000`）；`data_expected ≥ 256` 才驱动状态机 |
+| T16 | 头字段编码 | `type_k` 拆分 golden：`(k<<5)\|(j<<2)\|type` 的编码/解析；`j ≥ k` 或 `n=index−j` 落在 `[1,D]` 外 → 判 malformed；`k=0` 的集合无 parity |
+| T17 | 空闲超时闭合 + `k_eff` 缩放 | 只发 3 个 data 后停 300ms：`T_flush` 触发、`n=3`、发 `k_eff = max(1, ceil(k×3/10))` 条 parity（`k=4` 时为 2 条）、下标 `3..3+k_eff-1`、`set_id` 前进；满组时 `k_eff == k`；**码长恒为 `n+k`：少发 parity 后缺 2 片的组仍能解码成功**（幽灵擦除，§4.4） |
+| T18 | `n` 由 parity 给出 | 收 `(index=12,j=2)` → `n=10`；收 `(index=6,j=1)` → `n=5`；两条 parity 给出不同 `n` → `struct_fail`；一条 parity 都没有时 `n` 取 `max_data_index+1`、解码次数 0、且 `data_rx_orig ≤ data_expected` 成立 |
+| T19 | 加密信封 28 字节 | 空明文 → wire 恰为 28 字节（`8+8+12`）；12 字节 IV 由 `counter \| 方向 \| 0×3` 本地重建（线上无方向字节）；12 字节 tag 截断后校验正确包通过、篡改 1 字节即 `auth_fail`；**方向密钥隔离：c2s 密文用 s2c 密钥必验签失败（#26）**；MSS 断言 `1312`（IPv4/M=1400） |
+| T20 | 策略反解表 | `k_for()` 在 `loss = 2/5/10/15/20/25%` 上分别得 `1/1/2/3/4/4`，与 §8 表格逐项一致；`loss=20%` 不得回落到 3 |
+| T21 | 协商前 data 缓存 | `HelloSent` 状态下 data 段不上线、入缓存；协商完成后按序进集合；缓存超限（默认 512 段/512KB，可配置，#28③/F2）或握手失败 → 丢弃并 ERROR（§6.2） |
+| T22 | 计数恒等式 | `rx + rec + lost + late = expect` 在随机丢包 fuzz 下恒成立（§10）；`usable_loss` 不因重建被重复扣减 |
+| T23 | 握手通道 oob 化回归 | KCP 输出路径**无任何内容分类分支**；HELLO/ACK 以 type=2 上线、`set_id/index=0`；以 `FCP_HELLO_V3` 开头的用户数据段按 data 正常进集合（结构性保证，无需任何匹配逻辑）；type=3 未定义、按 struct_fail 丢弃；HELLO 重传由握手定时器承担、Established 后停止（#25） |
+| T24 | 重放窗口 256 槽 | 窗口内乱序（跨度 ≤256）全部接受交付；同 `nonce_ctr` 重放拒收 `auth_fail+1`；落后 >256 拒收；窗口滑动后旧包拒收（#26）；边界：恰好 256 前跳正常滑动 |
+| T25 | 终止线与方向密钥 | 发送侧 `nonce_ctr` 注入至 `2^32−1` 后再发包 → 会话主动断连且 ERROR（#26）；`key_c2s`/`key_s2c` 由 SP 800-108 KDF（label `fcp-c2`/`fcp-s2`）派生、互不相同、确定性可重算；两方向计数器独立从 0 起 |
+| T26 | 握手重传退避（#27①） | 超时间隔按 300→600→1200ms 递增（`next_retry` 序列）；ACK 在任意阶段到达即停（不再重传）；3 个 HELLO（首发 + 2 次重传）后仍无 ACK → ERROR 断连（总等待 2.1s）；RTT=500ms 仿真链路上握手成功（旧 900ms 总预算下必失败）；重复 HELLO 仍重发 ACK（幂等不受退避影响） |
+| T27 | 会话密钥按会话派生（#28①） | 同一 PSK、不同 salt → `session_key` 互异；同 PSK 同 salt → 两端各自派生结果逐字节一致；方向密钥从 `session_key`（而非 PSK）派生；旧方案（方向密钥直接来自 PSK）的手工报文不再被接受；T19/T25 断言不变。已落地：`envelope_test TestSessionKeyDerivation`，TestRecvNonceLimit 同步改为 session_key 派生密钥 |
+
+回归必守：MTU 不超；FECSTAT 不回退格式；`k` 变更只影响后续集合；`auth_fail` 不分类；`data_delivered` 单调且不重复。
+
+---
+
+## 14. 待标定与未决
+
+1. **阈值**：1.5% / 0.8% / 0.3% / 4.5% / 60s / 40ms 均为初值，需要在真实链路（参考：RTT≈200ms、丢包≈20%、5–8 Mbit/s）实测标定。
+2. **`Pmax` / `D`**：初值 `D=10, P=3, Pmax=4`（10+3 与 kcptun/kcp-go 的默认几何一致）。按 §8 的
+   0.8 修复率反解，20% 丢包对应 `k=4`、实测单组修复率 **87.0%**（旧均值公式给 `k=3`，只有 74.7%）。
+   25% 丢包时 `k=4` 只有 74.2%，`Pmax` 需提到 5~7 才够——`k` 字段占 3 位，上限 7，还有余量。
+3. ~~**`--fec` 默认模式**~~ → **已定**：无开关。FEC 恒开、恒成帧，默认 `FRAMED_REPAIR`；`P'=0` 时退化为 `FRAMED_STATS`（只观测，不纠错）。
+4. **非对称 D:P**：上下行丢包率常不对称，是否每方向独立几何（需要 caps 增加一组字段）。
+5. **`set_id` 回绕**：u32 在 1000 组/s 下约 50 天回绕；当前用半窗判据 `(id − last) mod 2^32 < 2^31`。若要求零回绕逻辑，需扩到 48 位（头 8 字节，+0.15%）。
+6. **会话关闭时的最后一条 FECSTAT**：`k ≥ 1` 的尾部组由自己的 parity 结算（`eligible` 认 parity），
+   不再有"永远不计账"的组；`k = 0` 的尾部组没有凭证，流停住时落在 `tail_dropped`（§5.2）。
+   关闭前最后一段样本（< 60s）可能没随报告发出，是否在断开时补发一条，留到 M2——只影响最后的
+   统计完整性，不影响策略。
+7. **加密信封的安全余量（8 / 8 / 12 的代价，已被接受）**：
+   - `salt` 64 位 → 两个并发会话撞同一 salt 的概率约 `N² / 2^65`（1 万并发时 ≈ `2.7e-15`）；
+     撞上等于**共用会话密钥**（salt 是 `session_key = AES128(PSK, salt‖0×8)` 的派生输入，#28①）
+     + 共用 nonce 起值，属灾难性，但概率比硬件故障低几个量级。服务端已有
+     "拒绝与在线会话共享 salt" 的检查，把它从概率问题变成显式错误。
+     **注意（#28①）：该论证依赖 salt 真正参与密钥派生——实现此前直接用 PSK 当会话密钥，
+     "salt 不同 ⇒ 密钥不同"的前提不成立，任意两会话密钥相同、IV 从 0 重叠，GCM 跨会话重用
+     （多客户端共用 PSK 部署下可互相解密/伪造）；修复见 §6.0，已落地（任务 F1）。**
+   - `tag` 96 位 → 单次伪造成功率 `2^-96`；按每秒 1e9 次尝试、连续 100 年计算，累计约 `1e-60`。
+   - `nonce` 线上 64 位计数器 → 计数器空间 `2^64` 远超终止线，不是约束；**约束来自 GCM 块预算（#26）**：
+     NIST SP 800-38D 要求同一密钥下全部调用的明文+AAD 总块数 `σ ≤ 2^39 − 256`，超限后 GHASH 伪造
+     概率按 `σ²/2^128` 平方劣化（σ=2^54 时单次伪造 ≈ 2^-20，公网可实际伪造）。满尺寸包明文约 84 块，
+     单方向终止线定为 **`nonce_ctr ≥ 2^32` 包**（≈ 2^36.1 块 < 2^39；两方向各持方向密钥后预算独立）。
+     按满尺寸 100k pps 约 12 小时、10k pps 约 5 天触发断连重连；代理场景会话生命周期远短于此。
+     原终线 2^48 包超预算 6.5 万倍，为 **#26 P0 勘误**。实现须在发送路径检查计数器，超限即主动断连。
+   - 反向风险：**这三项都是"一次性决定"**。若将来要接第三方实现，信封必须在握手 caps 里带版本号，
+     不能再改动字节宽度（第 5 条的 `set_id` 扩容同理）。
+8. **慢链路的 FEC 开启下限（2026-10-30 澄清，#22④）**：上报门 `data_expected ≥ 256` 与 60s 强制间隔
+   联合决定"能开 FEC"的链路下限 ≈ 4.3 包/s；更慢的链路（每 60s 不足 256 包）每个强制区间仍达不到
+   样本门，永远只观测。是否按速率放大强制间隔、或对慢链路单列样本门（如 `interval ≥ 60s` 时降为
+   ≥64 并用更保守阈值驱动），留 M2/M3 实测后定。
+9. **方向密钥（#24② 提出，#26 升级为 M1 强制）**：两方向共用一把 16 字节会话密钥时，GCM 块预算
+   也要两方向共摊（总预算减半），且单侧密钥泄露连坐反方向。改为按方向派生两把密钥：
+   NIST SP 800-108 Rev.1 计数器模式 KDF，AES-128 作 PRF（复用信封已验证的 AES 实现，不引入哈希），
+   `key_c2s = KDF(ikm, label="fcp-c2", L=128)` / `key_s2c = KDF(ikm, label="fcp-s2", L=128)`，
+   输入块为 `[i]1 | label | 0x00 | [L]8`（恰 16 字节）：两方向块预算独立（各 2^39），泄露隔离。
+   **ikm = session_key（#28①）**：由 PSK 与线上 salt 按会话派生（§6.0），不再是配置 PSK 本身。
+   **密钥派生不上线，零字节改动**，与终止线 2^32（第 7 条）配套生效；M1 实现直接按双密钥写，不留过渡。
+10. **`k_for` 的 i.i.d. 假设（#27②）**：§8 反解基于二项分布，隐含"组内丢包相互独立同分布"。
+    真实公网/无线丢包高度突发（Gilbert–Elliott）：一次长度 > k 的突发即可击穿单组
+    （`D=10, k=4` 时 5 连丢不可修），实测单组修复率将低于 §8 表格值——丢包率均值不变、
+    尾部变差，`k_for` 系统性欠保护。M1 验收以 burst 注入实测真实修复率（验收文档）；
+    突发检测（KL/经验分布，v5 遗产）留 M3（§12.2 已列）。在突发检测落地前，跨洲高丢包链路
+    建议把 `--fec-parity-max` 提到 5 以留余量。
+11. **拥塞场景的冗余正反馈（#27②）**：丢包常由拥塞引起。当前护栏只在"排队报告"周期禁止**上调**
+    `k`，且 `k` 下限为 1（不因拥塞降回 0）——"深队列 + 高丢包"链路上冗余字节（20% 丢包时约 40%）
+    可能加剧拥塞、推高丢包，形成正反馈。M1 上线需在"高丢包 + 深队列"场景观察 `usable_loss`
+    与吞吐的联动；结构性解法在 M2（`usable_loss` 接入 RTO，§9）与 M3（字节预算上限）。
+12. **无 PMTU 发现（#27②）**：`path_mtu` 是纯配置项（默认 1400）。实际路径 MTU 小于配置值时依赖
+    IP 分片，存在**黑洞故障模式**：超 MTU 的 data/parity 全丢且无 ICMP 反馈时表现为吞吐骤降
+    （HELLO 仅 20+28 字节不受影响，握手可正常完成——这使故障更隐蔽）。部署前提：配置值 ≤
+    路径最小 MTU；是否增加探测/运行时钳制留 M2 评估。
+13. **协商前缓存溢出与握手退避的交互（#28③）**：协商前 data 缓存上限 64 段/64KB，超限
+    **丢弃并 ERROR**（§6.2）。#27① 把最坏握手期从 0.9s 拉长到 2.1s（×2.3），而代理转发在握手期间
+    即开始灌数据：8 Mbit/s 下约 80ms 填满 64 段——"慢握手（恰是高 RTT）+ 快发送"叠加时连接直接
+    失败，且退避改动放大了暴露窗口。**已落地（任务 F2，2026-10-30）**：采用第二条路径——默认上限
+    放大到 **512 段 / 512KB** 并经 `SessionConfig` 可配置（`handshake_cache_segments/bytes`），
+    超限仍响亮失败；"暂停 KCP 泵"式反压需宿主配合（KCP 泵在库外），如部署仍触顶由宿主侧跟进。
+14. **`late_guard`/墓碑上限与 #27① 高 RTT 口径不一致（#28④）**：退避为 RTT ≤ ~700ms 的链路打开了
+    握手大门，但 `late_guard = clamp(1×RTT, 100ms, **500ms**)`、`max_tombstone = clamp(2×RTT,
+    200ms, **1s**)` 的上限都低于该 RTT 区间——高 RTT + 重排时结算会把在途分片误计丢失（方向安全：
+    高估 → `k` 上调 → 偏保守），墓碑提前结束只损失迟到修复的诊断计数，均非正确性缺陷；
+    但与"支持跨洲链路"的定位不自洽。上限是否提到 ≥700ms 或改按实测 srtt 缩放，留 M2 标定。
+15. **FECSTAT 自身无重传、无冗余（#28⑤）**：FECSTAT 走 oob 单发不重发，控制信令恰好在它要修的
+    信道上裸奔——丢包率高的链路上 FECSTAT 丢失率也高，丢失时策略盲区最多 3 个报告周期
+    （"无报告 → 保持 k"，§8）。**已落地（任务 F3，2026-10-30）**：FECSTAT 每次报告**连发两份**
+    （`reporter` 发送两次，成本 128B）；接收端校验器新增 `kDuplicate` 判定——键等于最近接受值的
+    副本单独计数（`fecstat_dup`），不污染 `stale`/`dropped` 诊断口径（stale 仍只表示"genuinely 落后"）。
+16. **短生命周期流的自适应盲区（#28⑥）**：上报门 `≥2s 且 ≥256 包`——代理场景大量连接只活几秒，
+    状态机从未被驱动，全程 `k=0`（或 pinned）。这是结构性边界而非缺陷：自适应机制只对"活过
+    2~3 个报告周期"的连接生效。短连接密集的部署应使用 `--fec-parity-pinned K`；跨连接继承策略
+    状态（按目标地址聚合丢包样本）留 M3 评估。
+
+---
+
+## 附录 A：一个集合的字节示例
+
+`D=10, P=3, S=13, k=1`，其中 index 3 的 data 为最大分片（`payload=1336`）：
+
+```text
+symbol_max = 2 + 1336 = 1338
+data (index 3) wire = 16 + 6 + 1338 + 12 = 1372   (= path_mtu 1400 − IPv4/UDP 28) ✔
+data (index 0, ACK-only, payload=32)
+     wire = 16 + 6 + (2+32) + 12 = 68
+parity (index 10)  wire = 16 + 6 + 1338 + 12 = 1372 ✔
+type_k: data = (1<<5)|(0<<2)|0 = 0x20；parity(index 10, j=0) = (1<<5)|(0<<2)|1 = 0x21
+index 11 / 12 永不出现（k=1 < P=3）
+```
+
+接收端收到 9 个 data + 1 个 parity ⇒ `symbol_max=1338`（由 parity 得知），零扩展后 RS 重建 index 3；
+若 index 3 恰是丢失的那一个，重建出的 symbol 前两字节给出 `len=1338`，截断后交付 KCP。
+
+> 同一组的纯 ACK 报文只有 68 字节，而 parity 恒为 1372 字节——这就是"备用包最贵"的来源。
+
+---
+
+## 附录 B：与 v5 的差异清单
+
+| v5 | v6 | 原因 |
+|---|---|---|
+| `seqid(4)+type(2)`，`set_id = seqid/S` | `set_id(4)+index(1)+type_k(1)` | 去掉除法、paws、半窗展开 |
+| 64 位内部 seqid + 32 位线上 + `session_epoch` | **删除** | 一个连接一个 KCP 会话；重连即新密钥，旧报文在 AEAD 失败 |
+| `caps_mac`、无 PSK 分支 | **删除** | HELLO/ACK 是 KCP 消息，已在 AEAD 内 |
+| `FEC_PROGRESS` + 结算器 + 超时兜底 | **删除**，改为按集合结算 | 尾部缺口由 `set_id` 跳变自愈，最多滞后一个上报区间 |
+| 线上填充到 `max_symbol_len` | **取消**，自然长度 + 零扩展 | 避免 ACK 小包被放大；`symbol_max` 由 parity 携带 |
+| RS 域含 `fec_hdr` | 域为 `len|payload`（头在域外） | 与 kcp-go 一致，且 parity 与 data 明文等长可证明 |
+| `deadline_rx/deadline_tx/Δ/α/max_defer` | 降级为"结算时刻"概念 | 不需要时钟模型即可定义"期限内恢复" |
+| FIN 走 oob | **FIN 回到有序流** | 半关闭必须保证"FIN 在已排队数据之后" |
+| 经验分布 + KL 突发检测（M1） | 推到 M3 | M1 只需丢包率 → k |
+| `report_seq` / `progress_seq` | `accounted_through_set_id` 作单调键 | 少一个序号维度 |
+| 128 字节 FECSTAT（字段略不同） | 128 字节 FECSTAT v6 | 字段按集合结算重排，新增 `sets_k_unknown`、`struct_fail`、`data_late_rx` |
+| 加密信封 `salt16+nonce12+tag16`（44B） | `salt8+nonce8+tag12`（28B） | 三者各有一半是可推算/恒定的：nonce 的方向字节与 3 个零每包重发、salt 只需当会话 ID（128 位熵属冗余）、tag 96 位已远超需要 |
+
+---
+
+## 附录 C：2026-10-29 评审修订
+
+| # | 修订 | 原因 |
+|---|---|---|
+| 1 | 迟到原始 data 新增独立计数 `data_late_rx`（FECSTAT offset 100，原 reserved0；#18 前移后为 100）；校验不变量加上该项 | 原"计 late_dup 且交付"会打破 `data_delivered ≤ rx_orig + rec_dl + rec_late`（§5.3 与 §7.1 自相矛盾） |
+| 2 | HELLO/ACK 带 FEC 头（type=3，control）；接收端仅凭 type 分流；`type==data 且 index ≥ D` 判 malformed；窗口锚点定义为本端已见最大 set_id − max_active_sets | 裸 HELLO 会被 FEC 层误解析为 parity（`"FCP_"` ASCII 字节命中 type=1）；原"早于当前窗口"无定义 |
+| 3 | 删除 `LEGACY` 模式与 V1/V2/v5 兼容：握手失败即 ERROR 断连；caps 校验 `D' ≥ 1`、`D'+P' ≤ 256` | 无历史负担（决策⑪）；原单列约束不充分（D=255+P=63 时 S=318 溢出 index u8） |
+| 4 | 整组全丢集合的 `t_first_seen` 取跳变观测时刻，`late_guard` 从该时刻起算 | 原规格未定义从未见过分片的集合如何计时 |
+| 5 | FECSTAT 所有计数字段明确为"本区间"口径，每周期清零重计 | 消除 u32 回绕歧义，锚定 T1 golden 测试 |
+| 6 | control（type=3）明确"不占 index、不进集合、不计数、symbol 无 len 前缀"（§4.4 补分支） | 上一轮引入 type=3 时未同步 §4.4，实现若"占槽位但不置位"会让 `pre_repair_loss` 虚高 1/D，直接把 `k` 顶到 `P` |
+| 7 | （已被 #12 取代）曾把 parity 统计降为诊断、`sets_without_parity`、删除 `parity_rx ≤ parity_expected` | 当时的线格式里 `k` 确实不可知 |
+| 8 | 冻结"一 symbol = 一 KCP segment" | KCP 若合并多段，type=3 打标、sn 去重、MSS 推导全部失效 |
+| 9 | 解码改为"每条新分片触发一次"，删除"每秒 4 次"限流；`max_active_sets` 64→256 且墓碑优先于容量淘汰 | 限流会挡掉凑够片数后的关键解码；64 在 8 Mbit/s 下小于墓碑覆盖组数，迟到修复能力归零 |
+| 10 | 上报区间改为"≥2s 且 `data_expected ≥ 256`，上限 10s"；策略加样本门限 | 单区间粒度是 1/D（现默认 `D=10` 即 10%），0.8%/1.5% 阈值在低速率链路不可达 |
+| 11 | 小项：决策⑩ magic 16 字节只约束 oob；决策① 开销按报文大小分别标注；§9 RTO 行标 M2；parity `index < D` 判 malformed；两端同时 HELLO 幂等；§14.3 默认模式收敛为 `FRAMED_REPAIR` | 表述冲突与遗漏 |
+| 12 | `k` 改为集合开始时锁定，**data 与 parity 都携带**（当时是头部高 6 位；#20 之后为高 3 位 + `j` 3 位）；`sets_without_parity` → `sets_k_unknown`；恢复 `parity_rx ≤ parity_expected` 断言；T5 改写、新增 T16 | 数据包带上 `k` 后只要收到任一分片就能定 `k`，"没发 vs 全丢"的不可判定性消失（决策⑭） |
+| 13 | 补 control 的两条实现定义：**逐段判定**（不缓存首发标记、不接受旁路状态）、`len` 前缀只用于 data（§4.4） | 原 §4.4 只写 `if 该报文是控制消息`，未定义判定方式；按"首发打标记"实现时，重发的 HELLO 会以 `type=0` 占掉数据槽位，重回 #6 的 1/D 误报 |
+| 14 | **删除 `BARE_KCP` 与 `--fec off`**：FEC 恒开、恒成帧，线上不存在裸 KCP 报文；决策① 改为"恒成帧"；§3/§11/§12/§14.3 同步 | 一端开、一端关时的故障是静默的（裸包过不了 AEAD，只有 `auth_fail` 在涨，不报错）；留一个必然配错就断的开关，收益为负 |
+| 15 | **允许每组不满 D**：新增空闲超时 `T_flush` 闭合、parity 下标基址改为 `n`、接收端三条规则定 `n`（已由 #17、#20 两次改写）、`data_expected += n`、新增 `sets_partial`（FECSTAT offset 104） | 原设计"攒满 D 才发 parity"，稀疏流量下整组长期无保护且永不结算；直接"到点就发"会让 `data_expected` 仍按 D 记账，误报 `(D−n)/D` 的丢包 |
+| 16 | **默认几何 8+2 → 10+3**（`D=10, P=3, S=13`，决策⑯）；重算全部派生数字：`1/D` 误报 12.5%→10%、`T_flush` 论证改用单包间隔、区间样本组数 32→26、集合率 60–97→50–78 组/s、`k` 配平示例、日志样例、附录 A 示例、`data_expected` 字段口径改为 `Σn` | 与 kcptun/kcp-go 默认几何同口径；`P=2` 在 20% 丢包下单组修复概率仅 **67.8%**（原写 80%，算错），余量不足 |
+| 17 | （已被 #20 取代）曾用上下界夹逼定 `n`：`n_low/n_high` 收敛即精确 | 夹逼能到 96%，但仍有 4% 判不出码长；#20 改为片内直接携带，彻底消除 |
+| 18 | **加密信封收紧到 `salt(8) │ nonce(8) │ tag(12)`（28 字节）**：IV 由 `counter+方向+0×3` 本地展开、方向不进线上；FECSTAT 的 `session_salt` 同步改 8 字节，其后 u32 字段整体前移 8；MTU 表重算（`payload_max 1336`、`MSS 1312`）；附录 A 示例重算；新增 T19；决策⑰ | 新协议无历史包袱，三项各有一半冗余：nonce 的方向字节与 3 个零恒不变、salt 只需作会话 ID、tag 96 位已远超需要。合计省 16 字节/包，满包效率 92.6%→93.7%。安全代价见 §14.7 |
+| 19 | **`eligible` 增加"收到本集合 parity 即视为闭合"**；改正"空闲闭合的尾组能正常结算"的错误表述 | 原判据只认"更高 `set_id`"，而空闲闭合只发生在发送端、不产生更高的 `set_id`——流一停尾组就永远不结算（1s 后落 `tail_dropped`）。parity 只在 `close_set()` 里发，本身就是闭合凭证 |
+| 20 | **头字段拆成 `k`(3 位)+`j`(3 位)**：`n = index − j`，删除 `n_low/n_high` 夹逼与 4% 残余；`k` 语义统一为"计划值"，`k_eff = max(1, ceil(k·n/D))` 只为提前闭合组缩放；策略改为按 0.8 修复率反解（`k_for`）；区间上限 10s→60s；T15/T16/T17/T18 改写、新增 T20 | `n` 靠推导永远会有推不出的组（`D=10,k=3,p=20%` 时 4%）——推不出就不重建，等于**最需要修补的组反而不修**；让 parity 自带序号后任一片即精确，且规格少掉一整节推导。缩放解决"只装 2 个包却背 3 个满尺寸 parity"的开销爆炸。修复率反解解决 `k=3` 在 20% 丢包下只有 74.7% 的问题 |
+| 21 | **详细设计阶段发现并修正的 7 处错误**（实现行为以 `FCP_V6_DETAILED_DESIGN.md` 附录 A 为准，本文已同步回改）：<br>① RS 码长恒为 `n+k`（计划值），`k_eff` 只决定发送条数不进矩阵——否则提前闭合组两端矩阵不一致、全部解不出（§4.4）；<br>② `orig_mask`/`recov_mask` 分离，`data_rx_orig` 不含重建项——否则 `usable_loss` 把同一批包扣两遍（§4.5/§5.2）；<br>③ 整组全丢只计 `sets_k_unknown`、不进 `data_expected`，占比 >10% 时样本标记不可信——按 D 记账会把稀疏流丢包率虚高数倍（20%→71%）（§5.2）；<br>④ 协商完成前只放行 control，data 段缓存（64 段/64KB）——协商前 `D` 未定，data 进集合会错位（§6.2）；<br>⑤ 日志样例数字修正并补恒等式 `rx+rec+lost+late=expect`、ppm 打印（§10）；<br>⑥ "连续 5 个报告"删掉"约 10s"换算，明确按报告数计（60s 区间下是 10s~300s）（§8）；<br>⑦ caps 的 `D+P≤256` 校验必须用 u16 中间量（u8 回绕）（§6.2） | 详细设计落地时逐条推演实现行为，暴露出规格层面的隐含矛盾；全部为局部修改，不动线格式。测试矩阵新增 T21/T22 |
+| 22 | **2026-10-30 文档审查，5 处**（均为文档/表述修正，不动线格式）：① **control 判定收紧**：从"前缀命中 + `len≥16`"改为"与握手层在途 HELLO/ACK 登记**整段字节相等**"（HELLO 登记至收到 HELLO_ACK、ACK 至 KCP 层确认或 `max(3×srtt,2s)` 兜底注销；#23① 再勘：注销规则已统一）——原判定可被任意以 `FCP_HELLO_V3` 开头的用户段撞上：该段被静默吞掉后 KCP 永远收不到、每次重传继续命中，最终 dead_link 断连且全程零计数（静默丢数据 + 断连）；重发命中性质由"字节相同、登记仍在"天然保证，新增 T23（§4.4）；**#25 裁定改走 oob 后，内容分类与登记机制整体作废，本条记录保留**；<br>② **`lost` 口径统一为 `expect − rx − rec − late`**（完全未收到）：§10 原公式 `expect − rx − rec` 与自己的样例/恒等式矛盾（详细设计 §11 样例 `lost=150` 同错，应为 50）；实现与会话日志本就按此口径（§10）；<br>③ §12.1 的 RS 接口 `Encode(buffer, len, k_eff, out)` 是 #21① 之前的旧契约，改为 `Encode(data[], n, k, symbol_max, out)`——按计划值 k 算满 k 条，`k_eff` 只决定发送条数；<br>④ §7.1 澄清 60s 强制间隔下"能开 FEC"的链路下限 ≈ 4.3 包/s，更慢链路保持只观测并列入 §14.8 待标定——原"让每秒几个包的链路开 FEC"的表述超出机制实际能力；<br>⑤ 小项：§5.2 整组全丢例题改为 25 组全丢（原 20 组对应 16.7%→66.7%，与"20%→71%"不符）；未结算集合丢弃计时由 `max_tombstone` 改为固定 1s（与设计/实现对齐）；`sets_tail_dropped` 字段说明补第二种来源（k=0 尾组无凭证）；§6.2 明确重复 HELLO 必须重发 ACK（实现已如此，原"多余报文吞掉"有歧义） |
+| 23 | **2026-10-30 对抗分析（文档层），9 处**：① **HELLO/ACK 注销规则统一**为"该段被 KCP 层确认时注销，或 `max(3×srtt,2s)` 兜底"——#22① 原把 HELLO 注销挂在"对端确认附着于 HELLO_ACK 段"上，那不是协议保证（确认可能已单独 flush 且丢失），此时仍未确认的 HELLO 迟到重传会以 data 进集合：占一个槽位 + 对端应用流被注入 16 字节握手垃圾（§4.4；#25 后随 oob 化作废）；<br>② §7.1 校验项补**尾丢豁免**：k=0 尾组分片已交付但不进 expected，`data_delivered ≤ rx_orig+rec_dl+rec_late+data_late_rx` 须加回本地诊断量 `tail_delivered`（不占线格式）才恒成立——第二轮 F5 已按此实现（§7.1）；<br>③ §4.1 新增**重放窗口**：重放有效密文不需要密钥；接收端每方向 64 槽滑动窗口（前跳滑动/窗口内未见接受/已见或落后超窗拒收，同 IPsec 反重放），被拒重放计 `auth_fail`；此前规格对重放只字未提（§4.1）；<br>④ §4.5 补 **k 一致性校验**：同一集合出现不同计划 `k` → `struct_fail`（n 有此校验而 k 缺失；实现 `note_k` 冲突即拒，规格补齐）（§4.5）；<br>⑤ §4.5 补**认证后超 MTU 拒收**：明文 > `H_hdr + symbol_max 上限` 计 `struct_fail`（实现 `pre_struct_fail`，第一轮 #2 的落点；无此检查则合法密文可抬高 `symbol_max`、解码缓冲按集合数放大）（§4.5）；<br>⑥ §4.5 容量淘汰补兜底：全部为墓碑时淘汰**最老墓碑**守住硬上限（第二轮 F3，原文"只淘汰未结算集合"已不完整）；<br>⑦ §7.1 单调键注明按 §14.5 **半窗判据**比较（第二轮 F4 落地后的口径对齐）；<br>⑧ §6.2 caps 校验清单补 `ver == 1` 与 flags bit4..7 == 0（实现 `caps_valid` 已有；保留位是前向兼容闸门，不是发送端礼节）；<br>⑨ §5.2 补已知边界：慢发送者（包间隔略小于 `T_flush`）可把集合开过 1s，接收端会把仍活跃的集合 tail_drop 并在后续分片到达时重建拆账——诊断量受损、方向为低估，非缺陷；<br>⑩ 清理 §4.1（设计）/§12.1（规格）残留的 OpenSSL EVP 表述——T0 决策 2 为内置 AES-GCM 实现，OpenSSL 字样属早期方案残留 |
+| 24 | **2026-10-30 设计合理性复查，2 处**：① §4.1 "salt 三合一"更正——实现中 `nonce` 计数器每方向独立、从 0 起（`send_nonce_(0)`），salt 只承担 KDF 熵源与会话查找键两个职责，原文"nonce 计数器起值"与实现不符（§4.1）；② 新增 §14.9：两方向现共用一把会话密钥（仅 IV 方向字节隔离），建议 M2 前改为 HKDF 按方向派生两把密钥——零线上成本、纯收益的加固（§14.9） |
+| 25 | **2026-10-30 设计分叉裁定：control 通道 KCP→oob**（设计合理性复查后拍板）：HELLO/ACK 改为 **oob（type=2）** 发送，重传由握手层 3×300ms 定时器承担。理由：KCP 内联 control 依赖的**内容分类**是 #6（占槽位 1/D 误报）、#13（重发判定）、第一轮 #8（握手自锁）、#22①（payload 撞 magic 静默断连）、#23①（注销时机假设）全部缺陷的唯一根源，且其唯一收益"复用 KCP 重传"与握手层自带重传定时器冗余——AEAD 保护也不依赖 KCP（oob 同在信封内）。改动：HELLO magic 补齐 16 字节 oob 约定（线上 16→20B；ACK 恰好不变）；`type=3` 取消（2 位字段仍可编码，#25 后未定义，收到按 struct_fail 丢弃）；删除成帧层内容分类、在途登记、注销规则；§0⑦⑫、§4.2/§4.4/§4.5/§4.7/§6.1/§6.2、T14/T23、§12.1 同步。**协商前 data 缓存（T21）保留**——其存在理由是 `D` 未定，与传输通道无关 |
+| 26 | **2026-10-30 网络专家审查，4 处**（均不动线格式字节布局）：① **GCM 块预算超限（P0 勘误）**：会话终止线 `nonce_ctr ≥ 2^48` → **`2^32` 包/方向**——NIST SP 800-38D 限定同一密钥全部调用的明文+AAD 总块数 `σ ≤ 2^39−256`，与 IV 长度无关；满尺寸包约 84 块，2^48 包 ≈ 2^54.3 块，超预算 6.5 万倍，GHASH 伪造概率劣化至 ≈2^-20（公网可实际伪造）；原"2^64 计数器空间远超 2^48，不构成约束"的论证只看了计数器、漏了块预算（§14.7）；<br>② **方向密钥升级为 M1 强制**：#24② 原"建议 M2 前采纳"——与①配套：单密钥时两方向共摊块预算（总预算减半），SP 800-108 计数器 KDF（AES 作 PRF，label `fcp-c2`/`fcp-s2`）派生两把密钥后各得独立 2^39 预算，且泄露隔离；零线上改动（§14.9、T19/T25）；<br>③ **重放窗口 64 → 256 槽/方向**：64 槽在 100 Mbps × 200ms RTT（在途约 1900 包）下被突发重排周期性击穿，误拒伪装成丢包推高 `pre_repair_loss`、把 `k` 顶上去，形成"用 FEC 冗余修自己重放窗口"的闭环自激；256 槽位图每方向 32 字节，覆盖 25 Mbps × 200ms；更高 BDP 留 M2 自适应窗口（§4.1、T24）；<br>④ **`--fec-parity-max` 允许 5..7**：`Pmax=4` 在 ≥25% 丢包时单组修复率仅 74.2%（§8 表），跨洲链路常见此丢包区间；头字段 `k` 占 3 位、协议上限本就是 7，4 只是默认值；`k_for` 表延伸：25%→4、30%→5（P′=5，修复率 81.4%）（§2、§8、§12.1） |
+| 27 | **2026-10-30 网络协议评审，1 项机制变更 + 3 项边界入档**：① **握手重传固定 300ms → 指数退避 300/600/1200ms**（3 个 HELLO 上限不变、总等待 900ms → ~2.1s）——握手阶段没有任何 RTT 样本，`max(3×srtt,…)` 口径不可用；固定 900ms 总预算在 RTT > 450ms 链路（卫星/跨洲）上是"链路正常但 ACK 未到先判死"的假失败；退避后虚假重传在 ACK 到达即停（重复 HELLO 幂等且必须重发 ACK），代价可忽略（§6.2/§4.4/§12.1、T26）；② **`k_for` i.i.d. 假设入档**（§8/§14.10）：突发丢包下实测单组修复率低于二项表格值，M1 验收补 burst 注入实测，突发检测留 M3；③ **拥塞冗余正反馈入档**（§14.11）：护栏只禁上调、`k` 下限 1，深队列高丢包场景需实测观察，M2 RTO 接入/M3 字节预算为解法；④ **无 PMTU 发现入档**（§14.12）：黑洞故障模式隐蔽（握手可过、data/parity 全丢），部署前提为配置值 ≤ 路径最小 MTU。#26 的四项（终止线/方向密钥/重放窗口/Pmax）实现与测试复核确认，无改动 |
+| 28 | **2026-10-30 第二轮对抗复查，1 项 P0 修复设计 + 1 项算术勘误 + 4 项边界入档**：① **P0：会话密钥必须按会话派生 `session_key = AES128(PSK, salt‖0×8)`，新增 §6.0 密钥来源与信任模型**——HELLO/ACK 在 AEAD 内 ⇒ 静态 PSK 模型（此前规格从未写明）；规格原文"salt 是 KDF 熵源"（#24①/§14.7）在实现中不成立：`derive_direction_keys` 只用配置 PSK，salt 未参与任何派生（`envelope.cc` 核实），同一 PSK 的任意两会话（重连、或多客户端共用配置）派生出相同方向密钥，IV 每会话从 0 起 → GCM (key, IV) 跨会话重用：知道任一会话明文者可解另一会话同计数器流量并借已知明文恢复 GHASH 密钥 H 伪造报文；§14.7"撞上等于共用密钥"的论证同样依赖该前提。修复零线上改动（两端本地计算），明确无前向保密为接受取舍、PSK 轮换归运维、PFS 走 caps 保留位闸门（§6.0/§4.1/§12.1/§14.7/§14.9 同步；**实现待落地，任务 F1**）；② **重放窗口覆盖数字勘误**：256 槽 ≈ 336 KB ≈ **13–19 Mbps × 200ms**，#26④ 原写"覆盖 25 Mbps × 200ms"算错（25 Mbps × 200ms ≈ 476 包 > 256），该区间自激未消除，自适应窗口对高吞吐部署应前置（§4.1）；③ 协商前缓存溢出（64 段/64KB → ERROR）与 #27① 退避的交互：最坏握手期 ×2.3，8 Mbit/s 下 ~80ms 填满缓存，"慢握手+快发送"叠加直接断连，M2 应改反压（§14.13，任务 F2）；④ `late_guard` 上限 500ms / 墓碑上限 1s 低于 #27① 支持的 RTT≤700ms 区间——高估丢包方向安全，但口径不自洽，留 M2 标定（§14.14）；⑤ FECSTAT 无重传入档：连发两份 + 单调键幂等去重为 M2 小项（§14.15，任务 F3）；⑥ 短生命周期流自适应盲区入档：活不过 2~3 个报告周期的连接全程 k=0，短连接密集部署用 pinned k，跨连接继承留 M3（§14.16） |

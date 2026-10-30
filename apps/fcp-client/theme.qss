@@ -1,0 +1,283 @@
+QWidget {
+  color: #26221a;
+  font-size: 13px;
+}
+
+#root {
+  background: #f7f3ea;
+  border: 1px solid #d9d0b8;
+}
+
+#titleBar {
+  background: #f2ecdd;
+  border-bottom: 1px solid #e3dbc7;
+}
+
+#brandTitle {
+  color: #26221a;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+#brandSub {
+  color: #8a8171;
+  font-size: 10px;
+  letter-spacing: 1px;
+}
+
+#winBtn, #winClose {
+  background: transparent;
+  border: none;
+  border-radius: 5px;
+  color: #5c5547;
+  font-size: 13px;
+}
+
+#winBtn:hover {
+  background: #e9e1cd;
+}
+
+#winClose:hover {
+  background: #b5432f;
+  color: #f7f3ea;
+}
+
+#side {
+  background: #f2ecdd;
+  border-right: 1px solid #e3dbc7;
+}
+
+#sideCap {
+  color: #8a8171;
+  font-size: 11px;
+  letter-spacing: 4px;
+}
+
+#navBtn {
+  background: transparent;
+  border: none;
+  border-left: 3px solid transparent;
+  border-radius: 0;
+  color: #4a443a;
+  padding: 9px 12px 9px 19px;
+  text-align: left;
+}
+
+#navBtn:hover {
+  background: #ece4d2;
+}
+
+#navBtn:checked {
+  background: #e9e1cd;
+  border-left: 3px solid #b5432f;
+  color: #26221a;
+  font-weight: 600;
+}
+
+#sideFoot {
+  color: #a49a86;
+  font-size: 11px;
+  letter-spacing: 2px;
+}
+
+#viewPage {
+  background: transparent;
+}
+
+#eyebrow {
+  color: #8a8171;
+  font-size: 11px;
+  letter-spacing: 3px;
+}
+
+#statusText {
+  color: #26221a;
+  font-family: Georgia, "Times New Roman", SimSun, serif;
+  font-size: 24px;
+}
+
+#uptime {
+  color: #8a8171;
+  font-family: "Cascadia Mono", Consolas, "Courier New", monospace;
+  font-size: 12px;
+}
+
+#viewSub {
+  color: #7a7263;
+  font-size: 12px;
+}
+
+#viewTitle {
+  color: #26221a;
+  font-family: Georgia, "Times New Roman", SimSun, serif;
+  font-size: 20px;
+}
+
+#rule {
+  background: #e3dbc7;
+  border: none;
+}
+
+#kvKey {
+  color: #8a8171;
+  font-size: 11px;
+  letter-spacing: 1px;
+}
+
+#kvValue {
+  color: #26221a;
+  font-family: "Cascadia Mono", Consolas, "Courier New", monospace;
+  font-size: 13px;
+}
+
+#statusDot {
+  background: #9a927f;
+  border-radius: 5px;
+}
+
+#statusDot[tone="run"] {
+  background: #47685a;
+}
+
+#statusDot[tone="ok"] {
+  background: #3d7a5f;
+}
+
+#statusDot[tone="err"] {
+  background: #b5432f;
+}
+
+#btnPrimary {
+  background: #47685a;
+  border: none;
+  border-radius: 6px;
+  color: #f7f3ea;
+  font-weight: 600;
+  padding: 8px 22px;
+}
+
+#btnPrimary:hover {
+  background: #3a5549;
+}
+
+#btnPrimary:disabled {
+  background: #b9b1a0;
+}
+
+#btnGhost {
+  background: transparent;
+  border: 1px solid #c9c0aa;
+  border-radius: 6px;
+  color: #26221a;
+  padding: 8px 22px;
+}
+
+#btnGhost:hover {
+  background: #efe7d5;
+}
+
+#btnGhost:disabled {
+  border-color: #ded5c1;
+  color: #b0a794;
+}
+
+#testResult {
+  color: #7a7263;
+  font-size: 12px;
+}
+
+#card, #resultCard {
+  background: #fbf8f1;
+  border: 1px solid #e3dbc7;
+  border-radius: 8px;
+}
+
+#trafficDir {
+  color: #7a7263;
+  font-size: 11px;
+  letter-spacing: 1px;
+}
+
+#trafficRate {
+  color: #26221a;
+  font-family: "Cascadia Mono", Consolas, "Courier New", monospace;
+  font-size: 19px;
+  font-weight: 600;
+}
+
+#trafficCap {
+  color: #a49a86;
+  font-size: 11px;
+}
+
+#trafficDivider {
+  background: #e3dbc7;
+  border: none;
+}
+
+#resultValue {
+  color: #26221a;
+  font-family: "Cascadia Mono", Consolas, "Courier New", monospace;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+#fldLabel {
+  color: #7a7263;
+  font-size: 12px;
+}
+
+QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
+  background: #fffdf8;
+  border: 1px solid #d9d0b8;
+  border-radius: 6px;
+  padding: 6px 9px;
+  selection-background-color: #47685a;
+  selection-color: #f7f3ea;
+}
+
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
+  border: 1px solid #47685a;
+}
+
+QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled {
+  background: #f2ecdd;
+  color: #a49a86;
+}
+
+QLineEdit#monoInput {
+  font-family: "Cascadia Mono", Consolas, "Courier New", monospace;
+}
+
+QComboBox::drop-down {
+  border: none;
+  width: 20px;
+}
+
+QComboBox QAbstractItemView {
+  background: #fffdf8;
+  border: 1px solid #d9d0b8;
+  selection-background-color: #e9e1cd;
+  selection-color: #26221a;
+}
+
+QCheckBox {
+  color: #4a443a;
+  spacing: 8px;
+}
+
+QPlainTextEdit#logView {
+  background: #fbf8f1;
+  border: 1px solid #e3dbc7;
+  border-radius: 8px;
+  font-family: "Cascadia Mono", Consolas, "Courier New", monospace;
+  font-size: 12px;
+  padding: 10px;
+}
+
+QToolTip {
+  background: #26221a;
+  border: none;
+  color: #f7f3ea;
+  padding: 5px 8px;
+}

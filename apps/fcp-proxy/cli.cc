@@ -89,11 +89,16 @@ bool CollectArgs(int argc, char** argv, std::map<std::string, std::string>* opts
       continue;
     }
     const size_t eq = arg.find('=');
-    if (arg.rfind("--", 0) != 0 || eq == std::string::npos) {
+    if (arg.rfind("--", 0) != 0) {
       std::fprintf(stderr, "unknown argument: %s\n", arg.c_str());
       return false;
     }
-    (*opts)[arg.substr(2, eq - 2)] = arg.substr(eq + 1);
+    if (eq == std::string::npos) {
+      // Bare boolean flag (e.g. --no-prewarm): presence is the value.
+      (*opts)[arg.substr(2)] = "";
+    } else {
+      (*opts)[arg.substr(2, eq - 2)] = arg.substr(eq + 1);
+    }
   }
   return true;
 }

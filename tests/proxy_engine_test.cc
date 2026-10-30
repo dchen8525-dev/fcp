@@ -275,12 +275,6 @@ std::vector<uint8_t> socks5_request(uint8_t cmd, uint8_t atyp, const std::vector
   return out;
 }
 
-std::vector<uint8_t> domain_addr(const std::string& name) {
-  std::vector<uint8_t> out = {static_cast<uint8_t>(name.size())};
-  out.insert(out.end(), name.begin(), name.end());
-  return out;
-}
-
 std::string text_of(const std::vector<uint8_t>& bytes) {
   return std::string(bytes.begin(), bytes.end());
 }

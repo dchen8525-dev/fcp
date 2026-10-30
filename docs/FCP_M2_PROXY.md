@@ -251,8 +251,9 @@ timeout→`0x06`、not supported→`0x08`、too many→`0x02`；HTTP 监听侧�
 表满时先清过期项再写、全满则拒收新键）、`apply_prewarm` 的独立性与 no-op、
 以及会话侧"新会话第一个集合就带 parity，且不需要任何 FECSTAT 上报"这一条正面证据
 （`k=3` seed 下单符号集合按 `k_eff = ceil(k·n/D)` 缩到 1 个 parity，仍完成重建）。
-T33（同链路 20 条短连接的开/关对比）的两个开关都已就位（默认开、`--no-prewarm` 关），
-剩下的是在真实 WAN 上跑一遍，属 #22 的联调范围。
+T33（同链路 20 条短连接的开/关对比）的两个开关都已就位（默认开、`--no-prewarm` 关）。
+WAN A/B 已随 #22 收口（见 §8.1）：先 1MiB 预热传输学出 k，再 40 条 64KB 短连接，预热开
+每条省 ~0.43s（~25%）；5.4KB 小响应上差异低于运行间漂移（固定成本 ~4×RTT 主导，预期）。
 
 ## 6. 模块与文件
 
@@ -349,5 +350,37 @@ OPEN 三种报文的往返与全部拒绝分支、`OpenError → Socks5Rep` 映�
 T32 的回环半边已在 `build/proxy-live/suite.sh`（git 忽略的临时目录）跑通七项：普通 GET、
 `/big` 与 2MiB `/huge` 的 `cmp` 逐字节一致、分块 `/slow`、HTTP CONNECT + TLS、拒绝目标、
 20 条串行 + 10 条并发；服务端收尾统计 `live=0 up=36 tunnels=35 refused=1 hs_failed=0
-clash=0 over=0 unknown=0`，2MiB 传输 `t=0.366s`。WAN 半边（对测试 VPS）与 T33 的预热
-A/B 属于任务 #22，尚未收口。
+clash=0 over=0 unknown=0`，2MiB 传输 `t=0.366s`。
+
+### 8.1 WAN 半边与 T33（#22，2026-10-31 收口）
+
+环境：本机(电信) ↔ 测试 VPS（Ubuntu 24.04, g++ 13.3；地址不入库），RTT 180ms，当晚
+下行丢包 10–17%（服务端 FECSTAT `pre` 口径 122923–182519ppm；fcp_bench 发/收差 7%，
+ICMP 口径一度 20%）。部署注意：该
+云商**只放行 UDP/40000**（UDP/40001 报文到网卡但不进 socket，与 §16 的 53/443 拦截同类）。
+
+- **T32 WAN 七项全绿**：普通 GET、HTTP CONNECT + TLS（证书端到端校验）、5400B 与 8MiB
+  逐字节 `cmp` 一致（直连同源对照）、拒绝目标（Linux 立即 `OPEN_ERR 1`→SOCKS `0x05`，
+  0.43s——对比 Windows 回环的 2.1s 反向印证 §7 第 9 条是 OS 行为）、20 串行 + 10 并发。
+  服务端收尾 `up=35 tunnels=34 refused=1 bad_entry=0 hs_failed=0 clash=0 over=0
+  unknown=0`，客户端 `live=0`；两端统计自洽（服务端 wire tx 17.13MB ↔ 客户端收
+  14.39MB，1.19× = parity + 重传）。
+- **尾段竞态（WAN 可见、回环掩盖，良性）**：客户端会话先亡时，服务端迟到的重传在客户端
+  计 `unknown_salt`（42 个，封顶不增长）；客户端 2 条 grace 钟 close 对应服务端尾段 FIN
+  迟到，收尾统计前双端会话全部归零（服务端 `live` 从 14 → 0）。正确性不受影响；M3 若
+  做优雅关闭可考虑 tombstone 之后短暂保留路由。
+- **吞吐 = §7 第 2 条的 WAN 定价实测**：8MiB 下载自适应 k 51.9s（1.29 Mbps）、钉 k=3
+  32.2s；速率曲线是 ~1MB 突发 + ~2s 停顿，即单块 SACK 之外等 RTO 的节奏；窗口
+  256KiB→2MiB 仅 +12%（排除窗口瓶颈）。同日 fcp_bench 标定（无交付义务、令牌桶匀速、
+  k=3 先验）同方向 25.8 Mbps——差值即"非完整快速重传"的价格，快速重传留 M3。
+- **T33 预热 A/B**：每臂先 1MiB 预热传输学出 k，再 40 条 64KB 短连接（双端全新进程，
+  开/关各两轮）：预热开 1.269/1.365s vs 关 1.727/1.777s（conns2+ 均值 t_total），
+  **每条短连接省 ~0.43s（~25%）**；服务端 40/40 条 `FEC warmed: k=2 (prewarm)`。机制
+  与 §5 预期一致：短会话凑不齐 FECSTAT 的 256 符号门槛、自己永远学不出 k，冷臂每个
+  丢失都付本层 ARQ 往返，暖臂 parity 内联修复。5.4KB 响应（~5 段）上差异低于运行间
+  漂移（0.79 vs 0.79s）——固定成本 ~4×RTT + 握手主导，预热对小响应无感。
+- **#22 修掉一个真实缺陷**：CLI 参数解析要求所有选项必须带 `=`，帮助文本与文档承诺的
+  裸布尔旗标 `--no-prewarm` 实际传不进去（"unknown argument"）。`CollectArgs` 现接受
+  裸 `--flag`（存空串，`Find` 语义不变）。
+
+Linux × Debug/Release ctest 均 25/25（与 Windows 同日四套全绿）。

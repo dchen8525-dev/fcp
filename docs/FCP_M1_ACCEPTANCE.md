@@ -480,5 +480,6 @@ bad_entry=0 refused=1 hs_failed=0 reset=0 idle=0 clash=0 over=0 unknown=0`——
 
 ### 18.6 未覆盖项
 
-WAN 半边（对测试 VPS 的 `curl --socks5` HTTP/HTTPS、T33 预热 A/B、Linux × Debug/Release
-25 项目录回归）属任务 #22；GUI 代理页与 Qt 侧适配器属 #23。
+WAN 半边与 T33 预热 A/B 已于 2026-10-31 随 #22 收口（T32 七项全绿、T33 预热开每条
+64KB 短连接省 ~25%、Linux × Debug/Release 25/25；详见 `FCP_M2_PROXY.md` §8.1）。
+GUI 代理页与 Qt 侧适配器属 #23。

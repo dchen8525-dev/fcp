@@ -87,8 +87,8 @@ enum class Socks5Parse {
   kOk = 0,
   kNeedMore,
   // Not a SOCKS5 client, or a field this subset does not allow (wrong version,
-  // NMETHODS == 0, non-zero RSV, zero-length DOMAIN). The host replies nothing
-  // and closes.
+  // NMETHODS == 0, non-zero RSV, zero-length DOMAIN, port 0). The host replies
+  // nothing and closes.
   kMalformed,
   kCommandNotSupported,
   kAtypNotSupported,
@@ -110,6 +110,9 @@ size_t socks5_write_greeting_reply(uint8_t* out, size_t cap, bool accept_no_auth
 
 // request: ver(1)=5 | cmd(1) | rsv(1)=0 | atyp(1) | addr | port(2)
 // On kOk, `*consumed` is the whole request; everything after it is the tunnel.
+// `len` may already run past the request -- a client can write the first payload
+// bytes immediately after it -- so only the first kSocks5MaxRequestBytes are
+// examined, and a message longer than that cannot exist.
 Socks5Parse socks5_parse_request(const uint8_t* buf, size_t len, size_t* consumed,
                                  ProxyTarget* out);
 
@@ -164,10 +167,13 @@ constexpr uint8_t kOpenVersion = 1;
 constexpr uint8_t kOpenKindOk = 0x01;
 constexpr uint8_t kOpenKindErr = 0xFF;
 constexpr size_t kOpenMaxAddrLen = 255;
-constexpr size_t kOpenOkLen = 9;
-constexpr size_t kOpenErrLen = 8;
-// Longest legal OPEN: fixed 9 bytes plus a 255-byte domain. The host stops
-// accumulating once it is past this and it still has no complete message.
+// OPEN_OK is magic | ver | kind | reserved(2) and OPEN_ERR is magic | ver | kind
+// | code(1), so the two replies are 8 and 7 bytes -- asymmetric, but that is
+// what §4.3 puts on the wire. The request's fixed part is 9 (magic | ver | atyp
+// | len | port), plus the address, so 9 + 255 is the longest legal OPEN: the
+// host stops accumulating past that if it still has no complete message.
+constexpr size_t kOpenOkLen = 8;
+constexpr size_t kOpenErrLen = 7;
 constexpr size_t kOpenMaxBytes = 9 + kOpenMaxAddrLen;
 
 enum class OpenError : uint8_t {
@@ -184,14 +190,18 @@ enum class OpenParse {
   kBadMagic,    // not FCP-OPEN at all
   kBadVersion,
   kBadAtyp,     // answer OPEN_ERR{kNotSupported}
-  kBadAddress,  // len disagrees with atyp, or is 0
-  kBadKind,     // reply byte is neither 0x01 nor 0xFF
+  kBadAddress,  // len disagrees with atyp, is 0, or the port is 0
+  kBadKind,     // reply byte is neither 0x01 nor 0xFF, or an unknown error code
+  kBadReserved,  // OPEN_OK with non-zero reserved: defined as zero on the wire
 };
 
+// `len` may run past the message (the client can send payload bytes behind its
+// OPEN); at most kOpenMaxBytes are examined. A buffer that starts with a byte
+// other than 'F' is reported kBadMagic at once rather than waiting for four.
 OpenParse open_parse_request(const uint8_t* buf, size_t len, size_t* consumed,
                              ProxyTarget* out);
 // Returns the bytes written, or 0 when the target is not encodable (unknown atyp,
-// wrong address length, empty domain) or cap is too small.
+// wrong address length, empty or overlong domain, port 0) or cap is too small.
 size_t open_write_request(uint8_t* out, size_t cap, const ProxyTarget& target);
 
 // Reply direction. `*ok` is true for OPEN_OK; `err` only means something when it

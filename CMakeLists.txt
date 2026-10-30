@@ -35,6 +35,7 @@ add_library(fcp
   src/fcp/session.cc
   src/fcp/stream.cc
   src/fcp/prewarm.cc
+  src/fcp/proxy_proto.cc
 )
 
 target_include_directories(fcp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)

@@ -6,8 +6,6 @@
 namespace fcp {
 namespace {
 
-constexpr size_t kMaxMessage = 1u << 20;
-
 bool host_char_ok(uint8_t c) {
   if (c >= 'a' && c <= 'z') {
     return true;
@@ -19,6 +17,23 @@ bool host_char_ok(uint8_t c) {
     return true;
   }
   return c == '.' || c == '-' || c == '_';
+}
+
+// Accepted inside brackets, where the text is an address rather than a name:
+// hex digits and colons, plus dots for an IPv4-mapped literal. Nothing else
+// parses as an address, and this layer never resolves -- it only refuses
+// obviously bogus text so the log and the tunnel carry something dialable.
+bool ipv6_char_ok(uint8_t c) {
+  if (c >= '0' && c <= '9') {
+    return true;
+  }
+  if (c >= 'a' && c <= 'f') {
+    return true;
+  }
+  if (c >= 'A' && c <= 'F') {
+    return true;
+  }
+  return c == ':' || c == '.';
 }
 
 // 1-65535 from ASCII digits; 0 on anything else, including an empty or
@@ -33,13 +48,44 @@ bool parse_port(const uint8_t* p, size_t n, uint16_t* port) {
     if (p[i] < '0' || p[i] > '9') {
       return false;
     }
-    value = value * 10u + (p[i] - '0');
+    value = value * 10u + static_cast<unsigned>(p[i] - '0');
   }
   if (value == 0u || value > 65535u) {
     return false;
   }
   *port = static_cast<uint16_t>(value);
   return true;
+}
+
+// Position of the blank line that ends an HTTP head. `*end` is the offset of the
+// first CR of the CRLFCRLF, so the head is `*end + 4` bytes long.
+bool find_head_end(const uint8_t* buf, size_t win, size_t* end) {
+  if (win < 4) {
+    return false;
+  }
+  for (size_t i = 0; i + 4 <= win; ++i) {
+    if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n') {
+      *end = i;
+      return true;
+    }
+  }
+  return false;
+}
+
+// Position of the CRLF that ends the request line, i.e. the offset of its CR.
+// Only CRLF counts: a bare LF is not a line ending here, and the head has to
+// have a request line before the blank line that was already found.
+bool find_line_end(const uint8_t* buf, size_t win, size_t* line_end) {
+  if (win < 2) {
+    return false;
+  }
+  for (size_t i = 0; i + 2 <= win; ++i) {
+    if (buf[i] == '\r' && buf[i + 1] == '\n') {
+      *line_end = i;
+      return true;
+    }
+  }
+  return false;
 }
 
 constexpr char kHttpOk[] = "HTTP/1.1 200 Connection Established\r\n\r\n";
@@ -80,7 +126,9 @@ std::string target_text(const ProxyTarget& target) {
   char num[40];
   if (target.atyp == kAtypIpv4 && target.addr.size() == 4) {
     const uint8_t* b = reinterpret_cast<const uint8_t*>(target.addr.data());
-    std::snprintf(num, sizeof(num), "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+    std::snprintf(num, sizeof(num), "%u.%u.%u.%u", static_cast<unsigned>(b[0]),
+                  static_cast<unsigned>(b[1]), static_cast<unsigned>(b[2]),
+                  static_cast<unsigned>(b[3]));
     out = num;
   } else if (target.atyp == kAtypIpv6 && target.addr.size() == 16) {
     const uint8_t* b = reinterpret_cast<const uint8_t*>(target.addr.data());
@@ -88,7 +136,8 @@ std::string target_text(const ProxyTarget& target) {
       if (i != 0) {
         out.push_back(':');
       }
-      std::snprintf(num, sizeof(num), "%x", (b[i] << 8) | b[i + 1]);
+      std::snprintf(num, sizeof(num), "%x",
+                    static_cast<unsigned>((b[i] << 8) | b[i + 1]));
       out += num;
     }
   } else if (target.atyp == kAtypDomain) {
@@ -96,7 +145,7 @@ std::string target_text(const ProxyTarget& target) {
   } else {
     out = "?";
   }
-  std::snprintf(num, sizeof(num), ":%u", target.port);
+  std::snprintf(num, sizeof(num), ":%u", static_cast<unsigned>(target.port));
   out += num;
   return out;
 }
@@ -106,11 +155,14 @@ Socks5Parse socks5_parse_greeting(const uint8_t* buf, size_t len, size_t* consum
   if (consumed != nullptr) {
     *consumed = 0;
   }
-  if (buf == nullptr || len < 2 || len > kMaxMessage) {
-    return Socks5Parse::kMalformed;
+  if (buf == nullptr || len == 0) {
+    return Socks5Parse::kNeedMore;
   }
   if (buf[0] != kSocks5Version) {
     return Socks5Parse::kMalformed;
+  }
+  if (len < 2) {
+    return Socks5Parse::kNeedMore;
   }
   const size_t nmethods = buf[1];
   if (nmethods == 0) {
@@ -150,17 +202,26 @@ Socks5Parse socks5_parse_request(const uint8_t* buf, size_t len, size_t* consume
   if (consumed != nullptr) {
     *consumed = 0;
   }
-  if (buf == nullptr || len < 4 || len > kMaxMessage) {
-    return Socks5Parse::kMalformed;
+  if (buf == nullptr || len == 0) {
+    return Socks5Parse::kNeedMore;
   }
+  // A complete request is at most this long, so bytes past it are already the
+  // tunnel and must not make a valid message look malformed.
+  const size_t win = len > kSocks5MaxRequestBytes ? kSocks5MaxRequestBytes : len;
   if (buf[0] != kSocks5Version) {
     return Socks5Parse::kMalformed;
+  }
+  if (win < 4) {
+    return Socks5Parse::kNeedMore;
   }
   // Command and address type are answered with a reply instead of a close, so
   // they are checked before framing: an unknown ATYP has no address length and
   // cannot be framed at all.
   if (buf[1] != kSocks5CmdConnect) {
     return Socks5Parse::kCommandNotSupported;
+  }
+  if (buf[2] != 0) {
+    return Socks5Parse::kMalformed;  // RSV is defined as X'00'
   }
   const uint8_t atyp = buf[3];
   if (!atyp_valid(atyp)) {
@@ -170,21 +231,25 @@ Socks5Parse socks5_parse_request(const uint8_t* buf, size_t len, size_t* consume
   size_t addr_len = fixed;
   size_t header = 4;  // ver | cmd | rsv | atyp, then the address
   if (atyp == kAtypDomain) {
-    if (len < 5) {
+    if (win < 5) {
       return Socks5Parse::kNeedMore;
     }
     addr_len = buf[4];
     header = 5;  // the length byte precedes the address
+    if (addr_len == 0) {
+      return Socks5Parse::kMalformed;  // an empty domain is not short, it is wrong
+    }
   }
   const size_t total = header + addr_len + 2;  // + port
-  if (addr_len == 0 || len < total) {
+  if (win < total) {
     return Socks5Parse::kNeedMore;
   }
-  size_t off = header;
+  const size_t off = header;
   if (atyp == kAtypDomain) {
     // The domain itself has to be a host name. Checked after framing because the
     // framing only needs its length: an invalid byte is a protocol error, not a
-    // short read.
+    // short read. A numeric address gets no such check -- the tunnel carries the
+    // raw 4 or 16 bytes and the far end dials it without parsing.
     for (size_t i = 0; i < addr_len; ++i) {
       if (!host_char_ok(buf[off + i])) {
         return Socks5Parse::kMalformed;
@@ -193,6 +258,9 @@ Socks5Parse socks5_parse_request(const uint8_t* buf, size_t len, size_t* consume
   }
   const uint16_t port = static_cast<uint16_t>((buf[off + addr_len] << 8) |
                                               buf[off + addr_len + 1]);
+  if (port == 0) {
+    return Socks5Parse::kMalformed;  // CONNECT to port 0 cannot be dialled
+  }
   if (consumed != nullptr) {
     *consumed = total;
   }
@@ -224,23 +292,21 @@ HttpParse http_parse_connect(const uint8_t* buf, size_t len, size_t* consumed,
     return HttpParse::kBadRequest;
   }
   // Everything below 8 KiB is answered; a head that never ends is 431 once the
-  // budget is spent. The buffer is still bounded by the caller, so the scan
-  // itself cannot be made expensive by a peer.
+  // budget is spent. The scan window is the budget even when the caller has read
+  // more, because a head longer than the budget is a rejection either way.
   const bool capped = len >= kHttpHeadMaxBytes;
   const size_t win = capped ? kHttpHeadMaxBytes : len;
-  const uint8_t* end = nullptr;
-  const uint8_t found_crlfcrlf = find_head_end(buf, win, &end);
-  if (!found_crlfcrlf) {
+  size_t blank = 0;
+  if (!find_head_end(buf, win, &blank)) {
     return capped ? HttpParse::kHeadTooLarge : HttpParse::kNeedMore;
   }
-  const size_t head_len = static_cast<size_t>(end - buf) + 4;
-  const uint8_t* line_end = nullptr;
-  if (!find_line_end(buf, head_len, &line_end)) {
-    // CRLFCRLF exists, so the request line cannot be unterminated unless it is
-    // empty; that is a bad request.
+  const size_t head_len = blank + 4;
+  size_t line_len = 0;
+  // The window is the whole head, not up to the blank line: a request with no
+  // headers ends at the very CRLF that starts that blank line.
+  if (!find_line_end(buf, head_len, &line_len) || line_len > blank) {
     return HttpParse::kBadRequest;
   }
-  const size_t line_len = static_cast<size_t>(line_end - buf);
   const uint8_t* tok[4] = {nullptr, nullptr, nullptr, nullptr};
   size_t tok_len[4] = {0, 0, 0, 0};
   size_t nt = 0;
@@ -266,52 +332,53 @@ HttpParse http_parse_connect(const uint8_t* buf, size_t len, size_t* consumed,
   if (tok_len[0] != 7 || std::memcmp(tok[0], "CONNECT", 7) != 0) {
     return HttpParse::kMethodNotAllowed;
   }
-  if (tok_len[2] != 8 || std::memcmp(tok[2], "HTTP/1.0", 8) != 0) {
+  if (tok_len[2] != 8 || std::memcmp(tok[2], "HTTP/1.", 7) != 0 ||
+      (tok[2][7] != '0' && tok[2][7] != '1')) {
     return HttpParse::kBadRequest;
   }
 
   const uint8_t* auth = tok[1];
-  size_t auth_len = tok_len[1];
+  const size_t auth_len = tok_len[1];
+  // Host plus ":port": the length byte in OPEN caps the host at 255 and the port
+  // is five digits and a colon. Refusing here beats truncating later.
   if (auth_len == 0 || auth_len > kHttpMaxHostLen + 6) {
     return HttpParse::kBadRequest;
   }
   std::string host;
   uint16_t port = 0;
+  const uint8_t* sep = nullptr;  // the colon that starts the port
+  bool bracketed = false;
   if (auth[0] == '[') {
-    // Bracketed IPv6 literal: the colons inside are not the host/port split.
+    // Bracketed IPv6 literal: every colon before the closing bracket belongs to
+    // the address, so the split is the colon that follows it.
     const uint8_t* close = nullptr;
-    for (size_t k = 0; k < auth_len; ++k) {
+    for (size_t k = 1; k < auth_len; ++k) {
       if (auth[k] == ']') {
         close = auth + k;
         break;
       }
     }
-    if (close == nullptr || close < auth + 2) {
-      return HttpParse::kBadRequest;
+    if (close == nullptr || close == auth + 1 || close + 2 >= auth + auth_len ||
+        close[1] != ':') {
+      return HttpParse::kBadRequest;  // no "]", empty address, or no "]:"
     }
+    sep = close + 1;
     host.assign(reinterpret_cast<const char*>(auth + 1),
                 static_cast<size_t>(close - auth - 1));
-    const uint8_t* sep = close + 1;
-    const size_t rest = auth_len - static_cast<size_t>(sep - auth);
-    if (rest != 0) {
-      return HttpParse::kBadRequest;  // junk after the closing bracket
+    bracketed = true;
+  } else {
+    for (size_t k = 1; k + 1 < auth_len; ++k) {
+      if (auth[k] == ':') {
+        sep = auth + k;
+        break;
+      }
     }
-    // An IPv6 literal without a port cannot be dialled: CONNECT has no default
-    // port of its own (the scheme-less authority carries it).
-    return HttpParse::kBadRequest;
-  }
-  const uint8_t* colon = nullptr;
-  for (size_t k = 1; k + 1 < auth_len; ++k) {
-    if (auth[k] == ':') {
-      colon = auth + k;
-      break;
+    if (sep == nullptr) {
+      return HttpParse::kBadRequest;  // CONNECT requires an explicit port
     }
+    host.assign(reinterpret_cast<const char*>(auth), static_cast<size_t>(sep - auth));
   }
-  if (colon == nullptr) {
-    return HttpParse::kBadRequest;  // CONNECT requires an explicit port
-  }
-  host.assign(reinterpret_cast<const char*>(auth), static_cast<size_t>(colon - auth));
-  if (!parse_port(colon + 1, auth_len - static_cast<size_t>(colon - auth) - 1, &port)) {
+  if (!parse_port(sep + 1, auth_len - static_cast<size_t>(sep - auth) - 1, &port)) {
     return HttpParse::kBadRequest;
   }
   if (host.empty() || host.size() > kHttpMaxHostLen) {
@@ -321,7 +388,8 @@ HttpParse http_parse_connect(const uint8_t* buf, size_t len, size_t* consumed,
   // bracketed; the tunnel could carry it as a domain and the resolver would
   // reject it, but refusing here keeps the log honest.
   for (size_t k = 0; k < host.size(); ++k) {
-    if (!host_char_ok(static_cast<uint8_t>(host[k]))) {
+    const uint8_t c = static_cast<uint8_t>(host[k]);
+    if (bracketed ? !ipv6_char_ok(c) : !host_char_ok(c)) {
       return HttpParse::kBadRequest;
     }
   }
@@ -361,16 +429,18 @@ OpenParse open_parse_request(const uint8_t* buf, size_t len, size_t* consumed,
   if (consumed != nullptr) {
     *consumed = 0;
   }
-  if (buf == nullptr || len > kOpenMaxBytes) {
-    return OpenParse::kBadMagic;
-  }
-  if (len < 4) {
+  if (buf == nullptr || len == 0) {
     return OpenParse::kNeedMore;
   }
-  if (std::memcmp(buf, "FCPO", 4) != 0) {
+  // Past the longest possible OPEN the extra bytes are payload, so the message
+  // is looked for in the first kOpenMaxBytes only.
+  const size_t win = len > kOpenMaxBytes ? kOpenMaxBytes : len;
+  // Fail fast: one byte that is not 'F' can never become the magic.
+  const size_t magic_len = win < 4 ? win : 4;
+  if (std::memcmp(buf, "FCPO", magic_len) != 0) {
     return OpenParse::kBadMagic;
   }
-  if (len < 7) {  // magic | ver | atyp | len
+  if (win < 7) {  // magic | ver | atyp | len
     return OpenParse::kNeedMore;
   }
   if (buf[4] != kOpenVersion) {
@@ -389,8 +459,12 @@ OpenParse open_parse_request(const uint8_t* buf, size_t len, size_t* consumed,
     return OpenParse::kBadAddress;
   }
   const size_t total = 7 + addr_len + 2;
-  if (len < total) {
+  if (win < total) {
     return OpenParse::kNeedMore;
+  }
+  const uint16_t port = static_cast<uint16_t>((buf[7 + addr_len] << 8) | buf[8 + addr_len]);
+  if (port == 0) {
+    return OpenParse::kBadAddress;  // nothing to dial
   }
   if (consumed != nullptr) {
     *consumed = total;
@@ -398,13 +472,13 @@ OpenParse open_parse_request(const uint8_t* buf, size_t len, size_t* consumed,
   if (out != nullptr) {
     out->atyp = atyp;
     out->addr.assign(reinterpret_cast<const char*>(buf + 7), addr_len);
-    out->port = static_cast<uint16_t>((buf[7 + addr_len] << 8) | buf[8 + addr_len]);
+    out->port = port;
   }
   return OpenParse::kOk;
 }
 
 size_t open_write_request(uint8_t* out, size_t cap, const ProxyTarget& target) {
-  if (out == nullptr || !atyp_valid(target.atyp)) {
+  if (out == nullptr || !atyp_valid(target.atyp) || target.port == 0) {
     return 0;
   }
   const size_t addr_len = target.addr.size();
@@ -434,14 +508,15 @@ OpenParse open_parse_reply(const uint8_t* buf, size_t len, size_t* consumed, boo
   if (consumed != nullptr) {
     *consumed = 0;
   }
-  if (buf == nullptr) {
-    return OpenParse::kBadMagic;
-  }
-  if (len < 7) {
+  if (buf == nullptr || len == 0) {
     return OpenParse::kNeedMore;
   }
-  if (std::memcmp(buf, "FCPO", 4) != 0) {
+  const size_t magic_len = len < 4 ? len : 4;
+  if (std::memcmp(buf, "FCPO", magic_len) != 0) {
     return OpenParse::kBadMagic;
+  }
+  if (len < 6) {  // magic | ver | kind
+    return OpenParse::kNeedMore;
   }
   if (buf[4] != kOpenVersion) {
     return OpenParse::kBadVersion;
@@ -451,8 +526,8 @@ OpenParse open_parse_reply(const uint8_t* buf, size_t len, size_t* consumed, boo
     if (len < kOpenOkLen) {
       return OpenParse::kNeedMore;
     }
-    if (buf[7] != 0 || buf[8] != 0) {
-      return OpenParse::kBadAddress;  // reserved must be zero, same rejection rule
+    if (buf[6] != 0 || buf[7] != 0) {
+      return OpenParse::kBadReserved;
     }
     if (consumed != nullptr) {
       *consumed = kOpenOkLen;
@@ -469,7 +544,7 @@ OpenParse open_parse_reply(const uint8_t* buf, size_t len, size_t* consumed, boo
     return OpenParse::kNeedMore;
   }
   OpenError code = OpenError::kRefused;
-  switch (buf[7]) {
+  switch (buf[6]) {
     case 1:
       code = OpenError::kRefused;
       break;
@@ -486,7 +561,7 @@ OpenParse open_parse_reply(const uint8_t* buf, size_t len, size_t* consumed, boo
       code = OpenError::kTooManySessions;
       break;
     default:
-      return OpenParse::kBadKind;
+      return OpenParse::kBadKind;  // 0 and 6+ are not defined codes
   }
   if (consumed != nullptr) {
     *consumed = kOpenErrLen;
@@ -509,7 +584,6 @@ size_t open_write_ok(uint8_t* out, size_t cap) {
   out[5] = kOpenKindOk;
   out[6] = 0;
   out[7] = 0;
-  out[8] = 0;
   return kOpenOkLen;
 }
 

@@ -146,15 +146,41 @@ FCP 侧的既有分工保持不变：Session 负责信封、RS/FEC、结算、FE
 
 ### 4.1 本地 SOCKS5（仅 CONNECT）
 
-标准 GSS 无关子集：方法协商只接受 `NO AUTH`(0x00)；请求 `CMD=CONNECT`，
-`ATYP ∈ {0x01 IPv4, 0x03 DOMAIN, 0x04 IPv6}`；其余 CMD 回 `0x07 command not supported`，
-未知 ATYP 回 `0x08`。绑定地址回 `ATYP=0x01, 0.0.0.0, 0`（不承诺真实出口地址）。
+标准 GSS 无关子集：方法协商只接受 `NO AUTH`(0x00)，客户端没提供时回 `05 FF` 后关闭；
+请求 `CMD=CONNECT`，`ATYP ∈ {0x01 IPv4, 0x03 DOMAIN, 0x04 IPv6}`；其余 CMD 回
+`0x07 command not supported`，未知 ATYP 回 `0x08`。绑定地址回 `ATYP=0x01, 0.0.0.0, 0`
+（不承诺真实出口地址）。
+
+编解码在 `src/fcp/proxy_proto.h/.cc`（纯函数、无 socket、无时钟），三条贯穿 §4 的约定：
+
+- **字节序**：代理侧报文（SOCKS5 与 OPEN）的多字节字段是**网络序（大端）**，与 RFC 1928
+  一致；FCP-STREAM 自身的段头是小端。两者不是同一套口径，也互不解析，所以不冲突。
+- **消费长度**：解析成功时输出整条请求的字节数，其后的字节属于被代理的连接，宿主原样
+  转进隧道、一个都不能吃；`kNeedMore` 不消费任何东西，宿主继续收。
+- **坏形与短读的区分**：`RSV≠0`、`NMETHODS=0`、DOMAIN 长度 0、端口 0、域名含非法字符、
+  版本非 5 都判畸形（不回复、直接关）；首字节不是 `0x05` 立刻判定"不是 SOCKS5"，不必等
+  凑满问候。请求最长 `kSocks5MaxRequestBytes = 262`，解析只看这个窗口——客户端可以把
+  问候、请求和首批数据写进同一次 `send()`，超出部分天生属于隧道。
 
 ### 4.2 本地 HTTP CONNECT
 
-解析 `CONNECT host:port HTTP/1.1` + 头部直到 `\r\n\r\n`（头部总量上限 8 KiB，超限
+解析 `CONNECT host:port HTTP/1.x` + 头部直到 `\r\n\r\n`（头部总量上限 8 KiB，超限
 `431`/关闭）；成功回 `HTTP/1.1 200 Connection Established\r\n\r\n`。非 CONNECT 方法回
-`405`。TLS over CONNECT 与 SOCKS5 之后的流量都是裸字节，本层不解析。
+`405`，其余坏形回 `400`，两个错误响应都带 `Connection: close`；响应体是常量、不含任何对端
+输入，因此没有头注入面。TLS over CONNECT 与 SOCKS5 之后的流量都是裸字节，本层不解析。
+
+口径补充（`tests/proxy_proto_test.cc` 逐条钉住）：
+
+- 版本接受 `HTTP/1.0` 与 `HTTP/1.1`，其他（含 `HTTP/2.0`）算 `400`；行尾只认 CRLF，裸 LF
+  不算换行。头部没读满 `\r\n\r\n` 之前一律 `kNeedMore`，所以方法判断发生在头部收齐之后
+  ——一个被截断的 `GET` 头部先表现为短读，收满才回 `405`。
+- 目标恒为 `kAtypDomain`（IP 字面量也一样）：远端解析走 `getaddrinfo()`，对字面量本来就
+  短路，把文本透过去比在本层手写 `inet_pton` 更省、也更不容易出错。带方括号的 IPv6
+  （`[::1]:8443`）去掉方括号、保留地址文本。
+- 端口必须显式给出且落在 1–65535（`CONNECT` 的 authority 没有默认端口），主机名 ≤255
+  字节——这正是 OPEN 的长度字段上限，超了拒绝而不是截断。
+- 431 的判据是"预算用尽且窗口内没有空行"：扫描窗口就是 8 KiB，所以宿主读超了也不会
+  改变结论；空行之后还有字节的完整头部照旧 `200`，多出来的进隧道。
 
 ### 4.3 隧道 OPEN（有序流上的第一段字节，非独立帧）
 
@@ -164,11 +190,17 @@ OPEN_OK  : "FCPO"(4) | ver(1)=1 | 0x01 | reserved(2)
 OPEN_ERR : "FCPO"(4) | ver(1)=1 | 0xFF | code(1)
 ```
 
-`atyp` 同 SOCKS5；DOMAIN 长度 1–255。**域名由服务端解析（远端解析）**，客户端不做
-本地 DNS，避免泄漏与污染绕过。`code`：1 refused（策略）、2 dns、3 target timeout、
-4 not supported（atyp 未知）、5 too many sessions。`OPEN_OK` 之后双向都是裸字节。
-服务端解析用可注入的 `Resolver` 接口（CLI 用工作线程，Qt 用 `QHostInfo`），
-解析超时 5s。
+`atyp` 同 SOCKS5；DOMAIN 长度 1–255，IPv4/IPv6 的 `len` 必须分别是 4/16，不符即
+`kBadAddress`。长度：OPEN 请求 = `9 + len`（最长 `kOpenMaxBytes = 264`）、OPEN_OK = 8、
+OPEN_ERR = 7；端口同样是网络序，`port = 0` 既编不出也解不出。OPEN_OK 的 reserved(2) 必须
+为 0，收到非 0 说明两端对格式的理解不一致，按 `kBadReserved` 关流而不是继续隧道。请求与
+应答的解析同样遵守"消费长度"契约：其后的字节都属于隧道，故 `len` 可以大于报文本身。
+**域名由服务端解析（远端解析）**，客户端不做本地 DNS，避免泄漏与污染绕过。`code`：
+1 refused（策略）、2 dns、3 target timeout、4 not supported（atyp 未知）、5 too many
+sessions。`OPEN_OK` 之后双向都是裸字节。`OpenError → Socks5Rep` 的映射放在同一层
+（`socks5_rep_for_open_error`），客户端只转发：refused→`0x05`、dns→`0x04`、
+timeout→`0x06`、not supported→`0x08`、too many→`0x02`。服务端解析用可注入的 `Resolver`
+接口（CLI 用工作线程，Qt 用 `QHostInfo`），解析超时 5s。
 
 ## 5. 链路参数预热
 
@@ -253,7 +285,11 @@ T33（同链路 20 条短连接的开/关对比）要等 `apps/fcp-proxy` 落地
 
 落地情况：T28/T29 由 `tests/stream_test.cc`（15 场景）覆盖，T30 由
 `tests/stream_e2e_test.cc`（6 场景：无损双向、纯 ARQ 随机丢包、pinned k 修复、burst 超出
-RS 预算、半关闭、200KB 持续流）覆盖，§5 的预热由 `tests/prewarm_test.cc`（13 场景）覆盖；
-三者都在 `build.bat` 的 ctest 门内（Windows Debug/Release 各 23/23）。T30 用的回环载体沿用
+RS 预算、半关闭、200KB 持续流）覆盖，§5 的预热由 `tests/prewarm_test.cc`（13 场景）覆盖，
+T31 由 `tests/proxy_proto_test.cc`（18 场景：SOCKS5 问候/请求/应答与 0xFF/0x07/0x08 分支、
+HTTP 的 200/400/405/431 与 authority 各种形态（含方括号 IPv6、255B 主机名、8 KiB 预算）、
+OPEN 三种报文的往返与全部拒绝分支、`OpenError → Socks5Rep` 映射；每条报文都按"逐字节截断"
+再解一遍，短读必须是短读、消费长度必须为 0）覆盖；四者都在 `build.bat` 的 ctest 门内
+（Windows Debug/Release 各 24/24）。T30 用的回环载体沿用
 `tests/e2e_link.h` 的 UDP socket 对，但其 `UdpSocket` 现在把 `SO_RCVBUF` 提到 1MiB——
 默认 8KiB 在窗口级突发下会溢出，那部分丢失不进注入器计数，注入模型就不再"已知"了。

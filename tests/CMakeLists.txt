@@ -22,6 +22,7 @@ set(FCP_TEST_NAMES
   stream_test
   stream_e2e_test
   prewarm_test
+  proxy_proto_test
   e2e_test
   soak_test
   adv_test

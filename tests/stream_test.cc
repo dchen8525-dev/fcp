@@ -890,6 +890,76 @@ void TestAckBeyondSndNxtIgnored() {
   CHECK_EQ(f.sa().bad_segs(), 1u);
 }
 
+// The SACK block gets the same treatment as cum: a range above snd_nxt_ or an
+// inverted range is a lie. Accepting one used to advance sack_filled_up_to_
+// past every real hole and to mark unacked segments SACKed, which turns off
+// the only repair path that beats the RTO.
+void TestInvalidSackBlockIgnored() {
+  Fixture f;
+  f.cut_all();
+  const std::vector<uint8_t> src = MakeBytes(400, 11);  // 4 segments
+  CHECK_EQ(f.push(kA, src), src.size());
+  CHECK_EQ(f.data_of(kA).size(), 4u);
+  const size_t cap = f.payload();
+
+  // A block far past anything we sent. With a lying block accepted, fill_holes
+  // would retransmit the whole queue and jump the fill gate beyond every hole.
+  const uint32_t far = 1u << 20;
+  f.feed(kA, MakeAck(0, f.cfg().rcv_buf_bytes, far, far + static_cast<uint32_t>(cap)));
+  CHECK_EQ(f.sa().bad_segs(), 1u);
+  CHECK_EQ(f.sa().retransmits(), 0u);
+
+  // Inverted range: malformed outright.
+  f.feed(kA, MakeAck(0, f.cfg().rcv_buf_bytes, 2u * static_cast<uint32_t>(cap),
+                     static_cast<uint32_t>(cap)));
+  CHECK_EQ(f.sa().bad_segs(), 2u);
+  CHECK_EQ(f.sa().retransmits(), 0u);
+
+  // The forged blocks did not poison the gate: a real block still repairs the
+  // hole at offset 0 without waiting for the RTO.
+  f.feed(kA, MakeAck(0, f.cfg().rcv_buf_bytes, static_cast<uint32_t>(cap),
+                     2u * static_cast<uint32_t>(cap)));
+  CHECK(f.sa().retransmits() >= 1u);
+  CHECK(f.data_with_offset(kA, 0) >= 2u);
+  CHECK_EQ(f.sa().bad_segs(), 2u);
+}
+
+// M2 §2.3: the close completes when OUR fin is acknowledged (cum >= fin_seq+1)
+// and the peer's fin has been delivered. Receiving the peer's fin while our
+// own fin is still unacked must not drop the retransmission queue: doing so
+// truncates data that never left or was lost, and the peer never sees a fin.
+void TestPeerFinDoesNotDropUnackedData() {
+  Fixture f;
+  f.cut_all();  // ACKs never reach A by themselves
+  const std::vector<uint8_t> src = MakeBytes(400, 11);  // 4 segments
+  CHECK_EQ(f.push(kA, src), src.size());
+  f.sa().close(f.now());  // fin queued behind the data, nothing acked yet
+
+  // B gets A's data and fin, and acks both -- but those ACKs are "lost".
+  for (const std::vector<uint8_t>& seg : f.data_of(kA)) {
+    f.feed(kB, seg);
+  }
+  CHECK(f.b().delivered == src);
+  CHECK_EQ(f.b().eof_count, 1);
+
+  // B answers with its own fin. A has not seen one ACK for its data or fin.
+  f.sb().close(f.now());
+  const std::vector<std::vector<uint8_t>> from_b = f.data_of(kB);
+  CHECK_EQ(from_b.size(), 1u);
+  f.feed(kA, from_b.back());
+  CHECK_EQ(f.a().eof_count, 1);   // read side is done
+  CHECK(!f.sa().closed());        // write side is not
+  CHECK(f.sa().unacked_segs() > 0u);
+
+  // The lost ACKs arrive; only now may A finish, and it names the acked fin.
+  for (const std::vector<uint8_t>& ack : f.acks_of(kB)) {
+    f.feed(kA, ack);
+  }
+  CHECK(f.sa().closed());
+  CHECK_EQ(f.sa().reason(), CloseReason::kLocalEof);
+  CHECK_EQ(f.a().closes.size(), 1u);
+}
+
 int main() {
   TestOrderedFlow();
   TestBidirectional();
@@ -910,6 +980,8 @@ int main() {
   TestRstAborts();
   TestIdleTimeout();
   TestAckBeyondSndNxtIgnored();
+  TestInvalidSackBlockIgnored();
+  TestPeerFinDoesNotDropUnackedData();
   TestMalformedSegments();
   TestRandomLossEndToEnd();
   return fcp_test::finish();

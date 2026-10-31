@@ -132,6 +132,9 @@ class Session {
 
   uint32_t auth_fail() const { return auth_fail_; }
   uint32_t struct_fail() const { return pre_struct_fail_ + (rx_ ? rx_->struct_fail() : 0); }
+  // #31 (M4 trigger metric): FEC/ARQ waste — retransmissions that lost the
+  // race to parity. Summed into the proxy stats line for the WAN calibration.
+  uint32_t dup_after_recovered() const { return rx_ ? rx_->dup_after_recovered() : 0; }
   uint32_t fecstat_dropped() const { return fecstat_dropped_; }
   uint32_t fecstat_stale() const { return fecstat_stale_; }
   // #28⑤ (F3): second copies of double-sent FECSTATs, ignored via the

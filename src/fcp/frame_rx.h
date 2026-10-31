@@ -131,6 +131,11 @@ class FrameRx {
   uint32_t data_delivered() const { return data_delivered_; }
   uint32_t recovered() const { return recovered_; }
   uint32_t decode_attempts() const { return decode_attempts_; }
+  // #31 (M4 trigger metric): data symbols for a slot FEC had already
+  // recovered — the sender's retransmission raced the parity and lost. Pure
+  // FEC/ARQ waste; the M4 evaluation doc uses it to decide whether a delayed
+  // retransmission is worth building.
+  uint32_t dup_after_recovered() const { return dup_after_recovered_; }
   uint32_t tail_dropped() const { return tail_dropped_; }
   // Fragments for an already-accounted, released set id (§5.3: settlement is
   // final; a late fragment must not open a second accounting unit).
@@ -189,6 +194,7 @@ class FrameRx {
   uint32_t struct_fail_ = 0;
   uint32_t stale_ = 0;
   uint32_t late_dup_ = 0;
+  uint64_t dup_after_recovered_ = 0;  // #31: retransmission lost the race to parity
   uint32_t late_data_ = 0;
   uint32_t late_recovered_ = 0;
   uint32_t data_delivered_ = 0;

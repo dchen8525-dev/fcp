@@ -97,6 +97,13 @@ struct EngineHost {
   // Cache key for a wire peer (§5): the client returns its server address, the
   // server the client's. Empty string means "do not prewarm this peer".
   std::function<std::string(uint64_t peer)> peer_key;
+  // Server only: a session routed through `peer` has been created / destroyed.
+  // The host keys its source-address table by peer id; the reactor recycles a
+  // slot only once its last session retires, so the two calls are balanced by
+  // create_server_conn() and reap(). Optional: a host without an address table
+  // (the Qt adapter) can leave them unset.
+  std::function<void(uint64_t peer)> peer_bound;
+  std::function<void(uint64_t peer)> peer_retired;
   std::function<void(uint8_t salt[Envelope::kSaltLen])> new_salt;
   std::function<void(const std::string& line)> log;
 };
@@ -158,6 +165,7 @@ class ProxyEngine {
     uint32_t over_limit = 0;  // refused: max_sessions reached
     uint32_t bad_entry = 0;   // malformed local request
     uint32_t open_failed = 0;  // OPEN_ERR sent or received
+    uint32_t dup_rec = 0;      // #31: FEC recovered a slot the ARQ rtx also hit
     uint32_t handshake_failed = 0;
     uint32_t reset = 0;        // stream RST either way
     uint32_t idle_closed = 0;
@@ -166,6 +174,9 @@ class ProxyEngine {
   };
 
   const Counters& counters() const { return counters_; }
+  // #31 (M4 trigger metric): live sum of every session's FEC/ARQ waste
+  // counter — retransmissions that lost the race to parity.
+  uint32_t dup_after_recovered() const;
   const PrewarmCache& prewarm_cache() const { return prewarm_; }
   // Bytes the engine is holding for `conn`'s application socket.
   size_t pending_app_bytes(uint64_t conn) const;

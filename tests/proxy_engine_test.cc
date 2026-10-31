@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "engine.h"
+#include "fcp/envelope.h"
 #include "fcp/proxy_proto.h"
 #include "test_util.h"
 
@@ -771,6 +772,98 @@ void trace_sink_writes_controller_trace() {
   CHECK(std::remove("replay_trace_test.101.jsonl") == 0);
 }
 
+// A server session is born from the first datagram that carries an unknown
+// salt, so that datagram has to authenticate. Before this check anybody with a
+// UDP socket could insert one Conn per random salt and pin --max-sessions: the
+// session sat in kNegotiating forever because there was no peer to negotiate
+// with, and every real client was then refused.
+void unauthenticated_datagrams_do_not_create_sessions() {
+  Options opt;
+  opt.server_max_sessions = 2;
+  Harness h{opt};
+
+  // Two random-salt datagrams arrive before the real client has said anything.
+  for (size_t i = 0; i < 2; ++i) {
+    std::vector<uint8_t> junk(64, 0xAA);
+    junk[0] = static_cast<uint8_t>(0xE0 + i);
+    h.server->on_wire(kOtherPeer, junk.data(), junk.size(), h.now_ms);
+  }
+  CHECK_EQ(h.server->counters().live, 0u);
+  CHECK(logged(h.server_log, "unauthenticated first datagram"));
+
+  // The table the junk would have filled is still available to a real client.
+  h.local_open(kLocalConn);
+  h.local_send(kLocalConn, greeting());
+  h.local_send(kLocalConn, socks5_request(0x01, 0x01, ipv4_bytes("198.51.100.9"), 80));
+  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, 60));
+  CHECK_EQ(h.server->counters().over_limit, 0u);
+}
+
+// The same table also has to survive an authenticated peer that never finishes
+// the handshake. Such a session can only be created by someone holding the
+// PSK, but it must still not live forever: the server's own HELLO retry clock
+// (300/600/1200ms, then failure) is what reaps it.
+void authenticated_non_hello_session_times_out() {
+  Harness h{Options()};
+  uint8_t key[16];
+  std::memset(key, 0x2A, sizeof(key));  // Harness PSK
+  const uint8_t salt[Envelope::kSaltLen] = {0x11, 0x22, 0x33, 0x44,
+                                            0x55, 0x66, 0x77, 0x88};
+  Envelope env(key, salt, Direction::kC2S, Direction::kS2C);
+  // Authenticated, but not oob and too short to be a FEC header: the session
+  // is born and then has nothing to negotiate on.
+  const uint8_t payload[4] = {0xDE, 0xAD, 0xBE, 0xEF};
+  std::vector<uint8_t> wire;
+  CHECK(env.seal(payload, sizeof(payload), &wire));
+  h.server->on_wire(kOtherPeer, wire.data(), wire.size(), h.now_ms);
+  CHECK_EQ(h.server->counters().live, 1u);
+
+  CHECK(h.run_until([&] { return h.server->counters().live == 0; }, 120));
+  CHECK_EQ(h.server->counters().handshake_failed, 1u);
+  CHECK(logged(h.server_log, "handshake failed"));
+}
+
+// A client may pipeline payload behind its OPEN, and the server can spend up to
+// dial_timeout_ms in kDialing. Those bytes live in stream_in, so they have to
+// count against the advertised window; otherwise the peer is told it may keep
+// sending while nothing consumes them, and the per-session buffer grows without
+// bound for the whole dial.
+void dial_backpressure_bounds_pre_tunnel_bytes() {
+  Options opt;
+  opt.dial_timeout_ms = 60000;  // answered by hand, not by the clock
+  opt.send_window_bytes = 64 * 1024;
+  opt.rcv_buf_bytes = 32 * 1024;
+  Harness h{opt};
+  h.auto_answer = false;
+  h.local_open(kLocalConn);
+  h.local_send(kLocalConn, greeting());
+  h.local_send(kLocalConn, socks5_request(0x01, 0x01, ipv4_bytes("198.51.100.9"), 80));
+  CHECK(h.run_until([&] { return !h.dials.empty(); }, 60));
+  const uint64_t target_conn = h.dials[0].conn;
+
+  // Feed the local socket only while the engine asks for it, exactly as the
+  // reactor does. The dial stays unanswered, so nothing consumes the payload.
+  const std::vector<uint8_t> chunk(4096, 0x5A);
+  size_t offered = 0;
+  for (int i = 0; i < 500; ++i) {
+    if (h.client->wants_local_read(kLocalConn)) {
+      h.local_send(kLocalConn, chunk);
+      offered += chunk.size();
+    }
+    h.step();
+  }
+  CHECK(offered > 0u);
+  // rcv_buf (32 KiB) plus the client's own send window (64 KiB), not 2 MiB.
+  CHECK(offered < 256 * 1024);
+
+  // The dial finishes and the window reopens: everything offered arrives, in
+  // order, so closing it early cost no bytes.
+  h.answer_dial(true, OpenError::kRefused);
+  CHECK(h.run_until([&] { return h.target_bytes(target_conn).size() >= offered; }, 600));
+  CHECK_EQ(h.target_bytes(target_conn).size(), offered);
+  CHECK_EQ(text_of(h.target_bytes(target_conn)), std::string(offered, 0x5A));
+}
+
 int main() {
   socks5_round_trip();
   http_connect_round_trip();
@@ -784,5 +877,8 @@ int main() {
   session_limits();
   salt_tombstone_absorbs_tail();
   trace_sink_writes_controller_trace();
+  unauthenticated_datagrams_do_not_create_sessions();
+  authenticated_non_hello_session_times_out();
+  dial_backpressure_bounds_pre_tunnel_bytes();
   return fcp_test::finish();
 }

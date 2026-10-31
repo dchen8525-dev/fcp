@@ -492,6 +492,48 @@ void TestZeroK() {
 
 }  // namespace
 
+
+// #31 (M4 trigger metric): a retransmission that loses the race to parity —
+// the slot was already recovered when the original copy finally arrives —
+// is counted as dup_after_recovered; plain duplicates are not.
+void TestDupAfterRecovered() {
+  std::vector<std::vector<uint8_t>> segs;
+  for (uint32_t i = 0; i < 10; ++i) {
+    segs.push_back(SegPayload(400 + i, 20));
+  }
+  const auto tx = BuildSet(10, 3, segs);
+
+  Fixture f(10, 3);
+  for (const auto& s : tx) {
+    if (IsData(s) && Erased(s.index, 2, 7)) {
+      continue;
+    }
+    f.feed_tx(s);
+  }
+  CHECK_EQ(f.rx.recovered(), 2u);
+  CHECK_EQ(f.rx.dup_after_recovered(), 0u);
+
+  // The sender's retransmission of slot 2 arrives after parity fixed it.
+  for (const auto& s : tx) {
+    if (IsData(s) && s.index == 2) {
+      f.feed_tx(s);
+    }
+  }
+  CHECK_EQ(f.rx.dup_after_recovered(), 1u);
+  CHECK_EQ(f.rx.late_dup(), 1u);   // counted there too, masks stay disjoint
+  CHECK_EQ(f.rx.recovered(), 2u);  // no double recovery
+  CHECK_EQ(f.count_sn(402), 1u);   // the payload is not delivered twice
+
+  // A plain duplicate of a delivered original is late_dup only.
+  for (const auto& s : tx) {
+    if (IsData(s) && s.index == 3) {
+      f.feed_tx(s);
+    }
+  }
+  CHECK_EQ(f.rx.dup_after_recovered(), 1u);
+  CHECK_EQ(f.rx.late_dup(), 2u);
+}
+
 int main() {
   TestDataDeliveryAndDedup();
   TestNoParityNoDecode();
@@ -505,5 +547,6 @@ int main() {
   TestMalformedDoesNotMoveAnchor();
   TestCapacityEviction();
   TestZeroK();
+  TestDupAfterRecovered();
   return fcp_test::finish();
 }

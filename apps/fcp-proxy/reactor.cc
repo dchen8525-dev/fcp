@@ -793,10 +793,10 @@ void Reactor::print_stats(int64_t now_ms) {
   const ProxyEngine::Counters& c = engine_.counters();
   std::printf(
       "stats %6.1fs live=%zu up=%zu tunnels=%zu tx=%" PRIu64 "B rx=%" PRIu64
-      "B bad_entry=%u refused=%u hs_failed=%u reset=%u idle=%u clash=%u over=%u unknown=%u tomb=%u\n",
+      "B bad_entry=%u refused=%u hs_failed=%u reset=%u idle=%u clash=%u over=%u unknown=%u tomb=%u duprec=%u\n",
       (now_ms - started_ms_) / 1000.0, c.live, c.established, c.tunnels, c.bytes_tx, c.bytes_rx,
       c.bad_entry, c.open_failed, c.handshake_failed, c.reset, c.idle_closed, c.salt_clash,
-      c.over_limit, c.unknown_salt, c.salt_tombstone);
+      c.over_limit, c.unknown_salt, c.salt_tombstone, engine_.dup_after_recovered());
   std::fflush(stdout);
 }
 

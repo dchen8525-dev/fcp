@@ -207,6 +207,7 @@ void ProxyEngine::on_wire(uint64_t peer, const uint8_t* data, size_t len, int64_
     salt_tombstones_.erase(tomb_it);  // grace over: forget it for real
   }
   Conn* c = find_by_salt(data, len);
+  bool born = false;
   if (c == nullptr) {
     // Client: a salt we did not mint is not ours. Server: this may be the first
     // HELLO of a new connection, which is the only way a session is born here.
@@ -218,6 +219,7 @@ void ProxyEngine::on_wire(uint64_t peer, const uint8_t* data, size_t len, int64_
     if (c == nullptr) {
       return;
     }
+    born = true;
   } else if (c->peer != peer) {
     // Same salt, different source address: a fourth-party replay of a live
     // session's datagram. The envelope would still authenticate (same key), so
@@ -228,7 +230,19 @@ void ProxyEngine::on_wire(uint64_t peer, const uint8_t* data, size_t len, int64_
     reap(now_ms);
     return;
   }
+  const uint32_t auth_before = c->session->auth_fail();
   c->session->on_wire(data, len, now_ms);
+  // A salt is minted by a peer that holds the PSK, so the datagram that
+  // creates a server session must authenticate. Otherwise anyone with a UDP
+  // socket could insert a Conn per random salt and pin max_sessions; the
+  // session would sit in kNegotiating forever because there is no peer to
+  // negotiate with. (The start() in create_server_conn bounds the same table
+  // for an authenticated peer that never completes a handshake.)
+  if (born && !c->session->established() && c->session->auth_fail() != auth_before) {
+    finish_conn(*c, now_ms, "unauthenticated first datagram");
+    reap(now_ms);
+    return;
+  }
   session_events(*c, now_ms);
   if (c->phase != Phase::kDone) {
     drain_stream(*c);
@@ -338,6 +352,17 @@ bool ProxyEngine::wants_target_read(uint64_t conn) const {
     return false;
   }
   return c->to_stream.empty() && c->stream && c->stream->can_write();
+}
+
+uint32_t ProxyEngine::dup_after_recovered() const {
+  uint32_t total = 0;
+  for (const auto& entry : by_conn_) {
+    const Conn& c = *entry.second;
+    if (c.session) {
+      total += c.session->dup_after_recovered();
+    }
+  }
+  return total;
 }
 
 size_t ProxyEngine::pending_app_bytes(uint64_t conn) const {
@@ -471,6 +496,16 @@ ProxyEngine::Conn* ProxyEngine::create_server_conn(uint64_t peer, const uint8_t*
   by_conn_[id] = std::move(conn);
   by_salt_.emplace(key, id);
   ++counters_.live;
+  if (host_.peer_bound) {
+    host_.peer_bound(peer);
+  }
+  // The server side of the handshake has to run its own retry clock too: an
+  // authenticated first datagram that is not a HELLO leaves the peer silent,
+  // and without start() the session would stay in kNegotiating (and in this
+  // table) forever. "Both sides may send HELLO simultaneously" (§6), so this
+  // costs nothing when the creating datagram was a HELLO -- it negotiates
+  // before the next tick and the scheduled HELLO never goes out.
+  raw->session->start(now_ms);
   return raw;
 }
 
@@ -547,6 +582,17 @@ void ProxyEngine::session_events(Conn& conn, int64_t now_ms) {
       queue_local_reply(conn, Socks5Rep::kGeneralFailure, HttpReply::kBadGateway);
     }
     finish_conn(conn, now_ms, "handshake failed");
+    return;
+  }
+  // #26①: past 2^32 packets the GCM block budget is spent and Session stops
+  // sealing (spec §4.1: the sender must disconnect, not go silent). Without
+  // this the tunnel would keep reading the application while every datagram
+  // was dropped, and only the peer's idle timer would end it.
+  if (conn.session->nonce_exhausted()) {
+    if (cfg_.role == EngineRole::kClient && conn.phase != Phase::kEntry) {
+      queue_local_reply(conn, Socks5Rep::kGeneralFailure, HttpReply::kBadGateway);
+    }
+    finish_conn(conn, now_ms, "send nonce space exhausted");
   }
 }
 
@@ -830,9 +876,13 @@ void ProxyEngine::flush_app(Conn& conn) {
     drop_front(&conn.app_in, taken);
   }
   if (conn.stream) {
-    // What the socket would not take is still this stream's receive buffer, so
-    // the advertised window closes instead of the buffer growing.
-    conn.stream->set_delivery_pending(conn.app_in.size());
+    // What the socket would not take, plus what a parser has not consumed yet,
+    // is still this stream's receive buffer. The pre-tunnel phases matter as
+    // much as kTunnel: a client may pipeline payload behind its OPEN, and the
+    // server can spend up to dial_timeout_ms in kDialing. Counting only app_in
+    // there would keep the window open and let the peer grow stream_in without
+    // bound -- the exact bypass the rwnd exists to prevent.
+    conn.stream->set_delivery_pending(conn.app_in.size() + conn.stream_in.size());
   }
   maybe_fin(conn);
 }
@@ -937,6 +987,11 @@ void ProxyEngine::reap(int64_t now_ms) {
       }
       by_conn_.erase(it);
       --counters_.live;
+      // save_profile / flush_report above still needed the peer's address, so
+      // the release has to wait until the connection is really gone.
+      if (cfg_.role == EngineRole::kServer && host_.peer_retired) {
+        host_.peer_retired(conn.peer);
+      }
       if (host_.app_close) {
         host_.app_close(id);
       }

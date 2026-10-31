@@ -370,7 +370,12 @@ void Stream::deliver_prefix(int64_t now_ms) {
     if (eof_) {
       eof_();  // read side finished; the write side may still have data queued
     }
-    if (fin_sent_) {
+    // The peer's fin completes the close only once OUR fin is acknowledged
+    // (M2 §2.3: `cum >= fin_seq + 1`). fin_sent_ only says the segment was
+    // built: closing on it would drop tx_ -- data that never left, or left and
+    // was lost -- and the peer would wait for a fin that is never resent.
+    // handle_ack() finishes the stream when the ack that covers our fin lands.
+    if (fin_sent_ && seq_at_or_after(snd_una_, fin_offset_ + 1)) {
       finish(now_ms, CloseReason::kPeerClose);
     }
   }
@@ -389,8 +394,22 @@ void Stream::handle_ack(const uint8_t* seg, size_t len, int64_t now_ms) {
     return;
   }
   peer_rwnd_ = get_u32(seg + 5);
-  const uint32_t sack_start = get_u32(seg + 9);
-  const uint32_t sack_end = get_u32(seg + 13);
+  uint32_t sack_start = get_u32(seg + 9);
+  uint32_t sack_end = get_u32(seg + 13);
+  // #30 hardening, same rule as cum below: the block must describe a non-empty
+  // range above the cumulative point that we could actually have sent. A lying
+  // range used to jump sack_filled_up_to_ past every real hole (disabling the
+  // only repair path that beats the RTO) and to mark unacked segments as
+  // SACKed; an inverted block is malformed outright. Ignore the SACK half of
+  // such an ACK but keep its cumulative point and window, which are bounded and
+  // useful on their own.
+  if (sack_start != sack_end &&
+      (!seq_at_or_after(sack_start, cum) || !seq_after(sack_end, sack_start) ||
+       seq_after(sack_end, snd_nxt_))) {
+    ++bad_segs_;
+    sack_start = cum;
+    sack_end = cum;
+  }
   const uint32_t prior_una = snd_una_;
 
   // #27 fast retransmit: a repeated cumulative point with unacked data is the

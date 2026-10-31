@@ -138,8 +138,10 @@ void FrameRx::on_datagram(const uint8_t* plaintext, size_t len, int64_t now_ms) 
     }
     if (set.recov_mask.test(index)) {
       // Already credited as recovered; masks must stay disjoint or settlement
-      // would double count this index.
+      // would double count this index. #31: this is also the FEC/ARQ waste
+      // signal — the sender's retransmission raced the parity and lost.
       ++late_dup_;
+      ++dup_after_recovered_;
       emit_event(RxEvent::kDataDuplicate, 0);
       return;
     }

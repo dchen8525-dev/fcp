@@ -84,11 +84,46 @@ void TestKForEdges() {
   }
 }
 
+// M3 R(k) correction primitive: the loss whose binomial tail equals q.
+void TestBinomPForCdf() {
+  // Roundtrip against the forward CDF over operating points k_for actually
+  // visits (D = 10). Skip q within ~1e-9 of 1: there the double-precision
+  // CDF is flat (dP(X>=k+1)/dp ~ p^k), the inverse's answer is at the
+  // resolution limit (measured err 1.6e-9 @ k=6, 1.8e-7 @ k=7 for p=0.01),
+  // and the correction's one-sided max() makes any residual harmless.
+  const double losses[] = {0.01, 0.05, 0.10, 0.15, 0.20, 0.35, 0.60};
+  for (const double p : losses) {
+    for (unsigned k = 1; k <= 7; ++k) {
+      const double q = fcp::binom_cdf(k, 10 + k, p);
+      if (q > 1.0 - 1e-9 || q < 1e-12) {
+        continue;
+      }
+      const double back = fcp::binom_p_for_cdf(k, 10 + k, q);
+      CHECK(Near(back, p, 1e-9));
+    }
+  }
+
+  // Edges: perfect recovery maps to zero loss, hopeless failure to one.
+  CHECK(Near(fcp::binom_p_for_cdf(2, 12, 1.0), 0.0));
+  CHECK(Near(fcp::binom_p_for_cdf(2, 12, 0.0), 1.0));
+  CHECK(Near(fcp::binom_p_for_cdf(2, 12, 1.5), 0.0));
+  CHECK(Near(fcp::binom_p_for_cdf(2, 12, -0.5), 1.0));
+
+  // Monotone non-increasing in q: a worse failure rate demands more loss.
+  double prev = 1.0;
+  for (int i = 0; i <= 100; ++i) {
+    const double p = fcp::binom_p_for_cdf(2, 12, i / 100.0);
+    CHECK(p <= prev + 1e-12);
+    prev = p;
+  }
+}
+
 }  // namespace
 
 int main() {
   TestKForTable();
   TestCdfReference();
   TestKForEdges();
+  TestBinomPForCdf();
   return fcp_test::finish();
 }

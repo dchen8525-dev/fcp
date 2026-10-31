@@ -320,6 +320,101 @@ void TestKInvariant() {
 
 }  // namespace
 
+// A report carrying the M3 ledger (FCP_M3_CONTROL.md §1.2). fail_rate is the
+// empirical share of full-size groups with >= 1 unrecovered data.
+fcp::FecstatPacket LedgerReport(uint32_t set_id, double loss, uint32_t groups,
+                                double fail_rate, uint8_t ledger_k,
+                                bool with_flag = true) {
+  fcp::FecstatPacket p = LossReport(set_id, loss);
+  if (with_flag) {
+    p.flg |= fcp::kFlgLedger;
+  }
+  p.ledger_groups = groups;
+  p.ledger_fail_ppm = static_cast<uint32_t>(fail_rate * 1000000.0 + 0.5);
+  p.ledger_meta = ledger_k;
+  return p;
+}
+
+// ON at k = 2 (loss 10%), then one plain report so the steady state is
+// established with the entry report out of the way.
+void DriveToK2(fcp::FecStrategy* st, uint32_t* id) {
+  Feed(st, id, 0.10);
+  CHECK(st->state() == fcp::FecState::kOn);
+  CHECK_EQ(st->k(), 2);
+  Feed(st, id, 0.10);
+  CHECK_EQ(st->k(), 2);
+}
+
+// Empirical failure worse than the i.i.d. prediction must lift k: the ledger
+// maps to p_eff > p_observed, and k_for acts on the larger input.
+void TestLedgerLiftsK() {
+  fcp::FecStrategy st;
+  uint32_t id = 0;
+  DriveToK2(&st, &id);
+  // Bursty link: 26.4% of k=2 groups keep a hole where i.i.d. 15% loss would
+  // produce the same failure rate.
+  const double bursty_fail = 1.0 - fcp::binom_cdf(2, 12, 0.15);
+  st.on_report(LedgerReport(++id, 0.10, 200, bursty_fail, 2), false);
+  CHECK(st.ledger_active());
+  CHECK(st.last_p_eff() > 0.149 && st.last_p_eff() < 0.151);
+  CHECK_EQ(st.k(), 3);  // k_for(0.15) = 3, one step up
+}
+
+// Better-than-i.i.d. ledger must not push k down: the correction is
+// one-sided, a good interval is treated as luck (§1.2).
+void TestLedgerOneSided() {
+  fcp::FecStrategy st;
+  uint32_t id = 0;
+  DriveToK2(&st, &id);
+  const double lucky_fail = 1.0 - fcp::binom_cdf(2, 12, 0.05);
+  st.on_report(LedgerReport(++id, 0.10, 200, lucky_fail, 2), false);
+  CHECK(st.ledger_active());
+  CHECK(st.last_p_eff() < 0.10);
+  CHECK_EQ(st.k(), 2);  // p_use stays at the observed 10%
+}
+
+// i.i.d. link: the ledger's own answer reproduces the observed loss, so k
+// holds steady — the correction degenerates to identity.
+void TestLedgerIidStable() {
+  fcp::FecStrategy st;
+  uint32_t id = 0;
+  DriveToK2(&st, &id);
+  const double iid_fail = 1.0 - fcp::binom_cdf(2, 12, 0.10);
+  for (int i = 0; i < 5; ++i) {
+    st.on_report(LedgerReport(++id, 0.10, 200, iid_fail, 2), false);
+    CHECK(st.ledger_active());
+    CHECK(st.last_p_eff() > 0.099 && st.last_p_eff() < 0.101);
+    CHECK_EQ(st.k(), 2);
+  }
+}
+
+void TestLedgerGates() {
+  // Too few groups: the failure rate carries no signal.
+  fcp::FecStrategy st;
+  uint32_t id = 0;
+  DriveToK2(&st, &id);
+  const double bursty_fail = 1.0 - fcp::binom_cdf(2, 12, 0.20);
+  st.on_report(LedgerReport(++id, 0.10, fcp::kMinLedgerGroups - 1, bursty_fail, 2),
+               false);
+  CHECK(!st.ledger_active());
+  CHECK_EQ(st.ledger_skipped(), 1u);
+  CHECK_EQ(st.k(), 2);
+
+  // Dominant k does not match the k we run: unusable, not hostile.
+  st.on_report(LedgerReport(++id, 0.10, 200, bursty_fail, 3), false);
+  CHECK(!st.ledger_active());
+  CHECK_EQ(st.ledger_skipped(), 2u);
+  CHECK_EQ(st.k(), 2);
+
+  // No bit3 (pre-M3 peer): ignored entirely, not a skip.
+  const uint32_t skipped_before = st.ledger_skipped();
+  st.on_report(LedgerReport(++id, 0.10, 200, bursty_fail, 2, false), false);
+  CHECK(!st.ledger_active());
+  CHECK_EQ(st.ledger_skipped(), skipped_before);
+  CHECK_EQ(st.ledger_reports(), 0u);
+  CHECK_EQ(st.k(), 2);
+}
+
 int main() {
   TestOffToOn();
   TestTwoReportEntry();
@@ -332,5 +427,9 @@ int main() {
   TestStaleReport();
   TestPinned();
   TestKInvariant();
+  TestLedgerLiftsK();
+  TestLedgerOneSided();
+  TestLedgerIidStable();
+  TestLedgerGates();
   return fcp_test::finish();
 }

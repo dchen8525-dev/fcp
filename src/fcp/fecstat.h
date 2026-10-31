@@ -16,6 +16,12 @@ constexpr size_t kFecstatLen = 128;
 constexpr uint8_t kFecstatVersion = 6;
 constexpr char kFecstatMagic[16] = "FCP_FECSTAT_V6";
 
+// flg bit3: the M3 ledger fields (ledger_groups/fail_ppm/meta) are valid.
+// Sender sets it only when the interval accounted at least one full-size
+// group; receivers additionally gate on ledger_groups, so a bit without
+// backing counts is still ignored.
+constexpr uint8_t kFlgLedger = 0x08;
+
 struct FecstatPacket {
   char magic[16];              // "FCP_FECSTAT_V6" + 2 x NUL, fixed width
   uint8_t session_salt[8];
@@ -43,8 +49,26 @@ struct FecstatPacket {
   uint32_t sets_tail_dropped;
   uint32_t data_late_rx;
   uint32_t sets_partial;
-  uint32_t reserved[5];
+  // M3 R(k) ledger (FCP_M3_CONTROL.md §1.2), carved out of the frozen
+  // reserved[5]. Old peers leave these zero and every consumer treats
+  // ledger_groups == 0 as "no ledger", so no handshake negotiation is needed
+  // in either direction.
+  uint32_t ledger_groups;      // settled sets with n_used == D, k known, k >= 1
+  uint32_t ledger_fail_ppm;    // of those, >= 1 data unrecovered at settlement
+  uint32_t ledger_meta;        // byte0 = dominant k; byte1 = 0;
+                               // bytes2-3 = burst KL, 0.01 nat (#26 fills it)
+  uint32_t reserved[2];
 };
+
+// ledger_meta unpacking (see field comment): dominant k in byte0, burst KL
+// quantized to 0.01 nat in bytes2-3.
+inline uint8_t ledger_k(const FecstatPacket& p) {
+  return static_cast<uint8_t>(p.ledger_meta & 0xFFu);
+}
+
+inline uint16_t ledger_burst_kl(const FecstatPacket& p) {
+  return static_cast<uint16_t>(p.ledger_meta >> 16);
+}
 
 static_assert(std::is_standard_layout_v<FecstatPacket>);
 static_assert(sizeof(FecstatPacket) == 128);
@@ -75,7 +99,10 @@ static_assert(offsetof(FecstatPacket, parity_bytes_rx) == 92);
 static_assert(offsetof(FecstatPacket, sets_tail_dropped) == 96);
 static_assert(offsetof(FecstatPacket, data_late_rx) == 100);
 static_assert(offsetof(FecstatPacket, sets_partial) == 104);
-static_assert(offsetof(FecstatPacket, reserved) == 108);
+static_assert(offsetof(FecstatPacket, ledger_groups) == 108);
+static_assert(offsetof(FecstatPacket, ledger_fail_ppm) == 112);
+static_assert(offsetof(FecstatPacket, ledger_meta) == 116);
+static_assert(offsetof(FecstatPacket, reserved) == 120);
 
 enum class FecstatStatus : uint8_t {
   kOk = 0,

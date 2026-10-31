@@ -53,6 +53,17 @@ struct SettleCounters {
   // they are added back in.
   uint32_t tail_delivered = 0;
   uint32_t late_dup = 0;
+  // M3 R(k) ledger (FCP_M3_CONTROL.md §1.2): full-size (n_used == d) settled
+  // sets whose k is known and >= 1. Whole-set losses cannot know their k and
+  // stay outside, so extreme bursts make the ledger optimistic (§1.3);
+  // partial sets stay out because their code length breaks the binomial
+  // model's D+k assumption.
+  uint32_t ledger_groups = 0;
+  uint32_t ledger_groups_failed = 0;
+  uint32_t ledger_k_hist[8] = {};  // index = k (1..7 used); [0] unused
+  // Max consecutive missing run within the set (recovered slots do not
+  // count); bucket 8 absorbs ">= 8". Input for the §3 burst detector (#26).
+  uint32_t run_hist[9] = {};
 };
 
 class FcpSettle {
@@ -76,6 +87,10 @@ class FcpSettle {
   bool delivered_le_sum() const;
   bool identity_ok() const;
   uint32_t data_lost() const;
+
+  // Dominant k over the interval's ledger (mode of ledger_k_hist; ties go to
+  // the lower k). 0 when the ledger is empty.
+  uint8_t ledger_k() const;
 
   static int64_t late_guard_ms(int64_t rtt_ms);
   static int64_t tombstone_ms(int64_t rtt_ms);

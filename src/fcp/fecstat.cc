@@ -69,6 +69,9 @@ void encode_fecstat(const FecstatPacket& packet, uint8_t out[kFecstatLen]) {
   write32(out + offsetof(FecstatPacket, sets_tail_dropped), packet.sets_tail_dropped);
   write32(out + offsetof(FecstatPacket, data_late_rx), packet.data_late_rx);
   write32(out + offsetof(FecstatPacket, sets_partial), packet.sets_partial);
+  write32(out + offsetof(FecstatPacket, ledger_groups), packet.ledger_groups);
+  write32(out + offsetof(FecstatPacket, ledger_fail_ppm), packet.ledger_fail_ppm);
+  write32(out + offsetof(FecstatPacket, ledger_meta), packet.ledger_meta);
   for (size_t i = 0; i < sizeof(packet.reserved) / sizeof(packet.reserved[0]); ++i) {
     write32(out + offsetof(FecstatPacket, reserved) + 4 * i, packet.reserved[i]);
   }
@@ -118,6 +121,9 @@ FecstatStatus decode_fecstat(const uint8_t* in, size_t len, const uint8_t salt[8
   packet.sets_tail_dropped = read32(in + offsetof(FecstatPacket, sets_tail_dropped));
   packet.data_late_rx = read32(in + offsetof(FecstatPacket, data_late_rx));
   packet.sets_partial = read32(in + offsetof(FecstatPacket, sets_partial));
+  packet.ledger_groups = read32(in + offsetof(FecstatPacket, ledger_groups));
+  packet.ledger_fail_ppm = read32(in + offsetof(FecstatPacket, ledger_fail_ppm));
+  packet.ledger_meta = read32(in + offsetof(FecstatPacket, ledger_meta));
   for (size_t i = 0; i < sizeof(packet.reserved) / sizeof(packet.reserved[0]); ++i) {
     packet.reserved[i] = read32(in + offsetof(FecstatPacket, reserved) + 4 * i);
   }

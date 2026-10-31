@@ -89,6 +89,26 @@ void FcpSettle::account(const RxSetView& view) {
     if (view.k_known && view.k > 0) {
       counters_.parity_expected += view.k;  // planned k, an upper bound
     }
+    // M3 R(k) ledger: only full-size groups with known k >= 1 match the
+    // binomial model k_for solves against (FCP_M3_CONTROL.md §1.2).
+    if (view.k_known && view.k > 0 && view.k <= 7 && n_used == static_cast<uint32_t>(d_)) {
+      ++counters_.ledger_groups;
+      ++counters_.ledger_k_hist[view.k];
+      if (orig + recov < n_used) {
+        ++counters_.ledger_groups_failed;
+      }
+      unsigned run = 0;
+      unsigned best = 0;
+      for (uint32_t i = 0; i < n_used; ++i) {
+        if (!view.orig_mask.test(i) && !view.recov_mask.test(i)) {
+          ++run;
+          best = std::max(best, run);
+        } else {
+          run = 0;
+        }
+      }
+      ++counters_.run_hist[std::min<unsigned>(best, 8)];
+    }
   }
   if (accounted_through_ == 0 || set_id_after(accounted_through_, view.set_id)) {
     accounted_through_ = view.set_id;
@@ -140,6 +160,18 @@ uint32_t FcpSettle::data_lost() const {
                        counters_.data_rx_orig - counters_.data_recovered_dl -
                        counters_.data_late_rx;
   return lost > 0 ? static_cast<uint32_t>(lost) : 0;
+}
+
+uint8_t FcpSettle::ledger_k() const {
+  uint8_t best_k = 0;
+  uint32_t best_n = 0;
+  for (uint8_t k = 1; k < 8; ++k) {
+    if (counters_.ledger_k_hist[k] > best_n) {
+      best_n = counters_.ledger_k_hist[k];
+      best_k = k;
+    }
+  }
+  return best_k;
 }
 
 bool FcpSettle::identity_ok() const {

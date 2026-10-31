@@ -115,6 +115,17 @@ void FcpReporter::report(int64_t now_ms, int64_t elapsed_ms) {
     packet.sets_tail_dropped = c.sets_tail_dropped;
     packet.data_late_rx = c.data_late_rx;
     packet.sets_partial = c.sets_partial;
+    // M3 R(k) ledger (FCP_M3_CONTROL.md §1.2). burst_kl stays 0 until #26
+    // wires the detector; the ledger_meta bytes for it are reserved already.
+    if (c.ledger_groups > 0) {
+      packet.flg |= kFlgLedger;
+      packet.ledger_groups = c.ledger_groups;
+      packet.ledger_fail_ppm = static_cast<uint32_t>(
+          (static_cast<uint64_t>(c.ledger_groups_failed) * 1000000ull +
+           c.ledger_groups / 2) /
+          c.ledger_groups);
+      packet.ledger_meta = static_cast<uint32_t>(settle_->ledger_k());
+    }
   }
 
   uint8_t wire[kFecstatLen];

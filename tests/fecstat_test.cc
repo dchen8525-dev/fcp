@@ -45,8 +45,13 @@ fcp::FecstatPacket SamplePacket() {
   packet.sets_tail_dropped = 0x11121315u;
   packet.data_late_rx = 0x21222325u;
   packet.sets_partial = 0x31323335u;
-  for (int i = 0; i < 5; ++i) {
-    packet.reserved[i] = 0x41424345u + static_cast<uint32_t>(i);
+  // M3 ledger fields occupy the former reserved[0..2] (FCP_M3_CONTROL.md
+  // §1.2); reserved[3..4] stay reserved and keep a roundtrip check.
+  packet.ledger_groups = 0x41424345u;
+  packet.ledger_fail_ppm = 0x42424346u;
+  packet.ledger_meta = 0x43424347u;
+  for (int i = 0; i < 2; ++i) {
+    packet.reserved[i] = 0x44424348u + static_cast<uint32_t>(i);
   }
   return packet;
 }
@@ -84,9 +89,12 @@ void TestGoldenLayout() {
   put32(expected, 96, 0x11121315u);
   put32(expected, 100, 0x21222325u);
   put32(expected, 104, 0x31323335u);
-  for (int i = 0; i < 5; ++i) {
-    put32(expected, 108 + 4 * static_cast<size_t>(i),
-          0x41424345u + static_cast<uint32_t>(i));
+  put32(expected, 108, 0x41424345u);
+  put32(expected, 112, 0x42424346u);
+  put32(expected, 116, 0x43424347u);
+  for (int i = 0; i < 2; ++i) {
+    put32(expected, 120 + 4 * static_cast<size_t>(i),
+          0x44424348u + static_cast<uint32_t>(i));
   }
 
   uint8_t encoded[128];
@@ -101,7 +109,29 @@ void TestGoldenLayout() {
   CHECK_EQ(fcp_test::hex(reencoded, 128), fcp_test::hex(expected, 128));
   CHECK_EQ(decoded.interval_ms, 2000);
   CHECK_EQ(decoded.sets_partial, 0x31323335u);
-  CHECK_EQ(decoded.reserved[4], 0x41424349u);
+  CHECK_EQ(decoded.reserved[1], 0x44424349u);
+  CHECK_EQ(fcp::ledger_k(decoded), 0x47);
+  CHECK_EQ(fcp::ledger_burst_kl(decoded), 0x4342);
+}
+
+// A pre-M3 peer sends reserved bytes as zeros and no flg bit3; the new
+// consumer must read that as "no ledger" without any negotiation.
+void TestLegacyZeroLedger() {
+  uint8_t wire[128] = {};
+  std::memcpy(wire, fcp::kFecstatMagic, sizeof(fcp::kFecstatMagic));
+  std::memcpy(wire + 16, kSalt, 8);
+  wire[24] = fcp::kFecstatVersion;
+  wire[25] = 0x01;  // flg bit0 direction only: a pre-M3 sender knows no bit3
+  put32(wire, 28, 7);  // accounted_through_set_id
+
+  fcp::FecstatPacket decoded{};
+  CHECK(fcp::decode_fecstat(wire, sizeof(wire), kSalt, &decoded) ==
+        fcp::FecstatStatus::kOk);
+  CHECK_EQ(decoded.flg & fcp::kFlgLedger, 0);
+  CHECK_EQ(decoded.ledger_groups, 0u);
+  CHECK_EQ(decoded.ledger_fail_ppm, 0u);
+  CHECK_EQ(fcp::ledger_k(decoded), 0);
+  CHECK_EQ(fcp::ledger_burst_kl(decoded), 0);
 }
 
 void TestValidation() {
@@ -163,6 +193,7 @@ void TestMonotonicKey() {
 
 int main() {
   TestGoldenLayout();
+  TestLegacyZeroLedger();
   TestValidation();
   TestMonotonicKey();
   return fcp_test::finish();

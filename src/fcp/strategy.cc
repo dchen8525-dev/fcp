@@ -39,6 +39,28 @@ uint8_t k_for(double loss, uint8_t d, uint8_t p_max, double target) {
   return p_max;
 }
 
+double binom_p_for_cdf(unsigned max_losses, unsigned trials, double q) {
+  if (q >= 1.0) {
+    return 0.0;
+  }
+  if (q <= 0.0) {
+    return 1.0;
+  }
+  double lo = 0.0;
+  double hi = 1.0;
+  // 60 halvings put the interval far below double resolution; each step is a
+  // <=7-term CDF evaluation at report cadence, so cost is a non-issue.
+  for (int i = 0; i < 60; ++i) {
+    const double mid = 0.5 * (lo + hi);
+    if (binom_cdf(max_losses, trials, mid) >= q) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return 0.5 * (lo + hi);
+}
+
 FecStrategy::FecStrategy(const FecStrategyConfig& config)
     : d_(config.d),
       p_max_(std::min(config.p_max, kMaxParity)),
@@ -112,7 +134,16 @@ void FecStrategy::on_report(const FecstatPacket& stat, bool window_queued) {
     return;
   }
 
-  const uint8_t k_target = k_for(loss, d_, p_max_, target_recovery_);
+  // M3 R(k) correction (FCP_M3_CONTROL.md §1.2): a usable ledger from the
+  // peer upgrades the loss input from the observed mean to the i.i.d.-equivalent
+  // rate that reproduces the empirical group-failure rate. One-sided: only
+  // inflation is allowed, a ledger better than i.i.d. is treated as luck.
+  double p_use = loss;
+  update_p_eff(stat);
+  if (have_p_eff_ && last_p_eff_ > p_use) {
+    p_use = last_p_eff_;
+  }
+  const uint8_t k_target = k_for(p_use, d_, p_max_, target_recovery_);
   if (window_queued) {
     ++queued_streak_;
     if (queued_streak_ >= 3) {
@@ -154,6 +185,28 @@ void FecStrategy::enter_off() {
   queued_streak_ = 0;
   consec_ge_08_ = 0;
   cooldown_reports_ = 3;
+}
+
+void FecStrategy::update_p_eff(const FecstatPacket& stat) {
+  if ((stat.flg & kFlgLedger) == 0) {
+    return;  // pre-M3 peer; normal, not counted as a skip
+  }
+  have_p_eff_ = false;
+  if (stat.ledger_groups < kMinLedgerGroups) {
+    ++ledger_skipped_;
+    return;
+  }
+  const uint8_t lk = ledger_k(stat);
+  // The ledger measures the k we actually ran. A mismatched mode (our step
+  // lags the peer's report, or vice versa) is unusable, not hostile.
+  if (lk == 0 || lk != k_) {
+    ++ledger_skipped_;
+    return;
+  }
+  const double fail = std::clamp(stat.ledger_fail_ppm / 1000000.0, 0.0, 1.0);
+  last_p_eff_ = binom_p_for_cdf(k_, static_cast<unsigned>(d_) + k_, 1.0 - fail);
+  have_p_eff_ = true;
+  ++ledger_reports_;
 }
 
 }  // namespace fcp

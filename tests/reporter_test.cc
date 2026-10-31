@@ -132,7 +132,7 @@ void TestTwoSecondCadence() {
   CHECK(std::memcmp(p.magic, fcp::kFecstatMagic, sizeof(p.magic)) == 0);
   CHECK(std::memcmp(p.session_salt, kSalt, sizeof(kSalt)) == 0);
   CHECK_EQ(p.ver, fcp::kFecstatVersion);
-  CHECK_EQ(p.flg, fcp::kFlgDirection);
+  CHECK_EQ(p.flg, static_cast<uint8_t>(fcp::kFlgDirection | fcp::kFlgLedger));
   CHECK_EQ(p.interval_ms, 2000);
   CHECK_EQ(p.accounted_through_set_id, 29u);
   CHECK_EQ(p.sets_expected, 30u);
@@ -148,6 +148,11 @@ void TestTwoSecondCadence() {
   CHECK_EQ(p.sets_k_unknown, 0u);
   CHECK_EQ(p.repair_lat_p50_ms, 0);
   CHECK_EQ(p.repair_lat_p95_ms, 0);
+  // M3 ledger: 30 clean full-size k=1 groups, nothing failed.
+  CHECK_EQ(p.ledger_groups, 30u);
+  CHECK_EQ(p.ledger_fail_ppm, 0u);
+  CHECK_EQ(fcp::ledger_k(p), 1);
+  CHECK_EQ(fcp::ledger_burst_kl(p), 0);
 
   // Interval counters were cleared; the monotonic key survived.
   CHECK_EQ(f.settle.counters().data_expected, 0u);
@@ -234,11 +239,17 @@ void TestFlags() {
   CHECK(f.rep.on_tick(2000));
   const fcp::FecstatPacket p = f.last_packet();
   CHECK_EQ(p.flg, static_cast<uint8_t>(fcp::kFlgDirection | fcp::kFlgTailDropped |
-                                      fcp::kFlgLateRecovery));
+                                      fcp::kFlgLateRecovery | fcp::kFlgLedger));
   CHECK_EQ(p.data_expected, 260u);
   CHECK_EQ(p.sets_tail_dropped, 1u);
   CHECK_EQ(p.data_recovered_late, 2u);
   CHECK_EQ(p.data_delivered, 263u);  // 258 originals + 3 tail-dropped + 2 late recon
+  // Ledger: 25 clean k=1 sets + set 25, whose two holes were still open at
+  // settlement (the recovery landed late, inside the tombstone) -> 1 of 26
+  // groups failed. Dominant k is 1 (25 vs 1).
+  CHECK_EQ(p.ledger_groups, 26u);
+  CHECK_EQ(p.ledger_fail_ppm, 38462u);
+  CHECK_EQ(fcp::ledger_k(p), 1);
 }
 
 void TestPercentiles() {

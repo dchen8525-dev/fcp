@@ -440,6 +440,18 @@ void Session::on_oob(const uint8_t* payload, size_t len, int64_t now_ms) {
                 strategy_->k(), strategy_->state() == FecState::kOn ? "ON" : "OFF");
   log(line);
 
+  // M3 R(k) correction (FCP_M3_CONTROL.md §1.2): peer's ledger lifted the
+  // loss input; own line keeps the §10 format untouched.
+  if (strategy_->ledger_active()) {
+    std::snprintf(line, sizeof(line),
+                  "FEC ledger: groups=%u fail=%uppm k=%u peff=%.4f "
+                  "(binomial %.4f) applied=%u skipped=%u",
+                  stat.ledger_groups, stat.ledger_fail_ppm, ledger_k(stat),
+                  strategy_->last_p_eff(), strategy_->last_loss(),
+                  strategy_->ledger_reports(), strategy_->ledger_skipped());
+    log(line);
+  }
+
   if (before == FecState::kOn && strategy_->state() == FecState::kOff) {
     std::snprintf(line, sizeof(line),
                   "FEC off: pre<0.30%% for 5 reports (last %.2f%%)",

@@ -31,6 +31,17 @@ double binom_cdf(unsigned max_losses, unsigned trials, double p);
 // Returns p_max when no k reaches the target (including loss >= 1).
 uint8_t k_for(double loss, uint8_t d, uint8_t p_max, double target = kTargetRecovery);
 
+// Inverse of binom_cdf along its (monotonically decreasing) loss argument:
+// the p with binom_cdf(max_losses, trials, p) == q. Bisection; q >= 1 -> 0,
+// q <= 0 -> 1. M3's R(k) correction uses it to map an empirical group-failure
+// rate back to the i.i.d. loss rate that would predict it (§1.2).
+double binom_p_for_cdf(unsigned max_losses, unsigned trials, double q);
+
+// The ledger correction only fires when the interval accounted enough
+// full-size groups for the failure rate to beat binomial noise: 64 groups
+// keep the estimate's resolution below the k_for step granularity.
+constexpr uint32_t kMinLedgerGroups = 64;
+
 enum class FecState : uint8_t {
   kOff = 0,
   kOn = 1,
@@ -70,9 +81,19 @@ class FecStrategy {
   uint32_t stale_reports() const { return stale_reports_; }
   uint32_t small_sample_reports() const { return small_sample_reports_; }
 
+  // M3 R(k) correction diagnostics: whether the last ON-state report carried
+  // a usable ledger (and the p_eff it produced), plus how many reports were
+  // applied vs gated out. `skipped` counts only bit3-bearing reports that
+  // failed a gate — a pre-M3 peer without the bit is normal, not a skip.
+  bool ledger_active() const { return have_p_eff_; }
+  double last_p_eff() const { return last_p_eff_; }
+  uint32_t ledger_reports() const { return ledger_reports_; }
+  uint32_t ledger_skipped() const { return ledger_skipped_; }
+
  private:
   void enter_on(double loss);
   void enter_off();
+  void update_p_eff(const FecstatPacket& stat);
 
   uint8_t d_;
   uint8_t p_max_;
@@ -95,6 +116,13 @@ class FecStrategy {
   uint32_t untrusted_reports_ = 0;
   uint32_t stale_reports_ = 0;
   uint32_t small_sample_reports_ = 0;
+
+  // R(k) correction state (one report of memory; the ±1 rate limiter does the
+  // smoothing, so no EWMA on top).
+  bool have_p_eff_ = false;
+  double last_p_eff_ = 0.0;
+  uint32_t ledger_reports_ = 0;
+  uint32_t ledger_skipped_ = 0;
 };
 
 }  // namespace fcp

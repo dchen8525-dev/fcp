@@ -481,6 +481,90 @@ void TestIdentityFuzz() {
 
 }  // namespace
 
+// M3 R(k) ledger (FCP_M3_CONTROL.md §1.2): only full-size groups with known
+// k >= 1 enter; a fully repaired group has run 0.
+void TestLedgerRecovery() {
+  const auto tx = BuildSet(10, 2, Payloads(400, 10));
+  Fixture f(10, 3);
+  for (const auto& s : tx) {
+    if (IsData(s) && (s.index == 2 || s.index == 7)) {
+      continue;  // both recovered by parity
+    }
+    f.feed_tx(s);
+  }
+  f.settle.tick(100, 100);
+  CHECK_EQ(f.c().ledger_groups, 1u);
+  CHECK_EQ(f.c().ledger_groups_failed, 0u);
+  CHECK_EQ(f.c().ledger_k_hist[2], 1u);
+  CHECK_EQ(f.settle.ledger_k(), 2);
+  CHECK_EQ(f.c().run_hist[0], 1u);
+}
+
+// More holes than parity: RS is underdetermined, nothing recovers, the whole
+// set settles as failed with its max missing run recorded.
+void TestLedgerFailedRun() {
+  const auto tx = BuildSet(10, 2, Payloads(500, 10));
+  Fixture f(10, 3);
+  for (const auto& s : tx) {
+    if (IsData(s) && (s.index == 3 || s.index == 4 || s.index == 8 || s.index == 9)) {
+      continue;  // 4 holes vs k=2: no unique solution, zero recovery
+    }
+    f.feed_tx(s);
+  }
+  f.settle.tick(100, 100);
+  CHECK_EQ(f.c().ledger_groups, 1u);
+  CHECK_EQ(f.c().ledger_groups_failed, 1u);
+  CHECK_EQ(f.c().data_recovered_dl, 0u);
+  CHECK_EQ(f.settle.data_lost(), 4u);
+  CHECK_EQ(f.c().run_hist[2], 1u);
+  CHECK_EQ(f.settle.ledger_k(), 2);
+}
+
+// Partial sets (n_used < D) and k-unknown sets stay outside the ledger even
+// when accounted; the dominant k still reflects the full-size population.
+void TestLedgerExclusions() {
+  Fixture f(10, 3);
+  // Set 0: k=0, data only — becomes eligible when set 1's symbols arrive.
+  for (const auto& s : BuildSet(10, 0, Payloads(600, 10))) {
+    if (IsData(s)) {
+      f.feed(0, s.index, s.type_k, s.symbol, 0);
+    }
+  }
+  // Set 1: partial (4 data) with parity, fully delivered.
+  for (const auto& s : BuildSet(10, 2, Payloads(700, 4))) {
+    f.feed(1, s.index, s.type_k, s.symbol, 0);
+  }
+  // Set 2: full size with k=3, one hole recovered.
+  for (const auto& s : BuildSet(10, 3, Payloads(800, 10))) {
+    if (IsData(s) && s.index == 5) {
+      continue;
+    }
+    f.feed(2, s.index, s.type_k, s.symbol, 0);
+  }
+  f.settle.tick(100, 100);
+  CHECK_EQ(f.c().sets_expected, 3u);
+  CHECK_EQ(f.c().ledger_groups, 1u);
+  CHECK_EQ(f.c().ledger_groups_failed, 0u);
+  CHECK_EQ(f.c().ledger_k_hist[3], 1u);
+  CHECK_EQ(f.c().ledger_k_hist[2], 0u);
+  CHECK_EQ(f.settle.ledger_k(), 3);
+  // The k=0 set is a candidate for the dominant-k tie rule: no groups, no k.
+  CHECK_EQ(f.c().run_hist[0], 1u);
+}
+
+// Dominant k is the mode of the k histogram (ties to the lower k).
+void TestLedgerDominantK() {
+  Fixture f(10, 3);
+  f.feed_as(0, BuildSet(10, 2, Payloads(900, 10)));
+  f.feed_as(1, BuildSet(10, 3, Payloads(1000, 10)));
+  f.feed_as(2, BuildSet(10, 3, Payloads(1100, 10)));
+  f.settle.tick(100, 100);
+  CHECK_EQ(f.c().ledger_groups, 3u);
+  CHECK_EQ(f.c().ledger_k_hist[2], 1u);
+  CHECK_EQ(f.c().ledger_k_hist[3], 2u);
+  CHECK_EQ(f.settle.ledger_k(), 3);
+}
+
 int main() {
   TestClamps();
   TestBasicAccounting();
@@ -493,5 +577,9 @@ int main() {
   TestNoReaccountAfterRelease();
   TestCapacityEvictionAccounting();
   TestIdentityFuzz();
+  TestLedgerRecovery();
+  TestLedgerFailedRun();
+  TestLedgerExclusions();
+  TestLedgerDominantK();
   return fcp_test::finish();
 }

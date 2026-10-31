@@ -74,6 +74,9 @@ void ProxyHost::start(const Options& options) {
   cfg_.mtu = static_cast<uint16_t>(opt_.mtu);
   cfg_.pinned_k = opt_.pinned_k;
   cfg_.prewarm = opt_.prewarm;
+  cfg_.fec_budget = opt_.fec_budget;
+  cfg_.trace = fcp::make_trace_sink(opt_.trace_prefix.toLocal8Bit().toStdString(),
+                                    1 /* single client session */);
   if (opt_.window_kib > 0) {
     const size_t bytes = static_cast<size_t>(opt_.window_kib) * 1024;
     cfg_.send_window_bytes = bytes;

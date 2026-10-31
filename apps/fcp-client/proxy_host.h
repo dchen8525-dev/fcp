@@ -51,6 +51,10 @@ class ProxyHost : public QObject {
     int window_kib = 0;     // 0 = engine default (256 KiB)
     int pinned_k = -1;      // -1 = adaptive
     bool prewarm = true;
+    // #35: M3 controller passthrough — the byte-budget ceiling and the
+    // per-session controller-trace prefix (empty = no recording).
+    double fec_budget = 0.50;
+    QString trace_prefix;
   };
 
   struct Stats {

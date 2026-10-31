@@ -1,0 +1,2306 @@
+# FCP 对抗分析报告（10 轮）
+
+> 本文档只记录问题与涉及代码，**未修改任何源代码**。
+> 文中所有代码片段均为从仓库原文摘录，行号对应下文「审查基线」。
+
+---
+
+## 0. 审查元信息
+
+| 项目 | 内容 |
+|---|---|
+| 代码库 | `D:\work\fcp`（FCP：基于 UDP 的可靠传输协议，C++17） |
+| 审查基线 | commit `1fcdebe`（"M4 #30续：对抗复查二轮（重放/确定性）——并行会话工作收编提交"） |
+| 审查方式 | 10 轮对抗分析，每轮一个独立攻击视角，互不通气、独立取证 |
+| 审查规模 | `src/fcp` 核心库 + `apps/fcp-proxy` 代理 + `apps/fcp-client` Qt 客户端 + `tools/` 基准与重放工具 + `tests/` 全量测试 |
+| 代码改动 | **零**。本轮仅新增本报告文件 |
+| 复核方式 | 标记「✓已复核」的条目由审查者本人在基线树上重新打开源码逐条核对行号与代码；标记「代理报告」的条目为对应轮次代理的取证结论，未逐条二次复核 |
+
+### 0.1 十轮视角分工
+
+| 轮次 | 视角 | 发现数 | 最高级别 |
+|---|---|---|---|
+| P1 | 内存安全与越界 | 4 + 补遗 | High |
+| P2 | 密码学与协议安全 | 13 | Critical |
+| P3 | 协议解析与状态机 | 8 | High |
+| P4 | 并发与时序竞态 | 11 | High |
+| P5 | 错误处理与资源生命周期 | 12 | High |
+| P6 | 业务逻辑与不变量（文档 vs 实现） | 9 | High |
+| P7 | 数学与算法正确性（GF/RS/Cauchy） | 7 | Medium |
+| P8 | 健壮性与故障注入 | 8 | Critical |
+| P9 | 性能与效率 | 15 | High |
+| P10 | 可维护性、API 误用与测试盲区 | 16 | High |
+| **合计** | | **约 103 条** | |
+
+### 0.2 级别分布
+
+| 级别 | 条数（约） | 典型代表 |
+|---|---|---|
+| Critical | 2 | 未认证 8 字节秒杀会话；跨会话 GCM 密钥/IV 重用 |
+| High | 24 | ACK 谎报防线用错上界；Qt 迭代器失效 UAF；无 SIGPIPE 保护；锚点无界前跳 |
+| Medium | 43 | `k` 未被 `P'` 约束；loss 公式分裂；样本门口径分叉；FECSTAT 键未推进被当重复 |
+| Low | 34 | 注释与实码不符；常量重复定义；死代码 |
+
+### 0.3 十轮之间最有价值的部分：跨轮互证
+
+对抗分析的价值不只在发现条数，而在**不同视角独立命中同一处缺陷**。本轮有 6 处被两轮及以上独立命中：
+
+| 缺陷 | 命中轮次 | 意义 |
+|---|---|---|
+| 明文 salt 参与预认证路由 → 源地址不符即杀会话 | P2-03、P8-1 | 一轮从密码学（AEAD 被绕过）看到，一轮从健壮性（8 字节即 DoS）看到，互相印证「无需凭据即可秒杀」 |
+| Qt `onTick` 遍历 QHash 时被引擎同步 erase | P4-2、P5-01 | 一轮从竞态看到，一轮从错误路径看到，两轮独立写出了同一条调用链 |
+| 对端声明的 `k` 未被协商值 `P'` 约束 | P3-5、P8-2 | 一轮从状态机看到，一轮从内存放大看到，合起来才是完整威胁模型 |
+| Qt 客户端 2 KiB UDP 缓冲（CLI 已修） | P1-1、P10-05 | 一轮从内存安全看到，一轮从"改了 A 忘了 B"看到 |
+| 会话侧/策略侧样本门口径分叉 | P6-4、P10-04 | 两轮各自从"文档承诺"和"改了一处忘了另一处"看到 |
+| `trace` 解码器 double→窄整型 UB | P10-12、P8-7 | 两轮独立命中；**已在 `1fcdebe` 修复** |
+
+---
+
+## 1. Critical / High 汇总（优先处理）
+
+| # | 级别 | 一句话 | 位置 | 来源 | 复核 |
+|---|---|---|---|---|---|
+| A1 | **Critical** | 8 字节未认证前缀即可秒杀任意已建立会话 | `apps/fcp-proxy/engine.cc:223-232` | P2-03 / P8-1 | ✓已复核 |
+| A2 | **Critical** | BenchEngine 用写死 salt 当会话 salt → 跨会话 GCM (key,IV) 重用 | `apps/fcp-client/bench_engine.cpp:160` | P2-04 | ✓已复核 |
+| A3 | **High** | 出厂 PSK 是 FIPS-197 公开测试向量，且明文落 QSettings | `apps/fcp-client/main_window.cpp:835` | P2-05 | ✓已复核 |
+| A4 | **High** | ACK 谎报防线用错上界 → 未发出段被弹出 → 数据永久丢失 | `src/fcp/stream.cc:392,442-458` | P6-1 | ✓已复核 |
+| A5 | **High** | Qt `onTick` 遍历 QHash 时被引擎同步 erase → 迭代器失效 UAF | `apps/fcp-client/proxy_host.cpp:541-547,274` | P4-2 / P5-01 | ✓已复核 |
+| A6 | **High** | `killSockets` 中 `abort()` 同步触发 `disconnected()` → 移除当前元素 | `apps/fcp-client/proxy_host.cpp:609-616,442` | P4-1 | ✓已复核 |
+| A7 | **High** | POSIX 下无 SIGPIPE 忽略 → 一个客户端断开杀死整个代理进程 | `apps/fcp-proxy/reactor.cc:261-262,848-858` | P5-02 | ✓已复核 |
+| A8 | **High** | 接收窗口锚点可被单个分片无界前跳 → 真实数据全部判 stale | `src/fcp/frame_rx.cc:117-119,68-71` | P3-1 | ✓已复核 |
+| A9 | **High** | 对端声明的 `k` 未被协商值 `P'` 约束 → 解码缓冲放大 250 倍 | `src/fcp/frame_rx.cc:87,127,395` | P3-5 / P8-2 | ✓已复核 |
+| A10 | **High** | `fcp_bench --seg=-1` → SIZE_MAX → 未捕获异常 abort | `tools/fcp_bench.cc:235,179` | P8-3 | ✓已复核 |
+| A11 | **High** | `dup_after_recovered` 生产路径恒为 0 → M4 测量仪未接线 | `src/fcp/frame_tx.cc:46,148` + `frame_rx.cc:144` | P6-3 | ✓已复核 |
+| A12 | **High** | GHASH 按位串行，分支模式逐比特泄露认证子密钥 H | `src/fcp/ghash.cc:13-25` | P2-01 | ✓已复核 |
+| A13 | **High** | `RxSetView` / `RxSet` / `view()` 三处字段镜像，新增字段必漏改 | `src/fcp/frame_rx.h:76,145` + `frame_rx.cc:247` | P10-02 | 代理报告 |
+| A14 | **High** | loss/lost 四份互不相同的公式，控制器与日志不是同一个数 | `src/fcp/strategy.cc:132` / `settle.cc:221` / `session.cc:446` | P10-03 | ✓已复核 |
+| A15 | **High** | 客户端/服务端 `SessionConfig` 两份逐行重复，加字段必漏改 | `apps/fcp-proxy/engine.cc:382,457` | P10-07 | 代理报告 |
+| A16 | **High** | `tx_pending_` 头部 `erase` → 每分段一次全量 memmove，O(n²) | `src/fcp/stream.cc:160` | P9-1 | ✓已复核 |
+| A17 | **High** | 发送路径每包 4 次堆分配 + 4 次 payload 全量拷贝 | `src/fcp/frame_tx.cc:44-61` + `session.cc:528` | P9-2 | 代理报告 |
+| A18 | **High** | FEC 解码每次尝试重新分配 (n+k) 个 `symbol_max` 缓冲 | `src/fcp/frame_rx.cc:395` | P9-3 | ✓已复核 |
+| A19 | **High** | 代理 `drop_front` 头部 memmove，应用读慢即缓冲搬放大 | `apps/fcp-proxy/engine.cc:16-22,864-876` | P9-4 | 代理报告 |
+| A20 | **High** | bench 把被内核丢弃的数据报计入吞吐，测量系统性偏高 | `tools/fcp_bench.cc:313-317,515,527` | P9-5 | ✓已复核 |
+| A21 | **High** | Qt 端把 GCM 解密 + FEC 解码全部放在 UI 线程 | `apps/fcp-client/bench_engine.cpp:291-316` | P9-6 | 代理报告 |
+| A22 | **High** | 对端 FIN 偏移可被后到的 FIN 覆盖 → EOF 永不投递 + FIN 永不确认 | `src/fcp/stream.cc:300-301` | P3-2 | ✓已复核 |
+| A23 | **High** | `decoded_once` 闩锁把 FEC 修复变成一次性，违反 §4.5 重试语义 | `src/fcp/frame_rx.cc:374-386` | P3-4 | 代理报告 |
+| A24 | **High** | 「不可信样本」判定写了三份，其中一份生产路径根本不用 | `src/fcp/settle.cc:215` / `strategy.cc:116` / `session.cc:431` | P10-01 | 代理报告 |
+
+---
+
+## 2. 逐轮详细发现
+
+### 2.1 第 1 轮 — 内存安全与越界
+
+> 本轮对 `src/fcp` 核心库给出**重要的负结果**：`frame_rx` / `frame_tx` / `rs` / `cauchy` / `envelope` / `gcm` / `ghash` / `aes` / `gf256` / `stream` / `settle` / `fecstat` / `trace` 未发现可由网络输入触发的越界写或越界读。所有 `std::array`/bitset 下标均有显式护栏（如 `frame_rx.cc:408` 的 `idx >= kMaxS`、`hdr.cc:33` 的 `hdr.index >= s`、`envelope.cc:198` 的 `delta >= recv_seen_.size()`）。
+> 另逐条排除三个看似可疑但实为安全的点：`frame_rx.cc:433` 的 `s[0]/s[1]`（前一行已保证 `s.size() == symbol_max >= 2`）、`frame_rx.cc:411` 的 `set->symbols[idx]`（`idx >= kMaxS` 已前置 continue）、`stream.cc:329` 的 `overlap`（`seq_dist` 为负时 `static_cast<size_t>` 得巨大值，被 `overlap >= c.bytes.size()` 拦下）。
+
+#### [P1-1] Qt 客户端 2 KiB UDP 接收缓冲，而 CLI 端早已因同一 bug 改成 64 KiB — High
+
+- 位置：`apps/fcp-client/proxy_host.cpp:21,519`；对照 `apps/fcp-proxy/reactor.h:92`
+- 涉及代码：
+```cpp
+// apps/fcp-client/proxy_host.cpp:21
+constexpr size_t kUdpBufBytes = 2048;        // one wire datagram
+// apps/fcp-client/proxy_host.cpp:519
+  uint8_t buf[kUdpBufBytes];
+```
+```cpp
+// apps/fcp-proxy/reactor.h:89-92
+// One maximum-size IPv4 UDP datagram. The old 2 KiB stack buffer silently
+// truncated every symbol once --mtu exceeded ~2 KiB, which the session then
+// dropped as an authentication failure with no diagnostic.
+constexpr size_t kUdpRecvBytes = 64 * 1024;
+```
+- 为什么是问题：CLI 侧明确把这个 2 KiB 记为「已修的 bug」（注释原话），Qt 侧保留着同一个数字。
+- 触发场景 → 后果：对端用 `--mtu=4096`（CLI 允许到 65535）时，Qt 客户端把数据报截断 → GCM tag 被切掉 → `Envelope::open` 失败 → 计入 `auth_fail`，表现为"连不上/一直认证失败"却没有任何截断诊断。`apps/fcp-client/` 完全无测试目标。
+- 严重级别：High　置信度：确认（✓已复核）
+
+#### [P1-2] `memcpy` 从长度未校验的 `QByteArray` 取固定 16/8 字节 — Medium（加固建议）
+
+- 位置：`apps/fcp-client/bench_engine.cpp:159-160`；`apps/fcp-client/proxy_host.cpp:73`
+- 涉及代码：
+```cpp
+// apps/fcp-client/bench_engine.cpp:157-161
+void BenchEngine::beginSession() {
+  fcp::SessionConfig cfg;
+  std::memcpy(cfg.key, opt_.key.constData(), 16);
+  std::memcpy(cfg.salt, opt_.salt.constData(), 8);
+```
+```cpp
+// apps/fcp-client/proxy_host.cpp:72-73
+  cfg_ = fcp::EngineConfig{};
+  cfg_.role = fcp::EngineRole::kClient;
+  std::memcpy(cfg_.key, opt_.key.constData(), sizeof(cfg_.key));
+```
+- 为什么是问题：`constData()` 在 `QByteArray` 长度不足 16 时不保证可读 16 字节 → 越界读。不变量只写在注释里（`// 16 bytes, validated by the caller`），公开 API 无保护。
+- 触发场景 → 后果：GUI 路径当前安全 —— `main_window.cpp:711,921-922` 有 `kHex32`/`kHex16` 正则校验长度（✓已复核）。但任何绕过 UI 的调用方（测试、脚本、后续组件）传入短 key 即越界读。
+- 严重级别：Medium　置信度：确认（活体路径已由 UI 校验挡住，属纵深防御缺口）
+
+#### [P1-5] `kdf_ctr_aes128` 的 `block[16]` 越界契约未被强制 — Low
+
+- 位置：`src/fcp/envelope.cc:44-63`
+- 涉及代码：
+```cpp
+void kdf_ctr_aes128(const uint8_t key[16], const char* label, size_t label_len,
+                    uint8_t* out, size_t out_len) {
+  ...
+  while (done < out_len) {
+    uint8_t block[16];
+    block[0] = counter;
+    std::memcpy(block + 1, label, label_len);
+    block[1 + label_len] = 0x00;
+    std::memcpy(block + 2 + label_len, l_be, 8);
+```
+- 为什么是问题：写入范围是 `[0, 2+label_len+8)`，要求 `label_len <= 6`，但代码零校验。当前两个调用点恰好传 6（`envelope.cc:93-94` 的 `"fcp-c2"` / `"fcp-s2"`，✓已复核），一旦有人加第三个方向密钥就是栈溢出。
+- 严重级别：Low　置信度：确认（当前不可触发）
+
+#### [P1-9] AEAD 校验前按攻击者给的长度分配堆缓冲 — Low-Medium
+
+- 位置：`src/fcp/envelope.cc:163-167`；上界 `apps/fcp-proxy/reactor.h:92`（64 KiB）
+- 涉及代码：
+```cpp
+  const size_t cipher_len = len - kOverhead;
+  const uint8_t* cipher = wire + kSaltLen + kNonceLen;
+  const uint8_t* tag = cipher + cipher_len;
+
+  std::vector<uint8_t> decoded(cipher_len);
+  if (!gcm_open(recv_key_, iv, nullptr, 0, cipher, cipher_len, tag, decoded.data())) {
+```
+- 为什么是问题：尺寸完全由**未经认证**的 `len` 决定，分配发生在 GCM 标签校验之前。注意**不是越界写**（`decoded` 尺寸与 `cipher_len` 精确相等），只是认证前分配放大。
+- 触发场景 → 后果：同网段攻击者观测到明文 salt 后可持续发送 64 KiB 数据报，每包一次 64 KiB 堆分配 + 一次全量 GCM 计算。
+- 严重级别：Low-Medium　置信度：确认
+
+---
+
+### 2.2 第 2 轮 — 密码学与协议安全
+
+> **正面结论**（该轮明确确认）：GCM 核心实现**正确**。`gcm.cc` 的 J0 构造、`inc32`、GHASH 长度块顺序（AD‖CT‖len(A)‖len(C)）、大端长度编码、12 字节 tag 左截断、tag 先验后解密、常数时间聚合比较，均与 NIST SP 800-38D 一致（`tests/gcm_test.cc` 用 NIST tc1/tc2/tc3 向量）。`gf128_mul` 的 GF(2^128) 约简（`v[0] ^= 0xE1`）也正确。**问题不在原语本身，而在原语周围**：GHASH 的常数时间性、salt 的明文路由与预认证绑定、密钥生命周期、应用层密钥管理。
+
+#### [P2-01] GHASH 乘法按位串行实现，分支模式逐比特泄露 GHASH 认证密钥 H — High
+
+- 位置：`src/fcp/ghash.cc:7-28`
+- 涉及代码：
+```cpp
+void gf128_mul(const uint8_t a[16], const uint8_t b[16], uint8_t out[16]) {
+  uint8_t z[16] = {};
+  uint8_t v[16];
+  std::memcpy(v, b, 16);
+
+  for (int i = 0; i < 128; ++i) {
+    if ((a[i >> 3] >> (7 - (i & 7))) & 1) {
+      for (int j = 0; j < 16; ++j) {
+        z[j] ^= v[j];
+      }
+    }
+    const uint8_t lsb = static_cast<uint8_t>(v[15] & 1);
+    for (int j = 15; j > 0; --j) {
+      v[j] = static_cast<uint8_t>((v[j] >> 1) | (v[j - 1] << 7));
+    }
+    v[0] = static_cast<uint8_t>(v[0] >> 1);
+    if (lsb != 0) {
+      v[0] ^= 0xE1;
+    }
+  }
+  std::memcpy(out, z, 16);
+}
+```
+- 为什么是问题：两个**数据相关分支**。分支 2（`if (lsb != 0)`）的取值序列是 H（= E_K(0)，GCM 认证子密钥）比特移位后的直接函数 —— 128 次分支逐比特泄漏 H；分支 1 泄漏 GHASH 状态（即明文/密文的汉明重量）。每轮一次可预测分支，时序信噪比极高，且各平台一致（GHASH 没有 AES-NI 快路径）。
+- 攻击场景：同宿主/同物理核的旁路攻击者测量执行时间或分支轮廓，恢复 H；再用一条已知的 (密文, tag) 对反推 `E_K(J0) = tag ⊕ GHASH(H,A,C)`，即可为任意伪造密文计算合法 tag，**完全伪造报文**（含 HELLO，破坏握手与 FEC 控制面）。
+- 严重级别：High　置信度：确认（✓已复核；非恒定时这一事实确定，可利用性需本地时序观测能力）
+
+#### [P2-02] 软件 AES 回退路径使用 T 表，缓存时序可恢复主密钥 — High
+
+- 位置：`src/fcp/aes.cc:66-89`（表构造）、`aes.cc:147-195`（T 表轮函数）
+- 涉及代码：
+```cpp
+struct AesTables {
+  uint32_t te0[256]; uint32_t te1[256]; uint32_t te2[256]; uint32_t te3[256]; uint32_t te4[256];
+  AesTables() {
+    for (int i = 0; i < 256; ++i) {
+      const uint8_t s = kSbox[i];
+      const uint8_t s2 = xtime(s);
+      const uint8_t s3 = static_cast<uint8_t>(s2 ^ s);
+      const uint32_t t = (static_cast<uint32_t>(s2) << 24) | (static_cast<uint32_t>(s) << 16) |
+                         (static_cast<uint32_t>(s) << 8) | static_cast<uint32_t>(s3);
+      te0[i] = t; te1[i] = rotr(t, 8); te2[i] = rotr(t, 16); te3[i] = rotr(t, 24);
+      te4[i] = static_cast<uint32_t>(s) * 0x01010101u;
+    }
+  }
+};
+```
+- 为什么是问题：索引由轮密钥与状态共同决定 → 表项访问的缓存行分布与密钥强相关，是 Bernstein 式经典缓存攻击的教科书目标。`aes128_encrypt_block` 在无 AES-NI 时自动落到该路径，即 **ARM 服务器 / 老旧 x86 / 禁用 AES-NI 的环境**全部受影响。
+- 攻击场景：能观测缓存的同机 VM / 共享 L3 攻击者做 cache-timing 采样即可恢复 PSK 派生链上的 AES-128 密钥；`derive_session_key`（`envelope.cc:77-86`）直接以 PSK 为 AES 密钥，一次主密钥恢复即解密所有会话。
+- 严重级别：High　置信度：确认
+
+#### [P2-03 / P8-1] 明文 salt 参与预认证路由 → 8 字节伪造包秒杀任意会话 — **Critical**
+
+- 位置：`apps/fcp-proxy/engine.cc:223-232`（判定）、`:233`（认证才发生）；salt 明文来源 `src/fcp/envelope.cc:136-138`
+- 涉及代码：
+```cpp
+// apps/fcp-proxy/engine.cc:212-233
+  Conn* c = find_by_salt(data, len);
+  bool born = false;
+  if (c == nullptr) {
+    if (cfg_.role != EngineRole::kServer) { ++counters_.unknown_salt; return; }
+    c = create_server_conn(peer, data, now_ms);
+    if (c == nullptr) { return; }
+    born = true;
+  } else if (c->peer != peer) {
+    // Same salt, different source address: a fourth-party replay of a live
+    // session's datagram. The envelope would still authenticate (same key), so
+    // this is the only place the binding is enforceable.
+    ++counters_.salt_clash;
+    log(label(*c) + " salt replay from another address");
+    finish_conn(*c, now_ms, "salt re-bound to a new address");
+    reap(now_ms);
+    return;
+  }
+  const uint32_t auth_before = c->session->auth_fail();
+  c->session->on_wire(data, len, now_ms);
+```
+```cpp
+// src/fcp/envelope.cc:136-138
+  wire->resize(kOverhead + len);
+  std::memcpy(wire->data(), salt_, kSaltLen);      // salt 明文，每包重复
+  store_le64(nonce_ctr, wire->data() + kSaltLen);
+```
+- 为什么是问题：线上格式是 `salt(8) | nonce(8) | ciphertext | tag(12)`，**salt 在每个数据报的明文前 8 字节，每包重复**。`find_by_salt()` 用的是**未经认证的原始字节**；`c->peer != peer` 分支在真正跑 GCM 之前就执行。注释里写的「the envelope would still authenticate」是错的 —— 判定发生时根本没有认证过。AEAD 的威胁模型正是「防同路径攻击者」，这一层把 AEAD 完全绕过。
+- 触发场景 → 后果：被动嗅探任意一个 FCP 包拿到 salt → 从任意伪造源地址发一个**恰好 8 字节**的包（内容 = salt）→ 服务端命中活会话 → `finish_conn()` 拆掉受害者的 Conn → 隧道断开、app socket 关闭、`by_salt_` 条目删除。**不需要 PSK、不需要合法 tag，一个包一条隧道，可无限重复。** 客户端侧逻辑相同，因此单向即可同时打掉双向。NAT rebinding 也会误杀活会话。
+- 严重级别：Critical　置信度：确认（✓已复核）
+
+#### [P2-04] BenchEngine 用 GUI 固定 salt 作为会话 salt → 跨会话 GCM (key,IV) 重用 — **Critical**
+
+- 位置：`apps/fcp-client/bench_engine.cpp:160`；默认值 `apps/fcp-client/main_window.cpp:836`
+- 涉及代码：
+```cpp
+// apps/fcp-client/bench_engine.cpp:157-161
+void BenchEngine::beginSession() {
+  fcp::SessionConfig cfg;
+  std::memcpy(cfg.key, opt_.key.constData(), 16);
+  std::memcpy(cfg.salt, opt_.salt.constData(), 8);
+  cfg.send_direction = fcp::Direction::kC2S;
+```
+```cpp
+// apps/fcp-client/main_window.cpp:835-836
+  pskEdit_->setText(
+      settings.value("crypto/psk", "2B7E151628AED2A6ABF7158809CF4F3C").toString());
+  saltEdit_->setText(settings.value("crypto/salt", "A1B2C3D4E5F60718").toString());
+```
+- 为什么是问题：协议把「每会话唯一 salt」当作跨会话密钥隔离的全部前提（`docs/FCP_PROTOCOL_V6.md:489-499`：`session_key = AES128(PSK, salt‖0×8)`）。但 `SessionConfig::salt` 是明文线上字段且由调用方提供，库层（`Envelope` 构造函数，`envelope.cc:97-118`）**不做任何唯一性检查**。BenchEngine 直接把 GUI 里那个写死并持久化的常量 `"A1B2C3D4E5F60718"` 当会话 salt —— 每次 bench 运行都得到**同一把 session_key**，而每个会话的 nonce 计数器都从 0 起（`Envelope::send_nonce_(0)`）。
+- 攻击场景 → 后果：同时旁观两次 bench 运行的被动攻击者，直接异或两段密文即得两段明文的异或（two-time pad）；再由一对已知明文/密文恢复 GHASH 密钥 H 与 `E_K(J0)`，即可为**该 PSK 下任意后续 bench 会话**伪造合法 tag（PSK 公开时所有会话密钥都可由明文 salt 直接算出：salt 在每个包头里明文重复）。这正是 #28① 声称已修掉的「跨会话 GCM (key,IV) 重用」。
+- 严重级别：Critical　置信度：确认（✓已复核）
+
+#### [P2-05] 客户端出厂 PSK 是公开的 FIPS-197 测试向量，并被明文写入 QSettings — High
+
+- 位置：`apps/fcp-client/main_window.cpp:834-836,845-847,858,867`；`main_window.cpp:703-712`
+- 涉及代码：
+```cpp
+// apps/fcp-client/main_window.cpp:834-836
+  pskEdit_->setText(
+      settings.value("crypto/psk", "2B7E151628AED2A6ABF7158809CF4F3C").toString());
+  saltEdit_->setText(settings.value("crypto/salt", "A1B2C3D4E5F60718").toString());
+// apps/fcp-client/main_window.cpp:858-859
+  settings.setValue("crypto/psk", pskEdit_->text().trimmed());
+  settings.setValue("crypto/salt", saltEdit_->text().trimmed());
+```
+- 为什么是问题：`2B7E151628AED2A6ABF7158809CF4F3C` 是 FIPS-197 附录 C.1 的公开示例密钥，既写在公开仓库里、又是 GUI 的**出厂默认值**；同时 PSK 以**明文**持久化到 QSettings（Windows 注册表 / Linux ini），任何本机低权进程或备份都能读取。UI 里 `pskEdit_` 也没设 `echoMode=Password`。PSK 经 `main_window.cpp:703-712` 的 `options->key = QByteArray::fromHex(psk.toLatin1())` 直接进入 `ProxyEngine` 的 `cfg_.key` → `SessionConfig::key` → `Envelope`。
+- 攻击场景 → 后果：用户点"开始"即用公开密钥加密全部隧道流量 —— 链路看起来是加密的，但任何读过本仓库/本机注册表的人都能解密全部历史与实时流量，并伪造任意报文（HELLO 也在 AEAD 内，握手可被完全接管）。
+- 严重级别：High　置信度：确认（✓已复核）
+
+#### [P2-06] PSK 通过命令行 `--key=HEX32` 传入（进程表 / shell 历史可见）— Medium
+
+- 位置：`apps/fcp-proxy/cli.cc:54,149-152`
+- 涉及代码：
+```cpp
+  const std::string* key = Find(opts, "key");
+  if (key == nullptr || !ParseKey(*key, ec.key)) {
+    std::fprintf(stderr, "--key=HEX32 (16 bytes as 32 hex digits) is required\n");
+    return 1;
+  }
+```
+- 为什么是问题：密钥进入 `argv`，Linux 暴露于 `/proc/<pid>/cmdline` 与 `ps`，Windows 暴露于进程命令行查询；同样进入 shell 历史与 CI 日志。库层没有从文件/环境变量/管道读取密钥的替代入口。
+- 严重级别：Medium　置信度：确认
+
+#### [P2-07] 信封 AAD 恒为空，salt/nonce 在 AEAD 之外；外层 IP/UDP 头与会话身份未被任何密码学手段绑定 — Medium
+
+- 位置：`src/fcp/envelope.cc:140-144`（seal）、`envelope.cc:160-168`（open）
+- 涉及代码：
+```cpp
+  uint8_t iv[kGcmIvLen];
+  make_iv(nonce_ctr, send_direction_, iv);
+  uint8_t* cipher = wire->data() + kSaltLen + kNonceLen;
+  uint8_t* tag = cipher + len;
+  return gcm_seal(send_key_, iv, nullptr, 0, plain, len, cipher, tag);   // aad = nullptr, 0
+```
+- 为什么是问题：salt 与 nonce_ctr 完全在认证之外（只被间接绑定：salt 参与密钥派生、nonce 是 IV）。真正的洞是：外层 UDP/IP 头（源地址、源端口）与「哪个 peer」的绑定**没有任何密码学保护**，而代理层恰恰用明文 salt 做预认证路由（P2-03）。AEAD 本该提供的「这段流量来自那个 peer」的保证，被降级成了「这段流量的前 8 字节等于某个 salt」。
+- 严重级别：Medium　置信度：确认
+
+#### [P2-08] RS 奇偶校验用 256 项查表乘以明文字节 → 缓存时序泄露 FEC 明文 — Medium
+
+- 位置：`src/fcp/rs.cc:11-19`；表来源 `src/fcp/gf256.cc:24-30,66`
+- 涉及代码：
+```cpp
+void xor_scaled(uint8_t* dst, const uint8_t* src, size_t len, uint8_t coeff) {
+  if (coeff == 0) {
+    return;
+  }
+  const uint8_t* row = gf256_mul_table()[coeff];
+  for (size_t i = 0; i < len; ++i) {
+    dst[i] ^= row[src[i]];      // 索引 = 明文字节
+  }
+}
+```
+- 为什么是问题：FEC 奇偶符号是在**加密之前**对明文符号计算的（`session.cc:528-534` 先拼明文符号，再 `env_.seal`）。`row[src[i]]` 的访存地址由明文字节决定，缓存分布直接编码明文分布。
+- 严重级别：Medium　置信度：确认（需本地缓存观测能力）
+
+#### [P2-09] 密钥材料零擦除缺失：PSK/会话密钥/round key 多份长期驻留 — Low
+
+- 位置：`src/fcp/envelope.h:87-95`（无析构擦除）、`src/fcp/gcm.cc:70-71,85-86`、`src/fcp/envelope.cc:44-47`
+- 涉及代码：
+```cpp
+ private:
+  bool accept_nonce(uint64_t nonce_ctr);
+
+  uint8_t send_key_[16];
+  uint8_t recv_key_[16];
+  uint8_t salt_[kSaltLen];
+  Direction send_direction_;
+  Direction recv_direction_;
+  uint64_t send_nonce_;
+```
+- 为什么是问题：全仓无任何安全擦除（`memset`/`explicit_bzero`/`SecureZeroMemory` 均 0 处命中）。PSK 至少存在 4 份副本：`EngineConfig::key` → `SessionConfig::key` → `Session::cfg_` → `Envelope` 的 send/recv key；`Aes128Key`（176 字节展开轮密钥）在多个栈帧上残留。
+- 严重级别：Low　置信度：确认
+
+#### [P2-10] 认证前按攻击者控制的密文长度分配缓冲区 — Low
+
+见 [P1-9]（同一处代码，该轮从密码学角度重复发现）。
+
+#### [P2-11] salt 每包明文重复发送 ⇒ 会话可被被动关联与流量分析 — Low
+
+- 位置：`src/fcp/envelope.cc:136-138`
+- 为什么是问题：salt 是固定 8 字节会话标识且逐包明文重复；nonce_ctr 同样逐包明文递增，观测者可直接读出该方向的包序号与发送速率。与 P2-03 互为放大器。
+- 严重级别：Low　置信度：确认
+
+#### [P2-12] salt 唯一性只对「在线会话」强制，库层零校验；规范声称的密钥隔离前提无强制点 — Medium
+
+- 位置：`src/fcp/envelope.cc:97-118`（构造函数不做唯一性检查）、`apps/fcp-proxy/engine.cc:443-446`（仅查在线表）、`envelope.cc:147-153`
+- 涉及代码：
+```cpp
+Envelope::Envelope(const uint8_t key[16], const uint8_t salt[kSaltLen],
+                   Direction send_direction, Direction recv_direction)
+    : send_key_{}, recv_key_{}, salt_{}, ... {
+  uint8_t session_key[16];
+  derive_session_key(key, salt, session_key);
+  ...
+  std::memcpy(salt_, salt, kSaltLen);
+}
+```
+- 为什么是问题：`docs/FCP_PROTOCOL_V6.md:495-496` 把「服务端已有的在线 salt 查重（§14.7）保证并发会话密钥互异」当作整个密钥隔离论证的基础。但这个保证有时间窗：会话被 reap 后 salt 即从 `by_salt_` 移除（仅保留 5 秒墓碑），此后同一 salt 可被重新绑定；`Envelope` 构造函数对相同 (PSK, salt) 完全静默地产生**相同的 session_key 与相同的 nonce 空间**。任何调用方都能无声违反，而协议文档把它当作安全论证的前提。
+- 严重级别：Medium　置信度：确认（已被 P2-04 实证触发）
+
+#### [P2-13] 握手无对端身份绑定，且协商取 min() ⇒ 持有 PSK 的一方可强制关闭 FEC — Low
+
+- 位置：`src/fcp/handshake.cc:153-167`
+- 涉及代码：
+```cpp
+bool Handshake::negotiate(const HandshakeCaps& peer) {
+  const uint8_t flags = static_cast<uint8_t>(local_flags_ & peer.flags);
+  const uint8_t required = static_cast<uint8_t>(kCapFraming | kCapFecstat);
+  if ((flags & required) != required) {
+    fail(HandshakeError::kMissingCapability);
+    return false;
+  }
+  params_.d = std::min(local_d_, peer.data);
+  params_.p = std::min(local_p_, peer.parity);
+  params_.flags = flags;
+  params_.mode = params_.p == 0 ? SessionMode::kFramedStats : SessionMode::kFramedRepair;
+```
+- 为什么是问题：HELLO/HELLO_ACK 确实整体在 AEAD 内（`handshake.h:4-5`），无 PSK 者无法伪造或降级 —— 这点实现是**对的**。但协商结果只由 `min()` 决定，且不存在任何「会话身份」概念：任何持有 PSK 的一方都可把 `parity` 报成 0，使 `mode = kFramedStats`（FEC 完全关闭），受害者无从察觉。
+- 严重级别：Low　置信度：确认
+
+---
+
+### 2.3 第 3 轮 — 协议解析与状态机
+
+#### [P3-1] 接收窗口锚点可被单个分片「跳到未来」，之后真实数据全部被判 stale — High
+
+- 位置：`src/fcp/frame_rx.cc:113-124`（锚点推进）、`src/fcp/frame_rx.cc:64-73`（stale 判据）
+- 涉及代码：
+```cpp
+// src/fcp/frame_rx.cc:115-124
+  const bool had_anchor = anchor_valid_;
+  const uint32_t prev_anchor = anchor_;
+  if (!anchor_valid_ || set_id_after(anchor_, hdr.set_id)) {
+    anchor_ = hdr.set_id;
+    anchor_valid_ = true;
+    prune_retired();
+  }
+  if (had_anchor && set_id_after(prev_anchor + 1, hdr.set_id)) {
+    create_placeholders(prev_anchor + 1, hdr.set_id, now_ms);
+  }
+```
+```cpp
+// src/fcp/frame_rx.cc:68-71
+  if (anchor_valid_ &&
+      static_cast<uint32_t>(anchor_ - hdr.set_id) > kMaxActiveSets &&
+      static_cast<uint32_t>(anchor_ - hdr.set_id) < 0x80000000u) {
+    ++stale_;
+    return;
+  }
+```
+- 为什么是问题：`set_id_after()` 只做半窗模比较，**对跳变幅度没有任何上限**。`kMaxGapPlaceholders = 64` 只限制"补建占位集合"的数量（`create_placeholders` 在 `gap > 64` 时直接 return，`frame_rx.cc:231`），**但锚点早已在第 117-119 行被无条件推到远端**。锚点是 stale 判据的基准 —— 锚点一旦跳到 X，真实发送方的 set_id 此后**连续约 X-真实值 个集合全部落在 stale 区**。规范 §4.5 只说"窗口锚点 = 本端已见最大 set_id"，没有授权这种无界跳变。
+- 触发场景 → 后果：发送 **1 个** `set_id = 真实值 + 1_000_000` 的合法 AEAD 数据分片 → 接收端锚点跳到 1e6 → 之后真实流量全部 stale（按 50 set/s 计约 **5.5 小时**收不到任何数据），KCP/FCP-STREAM 的重传也全被这一层挡掉（stale 在解密后、交付前 return）。
+- 严重级别：High　置信度：确认（✓已复核）
+
+#### [P3-2] 对端 FIN 偏移可被后到的 FIN 覆盖，EOF 永不投递且 FIN 永不被确认 — High
+
+- 位置：`src/fcp/stream.cc:299-302`（写）、`src/fcp/stream.cc:251-258`（读）
+- 涉及代码：
+```cpp
+// src/fcp/stream.cc:299-302
+  if (fin) {
+    peer_fin_ = true;
+    peer_fin_at_ = data_end;
+  }
+  deliver_prefix(now_ms);
+  emit_ack();
+```
+```cpp
+// src/fcp/stream.cc:251-258
+uint32_t Stream::cum_out() const {
+  // Once the peer's fin is contiguous with what we delivered, its pseudo byte
+  // counts as acknowledged too, so the sender can close without a second ack.
+  if (peer_fin_ && seq_at_or_after(rcv_nxt_, peer_fin_at_)) {
+    return rcv_nxt_ + 1;
+  }
+  return rcv_nxt_;
+}
+```
+- 为什么是问题：`peer_fin_at_` 是「对端流的终点」，是**一次性不变量**。代码在每次收到带 FIN 标志的段时无条件覆盖它，没有"已置位则必须一致"的检查。后果是双向死锁：(1) 覆盖后 `cum_out()` 永远返回 `rcv_nxt_`（不带 fin 的 +1）→ 对端 FIN 永远得不到累积确认 → 发送侧反复重传 FIN；(2) `deliver_prefix` 里的 `seq_at_or_after(rcv_nxt_, peer_fin_at_)` 永不成立 → **本地应用永远收不到 EOF**。同时 `stream.cc:277` 的"FIN 之后的数据"检查用的是可被改写的 `peer_fin_at_`，等于给对端一个"把流终点往后推"的合法手段。
+- 触发场景 → 后果：对端发一个 FIN 段把 `peer_fin_at_` 推到真实终点之后（受 `rcv_buf_bytes` 窗口限制）→ 接收方 EOF 永不触发、累积 ACK 停在旧点 → 双方互相重传到 `idle_timeout_ms`（默认 300 s）超时。数据本身不丢，但连接被"挂死"且持续消耗带宽。
+- 严重级别：High　置信度：确认（✓已复核）
+
+#### [P3-3] 解密前没有报文长度上限：单个 64 KB UDP 包 = 64 KB 分配 + 约 4000 个 AES 块 — Medium
+
+- 位置：`src/fcp/session.cc:102-117`、`src/fcp/envelope.cc:147-178`
+- 涉及代码：
+```cpp
+// src/fcp/session.cc:102-117
+void Session::on_wire(const uint8_t* wire, size_t len, int64_t now_ms) {
+  std::vector<uint8_t> plain;
+  if (!env_.open(wire, len, &plain)) {
+    ++auth_fail_;
+    sync_report_counters();
+    return;
+  }
+
+  // Authenticated but outside the MTU budget every conforming peer obeys
+  // (§4.5): reject before it can inflate a set's symbol_max, the decode
+  // buffers, or the pre-negotiation data cache.
+  if (limits_.valid && plain.size() > kFecHdrLen + limits_.symbol_max) {
+```
+- 为什么是问题：**MTU 预算是"认证之后"才检查的**，而 `env_.open()` 在其之前已经按对端给的 `len` 做了 `vector<uint8_t> decoded(cipher_len)` 的堆分配 + 完整 GCM 解密。`len` 只受 UDP 上限约束（最大 65507），因此攻击者可让服务端对每个包做 **64 KB 分配 + 约 4200 个 AES 块**，而正常包只有 1.3 KB（约 85 块）—— CPU/内存 churn 放大约 50 倍。全链路无速率限制。
+- 严重级别：Medium　置信度：确认
+
+#### [P3-4] `decoded_once` 把"重建结果结构非法"当成终态，该集合此后再也无法被 FEC 修复 — High
+
+- 位置：`src/fcp/frame_rx.cc:374-386`、`src/fcp/frame_rx.cc:423-451`
+- 涉及代码：
+```cpp
+// src/fcp/frame_rx.cc:374-386
+  std::vector<size_t> missing;
+  bool any_untried = false;
+  for (size_t i = 0; i < set->n; ++i) {
+    if (!set->orig_mask.test(i) && !set->recov_mask.test(i)) {
+      missing.push_back(i);
+      if (!set->decoded_once.test(i)) {
+        any_untried = true;
+      }
+    }
+  }
+  if (missing.empty() || !any_untried) {
+    return;
+  }
+```
+```cpp
+// src/fcp/frame_rx.cc:423-451
+  for (const size_t i : missing) {
+    if (set->decoded_once.test(i)) {
+      continue;  // structurally rejected earlier; never retried
+    }
+    set->decoded_once.set(i);
+    const std::vector<uint8_t>& s = recovered[i];
+    if (s.size() != symbol_max) { ++struct_fail_; continue; }
+    const size_t declared = static_cast<size_t>(s[0]) | (static_cast<size_t>(s[1]) << 8);
+    bool ok = declared >= 2 && declared <= symbol_max;
+    for (size_t b = declared; ok && b < symbol_max; ++b) {
+      if (s[b] != 0) { ok = false; }
+    }
+    if (!ok) { ++struct_fail_; continue; }
+```
+- 为什么是问题：规范 §4.5 明确要求"**每条新分片（未存过的 index）到达触发一次解码**"，即解码是**幂等重试**语义；而这里的 `decoded_once` 是**一次性闩锁**：只要某次解码返回了结构非法的重建，该下标即被永久标记，整个集合的解码路径**永久关闭** —— 哪怕之后又收到新的、能救回该下标的 parity。触发"一次非法重建"并不需要攻击者：`symbol_max` 是"已收符号长度的最大值"，只要集合里先到了一条比发送端 `symbol_max` 短的 data，而在 parity 到达之前 `symbol_max` 还停在较小值上，就可能先解出与真实 `symbol_max` 不一致的结果 → 尾部非零 → 闩锁落下。
+- 后果：FEC 冗余被静默放弃（只能靠上层 ARQ 重传），且 `struct_fail` 计数被污染（把一次正常的重建失败记成结构错误）。
+- 严重级别：High　置信度：确认（闩锁逻辑确定；触发前提依赖到达时序）
+
+#### [P3-5 / P8-2] 接收端不校验 `k ≤ 协商得到的 P'`，对端可用一个非法 `k` 毒化整个集合并放大缓冲 — High
+
+- 位置：`src/fcp/frame_rx.cc:87,127`、`src/fcp/frame_rx.cc:388-395`、`src/fcp/rs.cc:40`
+- 涉及代码：
+```cpp
+// src/fcp/frame_rx.cc:87
+  const uint8_t k_field = hdr_k(hdr.type_k);
+// src/fcp/frame_rx.cc:127
+  if (!note_k(&set, k_field)) {
+    ++struct_fail_;
+    return;
+  }
+```
+```cpp
+// src/fcp/frame_rx.cc:318-325
+bool FrameRx::note_k(RxSet* set, uint8_t k) {
+  if (set->k_known) {
+    return set->k == k;
+  }
+  set->k = k;
+  set->k_known = true;
+  return true;
+}
+```
+```cpp
+// src/fcp/frame_rx.cc:388-395
+  const size_t n = set->n;
+  const size_t k = set->k;                       // ← 来自对端，未与 p_ 比较
+  if (missing.size() > k || set->symbol_max < 2) {
+    return;
+  }
+  const size_t symbol_max = set->symbol_max;
+
+  std::vector<std::vector<uint8_t>> padded(n + k, std::vector<uint8_t>(symbol_max, 0));
+```
+- 为什么是问题：`hdr_k()` 只是取 3 bit（0..7），`validate_hdr`（`hdr.cc:46-55`）只校验 `j < k` 与 `n = index - j ∈ [1, d]`，**没有任何地方把 `k` 与协商出的 `P'` 比较**。`p_` 这个成员在 `frame_rx.cc` 里只被用于算 `s = d_ + p_`（`frame_rx.cc:75`）。三个后果：
+  - **集合毒化**：`note_k` 是"先到先定"，冲突即 `struct_fail` 并**丢弃该分片**。对端只要先送来一个 `k=7` 的 data 分片，本组内发送端后续所有携带 `k=3`（真实计划值）的分片全部被判冲突丢弃 → 该集合的所有 data 永久丢失。
+  - **统计口径被放大**：`settle.cc:148-150` 用 `view.k` 累加 `parity_expected` → `k=7` 而实际只发 3 条 parity → `parity_expected` 虚高 2.3 倍。
+  - **内存/CPU 放大**：`try_decode` 在**每个数据符号**（`frame_rx.cc:153`）和**每个 parity 符号**（`:166`）到达时都被调用，只要 `symbol_count >= n` 且仍有缺失，每次调用都重新分配 `n+k` 个 `symbol_max` 大小的缓冲。默认 `--d=10` 时约 25 KB/包（18 倍放大）；`--d=250 --p=6` 时约 262×1338 ≈ **350 KB/包（250 倍放大）**，且 `rs.cc:40` 的 `n + k > kRsMaxShards` 守卫让解码永远失败 → 纯浪费。
+- 严重级别：High　置信度：确认（✓已复核）
+
+#### [P3-6] FCP-OPEN 的域名分支不做字符校验，与 SOCKS5 分支不对称 → 目标串可注入日志/拨号 — Medium
+
+- 位置：`src/fcp/proxy_proto.cc:431-482`（OPEN），对比 `proxy_proto.cc:250-260`（SOCKS5）
+- 涉及代码：
+```cpp
+// src/fcp/proxy_proto.cc:436-442（OPEN 域名分支）
+  if (consumed != nullptr) {
+    *consumed = total;
+  }
+  if (out != nullptr) {
+    out->atyp = atyp;
+    out->addr.assign(reinterpret_cast<const char*>(buf + 7), addr_len);
+    out->port = port;
+  }
+  return OpenParse::kOk;
+```
+```cpp
+// src/fcp/proxy_proto.cc:255-262（SOCKS5 域名分支）
+    for (size_t i = 0; i < addr_len; ++i) {
+      if (!host_char_ok(buf[off + i])) {
+        return Socks5Parse::kMalformed;
+      }
+    }
+```
+- 为什么是问题：SOCKS5 的域名必须通过 `host_char_ok`（`proxy_proto.cc:9-20`，只允许 `A-Za-z0-9.-_`），而 **OPEN 的 `kAtypDomain` 分支一个字节都不校验**（`addr_len` 只受 1..255 限制）。该 `addr` 会 ① 原样进入 `ProxyTarget::addr`；② 由 `target_text()`（`proxy_proto.cc:145-147`）原样拼进 `ProxyEngine::label()`（`engine.cc:1057-1064`）→ 进日志行；③ 被 `Reactor::dial()` 原样交给 `getaddrinfo`（`reactor.cc:712-760`）。
+- 触发场景 → 后果：对端注入 `\r\n`、`\x00`、空格 → 日志行可被伪造/撕裂（log injection），且 `addr.c_str()` 会在内嵌 NUL 处截断 → **日志里显示的目标与实际拨号的目不一致**（审计与取证被污染）。
+- 严重级别：Medium　置信度：确认
+
+#### [P3-7] 代理层没有任何目标地址策略：HTTP CONNECT 一律降级为域名，服务器照单拨号（含环回/内网）— Medium
+
+- 位置：`src/fcp/proxy_proto.cc:402-406`、`apps/fcp-proxy/reactor.cc:712-760`
+- 涉及代码：
+```cpp
+// src/fcp/proxy_proto.cc:402-406
+  if (target != nullptr) {
+    target->atyp = kAtypDomain;
+    target->addr = host;
+    target->port = port;
+  }
+  return HttpParse::kOk;
+```
+- 为什么是问题：注释说"目标一律 `kAtypDomain`，解析在远端做"（`proxy_proto.cc:153-158`），于是 **IP 字面量也走域名解析**，而 `Reactor::dial` 先 `inet_pton` 再落到解析器队列，**两条路都没有任何"私网/环回/链路本地/link-metadata"判定**。代码里连"可配置拒绝列表"的钩子都没有 —— 这是**缺失的校验**而非实现偏差。
+- 触发场景 → 后果：`CONNECT 169.254.169.254:80` → 服务端去拨云元数据地址；`CONNECT 127.0.0.1:6379` → 打到服务器本机的 Redis。是否可利用取决于部署形态，但协议层没有任何拦截点。
+- 严重级别：Medium　置信度：确认（缺失项；是否算缺陷取决于产品定位）
+
+#### [P3-8] 结构错误只有一个 `struct_fail` 计数器：不可恢复的协议违规与可恢复的偶发错帧不可区分 — Low
+
+- 位置：`src/fcp/hdr.h:76-88`、`src/fcp/frame_rx.cc:79-103`
+- 涉及代码：
+```cpp
+enum class HdrStatus : uint8_t {
+  kOk = 0,
+  kIndexPastS,
+  kDataIndexPastD,
+  kJNotBelowK,
+  kBadN,
+  kDataPastKnownN,
+  kInvalidType,  // type outside data/parity/oob (3 is undefined since #25)
+};
+```
+- 为什么是问题：`HdrStatus` 精心分了 7 类（"对端几何讲错了" vs "这个对端根本不懂协议"），但 **`FrameRx` 把它们全部折叠成同一个 `struct_fail_` 计数器**，既不区分"这一片丢了"（可恢复）还是"这个对端在胡说"（不可恢复），也从不据此断连。对端可以持续发送结构非法的分片，会话永远保持 `kEstablished`，只在后台安静地涨 `struct_fail`。
+- 严重级别：Low　置信度：确认
+
+---
+
+### 2.4 第 4 轮 — 并发与时序竞态
+
+> **该轮的重要结构性结论**：整个代理/引擎栈实际上是**单线程**的 —— `ProxyEngine`、`Session`、`Stream` 均无内部锁，且注释明确写着"One logical thread per session; no internal locks"。唯一的真并发点是 `Reactor` 的 4 个 detached 解析线程，而它的互斥量用法本身是正确的（无锁内回调、无锁序问题）。全库未发现任何 `std::atomic` 参与的数据竞争（唯一的 atomic 是信号标志）。
+> 因此本轮的问题几乎全部集中在 **Qt 适配层的容器迭代失效、异步回调的跨轮次失效、以及生命周期/退出顺序**三处，而非锁序或内存序。
+
+#### [P4-1] `finishEngine()` 的 `killSockets` 在遍历 `locals_` 时被同步 `disconnected()` 回调移除 → use-after-free — High
+
+- 位置：`apps/fcp-client/proxy_host.cpp:609-616`，配合 `proxy_host.cpp:437-446`
+- 涉及代码：
+```cpp
+// apps/fcp-client/proxy_host.cpp:609-616
+  auto killSockets = [](QHash<uint64_t, QTcpSocket*>& m) {
+    for (auto it = m.begin(); it != m.end(); ++it) {
+      it.value()->abort();          // ← 同步发出 disconnected()
+      it.value()->deleteLater();
+    }
+    m.clear();
+  };
+  killSockets(locals_);
+```
+```cpp
+// apps/fcp-client/proxy_host.cpp:437-446
+    connect(sock, &QTcpSocket::disconnected, this, [this, conn_copy] {
+      if (engine_ != nullptr && locals_.contains(conn_copy)) {
+        engine_->on_local_closed(conn_copy, static_cast<int64_t>(clock_.elapsed()));
+      }
+      locals_.remove(conn_copy);    // ← 在 killSockets 的遍历中移除当前元素
+      ...
+    });
+```
+- 为什么是问题：`QAbstractSocket::abort()` 会**同步**发出 `disconnected()`。于是 `it.value()->abort()` 在栈上直接调用了 `disconnected` 槽 → `locals_.remove(conn_copy)` 把当前元素从 `locals_` 中删掉。`QHash::remove` 只保证"指向被删元素的迭代器失效"，回到 `for` 头部执行 `++it` 时解引用已释放的节点 → **堆 use-after-free**。同文件的 `sweepDials()`（`proxy_host.cpp:587-593`）是先 `erase` 再 `abort()`（写法正确），说明这里是漏改。
+- 后果：代理"停止"时随机崩溃 / 内存被破坏。
+- 严重级别：High　置信度：确认（✓已复核）
+
+#### [P4-2 / P5-01] `onTick()` 遍历 `locals_` 时引擎回调 `app_close()` 会 erase 该 map 的当前元素 → 迭代器失效 — High
+
+- 位置：`apps/fcp-client/proxy_host.cpp:541-547,548-554`，`proxy_host.cpp:265-274`，`apps/fcp-proxy/engine.cc:991-998`
+- 涉及代码：
+```cpp
+// apps/fcp-client/proxy_host.cpp:541-554
+  for (auto it = locals_.constBegin(); it != locals_.constEnd(); ++it) {
+    QTcpSocket* sock = it.value();
+    if (sock != nullptr && sock->bytesAvailable() > 0 &&
+        engine_->wants_local_read(it.key())) {
+      readLocal(it.key());          // → engine_->on_local_bytes → reap() → app_close()
+    }
+  }
+  for (auto it = targets_.constBegin(); it != targets_.constEnd(); ++it) {
+    ...
+      readTarget(it.key());
+  }
+```
+```cpp
+// apps/fcp-client/proxy_host.cpp:265-274
+void ProxyHost::appClose(uint64_t conn) {
+  auto local = locals_.constFind(conn);
+  if (local != locals_.constEnd()) {
+    QTcpSocket* sock = local.value();
+    locals_.erase(local);            // ← 在上面那个 range-for 迭代中修改被遍历的 QHash
+    sock->disconnectFromHost();
+  }
+```
+```cpp
+// apps/fcp-proxy/engine.cc:991-998（reap：先销毁 Conn，再同步通知宿主关 socket）
+      by_conn_.erase(it);
+      --counters_.live;
+      ...
+      if (host_.app_close) {
+        host_.app_close(id);          // 同步调用 → locals_.erase()
+      }
+```
+- 为什么是问题：`ProxyEngine::on_local_bytes()` 末尾必调 `reap(now_ms)`；`parse_entry()` 在遇到畸形 SOCKS5/HTTP 请求时直接 `finish_conn()` → `reap()` → `host_.app_close()` → `locals_.erase()`。这条链是**同步**的，而 `onTick()` 正在对同一个 `locals_`/`targets_` 做 range-for 迭代。被 erase 的正是当前迭代器指向的元素，`++it` 之后就是对已失效节点解引用 —— QHash 节点被摘链/释放后继续自增属于未定义行为。CLI 版 `reactor.cc` 的 `for (const auto& e : locals_)` 有同构风险（`flush_conn` → `app_close` → `locals_.erase`）。
+- 触发场景 → 后果：**任何本地进程**（端口扫描、telnet 探测、错误协议）发一个畸形 greeting → `finish_conn("malformed SOCKS5 greeting")` → 同步 erase → 崩溃或静默跳过条目。
+- 严重级别：High　置信度：确认（✓已复核）
+
+#### [P4-3] `ProxyHost::resolveServer()` 的异步解析回调存在 ABA：重启代理后旧回调仍会生效 — Medium
+
+- 位置：`apps/fcp-client/proxy_host.cpp:168-208`
+- 涉及代码：
+```cpp
+  resolving_ = true;
+  const QString name = opt_.server;
+  QHostInfo::lookupHost(name, this, [this, name](const QHostInfo& info) {
+    resolving_ = false;                 // ← 把新一轮的 resolving_ 标志清掉
+    if (engine_ == nullptr) return;     // ← 只判空，不判"是不是本轮的解析"
+    ...
+    server_addr_ = picked;               // ← 用旧一轮的解析结果覆盖新配置
+    onServerReady();
+  });
+```
+- 为什么是问题（check-then-act）：第 1 轮 `start(A)` 的 lookup 在飞行中 → 用户 stop（`engine_.reset()`）→ 再 `start(B)` → 第 1 轮的回调才回来，此时 `engine_ != nullptr`（已是第 2 轮的引擎）→ `server_addr_` 被写成 **A 的地址**，而 `opt_.port`/PSK 仍是 B 的 → 代理把 B 的密钥发往 A 的地址（密钥与端点错配）。
+- 严重级别：Medium　置信度：确认
+
+#### [P4-4] `BenchEngine::start()` 同样的 ABA：旧一轮的 DNS 回调把新一轮的测试连到旧服务器 — Medium
+
+- 位置：`apps/fcp-client/bench_engine.cpp:61-133`
+- 涉及代码：
+```cpp
+  setState(State::kResolving);
+  QHostInfo::lookupHost(opt_.host, this, [this](const QHostInfo& info) {
+    if (state_ != State::kResolving) { return; }   // ← 只判状态，不判轮次
+    ...
+    connectTo(addr);                                 // ← addr 属于旧的一轮
+  });
+```
+- 为什么是问题：旧轮次的回调在新一轮上通过了"状态检查" → 用 B 的 PSK 与 B 的端口去连 A。
+- 严重级别：Medium　置信度：确认
+
+#### [P4-5] 解析线程 `detach()` 且从不 join：`~Reactor` 在 worker 仍阻塞于 `getaddrinfo()` 时返回 — Medium
+
+- 位置：`apps/fcp-proxy/reactor.cc:250-252`、`134-163`、`713-749`
+- 涉及代码：
+```cpp
+  for (size_t i = 0; i < kResolverWorkers; ++i) {
+    std::thread([queue = resolve_]() { resolve_worker(queue); }).detach();
+  }
+```
+```cpp
+Reactor::~Reactor() {
+  {
+    const std::lock_guard<std::mutex> lock(resolve_->mutex);
+    resolve_->stopping = true;
+  }
+  resolve_->wake.notify_all();
+  ... 关闭所有 socket ...
+}                                  // ← 没有 join，worker 可能仍在 getaddrinfo() 中
+```
+- 为什么是问题：队列本身是安全的（`stopping` 在锁内置位、`wait` 谓词会重新检查、worker 持 `shared_ptr` 保证队列存活），**但没有 join**。线程 A 卡在 `getaddrinfo()`（DNS 超时可达数秒～数十秒），线程 B 的 `~Reactor` 置 `stopping` 后立即返回 → 进程 `exit()`，此时线程 A 仍在系统调用中。
+- 严重级别：Medium　置信度：确认
+
+#### [P4-6] 主机回调违反 engine.h 的「不得回调进引擎」契约 — Medium（存疑）
+
+- 位置：`apps/fcp-proxy/engine.cc:812-829`、`apps/fcp-proxy/engine.h:80-81`、`reactor.cc:665-711`
+- 涉及代码：
+```cpp
+void ProxyEngine::flush_dials() {
+  if (in_flush_dials_ || !host_.dial) return;
+  in_flush_dials_ = true;
+  while (!dial_queue_.empty()) {
+    const uint64_t id = dial_queue_.back();
+    dial_queue_.pop_back();
+    Conn* c = find(id);
+    if (c == nullptr || c->closing || c->phase != Phase::kDialing) continue;
+    host_.dial(id, c->target);      // ← 传的是 Conn 内部成员的引用
+  }
+  in_flush_dials_ = false;
+}
+```
+- 为什么是问题：`engine.h:80-81` 明确写着"Every function may be called many times per tick and **must not call back into the engine**"，但 `Reactor::dial` 与 `ProxyHost::dial` 都在主机回调里直接调 `engine_.on_dial_result()`。此时 `flush_dials()` 正持有 `Conn* c`，且 `c->target` 是**指向 Conn 内部成员的引用**；嵌套的 `on_dial_result` → `send_open_error` → `finish_conn` → `reap()` → `by_conn_.erase()` 会**销毁该 Conn**。目前两个主机实现都恰好在调用嵌套函数前把 target 拷进了局部变量 —— **是巧合而非契约保证**。
+- 严重级别：Medium　置信度：存疑（未找到当前可实际触发的 UAF，但契约已被破坏）
+
+#### [P4-7] `Reactor::run()` 的 tick 刷新循环用 range-for 遍历 `locals_`/`targets_`，而回调可能 erase — Low（存疑）
+
+- 位置：`apps/fcp-proxy/reactor.cc:339-355,786-802`
+- 涉及代码：
+```cpp
+      engine_.on_tick(now);
+      for (const auto& e : locals_) {
+        if (engine_.pending_app_bytes(e.first) != 0) {
+          flush_conn(e.first, now);      // ← → engine_.on_app_writable → 可能 → app_close
+        }
+      }
+```
+- 严重级别：Low　置信度：存疑（当前不可达）
+
+#### [P4-8] `appClose()` 对未连接的 socket 调 `disconnectFromHost()`：`disconnected()` 永不发出，socket 永久泄漏 — Low
+
+- 位置：`apps/fcp-client/proxy_host.cpp:265-289`
+- 涉及代码：
+```cpp
+    locals_.erase(local);
+    sock->disconnectFromHost();   // ← UnconnectedState 时直接 return，不会发 disconnected()
+```
+- 为什么是问题：`QAbstractSocket::disconnectFromHost()` 在 `UnconnectedState` 下直接返回，**不会**发出 `disconnected()`；而 `deleteLater()` 只写在 `disconnected` 槽里。于是"连接失败/尚未连上就被拆掉"的目标 socket 永远不会被 `deleteLater()`。
+- 严重级别：Low　置信度：确认
+
+#### [P4-9] `~ProxyHost` 期间发出 `finished()` 信号，槽函数运行在「正在析构」的 MainWindow 上 — Low（存疑）
+
+- 位置：`apps/fcp-client/proxy_host.cpp:59-63`、`main_window.cpp:789-799`
+- 涉及代码：
+```cpp
+ProxyHost::~ProxyHost() {
+  if (engine_ != nullptr) { stop(); }   // → finishEngine → Q_EMIT finished(result)
+}
+```
+```cpp
+void MainWindow::onProxyFinished(const ProxyHost::Result& result) {
+  ...
+  updateButtons();          // ← proxy_->running()：读一个正在析构的 ProxyHost 的 state_
+}
+```
+- 严重级别：Low　置信度：存疑
+
+#### [P4-10] 每连接接收缓冲 `app_in` 无硬上限：无视通告窗口的对端可让代理内存无界增长 — Medium
+
+- 位置：`apps/fcp-proxy/engine.cc:889-900,864-887`
+- 涉及代码：
+```cpp
+void ProxyEngine::on_stream_bytes(Conn& conn, const uint8_t* data, size_t len) {
+  if (conn.closing) return;
+  if (conn.phase == Phase::kTunnel) {
+    append_bytes(&conn.app_in, data, len);   // ← 无上限追加
+    flush_app(conn);
+    return;
+  }
+```
+- 为什么是问题：`app_in` 只靠"把窗口调小"来间接约束对端（`set_delivery_pending` → `rwnd_out()`），**没有任何本地硬上限**；`flush_app` 里 `host_.app_send` 返回 0 时只是 `break`，`app_in` 继续增长。这与 `engine.h:20-22` 宣称的"§7.8 限定每连接内存"不一致 —— `send_window_bytes`/`rcv_buf_bytes` 约束的是发送侧和乱序缓冲，`app_in` 不在其中。
+- 严重级别：Medium　置信度：确认
+
+#### [P4-11] 信号处理器里写 `std::atomic<bool>`；`std::signal` 在 POSIX 上会 SA_RESTART 掉 select — Low
+
+- 位置：`apps/fcp-proxy/reactor.cc:99-101,261-262`
+- 涉及代码：
+```cpp
+std::atomic<bool> g_signalled{false};
+void OnSignal(int) { g_signalled.store(true); }
+...
+  std::signal(SIGINT, OnSignal);
+  std::signal(SIGTERM, OnSignal);
+```
+- 为什么是问题：(a) `std::atomic<bool>::store` 在标准中**不是** async-signal-safe；(b) `g_signalled` 是命名空间级静态对象，其析构顺序相对于 `std::signal` 注册的处理函数没有保障 —— 若信号在静态析构期到达，写一个已析构的 atomic。
+- 严重级别：Low　置信度：确认
+
+---
+
+### 2.5 第 5 轮 — 错误处理与资源生命周期
+
+> **该轮的正面结论**：`apps/fcp-client/main_window.cpp`（纯 Qt 控件代码）与 `src/fcp/{aes,gf256,ghash,rs,cauchy}.cc`（纯算法、无 I/O 与资源）已通读，未发现错误处理/资源管理类问题。
+
+#### [P5-02] POSIX 下无 SIGPIPE 忽略，write 到已关闭对端会直接杀死整个代理进程 — High
+
+- 位置：`apps/fcp-proxy/reactor.cc:848-858`（触发点）、`reactor.cc:261-262`（只处理了 SIGINT/SIGTERM）
+- 涉及代码：
+```cpp
+// apps/fcp-proxy/reactor.cc:848-858
+size_t Reactor::app_send(uint64_t conn, const uint8_t* data, size_t len) {
+  Sock s = first_sock_of(locals_, conn);
+  if (s == kBadSock) {
+    s = first_sock_of(targets_, conn);
+  }
+  if (s == kBadSock || len == 0) {
+    return 0;
+  }
+  const int n = ::send(s, reinterpret_cast<const char*>(data), static_cast<int>(len), 0);
+  return n > 0 ? static_cast<size_t>(n) : 0;
+}
+```
+```cpp
+// apps/fcp-proxy/reactor.cc:261-262  —— 全文唯一的 signal 设置
+  std::signal(SIGINT, OnSignal);
+  std::signal(SIGTERM, OnSignal);
+```
+- 为什么是问题：全仓 `grep SIGPIPE|MSG_NOSIGNAL|SO_NOSIGPIPE|sigaction` **零命中**（✓已复核）。在 Linux/macOS 上，对端已关闭的 TCP 套接字调用 `send()` 会先返回 EPIPE **并向进程投递 SIGPIPE**，默认动作是终止进程。`CMakeLists.txt` 明确支持 gcc/clang（非 MSVC 分支有 `-maes` 与覆盖率门禁），说明 POSIX 是受支持的部署目标。
+- 触发场景 → 后果：用户取消下载 / 浏览器提前关闭连接 → 代理仍向该 socket 写剩余字节 → `send()` → EPIPE → SIGPIPE → **整个 fcp-proxy 进程被杀死，所有并发隧道一起断**。
+- 严重级别：High（POSIX 上等同 Critical）　置信度：确认（✓已复核）
+
+#### [P5-03] `Reactor::app_send` 把「致命错误」与「would block」压成同一个返回值 — Medium
+
+- 位置：`apps/fcp-proxy/reactor.cc:848-858`；契约 `apps/fcp-proxy/engine.h:83-88`；消费点 `apps/fcp-proxy/engine.cc:864-876`
+- 涉及代码：
+```cpp
+// apps/fcp-proxy/engine.h:83-88
+  // Write bytes to the application socket on the other end of this
+  // connection -- the local one on the client, the dialed target on the
+  // server. Returns how many the socket accepted; the engine keeps the rest
+  // and lets the advertised window close. 0 with a non-empty buffer means
+  // "would block".
+  std::function<size_t(uint64_t conn, const uint8_t* data, size_t len)> app_send;
+```
+```cpp
+// apps/fcp-proxy/engine.cc:864-876
+void ProxyEngine::flush_app(Conn& conn) {
+  while (!conn.app_in.empty()) {
+    if (!host_.app_send) {
+      break;
+    }
+    const size_t n = host_.app_send(conn.id, conn.app_in.data(), conn.app_in.size());
+    if (n == 0) {
+      break;                    // ← 无法区分 EAGAIN / EPIPE / ECONNRESET
+    }
+```
+- 为什么是问题：`send()` 返回 -1 时，无论 errno 是 EAGAIN（可重试）还是 EPIPE/ECONNRESET（连接已死、不可重试），`app_send` 一律返回 0。引擎据此认为"socket 暂时满了"，把字节留在 `app_in` 里继续等可写事件。致命错误没有任何日志、没有任何计数器，连接只能等 `flush_grace_ms`(2s) 或 `idle_timeout_ms`(300s) 的宽限钟兜底被砍。
+- 严重级别：Medium　置信度：确认
+
+#### [P5-04] `Reactor::wire_send` 完全丢弃 `send`/`sendto` 的返回值 — Medium
+
+- 位置：`apps/fcp-proxy/reactor.cc:886-900`
+- 涉及代码：
+```cpp
+void Reactor::wire_send(uint64_t peer, const uint8_t* wire, size_t len) {
+  if (udp_ == kBadSock) {
+    return;
+  }
+  if (opt_.role == EngineRole::kClient) {
+    ::send(udp_, reinterpret_cast<const char*>(wire), static_cast<int>(len), 0);
+    return;                       // 返回值丢弃
+  }
+  ...
+  ::sendto(udp_, reinterpret_cast<const char*>(wire), static_cast<int>(len), 0,
+           reinterpret_cast<const sockaddr*>(&to), sizeof(to));   // 返回值丢弃
+}
+```
+- 为什么是问题：UDP 发送失败（ENOBUFS 发送缓冲满、EMSGSIZE 报文过大、ENETUNREACH）与"发送成功"完全无法区分。**EMSGSIZE 尤其致命**：它意味着 `--mtu` 配得比路径 MTU 大，**每一个** FCP 报文都被丢掉，而上层看到的是"链路在丢包"，FEC 会不断加 k 去做无用功（自伤式放大）。
+- 严重级别：Medium　置信度：确认
+
+#### [P5-05] Qt 客户端 `wireSend` / 首包 backlog 丢弃 `writeDatagram` 返回值 — Medium
+
+- 位置：`apps/fcp-client/proxy_host.cpp:291-302,210-224`
+- 涉及代码：
+```cpp
+// apps/fcp-client/proxy_host.cpp:291-302
+void ProxyHost::wireSend(uint64_t, const uint8_t* wire, size_t len) {
+  if (server_addr_.isNull()) {
+    if (wire_backlog_.size() < kWireBacklogMax) {
+      wire_backlog_.emplace_back(wire, wire + len);
+    } else if (!wire_backlog_.empty()) {
+      Q_EMIT logLine("服务端地址未就绪，首批 wire 报文已丢弃");
+    }
+    return;
+  }
+  udp_.writeDatagram(reinterpret_cast<const char*>(wire),
+                     static_cast<qint64>(len), server_addr_, opt_.port);
+  // 返回值未检查：-1 时（EMSGSIZE / ENOBUFS / 网络不可达）报文静默丢失
+}
+```
+- 严重级别：Medium　置信度：确认（注意同仓库 `bench_engine.cpp:182-186` 是对的 —— 同一仓库两种写法并存，说明是疏漏而非设计）
+
+#### [P5-06] 关闭时未排空发送队列：Qt 端 `finishEngine` 用 `abort()` — Medium
+
+- 位置：`apps/fcp-client/proxy_host.cpp:600-635`（abort）、`:265-289`（注释里承认的正确做法）
+- 涉及代码：
+```cpp
+// apps/fcp-client/proxy_host.cpp:265-289 —— appClose：作者明确知道 abort() 会丢尾巴
+void ProxyHost::appClose(uint64_t conn) {
+  // The engine only calls this once the tunnel is done, so whatever is still
+  // queued for the application socket is real data: disconnectFromHost()
+  // flushes the write buffer before closing, the way the CLI's closesocket()
+  // does. abort() would drop those bytes (seen live as truncated downloads,
+  // ~380 bytes lost at the tail).
+  ...
+    sock->disconnectFromHost();
+```
+```cpp
+// apps/fcp-client/proxy_host.cpp:600-624 —— 但 finishEngine 用的正是 abort()
+void ProxyHost::finishEngine(bool ok, const QString& why) {
+  tick_.stop();
+  engine_.reset();                       // ← 引擎连同 app_in 一起被析构
+  ...
+  auto killSockets = [](QHash<uint64_t, QTcpSocket*>& m) {
+    for (auto it = m.begin(); it != m.end(); ++it) {
+      it.value()->abort();                // ← 丢弃内核写缓冲
+      it.value()->deleteLater();
+    }
+    m.clear();
+  };
+```
+- 为什么是问题：三处"关闭不排空"叠加成一条数据丢失链：(1) `engine_.reset()` 在 socket 关闭之前执行，引擎 `Conn::app_in` 里尚未被 socket 接受的字节被析构丢弃；(2) `finishEngine` 用 `abort()` 而不是 `disconnectFromHost()`，把 Qt 写缓冲里的尾巴也丢掉 —— 这正是同一文件 appClose() 注释里亲口承认会造成"truncated downloads, ~380 bytes lost at the tail"的写法。
+- 严重级别：Medium　置信度：确认
+
+#### [P5-07] 控制器 trace 的 `fwrite`/`fclose` 返回值全部忽略，且无逐行 flush — Medium
+
+- 位置：`apps/fcp-proxy/engine.cc:34-54`
+- 涉及代码：
+```cpp
+SessionConfig::TraceFn make_trace_sink(const std::string& prefix, uint64_t cid) {
+  ...
+  std::shared_ptr<std::FILE> file(std::fopen(path.c_str(), "wb"),
+                                  [](std::FILE* f) {
+                                    if (f != nullptr) {
+                                      std::fclose(f);        // 返回值忽略
+                                    }
+                                  });
+  if (file == nullptr || file.get() == nullptr) {
+    return nullptr;                       // 打不开时静默降级，无任何日志
+  }
+  return [file](const TraceEntry& e) {
+    std::string line;
+    encode_trace_line(e, &line);
+    line.push_back('\n');
+    std::fwrite(line.data(), 1, line.size(), file.get());   // 返回值忽略，且无 fflush
+  };
+}
+```
+- 为什么是问题：短写/失败（磁盘满、quota 超限、网络盘掉线）被完全忽略；FILE\* 是全缓冲的，每行既不 `fflush` 也不 `fsync`，进程被 kill 或崩溃时缓冲区里的最后若干行全部丢失且无痕迹。`fopen` 失败时静默返回 nullptr —— 而 trace 正是 `fcp_replay` 的唯一输入，缺失会直接让标定流程得出错误结论。
+- 严重级别：Medium　置信度：确认
+
+#### [P5-08] 每个 FEC set 固定约 6 KB 头部开销 × 256 set × 256 session，内存可放大到数百 MB — Medium
+
+- 位置：`src/fcp/frame_rx.h:145-165`、`src/fcp/frame_rx.cc:277-316`
+- 涉及代码：
+```cpp
+  struct RxSet {
+    uint32_t set_id = 0;
+    SetPhase phase = SetPhase::kActive;
+    ...
+    std::bitset<kMaxS> orig_mask;
+    std::bitset<kMaxS> recov_mask;
+    std::bitset<kMaxS> parity_mask;
+    std::bitset<kMaxS> decoded_once;
+    std::array<std::vector<uint8_t>, kMaxS> symbols;   // 256 × 24B = 6144B
+  };
+```
+- 为什么是问题：`std::array<std::vector<uint8_t>, 256>` 是**值成员**，每个 RxSet 光是 vector 头就占 6144 字节。每个 session 的 set 上限是 `kMaxActiveSets = 256` → 单 session 约 1.6 MB；服务端 `max_sessions` 默认 256 → 上限约 400 MB 的纯结构性开销。而集合实际最多只放 `D+P ≤ 28` 个符号（默认 13 个）—— **被放大约 50 倍**。
+- 严重级别：Medium　置信度：确认
+
+#### [P5-09] `open_udp` / `open_listener` 的失败路径不关闭已创建的 socket — Low
+
+- 位置：`apps/fcp-proxy/reactor.cc:165-207,209-233`
+- 涉及代码：
+```cpp
+    if (inet_pton(AF_INET, opt_.remote_host.c_str(), &remote.sin_addr) != 1) {
+      *error = "--remote must be an IPv4 address, got '" + opt_.remote_host + "'";
+      return false;                       // ← udp_ 描述符没有 close
+    }
+```
+```cpp
+  if (::bind(listener_, ...) != 0) {
+    *error = "listener bind " + ...;
+    return false;                         // ← listener_ 没有 close
+  }
+```
+- 为什么是问题：错误分支上已创建的描述符没有就地释放，只能靠 `~Reactor()` 兜底。`Reactor` 是可复用组件（`start()` 公开可重复调用），一旦上层重试启动，前一次的 socket 会被覆盖赋值而永久泄漏。
+- 严重级别：Low　置信度：确认
+
+#### [P5-10] `fcp_bench` 的 UDP 发送失败只计数不中止，且 `Recv` 无法区分 EAGAIN 与致命错误 — Medium
+
+- 位置：`tools/fcp_bench.cc:147-175,304-318,519`
+- 涉及代码：
+```cpp
+  bool Recv(uint8_t* buf, size_t cap, size_t* len) {
+    ...
+    const int n = static_cast<int>(::recvfrom(...));
+    if (n <= 0) {
+      return false;                     // EAGAIN 与 ECONNREFUSED 等价
+    }
+```
+```cpp
+        if (!ep.Send(wire, len)) {
+          ++tx_fail;                     // 只计数，benchmark 继续跑
+        }
+```
+- 为什么是问题：(1) `Recv` 把 EAGAIN（正常）和 ECONNREFUSED/ECONNRESET（ICMP 端口不可达等致命错）压成同一个 false；(2) `Send` 失败只累加 `tx_fail`，bench 继续跑完 18 秒并打印 `RESULT ... up_mbps=...`，退出码仍是 0 —— 一个 100% 发失败的 run 和一个成功的 run 在返回值上无法区分。
+- 严重级别：Medium　置信度：确认
+
+#### [P5-11] `fcp_replay` 读 trace 时忽略 `ferror`，且 `fgets` 固定 4 KB 会把长行切成多行 — Low
+
+- 位置：`tools/fcp_replay.cc:25-41`
+- 涉及代码：
+```cpp
+std::vector<std::string> ReadLines(const char* path) {
+  std::vector<std::string> lines;
+  std::FILE* f = std::fopen(path, "rb");
+  if (f == nullptr) {
+    return lines;                        // 打开失败：空列表
+  }
+  char buf[4096];
+  while (std::fgets(buf, sizeof(buf), f) != nullptr) {
+```
+- 严重级别：Low　置信度：确认（`1fcdebe` 已给 `fcp_replay` 加参数校验，此处主要剩 `ferror` 未查）
+
+#### [P5-12] `ProxyHost::connectTarget` 向 `targets_` 插入时若键已存在，旧套接字被静默覆盖而不关闭 — Low（存疑）
+
+- 位置：`apps/fcp-client/proxy_host.cpp:355-364`
+- 涉及代码：
+```cpp
+  auto* sock = new QTcpSocket(this);
+  sock->setProxy(QNetworkProxy::NoProxy);
+  TargetSock entry;
+  entry.sock = sock;
+  targets_.insert(conn, entry);        // ← 键已存在时覆盖旧值，旧 socket 无人关闭
+```
+- 严重级别：Low　置信度：存疑（正常路径下每 conn 只拨一次，需要异常时序才能触发）
+
+---
+
+### 2.6 第 6 轮 — 业务逻辑与不变量（文档 vs 实现）
+
+#### [P6-1] ACK 谎报防线的上界用的是「已分配偏移」而非「已发出偏移」→ 谎报 cum 可弹掉未发出的段并永久丢数据 — High
+
+- 位置：`src/fcp/stream.cc:386-395`（防线本体）、`stream.cc:155-163` 与 `:183-196`（未发段的存在性）
+- 涉及代码：
+```cpp
+// src/fcp/stream.cc:384-395
+  const uint32_t cum = get_u32(seg + 1);
+  // #30 adversarial hardening: the peer can never legitimately acknowledge
+  // bytes we have not sent. Accepting such a cum would pop every unacked
+  // segment and strand the data for good (the receiver does not have it
+  // either). A lying oversized rwnd is harmless — send_space() is clamped by
+  // our own send window — but a lying cum is data loss.
+  if (seq_after(cum, snd_nxt_)) {
+    ++bad_segs_;
+    return;
+  }
+```
+```cpp
+// src/fcp/stream.cc:155-163  —— 分配偏移与实际发出是分离的
+  while (max_payload > 0 && !tx_pending_.empty()) {
+    PendingSeg seg;
+    seg.offset = snd_nxt_;
+    ...
+    snd_nxt_ += static_cast<uint32_t>(n);      // ← 分配即推进
+    tx_.push_back(std::move(seg));             // 先入队，不受窗口约束
+  }
+```
+```cpp
+// src/fcp/stream.cc:183-196 —— 只有前一段真正发出，其余仍在 tx_ 里 unsent
+    if (!forced && in_flight_ + seg.wire_len() > allowed) {
+      break;
+    }
+    ...
+    seg.sent = true;      // 未走到的段 sent=false，仍留在 tx_
+```
+```cpp
+// src/fcp/stream.cc:442-458
+    while (!tx_.empty()) {
+      const PendingSeg& front = tx_.front();
+      const uint32_t front_end = front.offset + static_cast<uint32_t>(front.wire_len());
+      if (seq_after(front_end, cum)) {
+        break;  // still partly unacked
+      }
+      if (front.sent) {
+        ...
+        bytes_acked_ += front.bytes.size();
+      }
+      tx_.pop_front();      // ← sent==false 的段也被弹出，且从未发出
+    }
+    snd_una_ = cum;
+```
+- 违反的文档条款：`docs/FCP_M3_CONTROL.md` §变更记录 #30 第 ① 条（"`cum > snd_nxt` 的 ACK 会弹光全部未确认段并把数据永久搁浅……`handle_ack` 入口拒绝"）；以及代码注释自身声称的不变量"the peer can never legitimately acknowledge bytes we have not sent"。
+- 为什么是问题：`snd_nxt_` 在**段被分配**时就推进（`stream.cc:161`），而真正发出的最高 offset 是另一个值。防线只挡住了 `cum > snd_nxt_`，没挡住 `cum > 已发出的最高 offset`。更关键的是弹出循环 `tx_.pop_front()` **无视 `front.sent`** —— 未发出的段被弹出，其字节既不计入 `bytes_acked_`（`if (front.sent)` 为假）也从队列消失。
+- 触发场景 → 后果：应用写入 1 MB 但对端窗口只有 64 KB 时，`tx_` 里躺着大量 `sent==false` 的段而 `snd_nxt_` 已推进到 1 MB。一个被 PSK 认证但恶意/有 bug 的对端只要发一个 `cum` 落在 `(snd_una_, snd_nxt_)` 区间内 → 未发出的段全部被弹出 → **应用数据被静默丢弃**，同时 `bytes_queued_ - bytes_acked_` 仍把它们算作占用窗口 → 发送侧永久卡住。
+- 严重级别：High　置信度：确认（✓已复核）
+
+#### [P6-2] 账本校正的「门不满足」路径没有清掉旧的 `p_eff`，陈旧账本值可无限期把 k 顶住 — Medium
+
+- 位置：`src/fcp/strategy.cc:186-193,237-245`
+- 涉及代码：
+```cpp
+// src/fcp/strategy.cc:186-193
+  double p_use = loss;
+  update_p_eff(stat);
+  if (have_p_eff_ && last_p_eff_ > p_use) {
+    p_use = last_p_eff_;
+  }
+  const uint8_t k_target = k_for(p_use, d_, p_max_, target_recovery_);
+```
+```cpp
+// src/fcp/strategy.cc:237-245
+void FecStrategy::update_p_eff(const FecstatPacket& stat) {
+  if ((stat.flg & kFlgLedger) == 0) {
+    return;  // pre-M3 peer; normal, not counted as a skip
+  }
+  have_p_eff_ = false;
+  if (stat.ledger_groups < kMinLedgerGroups) {
+    ++ledger_skipped_;
+    return;
+  }
+```
+- 违反的文档条款：`docs/FCP_PROTOCOL_V6.md` §8.1、`docs/FCP_M3_CONTROL.md` §1.2（"门全部不满足（旧端、样本不足、k 错位）⇒ 行为与 M1 完全一致（`p_use = p_observed`）"）。
+- 触发场景 → 后果：`flg` bit3 不置位时 `update_p_eff` 直接 return，**没有**把 `have_p_eff_` 清成 false，于是上一份报告算出的 `last_p_eff_` 被继续用于 `p_use = max(loss, last_p_eff_)`。而发送侧 `reporter.cc:131-133` 只在 `c.ledger_groups > 0` 时才置 `kFlgLedger` —— 一次没有满编组的区间就会丢掉 bit3。此后链路改善（loss 20%→1%）时，陈旧的 `p_eff`（例如 0.25）持续把 `k_target` 顶在 3~4 → 无谓的 parity 开销，正好是 §14.11 要防的"冗余正反馈"。
+- 严重级别：Medium　置信度：确认
+
+#### [P6-3] FEC/ARQ 浪费重传计数器 `dup_after_recovered` 在真实发送路径上不可达，M4 的测量仪恒为 0 — High
+
+- 位置：`src/fcp/frame_rx.cc:139-147`（计数点）；`src/fcp/frame_tx.cc:44-61,94-153`（发送端从不复用 set_id）
+- 涉及代码：
+```cpp
+// src/fcp/frame_rx.cc:139-147
+    if (set.recov_mask.test(index)) {
+      // Already credited as recovered; masks must stay disjoint or settlement
+      // would double count this index. #31: this is also the FEC/ARQ waste
+      // signal — the sender's retransmission raced the parity and lost.
+      ++late_dup_;
+      ++dup_after_recovered_;
+      emit_event(RxEvent::kDataDuplicate, 0);
+      return;
+    }
+```
+```cpp
+// src/fcp/frame_tx.cc:44-47 —— 每个输出段都进当前集合，set_id 只增不减
+  TxSymbol out;
+  out.set_id = set_id_;
+  out.index = n_;
+```
+- 违反的文档条款：`docs/FCP_M4_EVAL.md` §1.1（"测量仪（已就位，#31）：接收端 `dup_after_recovered` 计数——槽位被 parity 修复后又收到原始副本 = 重传输掉了与 parity 的赛跑 = 纯浪费。已贯通到代理 stats 行（`duprec=N`）"）。
+- 为什么是问题：ARQ 重传（Stream 的 RTO/dup-ACK 重发）经 `Session::on_kcp_output → FrameTx::on_kcp_output` 重新成帧时，`set_id_` 已经递增（新集合）、`index` 也是新 index（`frame_tx.cc:46,75,102,148` 全部单调，✓已复核）。而 `recov_mask` 只可能出现在**已闭合**（收到 parity 才会 decode）的旧集合上 —— ARQ 副本永远落在另一个集合的另一个槽位上。于是 `set.recov_mask.test(index)` 在生产路径上恒为 false，该计数器只在 `tests/frame_rx_test.cc:498-533` 手工注入同 set_id 同 index 的合成帧时才 +1。
+- 后果：代理 stats 行的 `duprec=N`（`reactor.cc:1020`）恒为 0，M4 触发器 1.1 的"duprec / (recovered + rtx segments) ≥ 10%"永远无法被真实数据判定 → M4 #32 的 WAN 复测会得出"浪费为 0、候选 1.1 不触发"的**假阴性结论**。
+- 严重级别：High　置信度：确认（✓已复核）
+
+#### [P6-4 / P10-04] 会话侧的样本门与策略侧的样本门口径不一致 — Medium
+
+- 位置：`src/fcp/session.cc:409,430-444`；`src/fcp/strategy.cc:120-130`
+- 涉及代码：
+```cpp
+// src/fcp/strategy.cc:120-130  —— D3：强制报告样本门降到 64
+  const bool forced_interval = stat.interval_ms >= kFecstatMaxIntervalMs - 5000;
+  const uint32_t min_samples = forced_interval ? kMinSamplePackets / 4 : kMinSamplePackets;
+  if (stat.data_expected < min_samples) {
+    ++small_sample_reports_;
+    return;
+  }
+```
+```cpp
+// src/fcp/session.cc:409（策略已先行生效）
+  strategy_->on_report(stat, queued);
+...
+// src/fcp/session.cc:438-444  —— 会话侧仍用固定 256
+  if (stat.data_expected < kMinSamplePackets) {
+    char line[96];
+    std::snprintf(line, sizeof(line),
+                  "FEC sample too small: expected=%u",
+                  stat.data_expected);
+    log(line);
+    return;                      // ← 直接返回，后面的 FECSTAT/预算状态行全被跳过
+  }
+```
+- 违反的文档条款：`docs/FCP_M3_CONTROL.md` §5 第 2 条（"D3 慢链路样本门：interval ≥ 55s 的强制报告样本门降至 64、入门阈值加倍"）；`docs/FCP_PROTOCOL_V6.md` §10 的 FECSTAT 日志行格式与 §8.2 的 `FEC capped:` / `FEC budget restored:` 状态迁移行。
+- 触发场景 → 后果：慢链路走 60s 强制上报、且 `64 ≤ data_expected < 256` 时，策略侧用 64 的门正常工作（k 被真实驱动），会话侧用 256 的门判定"样本过小"并 `return` → (a) §10 规定的 FECSTAT 统计行整行不输出（pre/usable/lost 在最需要的慢链路区间全部丢失）；(b) `session.cc:485-495` 的预算状态迁移行位于这个 `return` 之后 → **CAPPED 的进入与回落完全不可见**，而 k 其实已经因预算被降过。
+- 严重级别：Medium　置信度：确认
+
+#### [P6-5] 快重路径重传的是 `tx_.front()`（可能是已被 SACK 的段），不是文档承诺的「第一个未确认洞」— Medium
+
+- 位置：`src/fcp/stream.cc:423-437`（快重）、`:469-481`（SACK 标记与 `fill_holes`）
+- 涉及代码：
+```cpp
+// src/fcp/stream.cc:423-437
+  if (dup_acks_ >= kDupAckThresh && !tx_.empty() && tx_.front().sent) {
+    dup_acks_ = 0;
+    PendingSeg& first = tx_.front();
+    first.sent_ms = now_ms;
+    first.retrans = true;
+    ++retransmits_;
+    emit_seg(first);
+  }
+```
+```cpp
+// src/fcp/stream.cc:469-481  —— 正确的"洞"语义在这里（跳过 sacked）
+  if (sack_end != sack_start) {
+    for (size_t i = 0; i < tx_.size(); ++i) {
+      PendingSeg& s = tx_[i];
+      ...
+      if (s.sent && seq_at_or_after(s.offset, sack_start) &&
+          seq_at_or_after(sack_end, s_end)) {
+        s.sacked = true;
+      }
+    }
+    fill_holes(sack_start, now_ms);
+  }
+```
+- 违反的文档条款：`docs/FCP_M3_CONTROL.md` §4 与 §4.1 第 2 条（"快重：同一 sn 的重复 ACK 计数 ≥ 3 ⇒ 立即重传第一个未确认洞，不等 RTO"）。
+- 触发场景 → 后果：对端收到段 0 但缺段 3（cum 卡在 0，SACK 块覆盖 3 之后）时，`tx_.front()` 是段 0 —— 它已被对端 SACK 确认收到，快重把一个**对端已有**的段重发一遍（纯浪费，且计入 `retransmits_`），真正的洞毫发无损。而 M3 §4.1 第 2 条要解决的正是"补洞重传再丢 → 洞卡到 RTO"这一场景。`fill_holes` 有 `s.sacked` 保护而快重没有，两条修复路径口径不一致。
+- 严重级别：Medium　置信度：确认
+
+#### [P6-6] 尾丢集合被重建后原已交付的分片被遗忘，该组 `pre_repair_loss` 虚高到接近 100% — Medium
+
+- 位置：`src/fcp/settle.cc:100-113`、`src/fcp/frame_rx.cc:277-316`
+- 涉及代码：
+```cpp
+// src/fcp/settle.cc:105-113
+      } else if (now_ms - view.t_first_ms >= kTailDropMs) {
+        ++counters_.sets_tail_dropped;
+        // Its data was already delivered to KCP: keep the delivered-vs-
+        // accounted invariant closed by remembering how much that is.
+        counters_.tail_delivered +=
+            static_cast<uint32_t>((view.orig_mask | view.recov_mask).count());
+        rx_->release_set(id);
+        continue;
+      }
+```
+```cpp
+// src/fcp/frame_rx.cc:312-315  —— 重建：orig_mask / recov_mask 全部归零
+  RxSet& set = sets_.emplace(set_id, RxSet{}).first->second;
+  set.set_id = set_id;
+  set.t_first_ms = now_ms;
+  return set;
+```
+- 违反的文档条款：`docs/FCP_PROTOCOL_V6.md` §5.2 已知边界（#23⑨）称"方向为低估 `expected`、少报丢包，诊断量受损但**不污染策略**——不要当 bug 修"。
+- 触发场景 → 后果：一个开了超过 1s 的集合被尾丢 → 集合状态被 `release_set` 抹掉 → 后续分片到达时 `get_or_create` 建出一个 `orig_mask` 全空的**新**集合 → 该组结算时 `n_used = n`（来自 parity）而 `orig = 0` → `data_expected += n`、`data_rx_orig += 0`，于是这一组被记成"n 个包全丢"，尽管其中一部分早已交付。文档承认"pre_repair_loss 虚高"，却断言"不污染策略" —— 实际上这份虚高的 `pre` 正是策略的输入（`strategy.cc:132-134`），会把 k 无谓地顶上去。
+- 严重级别：Medium　置信度：确认
+
+#### [P6-7] FECSTAT 的字节计数器是 u32 累加，长区间会回绕，预算比值可算出荒谬值并误触发 CAPPED — Low
+
+- 位置：`src/fcp/reporter.cc:31-32,101-104`；`src/fcp/strategy.cc:163-171`
+- 涉及代码：
+```cpp
+// src/fcp/reporter.cc:31-32
+void FcpReporter::add_data_bytes(uint32_t bytes) { data_bytes_ += bytes; }
+void FcpReporter::add_parity_bytes(uint32_t bytes) { parity_bytes_ += bytes; }
+```
+- 触发场景 → 后果：强制报告窗口最长 60s。区间内数据字节超过 4 GiB 时 `data_bytes_` 静默回绕（例如 4.2 GiB → 0.2 GiB），而 `parity_bytes_` 若未回绕则比值暴涨到几十倍 → 策略立刻判定"超预算"进入 CAPPED 并把 k 一路降到 1。回绕时的链路吞吐门槛约 570 Mbps × 60s —— 局域网/专线可达。
+- 严重级别：Low　置信度：确认
+
+#### [P6-8] 规范正文 §5.2/§5.3 的 late_guard / 墓碑上限仍是 500ms / 1s，与实现的 700ms / 1400ms 相反 — Low
+
+- 位置：`src/fcp/settle.h:30-36`；`docs/FCP_PROTOCOL_V6.md:412,466`
+- 涉及代码：
+```cpp
+// src/fcp/settle.h:30-36
+constexpr int64_t kLateGuardMinMs = 100;
+// #29a (§14.14): raised to match the handshake backoff's RTT <= ~700ms door
+// (decision #27); the old 500/1000 caps misjudged in-flight fragments as lost
+// on high-RTT links. Direction-safe: the guard only decides when to settle.
+constexpr int64_t kLateGuardMaxMs = 700;
+constexpr int64_t kTombstoneMinMs = 200;
+constexpr int64_t kTombstoneMaxMs = 1400;
+```
+- 为什么是问题：变更只写在 §14.14 和 M3 文档里，规范正文与实现直接冲突；`docs/FCP_M2_PROXY.md:91,244` 仍写 `clamp(RTT,100,500)`。按规范正文实现/审计的人会得到完全错误的结论。
+- 严重级别：Low　置信度：确认
+
+#### [P6-9] OFF→ON 的入口直接跳到 `k_for(loss)`，完全绕过账本校正 — Medium
+
+- 位置：`src/fcp/strategy.cc:137-156,219-226`
+- 涉及代码：
+```cpp
+// src/fcp/strategy.cc:137-156（OFF 分支：全程没有调用 update_p_eff）
+  if (state_ == FecState::kOff) {
+    if (cooldown_reports_ > 0) { ... }
+    if (loss >= 0.015 * (forced_interval ? 2.0 : 1.0)) {
+      enter_on(loss);
+    } else if (loss >= 0.008 * (forced_interval ? 2.0 : 1.0)) {
+      if (++consec_ge_08_ >= 2) { enter_on(loss); }
+    } else { consec_ge_08_ = 0; }
+    return;
+  }
+```
+```cpp
+// src/fcp/strategy.cc:219-226
+void FecStrategy::enter_on(double loss) {
+  state_ = FecState::kOn;
+  k_ = k_for(loss, d_, p_max_, target_recovery_);   // 只用均值，账本未参与
+```
+- 违反的文档条款：`docs/FCP_PROTOCOL_V6.md` §8.1（"校正（发送端，ON 态、每报告）：门：bit3 且 ledger_groups ≥ 64 且 主导 k == 当前 k；`p_use = max(p_observed, p_eff)`"）。
+- 触发场景 → 后果：`update_p_eff` 只在 ON 分支里被调用，OFF 期间不解析 bit3、也不保留账本值；因此重新进入 ON 的那一刻 `k = k_for(loss)` 是纯二项答案。Gilbert–Elliott 链路上均值 10% 给 `k_for=2`，而账本给出的等效 `p_eff≈0.17` 对应 `k=3` —— 入口这一步把 k 直接压到 2，随后要靠 ±1 限速再花一个报告周期才爬回 3，正是 M3 §3/T35 想修的"突发下欠保护"。
+- 严重级别：Medium　置信度：确认
+
+---
+
+### 2.7 第 7 轮 — 数学与算法正确性（GF(2^8) / RS / Cauchy）
+
+> **该轮的正面结论**：`gf256.cc` 的 exp/log 表、生成元 2 与 0x11D、`mul` 表索引上界（`log[a]+log[b] ≤ 508 < 512`）、`gf256_inv/pow` 的指数运算均**正确**；`cauchy_invert_matrix` 的增广 Gauss-Jordan（列主元 + 行交换 + 双方同缩放）**正确**，奇异时返回 false；`rs::decode` 的矩阵构造/求逆/RHS/回代**方向与维度全对**；`rs_test.cc` 的 golden parity 与 `cauchy_test.cc` 的 golden 矩阵互相印证了实现与冻结 wire 格式一致。**本轮未发现 GF/RS/Cauchy 内部计算错误。**
+
+#### [P7-1] `cauchy_coeff` 的 `k+c≤255` 前置条件只写在注释里；`rs::encode` 缺少 `rs::decode` 已有的 `n+k≤256` 守卫 — Medium
+
+- 位置：`src/fcp/cauchy.cc:9-11`、`src/fcp/cauchy.h:21-22`、`src/fcp/rs.cc:23-26` 与 `:40-42`
+- 涉及代码：
+```cpp
+// src/fcp/cauchy.cc:9-11
+uint8_t cauchy_coeff(size_t r, size_t c, size_t k) {
+  return gf256_inv(static_cast<uint8_t>(r ^ (k + c)));
+}
+```
+```cpp
+// src/fcp/cauchy.h:21-22
+// C[r][c] with r < k, c arbitrary. Requires k + c <= 255.
+uint8_t cauchy_coeff(size_t r, size_t c, size_t k);
+```
+```cpp
+// src/fcp/rs.cc:23-26  —— encode 侧唯一的守卫
+void encode(const uint8_t* const* data, size_t n, size_t k, size_t symbol_max,
+            uint8_t** parity_out) {
+  if (k == 0 || n == 0) {
+    return;
+  }
+```
+```cpp
+// src/fcp/rs.cc:40-42  —— decode 侧有上界守卫，encode 侧没有
+bool decode(const uint8_t* const* symbols, size_t n, size_t k, size_t symbol_max,
+            std::vector<std::vector<uint8_t>>* recovered) {
+  if (recovered == nullptr || n == 0 || n + k > kRsMaxShards) {
+    return false;
+  }
+```
+- 为什么是问题（数学机制）：柯西矩阵的列参数是 `y_c = k + c`，存进 `uint8_t` 即隐式 **mod 256**。合法性依赖两点：(a) `y` 集合内部互异；(b) `y` 集合与 `x` 集合 `{0..k-1}` 不交。这两点只有在 `k + n - 1 ≤ 255` 时由构造保证。一旦 `k + c > 255`，`y_c` 回绕：(1) 可能与 `x_r` 相撞 → 分母 `r ^ (k+c) == 0`；(2) 两个不同的 `c` 映射到同一 `y` → **两列完全相同**。柯西矩阵的 MDS 性质（"any square submatrix is invertible"）的前提就此失效。`encode` 没有任何 `n + k ≤ 256` 的检查而 `decode` 有 —— 两条路径的几何守卫不对称。
+- 触发场景 → 后果：任何绕过 `Session`/`Handshake` 配置层直接调用 `rs::encode` 的调用方传入 `n+k ≥ 257` → 编码器**静默成功**，产出非 MDS 的 parity；对端 `rs::decode` 因 `n+k > kRsMaxShards` 立刻返回 false → **FEC 静默失效**（无崩溃、无告警）。当前产品路径暂时安全（`session.cc:41-46` 的 `d+p ≤ 256`、`handshake.cc:13-21`、`frame_tx.cc:63` 三层共同保证），但**约束被放在配置层而不是 codec 层**。
+- 严重级别：Medium　置信度：确认（✓已复核）
+
+#### [P7-2] `gf256_inv(0)`/`gf256_div(a,0)` 静默返回 0，与头文件承诺相矛盾 — Medium
+
+- 位置：`src/fcp/gf256.cc:43-49`、`src/fcp/gf256.h:19-23`
+- 涉及代码：
+```cpp
+// src/fcp/gf256.cc:43-49
+uint8_t gf256_div(uint8_t a, uint8_t b) {
+  return a == 0 ? 0 : tables().mul[a][gf256_inv(b)];
+}
+
+uint8_t gf256_inv(uint8_t a) {
+  return a == 0 ? 0 : tables().exp[255 - tables().log[a]];
+}
+```
+```cpp
+// src/fcp/gf256.h:19-23
+// a / b. Returns 0 when a == 0; b must be non-zero.
+uint8_t gf256_div(uint8_t a, uint8_t b);
+
+// Multiplicative inverse; 0 maps to 0 so singular matrices surface as failures.
+uint8_t gf256_inv(uint8_t a);
+```
+- 为什么是问题（数学机制）：注释承诺"0 maps to 0 **so singular matrices surface as failures**"。但在 `cauchy_coeff` 里这个 0 **不会**浮现为失败：`gf256_inv(0) == 0` 直接变成一个 **0 系数**，既不报错也不可区分于"合法系数恰为 0"。分母为 0 → 该 (r,c) 系数为 0，矩阵不再是柯西矩阵（非 MDS），且只能事后靠"高斯消元找不到主元"才发现奇异，**发现点在 decode 而不是 encode**。`gf256_div(a, 0)` 静默返回 0（即"除以零 = 0"），无任何诊断。
+- 后果升级点：由于 FEC 重建的 data **没有逐片 AEAD 校验**（`docs/FCP_PROTOCOL_V6.md` §4.5 明示"重建的 data 没有逐片 AEAD 验证"），错误字节会被直接交给 KCP/上层，无第二道防线。
+- 严重级别：Medium　置信度：确认（✓已复核）
+
+#### [P7-3] FECSTAT 用「唯一单调键 + 同内容双发」，导致键未推进的合法新报告被对端判为 duplicate 丢弃 — Medium
+
+- 位置：`src/fcp/fecstat.cc:134-156`、`src/fcp/reporter.cc:149-156`、`src/fcp/settle.cc:176-178`
+- 涉及代码：
+```cpp
+// src/fcp/fecstat.cc:145-155
+  if (have_last_) {
+    if (out->accounted_through_set_id == last_set_id_) {
+      return FecstatStatus::kDuplicate;
+    }
+    if (!set_id_after(last_set_id_, out->accounted_through_set_id)) {
+      return FecstatStatus::kStale;
+    }
+  }
+  have_last_ = true;
+  last_set_id_ = out->accounted_through_set_id;
+  return FecstatStatus::kOk;
+```
+```cpp
+// src/fcp/reporter.cc:149-156
+    // #28⑤ (F3): FECSTAT travels over an oob datagram that is never
+    // retransmitted, so one lost copy would blind the peer's strategy for a
+    // full report period ... The 128-byte report is sent twice; the receiver's
+    // monotonic key classifies the copy as kDuplicate and ignores it.
+    send_(wire, sizeof(wire));
+    send_(wire, sizeof(wire));
+```
+```cpp
+// src/fcp/settle.cc:176-178
+  if (accounted_through_ == 0 || set_id_after(accounted_through_, view.set_id)) {
+    accounted_through_ = view.set_id;
+  }
+```
+- 为什么是问题：「同一份报告发两份」与「一份新报告但单调键没推进」在 wire 上**不可区分**（两者 `accounted_through_set_id` 相同）。验证器用 `==` 判 `kDuplicate` 并**静默丢弃**整份报告。`accounted_through_` 只在 `account()` 里推进；若某个上报周期内没有任何集合被结算（全部走 tail-drop，或只有 `auth_fail`/`struct_fail` 有增量），键保持不变 → 该周期的报告在端被当成 duplicate 丢掉。
+- 触发场景 → 后果：链路长时间只有丢包/鉴权失败而无成功结算的集合（正是最需要 FEC 提升 k 的场景）→ 对端持续收不到可用样本 → `k` 长时间停在 0（FEC off）。而 duplicate 报告**不会**被计入"无 FECSTAT"告警（`fecstat_rx_pending_` 只在 `kOk` 时置位）→ **告警也不触发**。这是控制回路里的一次静默丢样本。
+- 严重级别：Medium　置信度：确认
+
+#### [P7-4] `settle::identity_ok()` 是恒等式，结算不变量自检几乎不可能失败 — Low
+
+- 位置：`src/fcp/settle.cc:221-254`
+- 涉及代码：
+```cpp
+// src/fcp/settle.cc:249-254
+bool FcpSettle::identity_ok() const {
+  const int64_t sum = static_cast<int64_t>(counters_.data_rx_orig) +
+                      counters_.data_recovered_dl + data_lost() +
+                      counters_.data_late_rx;
+  return sum == static_cast<int64_t>(counters_.data_expected);
+}
+```
+- 为什么是问题（数学机制）：`data_lost()` 是**按定义**取残差 `expected − orig − recov_dl − late_rx`，于是 `identity_ok()` 恒为 `max(0, expected−X) + X == expected`，只要残差非负就自动成立。它只能抓到"过计"，抓不到"少计/错计"。真正想守的不变量是 `data_expected == Σ(每集合 n_used)` 这类**跨计数器**关系，现在无法由该函数证明。附带一个真实的量纲问题：`data_recovered_late`（结算后到达的重建）**没有**进入 `data_lost()` 的残差 → 一次"迟到重建"在账上仍被记为 lost → 对端看到的丢包率被**高估**（`strategy.cc:132-135` 正是用这个量算 loss）。
+- 严重级别：Low　置信度：确认
+
+#### [P7-5] `session.cc` 里 `data_rx_orig + data_recovered_dl` 是 uint32 裸加，可能回绕 — Low
+
+- 位置：`src/fcp/session.cc:446-458`
+- 涉及代码：
+```cpp
+  const uint32_t usable_part =
+      stat.data_expected > stat.data_rx_orig + stat.data_recovered_dl   // ← uint32 加法
+          ? stat.data_expected - stat.data_rx_orig - stat.data_recovered_dl
+          : 0;
+```
+- 为什么是问题：两个 `uint32_t` 相加，和 ≥ 2^32 时回绕成小值，随后的判据就反了，`usable_part` 会被算成巨大数，`ppm_of` 随之给出 > 1e6 ppm 的"可用丢包率"。同文件上一行的 `lost_signed` 用 `int64_t` 做了提升、`pre` 用了饱和式比较 —— 作者知道这里的坑，只是 `usable` 这一处漏了。
+- 严重级别：Low　置信度：确认（域缺陷确定，可达性存疑）
+
+#### [P7-6] `k_for` 的二项模型按「满组 d+k 个包」建模，实际组只有 `n + ceil(k·n/d)` 个包 — Low（存疑）
+
+- 位置：`src/fcp/strategy.cc:33-41`、`src/fcp/frame_tx.cc:110-115`、`src/fcp/settle.cc:148-150`
+- 涉及代码：
+```cpp
+// src/fcp/strategy.cc:33-41
+uint8_t k_for(double loss, uint8_t d, uint8_t p_max, double target) {
+  p_max = std::min(p_max, kMaxParity);
+  for (uint8_t k = 1; k <= p_max; ++k) {
+    if (binom_cdf(k, static_cast<unsigned>(d) + k, loss) >= target) {
+      return k;
+    }
+  }
+  return p_max;
+}
+```
+```cpp
+// src/fcp/frame_tx.cc:110-115
+  uint8_t k_eff = 0;
+  if (k_ >= 1) {
+    size_t scaled = (static_cast<size_t>(k_) * n_ + d_ - 1) / d_;
+    scaled = std::max<size_t>(scaled, 1);
+    k_eff = static_cast<uint8_t>(std::min<size_t>(k_, scaled));
+  }
+```
+- 为什么是问题：模型的试验次数是 `d + k`（满组包数），真实组是 `n_used + k_eff = n_used + ceil(k·n_used/d)`。组提前闭合（`n_used < d`）时冗余比例相同但**绝对试验次数**不同 → 二项尾概率不相等（实测方向：模型偏保守，会多配冗余）。`parity_expected` 累加的是**计划 k**，而实际只发了 k_eff 条 → 该计数系统性高估最多 `d/n_used` 倍（短组可高估 10 倍）。
+- 严重级别：Low　置信度：存疑（§8 明确规定按满组反解，可能是设计意图；注释也自认是上界）
+
+#### [P7-7] 单元测试在几何边界上只覆盖「恰好合法」的一侧 — Medium（测试覆盖缺口）
+
+- 位置：`tests/adv_test.cc:403-405,446-456`、`tests/rs_test.cc:53-105`、`tests/cauchy_test.cc:32-78`
+- 涉及代码：
+```cpp
+// tests/adv_test.cc:403-405
+  // R3.3 max geometry n + k = 256 works (index is u8).
+  run_case(249, 7, 32, 0x11, {3}, {});
+  run_case(255, 1, 32, 0x22, {254}, {});
+```
+```cpp
+// tests/adv_test.cc:445-456
+  // R3.6 x_r and y_c sets are disjoint for every legal (n, k): the Cauchy
+  // denominator x_r ^ (k + c) never vanishes (k + c <= 255 required).
+  for (size_t k = 1; k <= 7; ++k) {
+    for (size_t c = 0; k + c <= 255; ++c) {      // ← 循环条件把非法区间直接排除
+      for (size_t r = 0; r < k; ++r) {
+        CHECK(fcp::cauchy_coeff(r, c, k) != 0 || false);  // inverse of non-zero
+        const uint8_t denom = static_cast<uint8_t>(r ^ (k + c));
+        CHECK(denom != 0);
+      }
+    }
+  }
+```
+- 为什么是问题：测试把「合法几何」当作**前提**写进循环条件（`k + c <= 255`），因此**恰恰没有断言**「非法几何必须被拒绝」。`cauchy_coeff(r, c, k)` 在 `k+c > 255` 时的行为没有任何用例。边界只测了 `n+k == 256`（249+7、255+1），`n+k == 257` 一例都没有 —— 而 `rs::decode` 的守卫恰好就在 256/257 之间。
+- 严重级别：Medium　置信度：确认
+
+---
+
+### 2.8 第 8 轮 — 健壮性与故障注入
+
+#### [P8-2] 见 [P3-5]（同一处代码，该轮从内存放大角度重复发现）。
+
+#### [P8-3] `fcp_bench --seg=-1` → `size_t` 溢出为 SIZE_MAX → 未捕获异常导致进程 abort — High
+
+- 位置：`tools/fcp_bench.cc:235`（解析）、`:373`（double→size_t UB）、`:179`（assign 抛异常）、`:511`（触发点）
+- 涉及代码：
+```cpp
+    } else if (v_seg != nullptr) {
+      opt->seg = static_cast<size_t>(std::atoi(v_seg));   // atoi("-1") = -1 → SIZE_MAX
+    }
+```
+```cpp
+  const double wire_per_seg = 36.0 + static_cast<double>(opt.seg);
+  const size_t data_wire_len = static_cast<size_t>(wire_per_seg);     // 超出 size_t 范围，UB
+```
+```cpp
+void MakeSegment(uint32_t sn, size_t len, std::vector<uint8_t>* out) {
+  out->assign(len < 16 ? 16 : len, 0);   // len == SIZE_MAX → std::length_error
+```
+- 为什么是问题：`fcp_bench` 的全部数值参数都走裸 `atoi`/`atof`，**没有任何范围检查**（对比 `apps/fcp-proxy/cli.cc` 已有 `ParseInt`）。`--seg=-1` → `static_cast<size_t>(-1)` = `SIZE_MAX`；`:373` 处 double→整型的越界转换是 UB；随后 `out->assign(SIZE_MAX, 0)` 超过 `max_size()` → 抛 `std::length_error`；`main()` 无 try/catch → `std::terminate` → **abort（SIGABRT）**。
+- 最小触发输入 → 后果：`fcp_bench client --host=1.2.3.4 --port=5555 --seg=-1` → 进程在握手完成、开始发数据时崩溃（`:511`）。
+- 严重级别：High　置信度：确认（✓已复核）
+
+#### [P8-4] `--d` 与 `--p` 各自校验但组合非法：代理能启动、每条隧道却必然握手失败，且默认看不到原因 — Medium
+
+- 位置：`apps/fcp-proxy/cli.cc:178-193`；`src/fcp/session.cc:41-46,91-98`
+- 涉及代码：
+```cpp
+// apps/fcp-proxy/cli.cc:178-193（✓已复核：1fcdebe 之后仍是各自独立校验，无组合校验）
+  if (const std::string* v = Find(opts, "d")) {
+    long n = 0;
+    if (!ParseInt(*v, 1, 255, &n)) {
+      std::fprintf(stderr, "--d must be an integer in 1..255\n");
+      return 1;
+    }
+    ec.d = static_cast<uint8_t>(n);
+  }
+  if (const std::string* v = Find(opts, "p")) {
+    long n = 0;
+    if (!ParseInt(*v, 0, 7, &n)) {
+      std::fprintf(stderr, "--p must be an integer in 0..7\n");
+      return 1;
+    }
+    ec.p = static_cast<uint8_t>(n);
+  }
+```
+```cpp
+// src/fcp/session.cc:41-46
+bool local_caps_valid(const SessionConfig& cfg) {
+  if (cfg.d < 1 || cfg.p > 7) { return false; }
+  return static_cast<uint16_t>(cfg.d) + cfg.p <= 256;      // ← CLI 从不检查这一条
+}
+```
+- 为什么是问题：`D + P <= 256` 是协议的硬约束（`hdr.cc:88` 的 `s` 是 u16，索引是 u8）。CLI 把 `--d` 和 `--p` 当成两个独立区间校验，`--d=255 --p=7`（和 262）能通过 CLI。运行时 `Session::start()` 记一行日志就返回，**握手根本不启动** → 数据全进握手缓存 → 512 段/512 KiB 满了后 `fail(kCacheOverflow)` → 连接被关。该日志只经 `host_.log` 输出，而 `reactor.cc:126-130` 仅在 `--verbose` 时打印 —— 默认用户只看到"连接被关"。
+- 严重级别：Medium　置信度：确认（✓已复核）
+
+#### [P8-5] `fcp_bench --port` 静默回绕：绑/连到错误的端口 — Medium
+
+- 位置：`tools/fcp_bench.cc:231`（解析）、`:120` 与 `:136`（`uint16_t` 截断）
+- 涉及代码：
+```cpp
+    } else if (v_port != nullptr) {
+      opt->port = std::atoi(v_port);          // 无范围检查
+    }
+```
+```cpp
+    addr.sin_port = htons(static_cast<uint16_t>(port));   // server / client 两处
+```
+- 触发场景 → 后果：`atoi("70000")` = 70000 → `static_cast<uint16_t>(70000)` = 4464 → 服务端绑到 4464，客户端去连 4464，双方都以为对方在 70000。`atoi("-1")` → 65535；`atoi("abc")` → 0（客户端 connect 到 0 端口，服务器 bind 到 0 = 随机端口，两端彻底对不上且无错误提示）。同类：`--mbps=abc` → 0.0；`--mbps=nan` → `rate_bytes_per_s = NaN` → `tokens` 变 NaN → `while (tokens >= wire_per_seg)` 恒假 → **benchmark 一字节都不发**，最后以 "no upload stream within 25s" 退出，看起来像网络故障。
+- 严重级别：Medium　置信度：确认
+
+#### [P8-6] 服务端在认证之前就为「未知 salt 的报文」分配 Peer 槽位与完整 Conn/Session — Medium（存疑）
+
+- 位置：`apps/fcp-proxy/reactor.cc:496-505`、`apps/fcp-proxy/engine.cc:211-222,437-510`
+- 涉及代码：
+```cpp
+// apps/fcp-proxy/engine.cc:233-241
+  const uint32_t auth_before = c->session->auth_fail();
+  c->session->on_wire(data, len, now_ms);
+  if (born && !c->session->established() && c->session->auth_fail() != auth_before) {
+    finish_conn(*c, now_ms, "unauthenticated first datagram");   // 只挡「认证失败」
+```
+- 为什么是问题：守卫只能杀掉 **GCM 认证失败** 的首个报文。而**重放一个被截获的、合法认证过的报文**时 `auth_fail` 不变 → 守卫不触发 → 会话被正常创建并进入 `kNegotiating`，随后因攻击者不回 HELLO 而在约 2.1 s 后握手失败才被回收。`reactor.cc:500` 还会在此之前给该来源地址分配一个 peer 槽（上限 8192）。
+- 触发场景 → 后果：被动抓取 256 个不同会话的首个报文各重放一次 → 会话表被占满 2.1 s → 新客户端全部被拒（`engine.cc:439-442` 的 `over_limit`）。
+- 严重级别：Medium　置信度：存疑（需要被动抓包能力；代码路径确定，攻击前提有条件）
+
+#### [P8-7] `fcp_replay` / `decode_trace_line` 的历史版本对 double→整型无范围检查 — **已在 `1fcdebe` 修复**
+
+- 位置：`src/fcp/trace.cc:190-244`、`tools/fcp_replay.cc:145-182`
+- 涉及代码（修复后的当前形态）：
+```cpp
+  auto u8 = [&fields](const char* key, uint8_t fallback, uint8_t* out) {
+    double raw = 0;
+    if (!field_in_range(fields, key, 0.0, 255.0, fallback, &raw)) {
+      return false;
+    }
+    *out = static_cast<uint8_t>(raw);
+    return true;
+  };
+```
+- 说明：HEAD 版只拒绝非有限值（`!std::isfinite(value)`），没有上界检查 —— `"s_exp":1e20` 转 uint32 是 UB。`1fcdebe` 已为每个整数字段加上 `field_in_range` 校验。**残留缺口**：`--target=` / `--budget=` 只检查 `isfinite` 不检查范围 —— `--target=1e300` 会让 `k_for()` 里的 `binom_cdf(...) >= target` 恒真 → 候选 k 永远是最小值 1，而工具只打印差异不报错。
+- 严重级别：Low　置信度：确认（主体已修复）
+
+#### [P8-8] `SnDedup` 的 4096 槽表在 sn 回绕/跳变后可能误判重复，静默丢包 — Low（存疑）
+
+- 位置：`src/fcp/frame_rx.cc:16-30`、`src/fcp/frame_rx.h:31,39-54`
+- 涉及代码：
+```cpp
+bool SnDedup::accept(uint32_t sn, int64_t now_ms) {
+  Slot& slot = (*slots_)[sn % kSnWindow];      // 槽位 = sn mod 4096
+  if (slot.used && slot.sn == sn) {
+    return false;                              // 判为重复 → 整个 payload 被丢弃
+  }
+  slot.used = true;
+  slot.sn = sn;
+  slot.ts_ms = now_ms;
+  return true;
+}
+```
+- 为什么是问题：槽表按 `sn % 4096` 索引，窗口内 4096 个不同 sn 循环一圈后，旧 sn 会被新 sn 顶掉，随后同一个旧 sn 重传时 `slot.sn != sn` → 被判为新 → **重复投递**（去重失效）。`ts_ms` 被记录但**从未使用**，没有任何时间/窗口失效逻辑。目前 `SessionConfig::sn_of` 在引擎里被置为 `nullptr`（`engine.cc:402,469`），代理路径不受影响；但**默认 `SessionConfig::sn_of = &kcp_sn_of`**（`session.h:81`），`fcp_bench` 与 `tests/` 都带着这个去重窗口。
+- 严重级别：Low　置信度：存疑（取决于是否有人依赖 `sn_of` 去重）
+
+---
+
+### 2.9 第 9 轮 — 性能与效率
+
+#### [P9-1] `Stream::pump` 从 `tx_pending_` 头部 `erase`，每个分段一次全量 memmove → O(n²) — High
+
+- 位置：`src/fcp/stream.cc:149-163`
+- 涉及代码：
+```cpp
+void Stream::pump(int64_t now_ms) {
+  ...
+  while (max_payload > 0 && !tx_pending_.empty()) {
+    PendingSeg seg;
+    seg.offset = snd_nxt_;
+    const size_t n = std::min(tx_pending_.size(), max_payload);
+    seg.bytes.assign(tx_pending_.begin(), tx_pending_.begin() + n);
+    tx_pending_.erase(tx_pending_.begin(), tx_pending_.begin() + n);   // ← 头部删除
+    snd_nxt_ += static_cast<uint32_t>(n);
+    tx_.push_back(std::move(seg));
+  }
+```
+- 为什么是问题：`tx_pending_` 是 `std::vector<uint8_t>`（`stream.h:195`），`erase(begin, begin+n)` 会把剩余所有字节 memmove 到队首。代理端一次 `write()` 可塞进整个发送窗口（`engine.cc:855` → `stream.cc:68-80`，`send_window_bytes` 默认 256 KiB）。256 KiB / 1336 B ≈ 192 个分段，每次 erase 平均搬 128 KiB → 单次 256 KiB 写入产生约 24 MiB memmove，**放大约 96 倍**，且完全落在收包/发包回调里。窗口调到 1 MiB 时放大到 400 倍。
+- 严重级别：High　置信度：确认（✓已复核）
+
+#### [P9-2] 发送路径每包 4 次堆分配 + 4 次 payload 全量拷贝 — High
+
+- 位置：`src/fcp/frame_tx.cc:44-61`、`src/fcp/session.cc:520-542`
+- 涉及代码：
+```cpp
+// src/fcp/frame_tx.cc:44-61
+  const size_t sym_len = len + 2;
+  TxSymbol out;
+  out.set_id = set_id_;
+  out.index = n_;
+  out.type_k = pack_type_k(k_, 0, 0);
+  out.symbol.resize(sym_len);                 // 分配 #1
+  ...
+  std::memcpy(out.symbol.data() + 2, seg, len);   // 拷贝 #1
+  symbol_max_ = std::max(symbol_max_, sym_len);
+  symbols_.push_back(out.symbol);             // 拷贝 #2（push_back 复制而非 move）
+```
+```cpp
+// src/fcp/session.cc:528-541
+  std::vector<uint8_t> plain(kFecHdrLen + symbol.symbol.size());   // 分配 #2
+  pack_hdr(..., plain.data());
+  std::memcpy(plain.data() + kFecHdrLen, symbol.symbol.data(), symbol.symbol.size());  // 拷贝 #3
+  std::vector<uint8_t> wire;                  // 分配 #3
+  if (!env_.seal(plain.data(), plain.size(), &wire)) {   // 分配 #4 + 加密拷贝 #4
+```
+- 为什么是问题：一个 1200 B 载荷的包，发送侧被完整复制 **4 次**（symbol→plain→cipher 是必须的 1 次，另外 3 次是纯冗余），并产生 **4 次堆分配**。20 Mbps、1200 B/包 ≈ 2000 包/s → 8000 次分配/s + 约 9.6 MB/s 的冗余 memcpy（有效载荷只有 2.4 MB/s）。`symbols_.push_back(out.symbol)` 尤其可以直接 `std::move`。
+- 严重级别：High　置信度：确认
+
+#### [P9-3] FEC 解码每次尝试都重新分配 `(n+k)` 个 `symbol_max` 大小的缓冲 — High
+
+- 位置：`src/fcp/frame_rx.h:395`（`try_decode`）、`src/fcp/rs.cc:43,81,93`
+- 涉及代码：
+```cpp
+// src/fcp/frame_rx.cc:390-419
+  if (missing.size() > k || set->symbol_max < 2) {
+    return;
+  }
+  const size_t symbol_max = set->symbol_max;
+
+  std::vector<std::vector<uint8_t>> padded(n + k, std::vector<uint8_t>(symbol_max, 0));  // (n+k) 次分配
+  std::vector<const uint8_t*> symbols(n + k, nullptr);
+```
+- 为什么是问题：`try_decode` 在 **每个数据符号和每个 parity 符号到达时**都会被调用（`frame_rx.cc:153` 与 `:166`）。只要 `symbol_count >= n` 且仍有缺失，每次调用都会重新分配 `n+k` 个 `symbol_max`(约 1338 B) 的 buffer。以 D=10、P=3、2 个符号丢失为例：每组最多触发 3~4 次解码尝试 → 4 × (13 × 1338 B) 约 70 KB 分配 + 52 次 malloc，且全部在收包回调内。**FEC 只在丢包时工作，而它恰恰在工作的时候按"每符号一次"重复分配上百 KB 缓冲。**
+- 严重级别：High　置信度：确认（✓已复核）
+
+#### [P9-4] 代理侧 `drop_front` 同样是头部 memmove，`app_in`/`to_stream` 每次 flush 都整体搬移 — High
+
+- 位置：`apps/fcp-proxy/engine.cc:16-22`、`apps/fcp-proxy/engine.cc:864-876`
+- 涉及代码：
+```cpp
+// apps/fcp-proxy/engine.cc:16-22
+void drop_front(std::vector<uint8_t>* v, size_t n) {
+  if (n >= v->size()) {
+    v->clear();
+    return;
+  }
+  v->erase(v->begin(), v->begin() + static_cast<std::ptrdiff_t>(n));  // ← 整体 memmove
+}
+```
+- 为什么是问题：`app_in` 上限即接收窗口 256 KiB，`app_send` 每次通常只接受 16 KiB 级别，于是 16 次 memmove 搬 128 KiB 平均量 ≈ 8 倍放大。应用读取稍慢即触发缓冲搬放大，代理吞吐塌陷。
+- 严重级别：High　置信度：确认
+
+#### [P9-5] bench 工具把「被 socket 丢弃的数据报」计入吞吐，测量结果系统性偏高 — High
+
+- 位置：`tools/fcp_bench.cc:302-318`（发送回调）、`:509-518`（发送循环）、`:527-552`（吞吐计算）
+- 涉及代码：
+```cpp
+// tools/fcp_bench.cc:312-317
+        if (!ep.Send(wire, len)) {
+          ++tx_fail;              // 数据报被内核丢弃（EWOULDBLOCK）
+        }
+```
+```cpp
+// tools/fcp_bench.cc:510-516
+      while (tokens >= wire_per_seg && burst < 4000) {
+        MakeSegment(sn, opt.seg, &segment);
+        session.on_kcp_output(segment.data(), segment.size(), now);
+        ++sn;
+        ++tx_data_segs;
+        tx_data_bytes += segment.size();   // ← 无条件累加，丢弃的也算
+```
+- 为什么是问题：socket 是非阻塞的，发送缓冲打满时 `::send` 返回 −1，数据报**根本没上线**，但 `tx_data_bytes` 照样 +1200。最终 `up_mbps = tx_data_bytes * 8 / kPhaseSeconds` 把这些幽灵字节算成有效吞吐。Qt 端同理（`bench_engine.cpp` 的 `tx_data_bytes_ += segment_.size();` 在发送回调之后执行，丢弃只体现在 `++tx_fail_`，不回滚字节计数）。
+- 后果：跑分越高（发送缓冲越容易满）偏差越大 —— **恰在高压场景失真**；`tx_fail` 虽被打印但不参与 `up_mbps` 计算，问题被掩盖。
+- 严重级别：High　置信度：确认（✓已复核）
+
+#### [P9-6] Qt 端把 GCM 解密 + FEC 解码全部放在 UI 线程 — High
+
+- 位置：`apps/fcp-client/bench_engine.cpp:291-316`、`apps/fcp-client/proxy_host.cpp:512-528`
+- 涉及代码：
+```cpp
+// apps/fcp-client/bench_engine.cpp:291-316
+void BenchEngine::pumpSession(qint64 rel) {
+  ...
+  while (socket_.hasPendingDatagrams()) {
+    const qint64 n = socket_.readDatagram(buf, sizeof(buf));
+    ...
+    session_->on_wire(reinterpret_cast<const uint8_t*>(buf), static_cast<size_t>(n), rel);
+  }
+}
+```
+- 为什么是问题：`session_->on_wire` 内部是 GCM open（每包 AES key expansion + 2 次块加密）+ 可能的 RS 解码（`frame_rx.cc:395` 的 (n+k) 次分配）。1200 B/包、200 Mbps 约 20 000 包/s，全部在 GUI 线程的 5 ms 定时器回调里跑。更糟的是**测量本身被扭曲** —— 发送/接收都被同一个线程节流，测出来的"带宽上限"实际是单线程 UI 处理能力上限。
+- 严重级别：High　置信度：确认
+
+#### [P9-7] RS 运算走 64 KiB 查表乘法，每字节一次潜在 cache miss — Medium
+
+- 位置：`src/fcp/rs.cc:11-36`、`src/fcp/gf256.cc:9`
+- 涉及代码：
+```cpp
+// src/fcp/rs.cc:11-19
+void xor_scaled(uint8_t* dst, const uint8_t* src, size_t len, uint8_t coeff) {
+  if (coeff == 0) return;
+  const uint8_t* row = gf256_mul_table()[coeff];
+  for (size_t i = 0; i < len; ++i) {
+    dst[i] ^= row[src[i]];      // 每字节一次 64 KiB 表的随机访问
+  }
+}
+```
+```cpp
+// src/fcp/gf256.cc:9
+  uint8_t mul[256][256]{};      // 64 KiB
+```
+- 严重级别：Medium　置信度：确认
+
+#### [P9-8] 每个 FEC 符号一次 `sendto`/`writeDatagram`，无批量或写合并 — Medium
+
+- 位置：`apps/fcp-proxy/reactor.cc:886-900`、`apps/fcp-client/proxy_host.cpp:291-302`
+- 涉及代码：
+```cpp
+void Reactor::wire_send(uint64_t peer, const uint8_t* wire, size_t len) {
+  ...
+    ::sendto(udp_, reinterpret_cast<const char*>(wire), static_cast<int>(len), 0,
+             reinterpret_cast<const sockaddr*>(&to), sizeof(to));
+}
+```
+- 严重级别：Medium　置信度：确认
+
+#### [P9-9] 接收端每收到一个乱序段就整表重排 + 重建 + 复制字节 — Medium
+
+- 位置：`src/fcp/stream.cc:307-350`
+- 涉及代码：
+```cpp
+void Stream::insert_chunk(uint32_t offset, const uint8_t* data, size_t len) {
+  RcvChunk in;
+  in.offset = offset;
+  in.bytes.assign(data, data + len);
+  oob_.push_back(std::move(in));
+  std::sort(oob_.begin(), oob_.end(), [](const RcvChunk& a, const RcvChunk& b) { return seq_dist(a.offset, b.offset) < 0; });
+
+  std::deque<RcvChunk> merged;
+  size_t total = 0;
+  for (RcvChunk& c : oob_) {
+    ...
+      last.bytes.insert(last.bytes.end(), c.bytes.begin() + overlap,   // 字节再拷一次
+                        c.bytes.begin() + overlap + take);
+    ...
+  }
+  oob_.swap(merged);
+```
+- 严重级别：Medium　置信度：确认
+
+#### [P9-10] 每个 ACK 线性扫描全部未确认分段 — Medium
+
+- 位置：`src/fcp/stream.cc:469-481,497-522`
+- 涉及代码：
+```cpp
+  if (sack_end != sack_start) {
+    for (size_t i = 0; i < tx_.size(); ++i) {          // 每个 ACK 扫全表
+      PendingSeg& s = tx_[i];
+      ...
+    }
+    fill_holes(sack_start, now_ms);                    // 再扫一次
+  }
+```
+- 严重级别：Medium　置信度：确认
+
+#### [P9-11] GCM 每包重做 AES 密钥扩展，并每包重新计算 hash 子密钥 H — Medium
+
+- 位置：`src/fcp/gcm.cc:27-46,67-80`、`src/fcp/aes.cc:130-145`
+- 涉及代码：
+```cpp
+// src/fcp/gcm.cc:67-80
+bool gcm_seal(const uint8_t key[16], const uint8_t iv[kGcmIvLen], ...) {
+  Aes128Key round_keys;
+  aes128_expand_key(key, &round_keys);     // 每包 44 字密钥调度
+  ...
+}
+// src/fcp/gcm.cc:27-33
+void compute_tag(...) {
+  uint8_t h[16];
+  uint8_t zero[16] = {};
+  aes128_encrypt_block(key, zero, h);       // 每包重算 H（会话级常量）
+```
+- 严重级别：Medium　置信度：确认
+
+#### [P9-12] `RxSet` 固定约 6.3 KB/集合；占位集合每包一次 6.3 KB 分配 — Medium
+
+- 位置：`src/fcp/frame_rx.h:145-165`、`src/fcp/frame_rx.cc:227-239,312`
+- 涉及代码：
+```cpp
+// src/fcp/frame_rx.cc:227-239
+void FrameRx::create_placeholders(uint32_t first, uint32_t last, int64_t now_ms) {
+  ...
+  for (uint32_t id = first; id != last; ++id) {
+    RxSet& set = sets_.emplace(id, RxSet{}).first->second;   // 每次 ~6.3 KB
+```
+- 严重级别：Medium　置信度：确认（与 P5-08 同源）
+
+#### [P9-13] Reactor 每轮 select 都新建 4 个 `unordered_map` — Low-Medium
+
+- 位置：`apps/fcp-proxy/reactor.cc:283-289`
+- 涉及代码：
+```cpp
+    std::unordered_map<Sock, uint64_t> read_conn;
+    std::unordered_map<Sock, uint64_t> connect_conn;
+    std::unordered_map<Sock, uint64_t> write_conn;
+    std::unordered_map<Sock, uint64_t> except_conn;
+```
+- 严重级别：Low-Medium　置信度：确认
+
+#### [P9-14] settle tick 每周期复制全部集合视图（4 个 bitset）+ 分配 id 数组 — Low
+
+- 位置：`src/fcp/settle.cc:95-121`、`src/fcp/frame_rx.cc:247-275`
+- 严重级别：Low　置信度：确认
+
+#### [P9-15] Qt 代理每次 `app_send` 都查一次环境变量 — Low
+
+- 位置：`apps/fcp-client/proxy_host.cpp:242`
+- 涉及代码：
+```cpp
+ if (qEnvironmentVariableIsSet("FCP_PROXY_NO_CAP")) {
+    // BISECT: accept everything (Qt buffers unboundedly) to isolate a stall.
+```
+- 严重级别：Low　置信度：确认（同文件另两处同类检查用 `static const` 缓存了，唯独这里没有）
+
+---
+
+### 2.10 第 10 轮 — 可维护性、API 误用与测试盲区
+
+> **该轮的前提说明**：该轮开始时工作区有未提交改动（`trace.cc`、`tools/fcp_replay.cc`、`tests/CMakeLists.txt`、`tests/replay_test.cc`、`cli.cc`、`reactor.*`、`engine.cc`、`session.h`），这些改动后来被收编为 `1fcdebe`。该轮明确区分了「HEAD 已有」与「in-flight 改动已修」，本报告下文的标注同样遵循此区分。
+
+#### [P10-01] 同一「不可信样本(>10%)」判定被写了三份，其中一份只被测试调用 — High
+
+- 位置：`src/fcp/settle.cc:215`、`src/fcp/strategy.cc:116`、`src/fcp/session.cc:431`
+- 涉及代码：
+```cpp
+// src/fcp/settle.cc:215
+bool FcpSettle::untrusted() const {
+  const uint32_t denom = std::max<uint32_t>(1, counters_.sets_expected);
+  return static_cast<double>(counters_.sets_k_unknown) / denom >
+         kUntrustedKUnknownRatio;          // 0.10
+}
+```
+```cpp
+// src/fcp/strategy.cc:116
+  if (static_cast<uint64_t>(stat.sets_k_unknown) * 10 > sets) {
+    ++untrusted_reports_;
+    return;
+  }
+```
+```cpp
+// src/fcp/session.cc:431
+  if (static_cast<uint64_t>(stat.sets_k_unknown) * 10 > std::max<uint32_t>(1, sets)) {
+```
+- 为什么是问题：同一条协议规则有三种写法（浮点比较、整数 `*10 >`、整数版再写一遍）。**`settle::untrusted()` 在 `src/` 与 `apps/` 里没有任何调用点**（`grep` 全仓只在 `tests/settle_test.cc:151,222,242` 被调用）—— 测试验的是生产路径不用的副本，而生产路径用的是 `strategy.cc:116` 那份。把 `kUntrustedKUnknownRatio` 从 0.10 调到 0.08，`settle_test.cc` 全绿而真正生效的 `strategy.cc:116` 纹丝不动。
+- 严重级别：High　置信度：确认
+
+#### [P10-02] `FrameRx::RxSetView` 是 `RxSet` 的逐字段影子，新增字段必然漏改 — High
+
+- 位置：`src/fcp/frame_rx.h:76-95`（视图）、`:145-165`（真实状态）、`src/fcp/frame_rx.cc:247-275`（手工拷贝）
+- 涉及代码：
+```cpp
+// src/fcp/frame_rx.h:76
+struct RxSetView {
+  uint32_t set_id = 0;  SetPhase phase = SetPhase::kActive;
+  uint8_t k = 0;  bool k_known = false;
+  uint8_t n = 0;  bool n_known = false;
+  uint8_t max_data_index = 0;  bool saw_parity = false;
+  bool has_any_symbol = false;  size_t symbol_count = 0;  size_t symbol_max = 0;
+  int64_t t_first_ms = 0;  int64_t tombstone_until_ms = 0;
+  uint32_t decode_attempts = 0;
+  std::bitset<kMaxS> orig_mask, recov_mask, parity_mask, decoded_once;
+};
+```
+```cpp
+// src/fcp/frame_rx.cc:247
+bool FrameRx::view(uint32_t set_id, RxSetView* out) const {
+  ...
+  out->set_id = s.set_id;  out->phase = s.phase;  out->k = s.k;  out->k_known = s.k_known;
+  out->n = s.n;  out->n_known = s.n_known;  out->max_data_index = s.max_data_index;
+  out->saw_parity = s.saw_parity;  out->has_any_symbol = s.has_any_symbol;
+  out->symbol_count = s.symbol_count;  out->symbol_max = s.symbol_max;
+  out->t_first_ms = s.t_first_ms;  out->tombstone_until_ms = s.tombstone_until_ms;
+  out->decode_attempts = s.decode_attempts;
+  out->orig_mask = s.orig_mask;  out->recov_mask = s.recov_mask;
+  out->parity_mask = s.parity_mask;  out->decoded_once = s.decoded_once;
+```
+- 为什么是问题：18 个字段一一对应，`view()` 是 18 行手写赋值。"加一个字段"要改三处（RxSet、RxSetView、view()），漏改的后果是**静默读到默认值**，编译器一句警告都不会给。测试对 `RxSetView` 的字段集合没有任何一致性断言，这类漏改 100% 逃过测试。
+- 严重级别：High　置信度：确认
+
+#### [P10-03] 「loss/lost」有四份互不相同的公式，控制器与日志用的不是同一个数 — High
+
+- 位置：`src/fcp/strategy.cc:132-134`、`src/fcp/settle.cc:221-226`、`src/fcp/session.cc:446-458`
+- 涉及代码：
+```cpp
+// src/fcp/strategy.cc:132  —— 控制器真正用的：原始丢包率（不计 FEC 修复）
+  const int64_t lost = std::max<int64_t>(
+      0, static_cast<int64_t>(stat.data_expected) - static_cast<int64_t>(stat.data_rx_orig));
+  const double loss = static_cast<double>(lost) / static_cast<double>(stat.data_expected);
+```
+```cpp
+// src/fcp/settle.cc:221  —— 修复后剩余丢包（绝对数）
+uint32_t FcpSettle::data_lost() const {
+  const int64_t lost = static_cast<int64_t>(counters_.data_expected) -
+                       counters_.data_rx_orig - counters_.data_recovered_dl -
+                       counters_.data_late_rx;
+  return lost > 0 ? static_cast<uint32_t>(lost) : 0;
+}
+```
+- 为什么是问题：同一个词 "lost" 在策略侧 = `expected − rx_orig`（修复前），在 settle 侧和 session 日志侧 = `expected − rx_orig − recovered_dl − late_rx`（修复后）。session 又额外算 `pre`（修复前 ppm）与 `usable`（扣掉 recovered 的 ppm）。四个公式散在三个文件，谁改谁不知道别人改没改。现有测试只能证明每个公式在自己那处自洽，**没有任何测试断言"策略用的 loss"与"日志打印的 lost/pre"同源**。
+- 严重级别：High　置信度：确认（✓已复核）
+
+#### [P10-05] Qt 客户端仍用 2 KiB UDP 缓冲，而 CLI 早已因同一个 bug 改成 64 KiB — Medium
+
+见 [P1-1]（同一处代码，该轮从"改了 A 忘了 B"的角度重复发现）。
+
+#### [P10-06] `settle.h` 顶部注释的时序常量已经过期（500ms/1s vs 实码 700ms/1400ms）— Medium
+
+见 [P6-8]（同一处代码，该轮从"注释与实码不符"角度重复发现）。
+
+#### [P10-07] 引擎的客户端/服务端建连函数是两份近乎逐行重复的代码 — High
+
+- 位置：`apps/fcp-proxy/engine.cc:375-435` 与 `:437-510`
+- 涉及代码：
+```cpp
+// apps/fcp-proxy/engine.cc:382-403（客户端）
+  SessionConfig sc;
+  std::memcpy(sc.key, cfg_.key, sizeof(cfg_.key));
+  if (host_.new_salt) { host_.new_salt(sc.salt); } else { random_salt(sc.salt); }
+  sc.send_direction = Direction::kC2S;
+  sc.recv_direction = Direction::kS2C;
+  sc.d = cfg_.d;  sc.p = cfg_.p;  sc.p_max = cfg_.p_max;
+  sc.mtu = cfg_.mtu;  sc.ip_hdr_len = cfg_.ip_hdr_len;
+  sc.pinned_k = cfg_.pinned_k;  sc.fec_budget = cfg_.fec_budget;
+  sc.trace = make_trace_sink(cfg_.trace_prefix, id);
+  sc.sn_of = nullptr;
+  apply_prewarm(profile_for(peer, now_ms), &sc, &raw->stream_cfg);
+```
+```cpp
+// apps/fcp-proxy/engine.cc:457-471（服务端，同一批字段再来一遍）
+  SessionConfig sc;
+  std::memcpy(sc.key, cfg_.key, sizeof(cfg_.key));
+  std::memcpy(sc.salt, salt, Envelope::kSaltLen);
+  sc.send_direction = Direction::kS2C;
+  sc.recv_direction = Direction::kC2S;
+  sc.d = cfg_.d;  sc.p = cfg_.p;  sc.p_max = cfg_.p_max;
+  ...
+```
+- 为什么是问题：12 个字段逐行复制，唯一差别是 salt 来源和两个方向常量。三处 `SessionConfig` 字段在这里被"翻译"成 `EngineConfig`（再加 `FecStrategyConfig`、`TraceConfigSnapshot`，共四层平行配置结构）。给 `SessionConfig` 加一个字段只在一处补 → 客户端有、服务端没有（或反之），行为不对称且极难定位。`proxy_engine_test.cc` 有 18 个行为场景，但没有一个检查"两个角色的 SessionConfig 字段集合一致"。
+- 严重级别：High　置信度：确认
+
+#### [P10-08] 大小端转换在 5 个文件里各写一遍，wire 格式知识没有单一来源 — Medium
+
+- 位置：`src/fcp/envelope.cc:11,17`、`src/fcp/fecstat.cc:10,15,22,27`、`src/fcp/hdr.cc:5,14`、`src/fcp/stream.cc:15,22`、`src/fcp/session.cc:62`
+- 涉及代码：
+```cpp
+// src/fcp/envelope.cc:11
+void store_le64(uint64_t value, uint8_t out[8]) {
+  for (int i = 0; i < 8; ++i) out[i] = static_cast<uint8_t>(value >> (8 * i));
+}
+// src/fcp/fecstat.cc:15
+void write32(uint8_t* out, uint32_t value) {
+  out[0] = static_cast<uint8_t>(value);  out[1] = static_cast<uint8_t>(value >> 8);
+  out[2] = static_cast<uint8_t>(value >> 16);  out[3] = static_cast<uint8_t>(value >> 24);
+}
+```
+- 为什么是问题：LE32 有三份等价实现、LE64 一份、FECSTAT 的 16/32 位读写又是第四套，`proxy_proto.cc` 里还有第五套（BE16 内联在 261、469、505-506）。现有测试全部是**成对**的（自己写自己读），错 endian 时编码端和解码端会一起错而仍然自洽 —— 只有跨实现的 golden 才拦得住。
+- 严重级别：Medium　置信度：确认
+
+#### [P10-09] 线格式上限（7 / 256）在四个文件各定义一份，改一处不会改另一处 — Medium
+
+- 位置：`src/fcp/strategy.h:18`、`src/fcp/handshake.cc:10-11`、`src/fcp/rs.h:16-17`、`src/fcp/frame_rx.h:29`
+- 涉及代码：
+```cpp
+// src/fcp/strategy.h:18
+constexpr uint8_t kMaxParity = 7;
+// src/fcp/handshake.cc:10-11
+constexpr uint8_t kMaxParityField = 7;  // 3-bit k field
+constexpr uint16_t kMaxCodeLen = 256;   // D + P, compared as u16 (erratum #7)
+// src/fcp/rs.h:16-17
+constexpr size_t kRsMaxShards = 256;  // n + k, limited by the u8 index
+constexpr size_t kRsMaxParity = 7;    // k occupies 3 header bits
+// src/fcp/frame_rx.h:29
+constexpr size_t kMaxS = 256;           // index is u8; D + P <= 256
+```
+- 严重级别：Medium　置信度：确认
+
+#### [P10-10] `hdr.h` 里 type_k 字段有三种拆包方式，调用点各挑一种 — Low
+
+- 位置：`src/fcp/hdr.h:35-61`
+- 涉及代码：
+```cpp
+constexpr uint8_t pack_type_k(uint8_t k, uint8_t j, uint8_t type) {
+  return static_cast<uint8_t>(((k & 0x07) << 5) | ((j & 0x07) << 2) | (type & 0x03));
+}
+constexpr void unpack_type_k(uint8_t type_k, uint8_t* k, uint8_t* j, uint8_t* type) {
+  *k = static_cast<uint8_t>(type_k >> 5);
+  *j = static_cast<uint8_t>((type_k >> 2) & 0x07);
+  *type = static_cast<uint8_t>(type_k & 0x03);
+}
+constexpr SymbolType hdr_type(uint8_t type_k) { return static_cast<SymbolType>(type_k & 0x03); }
+constexpr uint8_t hdr_k(uint8_t type_k) { return static_cast<uint8_t>(type_k >> 5); }
+constexpr uint8_t hdr_j(uint8_t type_k) { return static_cast<uint8_t>((type_k >> 2) & 0x07); }
+```
+- 为什么是问题：`unpack_type_k` 几乎无人用（`grep` 只在定义处），实际代码用的是 `hdr_k`/`hdr_j`/`hdr_type` —— 字段布局知识因此有 3 个可写的实现，而死代码可以一直腐烂而不被发现。
+- 严重级别：Low　置信度：确认
+
+#### [P10-11] golden 文件由被测实现自己生成，只守住了「控制器确定性」，守不住结算/上报路径 — Medium
+
+- 位置：`tests/replay_test.cc:402-430`、`tests/replay_golden.jsonl`、`tests/CMakeLists.txt:55-66`
+- 涉及代码：
+```cpp
+// tests/replay_test.cc:402
+void MaybeWriteGolden(const std::vector<fcp::TraceEntry>& trace) {
+  const char* path = std::getenv("FCP_WRITE_TRACE_GOLDEN");
+  ...
+  for (const auto& e : trace) { encode_trace_line(e, &line); ... }
+}
+// tests/replay_test.cc:429
+  const auto golden_trace = RecordArm(false, 20, 8000);   // ← 用真实 Session 跑出来的
+  MaybeWriteGolden(golden_trace);
+```
+- 为什么是问题：`1fcdebe` 给 `fcp_replay` 加的 `--require-exact` 确实让"控制器阈值改了"能被发现。但 golden 的 **`s_*` 字段（即喂给策略的 FECSTAT 报告内容）本身就是当前实现跑出来的**，且 golden 是签入的静态文件、不会自动重生成。因此结算侧（`settle.cc` 的计数、`reporter.cc` 的组包）改了以后：签入的 golden 仍是旧数据 → 重放输入不变 → 策略决策不变 → `--require-exact` 照样通过。**结算与上报路径完全不在 golden 的守护范围内。**
+- 严重级别：Medium　置信度：确认
+
+#### [P10-12] `trace.cc` 解码器把 double 无检查地转成窄整型（UB），fuzz 用例恰好绕开了它 — **已在 `1fcdebe` 修复**
+
+见 [P8-7]。残留缺口：现有 fuzz 表只放了 `1e999`（非有限，被 `isfinite` 挡下），**没有放任何"有限但超出目标类型范围"的值**（如 `1e20`、`-1`、`300`）—— 所以新增的 `field_in_range` 本身没有测试证明。
+
+#### [P10-13] CLI 注释宣称「所有已知范围的数值选项都走 ParseInt」，但仍有 8 个走裸 `atoll` — **已在 `1fcdebe` 修复**
+
+- 位置：`apps/fcp-proxy/cli.cc`（当前 `grep` 结果：所有数值选项已走 `ParseInt`/`ParseDouble`，见第 5 章）
+- 严重级别：Medium → 已修复
+
+#### [P10-14] `proxy_proto.cc` 把 "FCPO" magic 与 BE16 端口读写内联重复，magic 没有常量 — Low
+
+- 位置：`src/fcp/proxy_proto.cc:444,500,586,594`（magic）、`:261-262,469,505-506`（BE16）
+- 涉及代码：
+```cpp
+// src/fcp/proxy_proto.cc:444 / 500 / 586 / 594 —— 四处字面量
+  if (std::memcmp(buf, "FCPO", magic_len) != 0) { return OpenParse::kBadMagic; }
+  std::memcpy(out, "FCPO", 4);
+// src/fcp/proxy_proto.cc:261-262（SOCKS5 端口，BE）
+  const uint16_t port = static_cast<uint16_t>((buf[off + addr_len] << 8) | buf[off + addr_len + 1]);
+```
+- 严重级别：Low　置信度：确认
+
+#### [P10-15] `stream.cc` 的默认 srtt 硬编码 200，绕开了 `kDefaultSrttMs` — Low
+
+- 位置：`src/fcp/stream.cc:46`、`src/fcp/stream.h:70`、`src/fcp/session.h:41`
+- 涉及代码：
+```cpp
+// src/fcp/stream.cc:46
+      srtt_ms_(config.initial_srtt_ms > 0 ? config.initial_srtt_ms : 200) {
+  rto_ms_ = clamp_ms(2 * srtt_ms_, cfg_.rto_min_ms, cfg_.rto_max_ms);
+// src/fcp/stream.h:70
+  int64_t initial_srtt_ms = 200;
+// src/fcp/session.h:41
+constexpr int64_t kDefaultSrttMs = 200;
+```
+- 严重级别：Low　置信度：确认
+
+#### [P10-16] `replay_test.cc` 有重复的注释行（复制粘贴残留）— Low
+
+- 位置：`tests/replay_test.cc:363-364`
+- 涉及代码：
+```cpp
+  // Giant-but-representable values survive a round trip exactly.
+  // Giant-but-representable values survive a round trip exactly.
+```
+- 严重级别：Low　置信度：确认
+
+---
+
+## 3. 测试盲区清单
+
+下表是第 10 轮单独产出、且与第 1/7 轮交叉印证过的盲区。每项都指明"哪个 bug 因此逃过了测试"。
+
+| # | 未覆盖场景 | 对应源码 | 为什么现有测试拦不住 |
+|---|---|---|---|
+| B1 | `FrameRx::RxSet` 新增字段是否同步到 `RxSetView`/`view()` | `frame_rx.h:76-95,145-165`、`frame_rx.cc:247-275` | 无字段集合一致性断言；漏改后 settle 静默读到默认值 |
+| B2 | 控制器用的 loss 与日志里的 `lost`/`pre`/`usable` 是否同源 | `strategy.cc:132-134`、`settle.cc:221-226`、`session.cc:446-458` | `strategy_test` 只验 `data_expected/data_rx_orig` 组合；`settle_test` 只验自己的 fixture；两者不交叉 |
+| B3 | 慢链路强制 60s 区间、样本 64..255 时 Session 日志与策略行为的一致性 | `strategy.cc:125-127`、`session.cc:438` | `strategy_test.cc` 只测策略层；`session_test.cc` 没有任何 `interval_ms=60000` 的 FECSTAT 用例，更没有断言日志文本 |
+| B4 | `FcpSettle::untrusted()` / `data_lost()` 在生产路径的等价物 | `settle.cc:215,221` vs `strategy.cc:116`、`session.cc:431` | 生产代码根本不调 `settle::untrusted()`；测试测的是死副本 |
+| B5 | Qt 客户端（`apps/fcp-client/`）全部功能 | `proxy_host.cpp:21,519`、`bench_engine.cpp:263,293` | `tests/CMakeLists.txt` 的 `FCP_TEST_NAMES` 里没有任何 client 目标；2 KiB UDP 截断无护栏 |
+| B6 | CLI 数值选项的越界/非法输入 | `apps/fcp-proxy/cli.cc:202-216,262-267` | 无任何 CLI 参数解析用例。**注意：`1fcdebe` 已把 `cli.cc` 全部改为 `ParseInt`/`ParseDouble`，但仍无测试守护这条新防线** |
+| B7 | `trace` 解码器对「有限但越界」的数值 | `trace.cc:194-244`、`tests/replay_test.cc:331-350` | fuzz 表只有 `1e999`（非有限）；没有 `1e20`/`-1`/`300`；新增的 `field_in_range` 尚无对应用例 |
+| B8 | `unpack_type_k` 与 `hdr_k`/`hdr_j`/`hdr_type` 的等价性 | `hdr.h:39-61` | `unpack_type_k` 是死代码，`hdr_test.cc` 未断言两条路径一致 |
+| B9 | 线格式上限常量在 4 个文件间的一致性 | `strategy.h:18`、`handshake.cc:10-11`、`rs.h:16-17`、`frame_rx.h:29` | 只测"越界要拒绝"，不测"上界本身一致" |
+| B10 | 结算/上报路径的行为变更（golden 只守控制器） | `tests/replay_test.cc:402-430`、`tests/replay_golden.jsonl` | golden 的 `s_*` 输入由实现自己生成且静态签入；结算改动 → 重放输入不变 → `--require-exact` 仍绿 |
+| B11 | 客户端/服务端 `SessionConfig` 字段集合一致性 | `apps/fcp-proxy/engine.cc:382-403,457-471` | `proxy_engine_test.cc` 的 18 个场景全部是行为场景，无配置对称性断言 |
+| B12 | `Envelope::open` 失败被 `Session::on_wire` 一律记成 `auth_fail`（含长度不足/盐不匹配的畸形包） | `session.cc:104-108` | 无用例区分"认证失败"与"畸形包"，`auth_fail` 统计口径无测试 |
+| B13 | `Session::kcp_sn_of` 的长度门限（`len < 16`，而 KCP 头是 24 字节） | `session.h:43-47`、`session.cc:62-71` | 无用例验证 16..23 字节的畸形负载不会被误当作带 sn 的段 |
+| B14 | `rs::encode` 的 `n+k ≤ 256` 与 `cauchy_coeff` 的 `k+c ≤ 255` 非法几何 | `rs.cc:23-26`、`cauchy.cc:9-11` | 测试把合法几何写进循环条件，非法几何一例未测（第 7 轮独立印证） |
+| B15 | `fcp_bench` / `fcp_replay` 的数值参数越界 | `tools/fcp_bench.cc:225-237` | 无任何 CLI 参数解析用例；`--seg=-1`、`--port=70000`、`--mbps=nan` 静默失效或崩溃 |
+| B16 | `dup_after_recovered` 在真实发送路径上的可达性 | `frame_tx.cc:44-61`、`frame_rx.cc:139-147` | 只有合成帧测试（M4 测量仪恒为 0，第 6 轮独立印证） |
+
+---
+
+## 4. 审查期间已被修复 / 已失效的发现
+
+审查期间工作区有并发改动，最终收编为 `1fcdebe`。下列发现**在该提交后已不成立**，列出以免重复排查：
+
+| 原发现 | 状态 | `1fcdebe` 的处置 |
+|---|---|---|
+| [P8-7] / [P10-12] `trace` 解码器 double→窄整型 UB | **已修复** | "解码器整数字段逐个线宽区间校验（-1/1e300/70000 原先经 double 转换为 UB）"，新增 `field_in_range` |
+| [P10-13] CLI 仍有 8 个选项走裸 `atoll` | **已修复** | `cli.cc` 新增 `ParseInt`/`ParseDouble`，当前 `grep` 确认所有数值选项均已走带范围校验的解析 |
+| `fcp_replay` 的 `--d`/`--target`/`--budget` 裸 `atoi`/`strtod` | **已修复** | "fcp_replay 裸旗标（--dump/--require-exact）+ 数值参数整串/区间校验" |
+| `reactor` 在 select 线程里做 `getaddrinfo` | **已修复** | "getaddrinfo 移出 select 线程（4 worker 池 + 256 队列上限）" |
+
+**但同时暴露的两个新盲区**（无测试守护）：
+
+- `cli.cc` 的 `ParseInt`/`ParseDouble` 与 `trace.cc` 的 `field_in_range` 本身**没有任何测试**（B6、B7）。这两条新防线一旦被重构掉，CI 不会红。
+- `--d` 与 `--p` 的**组合**合法性（`d + p ≤ 256`）仍然没有 CLI 层校验（[P8-4]，✓已复核）。
+
+---
+
+## 5. 修复优先级建议（仅排序，未改代码）
+
+按「改动成本 ÷ 消除的风险」排：
+
+**第一梯队 —— 改动小、后果不可逆**
+
+1. **[A1] salt 重绑定判定移到认证之后**（`engine.cc:223-232`）：判定前要求报文携带合法 GCM tag，或把 `c->peer != peer` 的处理延后到 `Session::on_wire` 之后。一处条件调整即消除 Critical。
+2. **[A4] ACK 谎报防线换用「已发出最高 offset」**（`stream.cc:392`）：维护 `snd_sent_max_`，比较改用它；弹段循环跳过 `!front.sent` 的段。
+3. **[A5][A6] Qt 迭代器失效**（`proxy_host.cpp:541-547,609-616`）：改为先收集待处理 id 的快照再遍历，或在遍历中把待删元素延后统一擦除。
+4. **[A7] `std::signal(SIGPIPE, SIG_IGN)`**（`reactor.cc:261` 附近）：POSIX 上两行代码，消除「一个客户端断开杀死整个代理」。
+
+**第二梯队 —— 协议语义被破坏**
+
+5. **[A8] 锚点跳变加界**（`frame_rx.cc:117-119`）：`anchor_ - prev_anchor > kMaxGapPlaceholders` 时重建窗口或断连，而不是照单全收。
+6. **[A9] `note_k` 用 `min(k_field, p_)` 夹紧**（`frame_rx.cc:127`），并在分配前检查 `n + k <= kMaxS`。
+7. **[A22] `peer_fin_at_` 首次置位后校验一致性**（`stream.cc:300-301`），不一致即 `bad_segs_`/RST。
+8. **[A23] `decoded_once` 只在成功交付后置位**（`frame_rx.cc:374-386`），失败允许随新 parity 重试。
+9. **[A2] bench 走每会话随机 salt**（`bench_engine.cpp:160`），或在 `Envelope` 构造时拒绝与已用 salt 相同的 (PSK, salt)。
+
+**第三梯队 —— 口径分裂与测量失真**
+
+10. **[A14] 统一 loss/lost 的定义**（`strategy.cc` / `settle.cc` / `session.cc` 三处），并加一条交叉断言测试（B2）。
+11. **[A11] `dup_after_recovered` 改按 KCP/Stream 序号或字节区间判重**（`frame_tx.cc` / `frame_rx.cc`），否则 M4 的候选判定是假阴性。
+12. **[A20] bench 的 `up_mbps` 扣除 `tx_fail`**（`fcp_bench.cc:515`），或改用接收侧线速统计。
+13. **[A10] `fcp_bench` 数值参数改走 `ParseInt`**（`fcp_bench.cc:225-237`），与 `cli.cc` 对齐。
+
+**第四梯队 —— 结构性重构（成本较高但收益持久）**
+
+14. **[A16][A17][A18][A19] 热路径缓冲复用**：`tx_pending_` 改 deque/环形缓冲；`symbols_.push_back` 改 `std::move`；`try_decode` 复用缓冲；代理 `drop_front` 改环形缓冲。
+15. **[A13][A15] 消除字段镜像与配置重复**：`RxSetView` 改为引用/生成式，`SessionConfig` 装配抽成一个函数。
+16. **[A12] GHASH 换 4-bit 表 + 常数时间规约**，或在 `docs/FCP_PROTOCOL_V6.md` 显式声明 GHASH 的时序侧信道前提。
+17. **[A3] 移除 FIPS-197 公开默认 PSK**，改首次启动生成并强制用户修改；PSK 不明文落 QSettings。
+
+**第五梯队 —— 文档与测试护栏**
+
+18. 把 [P6-8] 的规范正文常量（500/1000ms）与实现（700/1400ms）对齐。
+19. 补齐第 3 章 B1..B16 的测试盲区，优先级最高的是 B2（loss 同源）、B7（`field_in_range` 自身）、B14（非法几何）、B16（`dup_after_recovered` 可达性）。
+
+---
+
+## 6. 结论
+
+- 十轮对抗分析共产出 **约 103 条**问题，其中 **2 条 Critical、24 条 High**。
+- **最严重的两类问题都不是"复杂逻辑写错了"，而是"判定放在了错误的层级"**：
+  - **认证判定放在了认证之前**（[A1]）：salt 明文 + 预认证路由 → 8 字节秒杀会话；AEAD 的威胁模型被整体绕过。
+  - **上限判定放在了错误的量上**（[A4]）：ACK 谎报防线比较的是"已分配偏移"而不是"已发出偏移"，导致防线的方向对了、基准错了。
+- **第三类问题是"同一事实写了两遍、改了一处"**（[A13][A14][A15] 与 [P10-01]）：这解释了为什么 #29/#30 的自查复查没能发现它们 —— 自查读的是同一份代码的同一个副本。
+- **[A11] 是一个"仪器装上了但没接上"的典型**：M4 的浪费重传计数器在生产路径恒为 0，若不先修计数器就去做 WAN 复测，会得到假阴性结论并误关一个候选项。
+- 本轮**未在 `src/fcp` 核心库中发现可由网络输入触发的越界写或越界读**（第 1 轮的负结果），核心库的边界护栏总体是自洽的；问题集中在**信任边界的外侧**（Qt 适配层、代理宿主层、CLI/工具层）。
+
+---
+
+*本报告由 10 轮独立对抗分析汇总而成。所有代码片段摘录自基线 commit `1fcdebe` 的工作区状态；行号以该状态为准。审查过程未修改任何源代码。*
+
+
+
+

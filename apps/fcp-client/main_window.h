@@ -118,6 +118,8 @@ class MainWindow : public QMainWindow {
   QSpinBox* proxyMtuSpin_ = nullptr;
   QSpinBox* proxyKSpin_ = nullptr;
   QCheckBox* proxyPrewarmCheck_ = nullptr;
+  QDoubleSpinBox* proxyBudgetSpin_ = nullptr;  // #35: M3 byte-budget ceiling
+  QLineEdit* proxyTraceEdit_ = nullptr;        // #35: controller-trace prefix
   QPushButton* proxyStartBtn_ = nullptr;
   QPushButton* proxyStopBtn_ = nullptr;
   QLabel* proxyInfo_ = nullptr;

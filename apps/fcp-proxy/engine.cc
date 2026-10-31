@@ -55,6 +55,32 @@ void make_directories_for(const std::string& path) {
   }
 }
 
+void random_salt(uint8_t out[Envelope::kSaltLen]) {
+  static std::random_device rd;
+  for (size_t i = 0; i < Envelope::kSaltLen; ++i) {
+    out[i] = static_cast<uint8_t>(rd() & 0xFFu);
+  }
+}
+
+const char* stream_reason_text(CloseReason reason) {
+  switch (reason) {
+    case CloseReason::kNone:
+      return "open";
+    case CloseReason::kLocalEof:
+      return "flushed and closed";
+    case CloseReason::kPeerClose:
+      return "peer closed";
+    case CloseReason::kReset:
+      return "reset";
+    case CloseReason::kIdle:
+      return "idle timeout";
+  }
+  return "closed";
+}
+
+}  // namespace
+
+// Exported via engine.h (the Qt client builds its own sinks from settings).
 SessionConfig::TraceFn make_trace_sink(const std::string& prefix, uint64_t cid) {
   if (prefix.empty()) {
     return nullptr;
@@ -80,31 +106,6 @@ SessionConfig::TraceFn make_trace_sink(const std::string& prefix, uint64_t cid) 
     std::fwrite(line.data(), 1, line.size(), file.get());
   };
 }
-
-void random_salt(uint8_t out[Envelope::kSaltLen]) {
-  static std::random_device rd;
-  for (size_t i = 0; i < Envelope::kSaltLen; ++i) {
-    out[i] = static_cast<uint8_t>(rd() & 0xFFu);
-  }
-}
-
-const char* stream_reason_text(CloseReason reason) {
-  switch (reason) {
-    case CloseReason::kNone:
-      return "open";
-    case CloseReason::kLocalEof:
-      return "flushed and closed";
-    case CloseReason::kPeerClose:
-      return "peer closed";
-    case CloseReason::kReset:
-      return "reset";
-    case CloseReason::kIdle:
-      return "idle timeout";
-  }
-  return "closed";
-}
-
-}  // namespace
 
 ProxyEngine::ProxyEngine(const EngineConfig& config, EngineHost host)
     : cfg_(config),

@@ -40,6 +40,12 @@
 
 namespace fcp {
 
+// #29a/#35: one JSONL controller-trace sink per session, written to
+// `<prefix>.<cid>.jsonl`; the parent directory chain is created on demand and
+// an unopenable path disables recording with a stderr note. Shared by the CLI
+// (--trace) and the Qt client (settings proxy/trace_prefix).
+SessionConfig::TraceFn make_trace_sink(const std::string& prefix, uint64_t cid);
+
 enum class EngineRole : uint8_t {
   kClient = 0,  // local SOCKS5/HTTP listener, one session per connection
   kServer = 1,  // remote end: session table, resolves and dials the targets

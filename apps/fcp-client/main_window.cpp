@@ -590,6 +590,13 @@ QWidget* MainWindow::buildProxy() {
   proxyKSpin_->setValue(-1);
   proxyKSpin_->setToolTip("-1 = 自适应；≥1 = 固定每组 parity 数");
   proxyPrewarmCheck_ = new QCheckBox("链路预热（跨连接继承 k/RTT 先验）", page);
+  proxyBudgetSpin_ = new QDoubleSpinBox(page);
+  proxyBudgetSpin_->setRange(0.0, 1.0);
+  proxyBudgetSpin_->setSingleStep(0.05);
+  proxyBudgetSpin_->setValue(0.50);
+  proxyBudgetSpin_->setToolTip("冗余字节比上限 parity/data，0 = 不限（M3 §8.2）");
+  proxyTraceEdit_ = new QLineEdit(page);
+  proxyTraceEdit_->setPlaceholderText("留空 = 不录制（每会话一个 .jsonl）");
 
   auto* grid = new QGridLayout;
   grid->setContentsMargins(0, 20, 0, 0);
@@ -601,6 +608,8 @@ QWidget* MainWindow::buildProxy() {
   grid->addWidget(makeField("本地监听端口", proxyListenSpin_), 1, 1);
   grid->addWidget(makeField("MTU", proxyMtuSpin_), 2, 0);
   grid->addWidget(makeField("钉 k", proxyKSpin_), 2, 1);
+  grid->addWidget(makeField("FEC 预算", proxyBudgetSpin_), 3, 0);
+  grid->addWidget(makeField("轨迹前缀", proxyTraceEdit_), 3, 1);
   grid->setColumnStretch(0, 1);
   grid->setColumnStretch(1, 1);
   layout->addLayout(grid);
@@ -712,6 +721,8 @@ bool MainWindow::collectProxyOptions(ProxyHost::Options* options, QString* error
   options->mtu = proxyMtuSpin_->value();
   options->pinned_k = proxyKSpin_->value();
   options->prewarm = proxyPrewarmCheck_->isChecked();
+  options->fec_budget = proxyBudgetSpin_->value();
+  options->trace_prefix = proxyTraceEdit_->text().trimmed();
   return true;
 }
 
@@ -848,6 +859,8 @@ void MainWindow::loadSettings() {
   proxyMtuSpin_->setValue(settings.value("proxy/mtu", 1400).toInt());
   proxyKSpin_->setValue(settings.value("proxy/pinned_k", -1).toInt());
   proxyPrewarmCheck_->setChecked(settings.value("proxy/prewarm", true).toBool());
+  proxyBudgetSpin_->setValue(settings.value("proxy/fec_budget", 0.50).toDouble());
+  proxyTraceEdit_->setText(settings.value("proxy/trace_prefix").toString());
 }
 
 void MainWindow::saveSettings() {
@@ -869,6 +882,8 @@ void MainWindow::saveSettings() {
   settings.setValue("proxy/mtu", proxyMtuSpin_->value());
   settings.setValue("proxy/pinned_k", proxyKSpin_->value());
   settings.setValue("proxy/prewarm", proxyPrewarmCheck_->isChecked());
+  settings.setValue("proxy/fec_budget", proxyBudgetSpin_->value());
+  settings.setValue("proxy/trace_prefix", proxyTraceEdit_->text().trimmed());
 }
 
 void MainWindow::applyArgumentOverrides() {
@@ -887,6 +902,10 @@ void MainWindow::applyArgumentOverrides() {
       proxyListenSpin_->setValue(arg.mid(15).toInt());
     } else if (arg.startsWith("--proxy-psk=")) {
       proxyPskEdit_->setText(arg.mid(12));
+    } else if (arg.startsWith("--proxy-fec-budget=")) {
+      proxyBudgetSpin_->setValue(arg.mid(19).toDouble());
+    } else if (arg.startsWith("--proxy-trace=")) {
+      proxyTraceEdit_->setText(arg.mid(14));
     }
   }
 }

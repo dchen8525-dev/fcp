@@ -36,6 +36,7 @@ add_library(fcp
   src/fcp/session.cc
   src/fcp/stream.cc
   src/fcp/prewarm.cc
+  src/fcp/trace.cc
   src/fcp/proxy_proto.cc
 )
 

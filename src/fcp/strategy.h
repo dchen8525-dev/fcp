@@ -66,11 +66,12 @@ struct FecStrategyConfig {
   // its habit.
   int initial_k = -1;
   // M3 byte budget (FCP_M3_CONTROL.md §2): ceiling on the interval's
-  // parity_bytes/data_bytes ratio; 0 disables. The default 0.40 sits just
-  // under the wire ceiling k/(10+k) = 41% (k = 7), so it never binds at
-  // D = 10 unless the operator tightens it — wired and testable, off in
-  // practice.
-  double budget_ratio = 0.40;
+  // parity_bytes/data_bytes ratio; 0 disables. On the wire that ratio is k/D
+  // (parity and data packets cost the same bytes), so the 0.50 default
+  // leaves k <= 5 untouched at D = 10 and only constrains the k = 6..7
+  // extremes — the #28 replay test caught the original 0.40 default binding
+  // exactly at k = 4, the 20%-loss operating point.
+  double budget_ratio = 0.50;
 };
 
 class FecStrategy {
@@ -91,6 +92,7 @@ class FecStrategy {
 
   // Diagnostics for the §11 log line.
   double last_loss() const { return last_loss_; }
+  double target_recovery() const { return target_recovery_; }
   uint32_t untrusted_reports() const { return untrusted_reports_; }
   uint32_t stale_reports() const { return stale_reports_; }
   uint32_t small_sample_reports() const { return small_sample_reports_; }

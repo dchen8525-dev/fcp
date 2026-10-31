@@ -28,6 +28,7 @@
 #include "fcp/hdr.h"
 #include "fcp/reporter.h"
 #include "fcp/settle.h"
+#include "fcp/trace.h"
 #include "fcp/strategy.h"
 
 namespace fcp {
@@ -69,7 +70,7 @@ struct SessionConfig {
   // parity_bytes/data_bytes ratio seen by the peer's FECSTAT; 0 disables.
   // Exceeding it enters the kCapped state (one parity per report down, floor
   // 1) until a report measures back under the ceiling.
-  double fec_budget = 0.40;
+  double fec_budget = 0.50;
   // #28③ (F2): pre-negotiation data cache limits (see handshake.h defaults).
   size_t handshake_cache_segments = kHandshakeMaxCachedSegments;
   size_t handshake_cache_bytes = kHandshakeMaxCachedBytes;
@@ -78,6 +79,10 @@ struct SessionConfig {
   // retransmission deliberately repeats an id the peer has to see in order to
   // re-ack it, and suppressing that at this layer stalls the sender's window.
   FrameRx::SnFn sn_of = &kcp_sn_of;
+  // #28 controller trace sink (FCP_M3_CONTROL.md §5): invoked once per
+  // accepted FECSTAT report with the report, the config snapshot and the
+  // decision just made. Empty = no recording.
+  std::function<void(const TraceEntry&)> trace;
 };
 
 class Session {
@@ -156,6 +161,10 @@ class Session {
 
   SessionConfig cfg_;
   MtuLimits limits_;
+  // #28: the strategy's effective config, captured at construction for the
+  // trace sink (negotiated D / P' included — replaying with the configured
+  // values instead would drift whenever negotiation clamps them).
+  TraceConfigSnapshot trace_cfg_{};
   Envelope env_;
   SendFn send_;
   DeliverFn deliver_;

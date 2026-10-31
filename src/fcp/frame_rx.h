@@ -97,7 +97,9 @@ struct RxSetView {
 class FrameRx {
  public:
   using DeliverFn = std::function<void(const uint8_t* payload, size_t len)>;
-  using OobFn = std::function<void(const uint8_t* payload, size_t len)>;
+  // now_ms rides along: the trace recorder (SessionConfig::trace) stamps
+  // report arrival time, which the pre-#28 dispatch dropped on the floor.
+  using OobFn = std::function<void(const uint8_t* payload, size_t len, int64_t now_ms)>;
   // Extracts the KCP sn from a delivered payload into *sn; returns false when
   // the payload is too short to carry one (dedup is skipped for those). An
   // empty fn disables dedup entirely.

@@ -82,9 +82,10 @@ k_target  = k_for(p_use, ...)               # 其余状态机逻辑不变
 状态机从 OFF/ON 扩为 **OFF / ON / CAPPED**：
 
 - **进入 CAPPED**：本报告区间冗余比 `parity_bytes_rx / data_bytes_rx > R`
-  （`--fec-budget R`，R ∈ (0,1]，默认 **0.40**；`R = 0` 表示不限）。D=10、k ≤ 7 时冗余比
-  上界 k/(10+k) ≈ 41%，故默认值实际只在 k=7 时触界——**默认 practically off、wired and
-  testable**，深队列部署按需收紧。
+  （`--fec-budget R`，R ∈ (0,1]，默认 **0.50**；`R = 0` 表示不限）。**线上 ratio = k/D**
+  （parity 与 data 每包字节数相同，实测 golden 轨迹 0.29@k=3、0.40@k=4）——#28 的重放
+  测试逮住原默认 0.40 恰好绑在 k=4（20% 丢包的常用工作点）后改为 0.50：D=10 下 k ≤ 5
+  完全自由、k = 6..7 极端档才受限。
 - **CAPPED 行为**：k 只降不升（对齐 §8 排队护栏语义）；冗余比回落且连续 1 个报告不超 ⇒
   回 ON。预算比较在每报告时做。
 - **定位**（§14.11）：预算是"深队列 + 高丢包"下冗余字节的**天花板**，防正反馈靠它兜底，
@@ -228,3 +229,4 @@ M2 管线 225ms → #27 25ms（9×），`TestBurstLossExceedsFec` 以 <200ms 断
 | 2026-10-31 | **#25 落地（T36）**：三态控制器 + 字节预算。`FecState::kCapped`（OFF/ON/CAPPED，`fec_state_name()` 统一日志名）；`FecStrategyConfig::budget_ratio`（默认 0.40，≤0 钳为不限）；逻辑在 on_report 的采样门之后：`ratio = parity_bytes_rx/data_bytes_rx` 超限 → CAPPED 且每报告 k−=1（下限 1，预算优先于 k_target）；回落 1 报告 → 回 ON 不步进（滞回）。输入是 FECSTAT 既有字段，**零线上改动**。透传：`SessionConfig::fec_budget` → `EngineConfig::fec_budget` → CLI `--fec-budget=R`（strtod，帮助文本）。session 日志 `FEC capped:`/`FEC budget restored:` 进出行 + 状态名三态化。测试五场景：进态与逐报告降 k、回落滞回与步进恢复、**红线收敛**（R=0.10 → k=1，ratio≈k/10 仿真）、R=0 不绑、R<k=1 自身比值的退化边界（停在 CAPPED 不下溢）。**GUI 设置页顺延**：Qt 工具链在本机缺失（见 #24 条），`--fec-budget` 的 GUI 透传并入 #29 收口或下一个 GUI 任务；CLI 与 GUI 共用的 `fcp_proxy_core` 已含全量逻辑。协议文档 §8.2 入档。Windows Debug/Release ctest 25/25 |
 | 2026-10-31 | **#26 落地（T37 + T35 注入级）**：突发检测 = 原始游程账本 + 精确 i.i.d. 参照 + KL。`run_dist_iid`（游程 DP，P(M=l) 全分布，对 2^10 掩码穷举 1e-12）+ `burst_kl_iid`（Q 钳 1e-12，空账本返回 0）+ `FcpSettle::burst_kl()`（p 取账本总体原始丢失率）；reporter 打进 `ledger_meta` 高 16 位（0.01 nat 饱和），session 日志行加 `kl=`。**游程口径从 #24 的"结算时未恢复"改为原始丢失**——RS 全有全无修复会把 i.i.d. 链路伪装成突发；两处 #24 断言随之修正。KL 用途本里程碑定为诊断/可信度信号，不改校正门（加权留待真实轨迹标定）。session_test `Link` 加 GE 两态马尔可夫（**data-only**：丢 parity 会把 `sets_k_unknown` 顶过 10% 信任门，R(k) 反馈路径没被行使——实现期实测）；`TestLedgerLiftsKUnderBursts` 双臂对照（initial_k=2 起步、8000 段、发送与 tick 交错）：i.i.d. 臂全程 k=2；GE 臂 fail 17.5%→22%、kl 1.04→1.60，k=3 且在均值 9% 的报告上仍由 peff=0.149 顶住（二项答案 k=2）——账本而非均值在支撑 k。实现期另踩一坑：发送与 tick 不交错则首份 FECSTAT 在全部段发完后才到，全程 k=0、parity=0。settle_test 新增 3 组 KL 单测（穷举对照、KL(P=Q)=0、KL(δ)=−ln Q、场景级 clean=0 / run-of-3 > 1 nat）。Windows Debug/Release ctest 25/25 |
 | 2026-10-31 | **#27 落地（T38）**：快重/多洞 SACK。落地再定案见 §4.1——M2 `fill_holes` 对首洞已是即时补，真缺口是①非相邻多洞的单块盲区（接收端 dup-ACK 上轮转 SACK 块 + 发送端 `sacked` 段标记防把 SACK 段当洞重发）与②补洞重传再丢被 `sack_filled_up_to_` 卡到 RTO（发送端 dup≥3 每批一次强制补 `tx_.front()`，置于 fill 之前由其 fresh 守卫防双发）。17B ACK 格式不变；尾段丢失仍归 RTO（无 dup 载体）。测试：stream_test 新增 3 场景（轮转三块/强制补洞与每批一次/无虚假触发），`TestSackFillsHoleWithoutTimeout`、`TestKarnDropsAmbiguousSamples` 精确计数随行为更新（+1 fast copy，Karn 性质不变），e2e burst 场景确定性实测 225ms→25ms（9×）并以 <200ms 守回归。M2 §7 第 2 条入档指针已加。Windows Debug/Release ctest 25/25 |
+| 2026-10-31 | **#28 落地（T39 工具半边）**：`src/fcp/trace.h/.cc`（TraceEntry = 报告全字段扁平 JSONL + 生效配置快照 + 决策；严格扁平扫描解码，未知键跳过；`replay_trace` 用快照重建 FecStrategy 逐报告重放，确定性）→ `SessionConfig::trace` 录制钩子（每个 kOk 报告一条，含被门挡下的——重放时门行为同样复现；快照取协商后的 d/P'）→ `tools/fcp_replay`（装载/覆盖参数/重放，输出 k 轨迹、CAPPED 数、字节比峰值、与录制的 agree 率）。实现期修了 **FrameRx oob 回调丢 now_ms** 的老问题（分发硬编码 0，OobFn 加时间参数）——策略从不需要时间戳所以从未暴露。测试：往返/确定性复现（5/10/20% + GE 全部逐决策一致）/预算 what-if（0.10 → CAPPED 走到 k=1）/golden 文件 + ctest 冒烟。**逮住 #25 真缺陷**：线上 ratio = k/D 而非 §8.2 写的 k/(D+k)，默认 0.40 恰好绑在 k=4（20% 丢包工作点）——默认改 0.50，决策 #30 勘误入协议文档。**T39 全绿的控制器半边就此在 gate 内常驻**（5/10/20% k 稳定 + 预算不超 + GE 抬升）。**CLI/GUI 的 `--trace` 录制接线顺延 #29**（WAN 标定时随部署一起接）。Windows Debug/Release ctest 27/27（新增 replay_test 与 fcp_replay 冒烟） |

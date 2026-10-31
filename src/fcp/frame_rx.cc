@@ -50,7 +50,7 @@ void FrameRx::on_datagram(const uint8_t* plaintext, size_t len, int64_t now_ms) 
   const SymbolType type = hdr_type(hdr.type_k);
   if (type == SymbolType::kOob) {
     if (oob_) {
-      oob_(symbol, symbol_len);
+      oob_(symbol, symbol_len, now_ms);
     }
     return;
   }

@@ -19,6 +19,7 @@ set(FCP_TEST_NAMES
   settle_test
   reporter_test
   session_test
+  replay_test
   stream_test
   stream_e2e_test
   prewarm_test
@@ -50,3 +51,11 @@ if(WIN32)
     endif()
   endforeach()
 endif()
+
+# fcp_replay smoke (tools/, #28): replay the checked-in golden trace and make
+# sure the tool loads it and prints its summary. The golden is regenerated
+# with `set FCP_WRITE_TRACE_GOLDEN=<path>` before running replay_test.
+add_test(NAME replay_tool_smoke
+         COMMAND fcp_replay --trace=${CMAKE_CURRENT_SOURCE_DIR}/replay_golden.jsonl)
+set_tests_properties(replay_tool_smoke PROPERTIES
+         PASS_REGULAR_EXPRESSION "entries=[0-9]+ skipped=0")

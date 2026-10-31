@@ -500,7 +500,7 @@ struct RxFixture {
              delivered.emplace_back(p, p + len);
              delivered_sn.push_back(SnAt0(p, len));
            },
-           [this](const uint8_t* m, size_t len) { oobs.emplace_back(m, m + len); },
+           [this](const uint8_t* m, size_t len, int64_t) { oobs.emplace_back(m, m + len); },
            dedup ? fcp::FrameRx::SnFn(&SnAt0Fn) : fcp::FrameRx::SnFn()) {
     rx.set_event_sink([this](fcp::RxEvent e, uint32_t) { events.push_back(e); });
   }
@@ -856,7 +856,7 @@ struct SettleFixture {
     rx = std::make_unique<fcp::FrameRx>(
         d, p,
         [this](const uint8_t* pl, size_t len) { delivered.emplace_back(pl, pl + len); },
-        [](const uint8_t*, size_t) {}, fcp::FrameRx::SnFn(&SnAt0Fn));
+        [](const uint8_t*, size_t, int64_t) {}, fcp::FrameRx::SnFn(&SnAt0Fn));
     settle = std::make_unique<fcp::FcpSettle>(d);
     settle->attach(rx.get());  // settle takes rx's single event sink...
     // ...and this probe observes the same stream through settle's forwarder.

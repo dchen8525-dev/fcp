@@ -48,7 +48,7 @@ struct Fixture {
            [this](const uint8_t* payload, size_t len) {
              delivered.emplace_back(payload, payload + len);
            },
-           [](const uint8_t*, size_t) {}, &SnOf),
+           [](const uint8_t*, size_t, int64_t) {}, &SnOf),
         settle(10),
         rep(&settle,
             [this](const uint8_t* packet, size_t len) { sent.emplace_back(packet, packet + len); }) {

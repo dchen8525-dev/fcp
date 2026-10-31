@@ -288,7 +288,7 @@ void Session::configure(int64_t now_ms) {
           deliver_(payload, len);
         }
       },
-      [this](const uint8_t* payload, size_t len) { on_oob(payload, len, 0); }, cfg_.sn_of);
+      [this](const uint8_t* payload, size_t len, int64_t now_ms) { on_oob(payload, len, now_ms); }, cfg_.sn_of);
 
   settle_ = std::make_unique<FcpSettle>(np.d);
   settle_->attach(rx_.get());
@@ -331,6 +331,9 @@ void Session::configure(int64_t now_ms) {
   strategy_config.budget_ratio = cfg_.fec_budget;
   strategy_ = std::make_unique<FecStrategy>(strategy_config);
   tx_->set_k(strategy_->k());
+  trace_cfg_ = TraceConfigSnapshot{np.d, strategy_config.p_max,
+                                   strategy_->target_recovery(), cfg_.fec_budget,
+                                   cfg_.initial_k, pinned};
 
   sync_report_counters();
 
@@ -398,6 +401,17 @@ void Session::on_oob(const uint8_t* payload, size_t len, int64_t now_ms) {
   strategy_->on_report(stat, queued);
   if (tx_) {
     tx_->set_k(strategy_->k());
+  }
+  if (cfg_.trace) {
+    TraceEntry entry;
+    entry.now_ms = now_ms;
+    entry.window_queued = queued;
+    entry.stat = stat;
+    entry.snapshot = trace_cfg_;
+    entry.k_after = strategy_->k();
+    entry.state_after = strategy_->state();
+    entry.last_loss = strategy_->last_loss();
+    cfg_.trace(entry);
   }
   // Same measure the strategy acted on (§2); for the budget log lines only.
   const double ratio = stat.data_bytes_rx > 0

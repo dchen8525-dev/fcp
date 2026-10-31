@@ -47,7 +47,7 @@ struct Fixture {
       : d(d_in),
         rx(d_in, p_in,
            [this](const uint8_t* p, size_t len) { delivered.emplace_back(p, p + len); },
-           [this](const uint8_t* m, size_t len) { oobs.emplace_back(m, m + len); },
+           [this](const uint8_t* m, size_t len, int64_t) { oobs.emplace_back(m, m + len); },
            &SnFnAdapter) {}
 
   void feed(uint32_t set_id, uint8_t index, uint8_t type_k, const std::vector<uint8_t>& symbol,

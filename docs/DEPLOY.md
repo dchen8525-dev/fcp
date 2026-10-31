@@ -184,3 +184,24 @@ fcp_bench client --host=<服务端IP> --port=47123 [--key=HEX32] ...
 - Linux：`fcp-proxy-server` + `fcp-proxy-client` + `fcp_replay`（glibc 静态可用性视目标；
   同发行版构建最稳）。
 - 配套：`docs/DEPLOY.md`（本文）+ `docs/FCP_PROTOCOL_V6.md`（协议）+ `docs/FCP_M3_CONTROL.md`（控制器行为）。
+
+## 9. 排障实例：GUI 客户端 UDP 静默失败（2026-10-31，开发机实录）
+
+**现象**：GUI 代理页正常启动（SOCKS 监听、状态灯 OK），但任何隧道都无法建立；
+`QUdpSocket::writeDatagram` 返回成功，对端服务端 **零收**（`-v` + stats 确认）。
+
+**定位链**（可复用的方法论）：
+1. 服务端 `-v --stats` 确认零收 → 排除服务端；
+2. CLI 客户端同机同参数正常 → 排除网络/服务端/引擎；
+3. python 复刻 GUI 的 socket 形态（0.0.0.0 绑定 + 同尺寸 UDP）正常到达 → 排除 OS 路径；
+4. 引擎 `ProxyHost::start`/`onServerReady` 加 fprintf 探针 → Options 全部正确到达引擎；
+5. **#23 时代代码现编现跑同样失败** → 排除代码回归，锁定"按二进制"的进程级拦截。
+
+**根因**：本机安全软件对**首见二进制**（当日新编译、无签名）的 UDP 出站按哈希拦截——
+同一机器上"今天早些见过的进程"全部畅通，新编译的 GUI（含旧代码现编版）全灭。
+
+**处置**：安全软件中放行 `fcp_client.exe`（或对构建输出目录建立信任）；CLI 不受影响
+（其二进制在拦截生效前已通过首次判定）。Linux 部署无此问题（无同款安全层）。
+
+**引擎侧加固（已常驻）**：`ProxyHost::start`/`onServerReady`/`wireSend` 曾加临时探针
+定位后移除；引擎销毁诊断（closed 行携带 stream 统计）保留为永久能力。

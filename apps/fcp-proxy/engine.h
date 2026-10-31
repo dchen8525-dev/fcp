@@ -271,6 +271,7 @@ class ProxyEngine {
   PeerProfile profile_for(uint64_t peer, int64_t now_ms) const;
   std::string label(const Conn& conn) const;
   std::string label(uint64_t conn) const;
+  char diag_[256] = {};  // #33③: teardown forensics scratch
   void log(const std::string& line) const;
 
   EngineConfig cfg_;

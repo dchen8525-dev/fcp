@@ -170,6 +170,18 @@ class Link {
   size_t WriteB(const std::vector<uint8_t>& src) {
     return st_b->write(src.data(), src.size());
   }
+  // #34: upstream bulk needs the same chunked push with backpressure ticks.
+  size_t PushB(const std::vector<uint8_t>& src, int64_t budget_ms) {
+    size_t off = 0;
+    const int64_t deadline = now + budget_ms;
+    while (off < src.size() && now < deadline) {
+      off += st_b->write(src.data() + off, src.size() - off);
+      if (off < src.size()) {
+        TickAt(now + fcp::kSessionTickMs);
+      }
+    }
+    return off;
+  }
 
   WinsockGuard winsock;
   UdpSocket sock_a;
@@ -483,6 +495,32 @@ void TestSustainedFlowUnderLoss() {
 
 }  // namespace
 
+
+// #34: the WAN upload stall (8MiB client->server PUT froze at ~5MB until the
+// 300s idle teardown). Deterministic gate repro attempt: bulk UPSTREAM flow
+// (B->A) under both-direction loss — the pre-#34 suite only ever pushed bulk
+// A->B.
+void TestUpstreamBulkUnderLoss() {
+  Link h;
+  CHECK(h.Init(3, -1, 64 * 1024, 64 * 1024));
+  CHECK(h.Handshake());
+  h.loss_enabled = true;
+  h.loss_percent = 12;
+
+  const std::vector<uint8_t> src = MakeBytes(8 * 1024 * 1024, 97);
+  CHECK_EQ(h.PushB(src, 120000), src.size());
+  CHECK(h.WaitRx(src.size(), 0, 180000));
+
+  CHECK(h.rx_a == src);
+  CHECK(h.WaitIdle(60000));
+  CHECK_EQ(h.B()->bytes_acked(), src.size());
+  CHECK_EQ(h.A()->bytes_delivered(), src.size());
+  h.Advance(3000);  // settle drainage: the tail sets' tombstones expire here
+  CheckCarrierClean(h);
+  CHECK(h.SA()->settle()->delivered_le_sum());
+  CHECK_EQ(h.SA()->rx()->active_sets(), 0u);
+}
+
 int main() {
   TestLosslessBothDirections();
   TestRandomLossArqCoversFec();
@@ -490,5 +528,6 @@ int main() {
   TestBurstLossExceedsFec();
   TestHalfCloseOverSession();
   TestSustainedFlowUnderLoss();
+  TestUpstreamBulkUnderLoss();
   return fcp_test::finish();
 }

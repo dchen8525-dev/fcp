@@ -971,7 +971,24 @@ void ProxyEngine::finish_conn(Conn& conn, int64_t now_ms, const char* why) {
   }
   conn.phase = Phase::kDone;
   reap_ids_.push_back(conn.id);
-  log(label(conn) + " closed: " + why);
+  // #33③ forensics: on a teardown, the stream's own counters say which side
+  // stopped moving — a sender stuck mid-window (acked < queued) vs a receiver
+  // that stopped delivering turns "upload froze" into a localizable defect.
+  if (conn.stream != nullptr && (conn.stream->bytes_acked() != conn.stream->bytes_queued() ||
+                                 conn.stream->bytes_delivered() != conn.stream->bytes_acked())) {
+    std::snprintf(diag_, sizeof(diag_),
+                  "stream queued=%llu acked=%llu delivered=%llu unacked=%zu in_flight=%zu "
+                  "rwnd=%zu rto=%lld",
+                  static_cast<unsigned long long>(conn.stream->bytes_queued()),
+                  static_cast<unsigned long long>(conn.stream->bytes_acked()),
+                  static_cast<unsigned long long>(conn.stream->bytes_delivered()),
+                  conn.stream->unacked_segs(), conn.stream->in_flight(),
+                  conn.stream->peer_window(),
+                  static_cast<long long>(conn.stream->rto_ms()));
+    log(label(conn) + " closed: " + why + " [" + diag_ + "]");
+  } else {
+    log(label(conn) + " closed: " + why);
+  }
   (void)now_ms;
 }
 

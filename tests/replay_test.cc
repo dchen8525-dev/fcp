@@ -315,6 +315,63 @@ void TestReplayGELiftsK() {
   CHECK(held >= 2);
 }
 
+
+// #30 adversarial pass over the trace codec: truncation, giant numbers,
+// duplicates — nothing may parse half-baked, and nothing non-finite may
+// reach the int casts. Whitespace and defaults-only lines are tolerated on
+// purpose (the encoder never emits them); negative numbers are harmless.
+void TestTraceCodecFuzz() {
+  fcp::TraceEntry e;
+  e.now_ms = 123;
+  e.stat = fcp::MakeFecstatPacket(kSalt);
+  e.stat.data_expected = 42u;
+  std::string line;
+  fcp::encode_trace_line(e, &line);
+
+  const char* bad[] = {
+      "",                                  // empty
+      "{",                                 // truncated
+      "{\"ver\":1",                        // truncated after value
+      "{\"ver\":1,",                       // trailing comma, no close
+      "{\"ver\":2}",                       // wrong version
+      "{\"ver\":1e}",                      // valueless exponent
+      "{\"ver\":1,\"now\":1e999}",         // non-finite: HUGE_VAL rejected
+      "{\"ver\":1,\"now\":1,,}",           // double comma
+      "{\"ver\":1,now:1}",                 // unquoted key
+      "{\"ver\":1,\"now\":\"5\"}",         // string value
+      "not json",                          // garbage
+      "{\"ver\":1,\"now\":1}{\"ver\":1}",  // trailing garbage
+  };
+  for (const char* s : bad) {
+    if (fcp::decode_trace_line(s, &e)) {
+      std::fprintf(stderr, "accepted bad line: %s\n", s);
+      CHECK(false);
+    }
+  }
+  // Tolerated by design: whitespace, defaults-only entries, negatives.
+  CHECK(fcp::decode_trace_line("{ \"ver\":1 }", &e));
+  CHECK_EQ(e.now_ms, 0);
+  CHECK(fcp::decode_trace_line("{\"ver\":1,\"now\":-5}", &e));
+  CHECK_EQ(e.now_ms, -5);
+
+  // Giant-but-representable values survive a round trip exactly.
+  // Giant-but-representable values survive a round trip exactly.
+  fcp::TraceEntry big;
+  big.now_ms = (1LL << 52);
+  big.stat = fcp::MakeFecstatPacket(kSalt);
+  big.stat.data_expected = 0xFFFFFFFFu;
+  big.stat.accounted_through_set_id = 0xFFFFFFFFu;
+  big.snapshot.budget = 0.5;
+  fcp::encode_trace_line(big, &line);
+  CHECK(fcp::decode_trace_line(line, &e));
+  CHECK_EQ(e.stat.data_expected, 0xFFFFFFFFu);
+  CHECK_EQ(e.stat.accounted_through_set_id, 0xFFFFFFFFu);
+  // Duplicate keys: last one wins, still well-formed.
+  std::string dup = "{\"ver\":1,\"now\":7,\"now\":9}";
+  CHECK(fcp::decode_trace_line(dup, &e));
+  CHECK_EQ(e.now_ms, 9);
+}
+
 // Golden trace for the fcp_replay ctest smoke: run with
 // FCP_WRITE_TRACE_GOLDEN=<path> to (re)generate.
 void MaybeWriteGolden(const std::vector<fcp::TraceEntry>& trace) {
@@ -339,6 +396,7 @@ void MaybeWriteGolden(const std::vector<fcp::TraceEntry>& trace) {
 int main() {
   TestRoundTrip();
   TestReplayReproducesRecorded();
+  TestTraceCodecFuzz();
 
   // The 20% arm doubles as the golden source: deterministic seed, so the
   // checked-in file only moves when the format or controller changes.

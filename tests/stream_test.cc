@@ -866,6 +866,30 @@ void TestNoSpuriousFastRetransmit() {
   CHECK_EQ(f.sa().dup_acks(), 0u);
 }
 
+
+// #30 adversarial hardening: an ACK past everything we ever sent is a lie —
+// accepting it would pop all unacked segments and strand the data for good.
+void TestAckBeyondSndNxtIgnored() {
+  Fixture f;
+  f.cut_all();
+  const std::vector<uint8_t> src = MakeBytes(400, 11);  // 4 segments
+  CHECK_EQ(f.push(kA, src), src.size());
+  const size_t unacked_before = f.sa().unacked_segs();
+
+  const std::vector<uint8_t> lie = MakeAck(1u << 20, 4096, 0, 0);
+  f.feed(kA, lie);
+  CHECK_EQ(f.sa().bad_segs(), 1u);
+  CHECK_EQ(f.sa().unacked_segs(), unacked_before);
+  CHECK_EQ(f.sa().bytes_acked(), 0u);
+  CHECK_EQ(f.sa().retransmits(), 0u);
+
+  // A cum exactly at snd_nxt is the legitimate fin-ack boundary and must
+  // still work: ack the first two segments for real.
+  f.feed(kA, MakeAck(2 * f.payload(), 4096, 0, 0));
+  CHECK_EQ(f.sa().unacked_segs(), unacked_before - 2);
+  CHECK_EQ(f.sa().bad_segs(), 1u);
+}
+
 int main() {
   TestOrderedFlow();
   TestBidirectional();
@@ -885,6 +909,7 @@ int main() {
   TestCloseWithNothingQueued();
   TestRstAborts();
   TestIdleTimeout();
+  TestAckBeyondSndNxtIgnored();
   TestMalformedSegments();
   TestRandomLossEndToEnd();
   return fcp_test::finish();

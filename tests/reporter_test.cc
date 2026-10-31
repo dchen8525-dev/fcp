@@ -295,6 +295,31 @@ void TestExtraCounters() {
   CHECK(!f.rep.on_tick(120000));
 }
 
+
+// §14.6 (#30): a teardown with accounted traffic emits its last report
+// immediately; an idle direction stays silent.
+void TestFlushOnTeardown() {
+  Fixture f;
+  f.rep.on_tick(0);
+  for (uint32_t sid = 0; sid < 30; ++sid) {
+    f.feed_as(sid, BuildSet(10, 1, Payloads(7000 + 10 * sid, 10)));
+  }
+  f.settle.tick(100, 100);  // accounted, but the 2s cadence has not run
+  CHECK_EQ(f.sent.size(), 0u);
+  CHECK(f.rep.flush(500));
+  CHECK_EQ(f.sent.size(), 2u);  // double-sent per #28⑤ (F3)
+  CHECK_EQ(f.last_packet().data_expected, 300u);
+  // Flushed counters are cleared; a second flush has nothing to say.
+  CHECK(!f.rep.flush(501));
+  CHECK_EQ(f.sent.size(), 2u);
+
+  // An idle direction never reports, even on teardown.
+  Fixture idle;
+  idle.rep.on_tick(0);
+  CHECK(!idle.rep.flush(999));
+  CHECK_EQ(idle.sent.size(), 0u);
+}
+
 }  // namespace
 
 int main() {
@@ -304,5 +329,6 @@ int main() {
   TestFlags();
   TestPercentiles();
   TestExtraCounters();
+  TestFlushOnTeardown();
   return fcp_test::finish();
 }

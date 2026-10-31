@@ -1,6 +1,7 @@
 #include "fcp/trace.h"
 
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <utility>
@@ -77,6 +78,11 @@ bool scan_fields(const std::string& line,
     if (end == begin) {
       return false;
     }
+    // #30: 1e999 turns into HUGE_VAL; a non-finite field would become UB in
+    // the int casts downstream. Encode never emits one, so reject the line.
+    if (!std::isfinite(value)) {
+      return false;
+    }
     i += static_cast<size_t>(end - begin);
     out->emplace_back(std::move(key), value);
     skip_ws();
@@ -85,7 +91,11 @@ bool scan_fields(const std::string& line,
       continue;
     }
     if (i < line.size() && line[i] == '}') {
-      return true;
+      // #30: the object must end the line — trailing garbage after the close
+      // would let a second object ride inside one trace line.
+      ++i;
+      skip_ws();
+      return i >= line.size();
     }
     return false;
   }
@@ -93,9 +103,10 @@ bool scan_fields(const std::string& line,
 
 double field_or(const std::vector<std::pair<std::string, double>>& fields,
                 const char* key, double fallback) {
-  for (const auto& kv : fields) {
-    if (kv.first == key) {
-      return kv.second;
+  // Last one wins, matching how a JSON object parser would fold duplicates.
+  for (auto it = fields.rbegin(); it != fields.rend(); ++it) {
+    if (it->first == key) {
+      return it->second;
     }
   }
   return fallback;

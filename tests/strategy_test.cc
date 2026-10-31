@@ -550,6 +550,43 @@ void TestSlowLinkSampleGate() {
   CHECK(st3.state() == fcp::FecState::kOn);
   CHECK_EQ(st3.k(), 1);
 }
+
+// #30 adversarial pass over the ledger fields: out-of-range ppm and k are
+// clamped or ignored, never amplified into the state machine.
+void TestLedgerFieldExtremes() {
+  fcp::FecStrategy st;
+  uint32_t id = 0;
+  DriveToK2(&st, &id);
+  const double bursty_fail = 1.0 - fcp::binom_cdf(2, 12, 0.20);
+
+  // fail_ppm way above 1e6: clamped to a total loss, p_eff pins at 1.0,
+  // k_target saturates at p_max — bounded, no NaN.
+  st.on_report(LedgerReport(++id, 0.10, 200, 42.0, 2), false);
+  CHECK(st.last_p_eff() <= 1.0);
+  CHECK(st.last_p_eff() == st.last_p_eff());  // not NaN
+  CHECK(st.k() <= 4);
+
+  // Dominant k above the 3-bit field: unusable, skipped.
+  fcp::FecStrategy st2;
+  uint32_t id2 = 0;
+  DriveToK2(&st2, &id2);
+  st2.on_report(LedgerReport(++id2, 0.10, 200, bursty_fail, 9), false);
+  CHECK(!st2.ledger_active());
+  CHECK_EQ(st2.ledger_skipped(), 1u);
+  CHECK_EQ(st2.k(), 2);
+
+  // Absurd group count still passes the gate on its own merits; the failure
+  // rate is what carries information. 0.109 is the i.i.d. answer at 10% loss
+  // (1 - binom_cdf(2, 12, 0.10)), so the correction degenerates to identity.
+  fcp::FecStrategy st3;
+  uint32_t id3 = 0;
+  DriveToK2(&st3, &id3);
+  const double iid_fail = 1.0 - fcp::binom_cdf(2, 12, 0.10);
+  st3.on_report(LedgerReport(++id3, 0.10, 0xFFFFFFFFu, iid_fail, 2), false);
+  CHECK(st3.ledger_active());
+  CHECK_EQ(st3.k(), 2);
+}
+
 int main() {
   TestOffToOn();
   TestTwoReportEntry();
@@ -566,6 +603,7 @@ int main() {
   TestLedgerOneSided();
   TestLedgerIidStable();
   TestSlowLinkSampleGate();
+  TestLedgerFieldExtremes();
   TestLedgerGates();
   return fcp_test::finish();
 }

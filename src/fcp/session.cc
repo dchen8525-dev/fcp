@@ -246,6 +246,14 @@ void Session::on_tick(int64_t now_ms) {
   }
 }
 
+// §14.6 (#30): see session.h. A teardown report rides the peer's tombstone
+// window if its own session already died.
+void Session::flush_report(int64_t now_ms) {
+  if (reporter_) {
+    reporter_->flush(now_ms);
+  }
+}
+
 void Session::on_rtt_sample(int64_t srtt_ms) {
   if (srtt_ms <= 0) {
     return;

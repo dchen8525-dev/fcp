@@ -111,6 +111,11 @@ class Session {
 
   void on_rtt_sample(int64_t srtt_ms);
 
+  // §14.6 (#30): emit the interval's FECSTAT now if it holds anything.
+  // Called once at teardown so the peer's controller sees the final stretch
+  // of traffic instead of losing it to the < 60s cadence tail.
+  void flush_report(int64_t now_ms);
+
   bool established() const { return hs_.established(); }
   HandshakeState state() const { return hs_.state(); }
   HandshakeError error() const { return hs_.error(); }

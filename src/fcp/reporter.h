@@ -50,6 +50,12 @@ class FcpReporter {
   // Returns true when a report was emitted.
   bool on_tick(int64_t now_ms);
 
+  // §14.6 (#30): emit the interval now if it holds anything. Called on
+  // session teardown so the peer's controller sees the last stretch of
+  // traffic instead of losing it to the < 60s tail that never hit the
+  // cadence doors. Idle directions stay silent.
+  bool flush(int64_t now_ms);
+
   bool last_forced() const { return last_forced_; }
   uint32_t reports() const { return reports_; }
   int64_t last_report_ms() const { return last_report_ms_; }

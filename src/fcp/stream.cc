@@ -379,6 +379,15 @@ void Stream::deliver_prefix(int64_t now_ms) {
 void Stream::handle_ack(const uint8_t* seg, size_t len, int64_t now_ms) {
   (void)len;
   const uint32_t cum = get_u32(seg + 1);
+  // #30 adversarial hardening: the peer can never legitimately acknowledge
+  // bytes we have not sent. Accepting such a cum would pop every unacked
+  // segment and strand the data for good (the receiver does not have it
+  // either). A lying oversized rwnd is harmless — send_space() is clamped by
+  // our own send window — but a lying cum is data loss.
+  if (seq_after(cum, snd_nxt_)) {
+    ++bad_segs_;
+    return;
+  }
   peer_rwnd_ = get_u32(seg + 5);
   const uint32_t sack_start = get_u32(seg + 9);
   const uint32_t sack_end = get_u32(seg + 13);

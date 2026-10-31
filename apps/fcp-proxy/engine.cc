@@ -916,6 +916,12 @@ void ProxyEngine::reap(int64_t now_ms) {
       }
       Conn& conn = *it->second;
       save_profile(conn, now_ms);
+      // §14.6 (#30): the last report interval rides out before the session
+      // dies; the peer's tombstone window keeps the datagram routable even
+      // if its own session is already gone.
+      if (conn.session) {
+        conn.session->flush_report(now_ms);
+      }
       if (!conn.salt_key.empty()) {
         const auto salt_it = by_salt_.find(conn.salt_key);
         if (salt_it != by_salt_.end() && salt_it->second == id) {

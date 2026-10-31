@@ -73,6 +73,17 @@ bool FcpReporter::on_tick(int64_t now_ms) {
   return false;
 }
 
+bool FcpReporter::flush(int64_t now_ms) {
+  // §14.6 (#30): a teardown with any accounted traffic sends its last report
+  // immediately; the monotonic key on the peer makes it an ordinary report.
+  if (!have_last_ || !has_content()) {
+    return false;
+  }
+  const int64_t elapsed = now_ms - last_report_ms_;
+  report(now_ms, elapsed > 0 ? elapsed : 1);
+  return true;
+}
+
 void FcpReporter::report(int64_t now_ms, int64_t elapsed_ms) {
   FecstatPacket packet = MakeFecstatPacket(salt_);
   packet.flg = kFlgDirection;

@@ -115,6 +115,15 @@ struct Link {
   fcp::Session* b = nullptr;
   bool loss_enabled = false;
   uint32_t loss_percent = 20;
+  // Gilbert–Elliott two-state channel (#26, FCP_M3_CONTROL.md §3): Bad drops
+  // ge_p_bad percent, Good ge_p_good; per-symbol transitions with the same
+  // LCG. Mean loss ≈ (g2b/(g2b+b2g))·p_bad, mean bad stretch ≈ 100/b2g.
+  bool ge_enabled = false;
+  uint32_t ge_p_good = 0;
+  uint32_t ge_p_bad = 50;
+  uint32_t ge_g2b = 5;
+  uint32_t ge_b2g = 20;
+  bool ge_bad = false;
   bool drop_oob_from_b = false;
   uint32_t rng = 0x9E3779B9u;
   int64_t now = 0;
@@ -130,13 +139,35 @@ struct Link {
   std::vector<Bytes> b_oob_wires;
 
   bool drop(fcp::SymbolType type) {
-    if (!loss_enabled) {
+    if (!loss_enabled && !ge_enabled) {
       return false;
     }
     if (type != fcp::SymbolType::kData && type != fcp::SymbolType::kParity) {
       return false;
     }
     rng = rng * 1103515245u + 12345u;
+    if (ge_enabled) {
+      // Data-only (same convention as the socket harness's burst injector):
+      // dropping parity here would blind settlement (sets_k_unknown over the
+      // trust gate) and turn every report untrusted — the R(k) feedback path
+      // we are trying to exercise, not a link property.
+      if (type != fcp::SymbolType::kData) {
+        return false;
+      }
+      // Transition roll, then a drop roll — separate draws keep the state
+      // chain independent of the per-symbol loss.
+      const uint32_t t = (rng >> 16) % 100;
+      if (ge_bad) {
+        if (t < ge_b2g) {
+          ge_bad = false;
+        }
+      } else if (t < ge_g2b) {
+        ge_bad = true;
+      }
+      rng = rng * 1103515245u + 12345u;
+      const uint32_t d = (rng >> 16) % 100;
+      return (ge_bad ? d < ge_p_bad : d < ge_p_good);
+    }
     return ((rng >> 16) % 100) < loss_percent;
   }
 
@@ -881,6 +912,151 @@ void TestSessionTable() {
 
 }  // namespace
 
+// Every k the FECSTAT log line announced, in order (T35 trajectory view).
+std::vector<unsigned> AllKs(const std::vector<std::string>& logs) {
+  std::vector<unsigned> ks;
+  FecstatLogFields f;
+  for (const std::string& line : logs) {
+    if (line.rfind("FECSTAT sets=", 0) != 0) {
+      continue;
+    }
+    char state[8] = {};
+    unsigned k = 0;
+    if (std::sscanf(line.c_str(),
+                    "FECSTAT sets=%u expect=%u rx=%u rec=%u late=%u lost=%u "
+                    "pre=%uppm usable=%uppm -> k=%u state=%7s",
+                    &f.sets, &f.expect, &f.rx, &f.rec, &f.late, &f.lost, &f.pre,
+                    &f.usable, &k, state) == 10) {
+      ks.push_back(k);
+    }
+  }
+  return ks;
+}
+
+// T35 at injection level (FCP_M3_CONTROL.md §8): two arms at ~10% mean loss,
+// different texture. i.i.d. — the ledger confirms the binomial answer, k
+// holds at 2. Gilbert–Elliott bursts — the empirical group-failure rate
+// exceeds the binomial prediction, p_eff lifts the loss input, and k steps
+// to 3 and STAYS there through reports whose plain mean loss would send it
+// back to 2 (the ledger, not the mean, holds it up). Deterministic: fixed
+// LCG seeds, no wall clock.
+void TestLedgerLiftsKUnderBursts() {
+  const uint32_t kSegments = 8000;  // 800 full sets ≈ 8 report intervals
+
+  struct ArmResult {
+    std::vector<unsigned> ks;
+    std::vector<std::string> ledger_lines;
+  };
+  auto run_arm = [&](bool ge) {
+    Link link;
+    if (ge) {
+      // Bad state drops every data symbol in stretches of mean ~4.5
+      // (b2g = 22), entered 3% per symbol: mean loss ≈ 12%, fully clustered —
+      // runs of 3-4 land inside single groups and push the empirical
+      // group-failure rate at k=2 far above the binomial ~11%, so p_eff
+      // crosses the k=3 threshold (≈0.135) on its own.
+      link.ge_enabled = true;
+      link.ge_p_bad = 100;
+      link.ge_b2g = 22;
+      link.ge_g2b = 3;
+    } else {
+      link.loss_enabled = true;
+      link.loss_percent = 10;
+    }
+    std::vector<std::string> log_a;
+    std::vector<Bytes> delivered;
+    // Both arms start ON at k=2 (the prewarm seed): the first report's ledger
+    // then measures a pure k=2 interval, so the k=3 step at report 2 is
+    // attributable to p_eff alone, not to a mean-loss rise.
+    fcp::SessionConfig cfg_a = MakeConfig(fcp::Direction::kC2S, fcp::Direction::kS2C);
+    cfg_a.initial_k = 2;
+    fcp::SessionConfig cfg_b = MakeConfig(fcp::Direction::kS2C, fcp::Direction::kC2S);
+    cfg_b.initial_k = 2;
+    fcp::Session a(
+        cfg_a,
+        [&link](const uint8_t* w, size_t n, fcp::SymbolType t) { link.from_a(w, n, t); },
+        [](const uint8_t*, size_t) {},
+        [&log_a](const std::string& s) { log_a.push_back(s); });
+    fcp::Session b(
+        cfg_b,
+        [&link](const uint8_t* w, size_t n, fcp::SymbolType t) { link.from_b(w, n, t); },
+        [&delivered](const uint8_t* p, size_t n) { delivered.emplace_back(p, p + n); },
+        [](const std::string&) {});
+    link.a = &a;
+    link.b = &b;
+    CHECK(a.config_valid());
+    CHECK(b.config_valid());
+    a.start(0);
+    b.start(0);
+    a.on_tick(0);
+    b.on_tick(0);
+    CHECK(a.established());
+    CHECK(b.established());
+
+    // Interleave sends and ticks: the report at ~2.1s must reach the sender
+    // while segments are still flowing, or every set locks k=0 and the
+    // ledger stays empty.
+    uint32_t sn = 0;
+    for (int64_t t = fcp::kSessionTickMs; t <= 15000; t += fcp::kSessionTickMs) {
+      link.now = t;
+      while (sn < kSegments && 100 + static_cast<int64_t>(sn) <= t) {
+        const Bytes seg = Segment(sn);
+        a.on_kcp_output(seg.data(), seg.size(), link.now);
+        ++sn;
+      }
+      a.on_tick(t);
+      b.on_tick(t);
+    }
+    CHECK_EQ(sn, kSegments);
+    CHECK(b.settle()->identity_ok());
+    CHECK(b.settle()->delivered_le_sum());
+    // Every delivered byte is the segment that was sent (RS recovery, no
+    // corruption) — spot-check the sn trailer like TestFullLoop does.
+    CHECK_EQ(b.rx()->data_delivered(), static_cast<uint32_t>(delivered.size()));
+    ArmResult out;
+    out.ks = AllKs(log_a);
+    for (const std::string& s : log_a) {
+      if (s.rfind("FEC ledger: ", 0) == 0) {
+        out.ledger_lines.push_back(s);
+      }
+    }
+    return out;
+  };
+
+  const ArmResult iid = run_arm(false);
+  CHECK(!iid.ks.empty());
+  unsigned iid_max = 0;
+  for (const unsigned k : iid.ks) {
+    iid_max = std::max(iid_max, k);
+  }
+  CHECK_EQ(iid_max, 2u);  // k_for(0.10) = 2, and the ledger must not lift it
+
+  const ArmResult burst = run_arm(true);
+  CHECK(!burst.ks.empty());
+  unsigned burst_max = 0;
+  for (const unsigned k : burst.ks) {
+    burst_max = std::max(burst_max, k);
+  }
+  CHECK(burst_max >= 3);   // p_eff > binomial answer under clustered loss
+  CHECK(burst.ks.back() >= 3);  // and it holds at the end of the run
+  // The burst detector saw the texture and the correction actually acted.
+  CHECK(burst.ledger_lines.size() >= 3);
+  double kl_max = 0.0;
+  unsigned applied_max = 0;
+  for (const std::string& s : burst.ledger_lines) {
+    double kl = 0.0;
+    unsigned applied = 0;
+    if (std::sscanf(s.c_str(), "FEC ledger: groups=%*u fail=%*uppm k=%*u "
+                              "peff=%*lf (binomial %*lf) kl=%lf applied=%u",
+                    &kl, &applied) >= 1) {
+      kl_max = std::max(kl_max, kl);
+      applied_max = std::max(applied_max, applied);
+    }
+  }
+  CHECK(kl_max >= 1.0);       // i.i.d. sits at ~0; this texture is far off
+  CHECK(applied_max >= 3);    // p_eff corrections kept applying
+}
+
 int main() {
   TestFullLoop();
   TestHandshakeRidesOob();
@@ -895,5 +1071,6 @@ int main() {
   TestQueuedGuardrailUsesObservedMinRtt();
   TestMissingFecstatWarning();
   TestSessionTable();
+  TestLedgerLiftsKUnderBursts();
   return fcp_test::finish();
 }

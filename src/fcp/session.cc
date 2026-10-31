@@ -451,9 +451,10 @@ void Session::on_oob(const uint8_t* payload, size_t len, int64_t now_ms) {
   if (strategy_->ledger_active()) {
     std::snprintf(line, sizeof(line),
                   "FEC ledger: groups=%u fail=%uppm k=%u peff=%.4f "
-                  "(binomial %.4f) applied=%u skipped=%u",
+                  "(binomial %.4f) kl=%.2f applied=%u skipped=%u",
                   stat.ledger_groups, stat.ledger_fail_ppm, ledger_k(stat),
                   strategy_->last_p_eff(), strategy_->last_loss(),
+                  ledger_burst_kl(stat) / 100.0,
                   strategy_->ledger_reports(), strategy_->ledger_skipped());
     log(line);
   }

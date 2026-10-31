@@ -594,7 +594,7 @@ else:                              FRAMED_REPAIR
  104    4    u32le  sets_partial               提前闭合（`n < D`）的集合数（诊断）
  108    4    u32le  ledger_groups              账本：满编（n=D）且 k 已知且 k≥1 的结算集合数（M3，#29）
  112    4    u32le  ledger_fail_ppm            其中结算时仍有 ≥1 data 未恢复的占比（ppm）
- 116    4    u32le  ledger_meta                byte0=主导 k(1..7)；byte1=0；bytes2-3=burst_kl（0.01 nat，M3 #26 填充）
+ 116    4    u32le  ledger_meta                byte0=主导 k(1..7)；byte1=0；bytes2-3=burst_kl（0.01 nat，饱和 65535，#26）
  120    4    u32le  reserved3 = 0
  124    4    u32le  reserved4 = 0
 ```
@@ -636,6 +636,7 @@ else:                              FRAMED_REPAIR
 | `sets_partial` | 提前闭合（`n < D`）的集合数 | 诊断（稀疏流量下 `data_expected` 的样本质量） |
 | `parity_loss` | `(parity_expected − parity_rx) / parity_expected` | 诊断（冗余通道自身的丢包） |
 | `data_late_rx` | 结算后首次交付的迟到原始 data 数 | 诊断 |
+| `burst_kl` | 组内**原始丢失**（不含恢复）最大游程分布对 i.i.d. 参照（按满编组大小与账本实测丢包率精确 DP，非几何近似）的 KL 距离，nat；随 `ledger_meta` 高 16 位上线（0.01 nat） | 突发检测（§8.1 校正的可信度信号；#26） |
 | 集合成功率 | `(sets_full + 完全修复的集合) / sets_expected` | 诊断 |
 
 - `auth_fail` 不参与 data/parity 分类，因此不会污染丢包率。

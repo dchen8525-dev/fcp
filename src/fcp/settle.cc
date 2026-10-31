@@ -1,11 +1,70 @@
 #include "fcp/settle.h"
 
 #include <algorithm>
+#include <cmath>
 #include <utility>
 
 #include "fcp/hdr.h"
 
 namespace fcp {
+
+void run_dist_iid(double out[9], double p, uint8_t d) {
+  p = std::clamp(p, 0.0, 1.0);
+  const auto n = static_cast<int>(d);
+  // P(M >= m) = 1 - g_m(d), where g_m is the probability that no loss run
+  // reaches length m within d slots. g_m is a DP over the trailing run
+  // length r in 0..m-1: a lost slot extends it (r == m-1 dies), an arrived
+  // slot resets it. m = 0 is vacuous (P >= 0 = 1).
+  double tail[9];  // tail[m] = P(M >= m), m = 0..8
+  tail[0] = 1.0;
+  for (int m = 1; m <= 8; ++m) {
+    if (m > n) {
+      tail[m] = 0.0;  // a run cannot exceed the group size
+      continue;
+    }
+    double g[9] = {};  // g[r] = P(trailing run = r, no run >= m yet)
+    g[0] = 1.0;
+    for (int i = 0; i < n; ++i) {
+      double next[9] = {};
+      for (int r = 0; r < m; ++r) {
+        if (g[r] == 0.0) {
+          continue;
+        }
+        next[0] += g[r] * (1.0 - p);
+        if (r + 1 < m) {
+          next[r + 1] += g[r] * p;
+        }
+        // r + 1 == m: the run hits the bound, excluded from g_m.
+      }
+      std::copy(next, next + m, g);
+    }
+    double alive = 0.0;
+    for (int r = 0; r < m; ++r) {
+      alive += g[r];
+    }
+    tail[m] = 1.0 - alive;
+  }
+  for (int l = 0; l < 8; ++l) {
+    out[l] = tail[l] - tail[l + 1];
+  }
+  out[8] = tail[8];
+}
+
+double burst_kl_iid(const uint32_t run_hist[9], uint32_t groups, double p, uint8_t d) {
+  if (groups == 0) {
+    return 0.0;
+  }
+  double q[9];
+  run_dist_iid(q, p, d);
+  double kl = 0.0;
+  for (int l = 0; l < 9; ++l) {
+    const double e = static_cast<double>(run_hist[l]) / static_cast<double>(groups);
+    if (e > 0.0) {
+      kl += e * std::log(e / std::max(q[l], 1e-12));
+    }
+  }
+  return kl;
+}
 
 FcpSettle::FcpSettle(uint8_t d) : d_(d) {}
 
@@ -94,13 +153,17 @@ void FcpSettle::account(const RxSetView& view) {
     if (view.k_known && view.k > 0 && view.k <= 7 && n_used == static_cast<uint32_t>(d_)) {
       ++counters_.ledger_groups;
       ++counters_.ledger_k_hist[view.k];
+      counters_.ledger_data += n_used;
+      counters_.ledger_data_lost += static_cast<uint32_t>(n_used - orig);
       if (orig + recov < n_used) {
         ++counters_.ledger_groups_failed;
       }
+      // Raw-loss run (see run_hist comment): recovery must not bleed into the
+      // burst signal.
       unsigned run = 0;
       unsigned best = 0;
       for (uint32_t i = 0; i < n_used; ++i) {
-        if (!view.orig_mask.test(i) && !view.recov_mask.test(i)) {
+        if (!view.orig_mask.test(i)) {
           ++run;
           best = std::max(best, run);
         } else {
@@ -172,6 +235,15 @@ uint8_t FcpSettle::ledger_k() const {
     }
   }
   return best_k;
+}
+
+double FcpSettle::burst_kl() const {
+  if (counters_.ledger_groups == 0 || counters_.ledger_data == 0) {
+    return 0.0;
+  }
+  const double p = static_cast<double>(counters_.ledger_data_lost) /
+                   static_cast<double>(counters_.ledger_data);
+  return burst_kl_iid(counters_.run_hist, counters_.ledger_groups, p, d_);
 }
 
 bool FcpSettle::identity_ok() const {

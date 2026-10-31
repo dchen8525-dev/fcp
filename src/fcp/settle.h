@@ -33,6 +33,19 @@ constexpr int64_t kTombstoneMinMs = 200;
 constexpr int64_t kTombstoneMaxMs = 1000;
 constexpr double kUntrustedKUnknownRatio = 0.10;
 
+// Burst detection (FCP_M3_CONTROL.md §3, #26). The reference is the exact
+// i.i.d. law of the max raw-loss run M over one full-size group of `d` slots
+// at per-slot loss `p`: out[l] = P(M = l) for l = 0..7, out[8] = P(M >= 8).
+// Solved exactly by a run-length DP (no geometric approximation, no edge
+// fudge), sum == 1. `p` outside [0, 1] is clamped.
+void run_dist_iid(double out[9], double p, uint8_t d);
+
+// KL(P_emp ‖ Q_iid) in nats over the 9 run buckets, where P_emp is
+// run_hist/groups and Q_iid = run_dist_iid(p, d). Buckets with no empirical
+// mass contribute 0; Q is clamped at 1e-12 so an impossible-under-i.i.d.
+// empirical run stays finite (huge, which is the point). groups == 0 -> 0.
+double burst_kl_iid(const uint32_t run_hist[9], uint32_t groups, double p, uint8_t d);
+
 struct SettleCounters {
   uint32_t sets_expected = 0;
   uint32_t data_expected = 0;
@@ -61,8 +74,17 @@ struct SettleCounters {
   uint32_t ledger_groups = 0;
   uint32_t ledger_groups_failed = 0;
   uint32_t ledger_k_hist[8] = {};  // index = k (1..7 used); [0] unused
-  // Max consecutive missing run within the set (recovered slots do not
-  // count); bucket 8 absorbs ">= 8". Input for the §3 burst detector (#26).
+  // Ledger data slots and how many arrived without their original copy (raw
+  // loss, recovery-independent). Gives the burst detector a loss rate over
+  // the exact population the run histogram was taken from.
+  uint32_t ledger_data = 0;
+  uint32_t ledger_data_lost = 0;
+  // Max consecutive RAW-loss run within the set (original copies that never
+  // arrived; recovered slots still count as lost here). Bucket 8 absorbs
+  // ">= 8". Raw, not post-recovery, because RS fixes holes all-or-nothing:
+  // a group with holes > k shows every hole as unrecovered, which would
+  // fake burstiness on a perfectly i.i.d. link. Input for the §3 burst
+  // detector (#26).
   uint32_t run_hist[9] = {};
 };
 
@@ -91,6 +113,11 @@ class FcpSettle {
   // Dominant k over the interval's ledger (mode of ledger_k_hist; ties go to
   // the lower k). 0 when the ledger is empty.
   uint8_t ledger_k() const;
+
+  // burst_kl_iid over this interval's ledger, with p taken from the ledger's
+  // own raw-loss rate (same population as run_hist). 0 when the ledger is
+  // empty.
+  double burst_kl() const;
 
   static int64_t late_guard_ms(int64_t rtt_ms);
   static int64_t tombstone_ms(int64_t rtt_ms);

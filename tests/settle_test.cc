@@ -1,6 +1,7 @@
 #include "fcp/settle.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
@@ -482,13 +483,13 @@ void TestIdentityFuzz() {
 }  // namespace
 
 // M3 R(k) ledger (FCP_M3_CONTROL.md §1.2): only full-size groups with known
-// k >= 1 enter; a fully repaired group has run 0.
+// k >= 1 enter; runs are RAW loss (recovered slots still count as lost).
 void TestLedgerRecovery() {
   const auto tx = BuildSet(10, 2, Payloads(400, 10));
   Fixture f(10, 3);
   for (const auto& s : tx) {
     if (IsData(s) && (s.index == 2 || s.index == 7)) {
-      continue;  // both recovered by parity
+      continue;  // both recovered by parity — raw runs stay 1 and 1
     }
     f.feed_tx(s);
   }
@@ -497,7 +498,9 @@ void TestLedgerRecovery() {
   CHECK_EQ(f.c().ledger_groups_failed, 0u);
   CHECK_EQ(f.c().ledger_k_hist[2], 1u);
   CHECK_EQ(f.settle.ledger_k(), 2);
-  CHECK_EQ(f.c().run_hist[0], 1u);
+  CHECK_EQ(f.c().ledger_data, 10u);
+  CHECK_EQ(f.c().ledger_data_lost, 2u);
+  CHECK_EQ(f.c().run_hist[1], 1u);
 }
 
 // More holes than parity: RS is underdetermined, nothing recovers, the whole
@@ -548,8 +551,8 @@ void TestLedgerExclusions() {
   CHECK_EQ(f.c().ledger_k_hist[3], 1u);
   CHECK_EQ(f.c().ledger_k_hist[2], 0u);
   CHECK_EQ(f.settle.ledger_k(), 3);
-  // The k=0 set is a candidate for the dominant-k tie rule: no groups, no k.
-  CHECK_EQ(f.c().run_hist[0], 1u);
+  // Set 2's single hole recovered — raw run is still 1.
+  CHECK_EQ(f.c().run_hist[1], 1u);
 }
 
 // Dominant k is the mode of the k histogram (ties to the lower k).
@@ -563,6 +566,109 @@ void TestLedgerDominantK() {
   CHECK_EQ(f.c().ledger_k_hist[2], 1u);
   CHECK_EQ(f.c().ledger_k_hist[3], 2u);
   CHECK_EQ(f.settle.ledger_k(), 3);
+}
+
+// --- #26 burst detection (FCP_M3_CONTROL.md §3) ---
+
+// Exact i.i.d. reference via brute force over all 2^d loss masks (d = 10).
+void RunDistBruteForce(double out[9], double p, uint8_t d) {
+  for (int l = 0; l < 9; ++l) {
+    out[l] = 0.0;
+  }
+  const uint32_t n = 1u << d;
+  for (uint32_t mask = 0; mask < n; ++mask) {
+    double prob = 1.0;
+    unsigned best = 0;
+    unsigned run = 0;
+    for (uint8_t i = 0; i < d; ++i) {
+      if (mask & (1u << i)) {
+        prob *= p;
+        ++run;
+        best = std::max(best, run);
+      } else {
+        prob *= 1.0 - p;
+        run = 0;
+      }
+    }
+    out[std::min<unsigned>(best, 8)] += prob;
+  }
+}
+
+void TestRunDistIidMatchesBruteForce() {
+  for (const double p : {0.02, 0.10, 0.35, 0.70, 1.0}) {
+    double dp[9];
+    double bf[9];
+    fcp::run_dist_iid(dp, p, 10);
+    RunDistBruteForce(bf, p, 10);
+    double sum = 0.0;
+    for (int l = 0; l < 9; ++l) {
+      CHECK(std::fabs(dp[l] - bf[l]) < 1e-12);
+      sum += dp[l];
+    }
+    CHECK(std::fabs(sum - 1.0) < 1e-12);
+  }
+  // p = 0: no loss, all mass at run 0.
+  double q[9];
+  fcp::run_dist_iid(q, 0.0, 10);
+  CHECK(std::fabs(q[0] - 1.0) < 1e-12);
+  // Degenerate group smaller than the largest bucket: run 9 impossible.
+  fcp::run_dist_iid(q, 0.5, 5);
+  CHECK(q[8] == 0.0);
+}
+
+void TestBurstKlMath() {
+  double q[9];
+  fcp::run_dist_iid(q, 0.10, 10);
+  // An empirical histogram equal to the reference has zero distance (up to
+  // the rounding of counts).
+  uint32_t hist[9] = {};
+  const uint32_t n = 100000;
+  for (int l = 0; l < 9; ++l) {
+    hist[l] = static_cast<uint32_t>(q[l] * n + 0.5);
+  }
+  CHECK(fcp::burst_kl_iid(hist, n, 0.10, 10) < 0.001);
+  // A point mass at bucket l sits at exactly -ln Q(l) from the reference.
+  for (int l = 0; l < 9; ++l) {
+    if (q[l] <= 0.0) {
+      continue;
+    }
+    uint32_t delta[9] = {};
+    delta[l] = 64;
+    CHECK(std::fabs(fcp::burst_kl_iid(delta, 64, 0.10, 10) + std::log(q[l])) < 1e-9);
+  }
+  // Empty ledger: zero, not inf.
+  uint32_t empty[9] = {};
+  CHECK(fcp::burst_kl_iid(empty, 0, 0.10, 10) == 0.0);
+}
+
+// Clean ledger: no loss -> the reference is a point mass at 0 too -> kl == 0.
+// A low-loss link with run-of-3 bursts sits far from i.i.d. -> kl > 1 nat.
+void TestBurstKlScenarios() {
+  Fixture clean(10, 3);
+  for (uint32_t g = 0; g < 30; ++g) {
+    clean.feed_as(g, BuildSet(10, 2, Payloads(2000 + 100 * g, 10)));
+  }
+  clean.settle.tick(100, 100);
+  CHECK_EQ(clean.c().ledger_groups, 30u);
+  CHECK_EQ(clean.c().ledger_data_lost, 0u);
+  CHECK(std::fabs(clean.settle.burst_kl()) < 1e-12);
+
+  Fixture bursty(10, 3);
+  for (uint32_t g = 0; g < 100; ++g) {
+    const auto tx = BuildSet(10, 2, Payloads(5000 + 100 * g, 10));
+    for (const auto& s : tx) {
+      if (IsData(s) && g % 10 < 3 && s.index < 3) {
+        continue;  // 30 of 100 groups lose slots 0..2 as one run
+      }
+      bursty.feed(g, s.index, s.type_k, s.symbol, 0);
+    }
+  }
+  bursty.settle.tick(100, 100);
+  CHECK_EQ(bursty.c().ledger_groups, 100u);
+  CHECK_EQ(bursty.c().ledger_data_lost, 90u);
+  CHECK_EQ(bursty.c().run_hist[3], 30u);
+  CHECK_EQ(bursty.c().run_hist[0], 70u);
+  CHECK(bursty.settle.burst_kl() > 1.0);
 }
 
 int main() {
@@ -581,5 +687,8 @@ int main() {
   TestLedgerFailedRun();
   TestLedgerExclusions();
   TestLedgerDominantK();
+  TestRunDistIidMatchesBruteForce();
+  TestBurstKlMath();
+  TestBurstKlScenarios();
   return fcp_test::finish();
 }

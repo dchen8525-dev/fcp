@@ -115,8 +115,8 @@ void FcpReporter::report(int64_t now_ms, int64_t elapsed_ms) {
     packet.sets_tail_dropped = c.sets_tail_dropped;
     packet.data_late_rx = c.data_late_rx;
     packet.sets_partial = c.sets_partial;
-    // M3 R(k) ledger (FCP_M3_CONTROL.md §1.2). burst_kl stays 0 until #26
-    // wires the detector; the ledger_meta bytes for it are reserved already.
+    // M3 R(k) ledger (FCP_M3_CONTROL.md §1.2) with the #26 burst metric in
+    // the ledger_meta high half (0.01 nat, saturating).
     if (c.ledger_groups > 0) {
       packet.flg |= kFlgLedger;
       packet.ledger_groups = c.ledger_groups;
@@ -124,7 +124,11 @@ void FcpReporter::report(int64_t now_ms, int64_t elapsed_ms) {
           (static_cast<uint64_t>(c.ledger_groups_failed) * 1000000ull +
            c.ledger_groups / 2) /
           c.ledger_groups);
-      packet.ledger_meta = static_cast<uint32_t>(settle_->ledger_k());
+      const uint16_t kl =
+          static_cast<uint16_t>(std::min<uint64_t>(
+              65535, static_cast<uint64_t>(settle_->burst_kl() * 100.0 + 0.5)));
+      packet.ledger_meta =
+          static_cast<uint32_t>(settle_->ledger_k()) | (static_cast<uint32_t>(kl) << 16);
     }
   }
 

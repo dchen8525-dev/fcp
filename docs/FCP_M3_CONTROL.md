@@ -90,18 +90,28 @@ k_target  = k_for(p_use, ...)               # 其余状态机逻辑不变
 - **定位**（§14.11）：预算是"深队列 + 高丢包"下冗余字节的**天花板**，防正反馈靠它兜底，
   不是拥塞控制器；排队护栏（srtt − min_rtt ≥ 40ms 不升 k）语义不变。
 
-## 3. 突发检测：经验分布 + KL（#26）
+## 3. 突发检测：经验分布 + KL（#26，已落地）
 
-v5 遗产的结构化版本：
+v5 遗产的结构化版本，实现与原案有三处刻意偏差：
 
-- 输入：账本的 `run_hist`（组内最大连续丢失游程 l = 0..8+ 的分布）。
-- 参照：i.i.d. 假设下 P(L ≥ l) 的几何衰减预测（用区间实测丢包率与 D、k 推出）。
-- 距离：KL(P_emp ‖ Q_iid)，量化 0.01 nat 填进 `ledger_meta` 高 16 位。
-- 用途：`burst_kl` 高 ⇒ p_eff 校正可信度升高（突发是偏差来源）；`burst_kl ≈ 0` ⇒
-  i.i.d. 成立，校正在容差内自动退化为恒等。**检测器不是模型**：只输出偏离度，不估计
-  Gilbert–Elliott 参数（p/g/转移概率留给有真实轨迹标定后，见离线重放工具）。
-- 验收载体：`tests/e2e_link.h` 增加 Gilbert–Elliott 注入（好/坏两态马尔可夫，坏态丢包
-  p_bad、转移概率可配），与既有随机/burst 注入并列。
+- 输入：账本的 `run_hist`——组内最大**原始丢失**游程（`orig_mask` 上的连续缺位，l = 0..8+，
+  桶 8 吸收 "≥8"）。**不含恢复位图**：RS 是全有全无修复，洞数 > k 的组所有洞都算未恢复，
+  混入会把完美 i.i.d. 链路伪装成突发。原始口径在 #24 的"结算时未恢复"基础上改定。
+- 参照：**精确 DP**（游程长度的马尔可夫递推）给出满编组在 i.i.d. 丢包率 p 下的
+  P(M = l) 全分布——不是几何近似（几何会错掉有界组长的边界质量，实测对 2^10 掩码穷举
+  误差 1e-12）。p 取账本自身总体的原始丢失率（`ledger_data_lost / ledger_data`）。
+- 距离：KL(P_emp ‖ Q_iid)，Q 钳 1e-12 防 inf，量化 0.01 nat（饱和 65535）填进
+  `ledger_meta` 高 16 位；P_emp 无质量的桶贡献 0。
+- 用途（本里程碑内是诊断 + 可信度信号，不改 #24 的校正门）：`burst_kl` 高 ⇒ 突发是
+  p_eff 偏差的来源；`burst_kl ≈ 0` ⇒ i.i.d. 成立。用 KL 加权校正留给有真实轨迹标定后
+  （离线重放工具）。**检测器不是模型**：只输出偏离度，不估计 Gilbert–Elliott 参数。
+- 验收载体（落地时改定）：GE 两态马尔可夫进 `session_test` 的 `Link`（虚拟时钟、固定
+  LCG、data-only 丢弃）而非 `e2e_link.h`——后者是真 UDP socket 载体，突发/吞吐测试继续
+  用它的周期注入器。**data-only 是关键约定**：GE 若连 parity 一起丢，`sets_k_unknown`
+  超 10% 信任门，报告整体不可信，R(k) 反馈路径根本没被行使（实现期实测踩中）。
+  T35 注入级验证（`TestLedgerLiftsKUnderBursts`）：双臂同为 ~10% 均值、initial_k=2 起步，
+  i.i.d. 臂全程 k=2；GE 臂 fail 17.5%→22% → peff 0.123→0.137→0.169，k=3 且在均值回落到
+  9% 的报告上仍被账本顶住（二项答案 k=2）——账本而非均值在支撑 k。
 
 ## 4. 快速重传与多洞 SACK（#27，承接 M2 §7 第 2 条）
 
@@ -139,7 +149,7 @@ M2 的定价（单洞 SACK 立补、其余等 RTO）在 WAN 上的实测签名�
 | `src/fcp/reporter.h/.cc` | 打包账本字段与 flg bit3 | `settle.h` |
 | `src/fcp/session.cc` | FECSTAT 日志行追加账本/p_eff 字段 | — |
 | `src/fcp/stream.h/.cc`（#27） | dup-ACK 快重 + 多洞 SACK 记分板 | 仅 std |
-| `tests/e2e_link.h`（#26） | Gilbert–Elliott 注入 | — |
+| `tests/e2e_link.h`（#26） | Gilbert–Elliott 注入 → **落地改定**：GE 进 `tests/session_test.cc` 的 `Link`（虚拟时钟、data-only），`e2e_link.h` 维持周期突发注入（真 socket 载体） | — |
 | `tools/fcp_replay.cc`（#28） | 轨迹录制/回放 | `fcp` |
 | `apps/fcp-proxy/`（#25） | `--fec-budget` 透传：`EngineConfig::fec_budget` → `SessionConfig`；CLI 已落地，**GUI 设置页顺延 #29**（本机 Qt 工具链缺失，见变更记录 #24 条） | `fcp_proxy_core` |
 
@@ -194,3 +204,4 @@ M2 的定价（单洞 SACK 立补、其余等 RTO）在 WAN 上的实测签名�
 | 2026-10-31 | M3 开工：范围盘点（M2 观测增强三项已在位）、设计定案（R(k) 单侧校正、FECSTAT reserved 复用、三态 CAPPED、预算默认 0.40）、任务分解 #24–#29 |
 | 2026-10-31 | **#24 落地**：`settle` 账本（满编组/失败/游程直方图/主导 k）→ `reporter` 打包（flg bit3、fail_ppm 整除舍入）→ `fecstat` codec 语义化 reserved0..2 → `strategy` 的 `binom_p_for_cdf` 反解与单侧校正门（`kMinLedgerGroups=64`、主导 k 必须等于当前 k）→ `session` 日志行 `FEC ledger: ...`。决策 #29 入协议文档（§7.1 字段表 + §8.1）。实现期修正两个测试假设：①洞数 > k 时 RS 欠定、**零恢复**（`TestLedgerFailedRun` 断言 recovered=0 而非 2）；②`binom_cdf` 在 q→1 处双精度平坦（实测 δp=1.6e-9@k=6、1.8e-7@k=7），反解 roundtrip 跳过 q>1−1e-9 带——校正路径无害（max() 单侧兜底）。fecstat_test 补旧端零账本互操作 golden；reporter_test 两场景 flg 断言升级 + 账本字段断言（26 组 1 失败 → 38462ppm）。T34 覆盖；T35 的注入级验证随 #26 的 GE 载体一起做。Windows Debug/Release ctest 25/25（Linux 回归随 #29 WAN 收口）。**Qt 客户端构建门禁本轮未复验**：本机 vcpkg（D:\work\vcpkg 与 VS 内置）均无 qt6、`build/windows-x64-app` 陈旧缓存 `Qt6_DIR-NOTFOUND`——环境缺依赖，非本次改动所致；`apps/` 不含对 `fecstat/settle/strategy` 头的任何引用（Qt 侧只经 `fcp_proxy_core` 引擎 API），新增字段零影响，Qt 门禁在下一次 GUI 相关任务或 #29 收口时补跑 |
 | 2026-10-31 | **#25 落地（T36）**：三态控制器 + 字节预算。`FecState::kCapped`（OFF/ON/CAPPED，`fec_state_name()` 统一日志名）；`FecStrategyConfig::budget_ratio`（默认 0.40，≤0 钳为不限）；逻辑在 on_report 的采样门之后：`ratio = parity_bytes_rx/data_bytes_rx` 超限 → CAPPED 且每报告 k−=1（下限 1，预算优先于 k_target）；回落 1 报告 → 回 ON 不步进（滞回）。输入是 FECSTAT 既有字段，**零线上改动**。透传：`SessionConfig::fec_budget` → `EngineConfig::fec_budget` → CLI `--fec-budget=R`（strtod，帮助文本）。session 日志 `FEC capped:`/`FEC budget restored:` 进出行 + 状态名三态化。测试五场景：进态与逐报告降 k、回落滞回与步进恢复、**红线收敛**（R=0.10 → k=1，ratio≈k/10 仿真）、R=0 不绑、R<k=1 自身比值的退化边界（停在 CAPPED 不下溢）。**GUI 设置页顺延**：Qt 工具链在本机缺失（见 #24 条），`--fec-budget` 的 GUI 透传并入 #29 收口或下一个 GUI 任务；CLI 与 GUI 共用的 `fcp_proxy_core` 已含全量逻辑。协议文档 §8.2 入档。Windows Debug/Release ctest 25/25 |
+| 2026-10-31 | **#26 落地（T37 + T35 注入级）**：突发检测 = 原始游程账本 + 精确 i.i.d. 参照 + KL。`run_dist_iid`（游程 DP，P(M=l) 全分布，对 2^10 掩码穷举 1e-12）+ `burst_kl_iid`（Q 钳 1e-12，空账本返回 0）+ `FcpSettle::burst_kl()`（p 取账本总体原始丢失率）；reporter 打进 `ledger_meta` 高 16 位（0.01 nat 饱和），session 日志行加 `kl=`。**游程口径从 #24 的"结算时未恢复"改为原始丢失**——RS 全有全无修复会把 i.i.d. 链路伪装成突发；两处 #24 断言随之修正。KL 用途本里程碑定为诊断/可信度信号，不改校正门（加权留待真实轨迹标定）。session_test `Link` 加 GE 两态马尔可夫（**data-only**：丢 parity 会把 `sets_k_unknown` 顶过 10% 信任门，R(k) 反馈路径没被行使——实现期实测）；`TestLedgerLiftsKUnderBursts` 双臂对照（initial_k=2 起步、8000 段、发送与 tick 交错）：i.i.d. 臂全程 k=2；GE 臂 fail 17.5%→22%、kl 1.04→1.60，k=3 且在均值 9% 的报告上仍由 peff=0.149 顶住（二项答案 k=2）——账本而非均值在支撑 k。实现期另踩一坑：发送与 tick 不交错则首份 FECSTAT 在全部段发完后才到，全程 k=0、parity=0。settle_test 新增 3 组 KL 单测（穷举对照、KL(P=Q)=0、KL(δ)=−ln Q、场景级 clean=0 / run-of-3 > 1 nat）。Windows Debug/Release ctest 25/25 |

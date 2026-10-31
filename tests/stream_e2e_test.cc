@@ -401,13 +401,20 @@ void TestBurstLossExceedsFec() {
   h.burst_len = 4;
 
   const std::vector<uint8_t> src = MakeBytes(24 * 1024, 53);
+  const int64_t t0 = h.now;
   CHECK_EQ(h.WriteA(src), src.size());
   CHECK(h.WaitRx(0, src.size(), 40000));
+  const int64_t elapsed = h.now - t0;
 
   CHECK(h.rx_b == src);
   h.Advance(2000);
   CHECK(h.SB()->rx()->recovered() > 0u);
   CHECK(h.A()->retransmits() > 0u);
+  // T38: multi-hole burst recovery is RTT-scale, not RTO-scale. Deterministic
+  // virtual time, same seed: 25ms with the #27 rotation + fast retransmit vs
+  // 225ms under the M2 hole-per-RTT pipeline (and holes x rto(400ms) far past
+  // that). The bound catches a regression to the old pipeline.
+  CHECK(elapsed < 200);
   CheckCarrierClean(h);
 }
 

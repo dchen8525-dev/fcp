@@ -213,9 +213,23 @@ void Stream::emit_ack() {
   put_u32(buf + 1, cum);
   put_u32(buf + 5, static_cast<uint32_t>(rwnd_out()));
   if (!oob_.empty()) {
-    put_u32(buf + 9, oob_.front().offset);
-    put_u32(buf + 13, oob_.front().offset + static_cast<uint32_t>(oob_.front().bytes.size()));
+    // #27: the wire carries one SACK block, so on a repeated cumulative point
+    // (the peer is buffered past a hole) rotate through the buffered chunks —
+    // every hole gets reported within oob_.size() duplicates instead of only
+    // after the first hole heals and cum moves.
+    if (have_ack_cum_ && cum == last_ack_cum_) {
+      ++sack_rotate_;
+    } else {
+      sack_rotate_ = 0;
+    }
+    last_ack_cum_ = cum;
+    have_ack_cum_ = true;
+    const RcvChunk& blk = oob_[sack_rotate_ % oob_.size()];
+    put_u32(buf + 9, blk.offset);
+    put_u32(buf + 13, blk.offset + static_cast<uint32_t>(blk.bytes.size()));
   } else {
+    have_ack_cum_ = false;
+    sack_rotate_ = 0;
     put_u32(buf + 9, cum);
     put_u32(buf + 13, cum);
   }
@@ -370,6 +384,30 @@ void Stream::handle_ack(const uint8_t* seg, size_t len, int64_t now_ms) {
   const uint32_t sack_end = get_u32(seg + 13);
   const uint32_t prior_una = snd_una_;
 
+  // #27 fast retransmit: a repeated cumulative point with unacked data is the
+  // peer saying "I am buffered past a hole". After kDupAckThresh of them,
+  // force one copy of the first unacked segment — the only path that beats
+  // both the RTO and the sack_filled_up_to_ guard when a repair itself was
+  // lost. Runs before fill_holes so the fill's fresh-retransmission guard
+  // keeps this ACK from emitting the same segment twice. One trigger per
+  // batch (counter resets here and on any cum advance); once the repair
+  // lands, cum moves and the counting restarts.
+  if (have_cum_ && cum == last_cum_) {
+    ++dup_acks_;
+  } else {
+    dup_acks_ = 0;
+  }
+  last_cum_ = cum;
+  have_cum_ = true;
+  if (dup_acks_ >= kDupAckThresh && !tx_.empty() && tx_.front().sent) {
+    dup_acks_ = 0;
+    PendingSeg& first = tx_.front();
+    first.sent_ms = now_ms;
+    first.retrans = true;
+    ++retransmits_;
+    emit_seg(first);
+  }
+
   if (seq_after(cum, snd_una_)) {
     bool popped_retrans = false;
     int64_t sample_ms = -1;
@@ -401,6 +439,16 @@ void Stream::handle_ack(const uint8_t* seg, size_t len, int64_t now_ms) {
   // buffering past the hole keeps re-advertising the same SACK block, and waiting
   // a full RTO on top of that is exactly the stall this block exists to avoid.
   if (sack_end != sack_start) {
+    // #27: the block says these bytes arrived — mark them so the rotating
+    // blocks of later ACKs never re-fill a SACKed segment as if it were a hole.
+    for (size_t i = 0; i < tx_.size(); ++i) {
+      PendingSeg& s = tx_[i];
+      const uint32_t s_end = s.offset + static_cast<uint32_t>(s.wire_len());
+      if (s.sent && seq_at_or_after(s.offset, sack_start) &&
+          seq_at_or_after(sack_end, s_end)) {
+        s.sacked = true;
+      }
+    }
     fill_holes(sack_start, now_ms);
   }
   if (snd_una_ == prior_una) {
@@ -429,8 +477,8 @@ void Stream::fill_holes(uint32_t sack_start, int64_t now_ms) {
   for (size_t i = 0; i < tx_.size(); ++i) {
     PendingSeg& seg = tx_[i];
     const uint32_t seg_end = seg.offset + static_cast<uint32_t>(seg.wire_len());
-    if (!seq_after(seg_end, snd_una_) || !seg.sent) {
-      continue;  // acked, or not on the wire yet (pump handles those)
+    if (!seq_after(seg_end, snd_una_) || !seg.sent || seg.sacked) {
+      continue;  // acked, not on the wire (pump handles those), or not a hole
     }
     if (seq_dist(seg.offset, sack_start) >= 0) {
       break;  // at or past the hole

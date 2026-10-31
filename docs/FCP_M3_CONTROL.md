@@ -125,6 +125,28 @@ M2 的定价（单洞 SACK 立补、其余等 RTO）在 WAN 上的实测签名�
 - 验收：burst 注入下交付时延从"RTO 尺度"降到"RTT 尺度"；有序/恒等式/无重复不变式全部
   保留（T29/T30 既有断言不许回退）。
 
+### 4.1 落地时的再定案（#27，相对原案的两处修正）
+
+实现前通读 `stream.cc` 发现：M2 的 `fill_holes` 对**第一个**洞已经是" sightings 即补"，
+原案快重对其无增益。真正的缺口有两个，落地对应两条机制（17B ACK 线格式不变）：
+
+1. **多洞盲区 → 接收端 SACK 块轮转**：ACK 只携带一个 SACK 块且恒为 `oob_.front()`，
+   非相邻多洞时发送端每洞多付一个 RTT（cum 推进后才看得到下一个块）。#27 让接收端在
+   **重复 ACK**（同 cum，即对端正被洞挡住）上轮转上报的块——`oob_.size()` 个重复内全部
+   暴露，配合 `fill_holes` "补齐 sack_start 之下一切" 的语义，一个远块 sighting 即修复
+   其后全部洞。配套给段加 `sacked` 标记：轮转暴露的块会覆盖已 SACK 的段，不标记会被
+   `fill_holes` 当洞重发（实现期发现，属组合缺陷）。
+2. **补洞重传再丢 → 发送端 dup-ACK 强制补**：`sack_filled_up_to_` 单调门会让丢失的
+   重传卡到 RTO。dup-ACK ≥ 3（`kDupAckThresh`，每批一次、cum 推进重置）强制重发
+   `tx_.front()`，先于 `fill_holes` 执行、由其 fresh 守卫防同 ACK 双发。代价：常见
+   单洞场景多一个副本（SACK 修复在途时 3 个 dup 已到达）——每洞一次、cum 推进即止，
+   接收端按字节裁剪进 `dup_bytes`；既有两测试的精确计数随行为更新（1→2、copies 2→3）。
+
+已知边界不变：**尾段丢失无 dup-ACK 载体**（接收方无新段可确认），仍由 RTO 兜底——
+这是 §4 原案就声明的定价。验收实测：同一确定性 burst 场景（e2e，虚拟时钟同种子）
+M2 管线 225ms → #27 25ms（9×），`TestBurstLossExceedsFec` 以 <200ms 断言守回归；
+`TestSackRotationReportsAllHoles` 以"时钟冻结"证明修复全程无超时参与。
+
 ## 5. 承接小项（#29 收口时逐项处理）
 
 1. **优雅关闭与 tombstone 路由保留**（M2 §8.1 尾段竞态）：墓碑之后短暂保留 salt 路由，
@@ -205,3 +227,4 @@ M2 的定价（单洞 SACK 立补、其余等 RTO）在 WAN 上的实测签名�
 | 2026-10-31 | **#24 落地**：`settle` 账本（满编组/失败/游程直方图/主导 k）→ `reporter` 打包（flg bit3、fail_ppm 整除舍入）→ `fecstat` codec 语义化 reserved0..2 → `strategy` 的 `binom_p_for_cdf` 反解与单侧校正门（`kMinLedgerGroups=64`、主导 k 必须等于当前 k）→ `session` 日志行 `FEC ledger: ...`。决策 #29 入协议文档（§7.1 字段表 + §8.1）。实现期修正两个测试假设：①洞数 > k 时 RS 欠定、**零恢复**（`TestLedgerFailedRun` 断言 recovered=0 而非 2）；②`binom_cdf` 在 q→1 处双精度平坦（实测 δp=1.6e-9@k=6、1.8e-7@k=7），反解 roundtrip 跳过 q>1−1e-9 带——校正路径无害（max() 单侧兜底）。fecstat_test 补旧端零账本互操作 golden；reporter_test 两场景 flg 断言升级 + 账本字段断言（26 组 1 失败 → 38462ppm）。T34 覆盖；T35 的注入级验证随 #26 的 GE 载体一起做。Windows Debug/Release ctest 25/25（Linux 回归随 #29 WAN 收口）。**Qt 客户端构建门禁本轮未复验**：本机 vcpkg（D:\work\vcpkg 与 VS 内置）均无 qt6、`build/windows-x64-app` 陈旧缓存 `Qt6_DIR-NOTFOUND`——环境缺依赖，非本次改动所致；`apps/` 不含对 `fecstat/settle/strategy` 头的任何引用（Qt 侧只经 `fcp_proxy_core` 引擎 API），新增字段零影响，Qt 门禁在下一次 GUI 相关任务或 #29 收口时补跑 |
 | 2026-10-31 | **#25 落地（T36）**：三态控制器 + 字节预算。`FecState::kCapped`（OFF/ON/CAPPED，`fec_state_name()` 统一日志名）；`FecStrategyConfig::budget_ratio`（默认 0.40，≤0 钳为不限）；逻辑在 on_report 的采样门之后：`ratio = parity_bytes_rx/data_bytes_rx` 超限 → CAPPED 且每报告 k−=1（下限 1，预算优先于 k_target）；回落 1 报告 → 回 ON 不步进（滞回）。输入是 FECSTAT 既有字段，**零线上改动**。透传：`SessionConfig::fec_budget` → `EngineConfig::fec_budget` → CLI `--fec-budget=R`（strtod，帮助文本）。session 日志 `FEC capped:`/`FEC budget restored:` 进出行 + 状态名三态化。测试五场景：进态与逐报告降 k、回落滞回与步进恢复、**红线收敛**（R=0.10 → k=1，ratio≈k/10 仿真）、R=0 不绑、R<k=1 自身比值的退化边界（停在 CAPPED 不下溢）。**GUI 设置页顺延**：Qt 工具链在本机缺失（见 #24 条），`--fec-budget` 的 GUI 透传并入 #29 收口或下一个 GUI 任务；CLI 与 GUI 共用的 `fcp_proxy_core` 已含全量逻辑。协议文档 §8.2 入档。Windows Debug/Release ctest 25/25 |
 | 2026-10-31 | **#26 落地（T37 + T35 注入级）**：突发检测 = 原始游程账本 + 精确 i.i.d. 参照 + KL。`run_dist_iid`（游程 DP，P(M=l) 全分布，对 2^10 掩码穷举 1e-12）+ `burst_kl_iid`（Q 钳 1e-12，空账本返回 0）+ `FcpSettle::burst_kl()`（p 取账本总体原始丢失率）；reporter 打进 `ledger_meta` 高 16 位（0.01 nat 饱和），session 日志行加 `kl=`。**游程口径从 #24 的"结算时未恢复"改为原始丢失**——RS 全有全无修复会把 i.i.d. 链路伪装成突发；两处 #24 断言随之修正。KL 用途本里程碑定为诊断/可信度信号，不改校正门（加权留待真实轨迹标定）。session_test `Link` 加 GE 两态马尔可夫（**data-only**：丢 parity 会把 `sets_k_unknown` 顶过 10% 信任门，R(k) 反馈路径没被行使——实现期实测）；`TestLedgerLiftsKUnderBursts` 双臂对照（initial_k=2 起步、8000 段、发送与 tick 交错）：i.i.d. 臂全程 k=2；GE 臂 fail 17.5%→22%、kl 1.04→1.60，k=3 且在均值 9% 的报告上仍由 peff=0.149 顶住（二项答案 k=2）——账本而非均值在支撑 k。实现期另踩一坑：发送与 tick 不交错则首份 FECSTAT 在全部段发完后才到，全程 k=0、parity=0。settle_test 新增 3 组 KL 单测（穷举对照、KL(P=Q)=0、KL(δ)=−ln Q、场景级 clean=0 / run-of-3 > 1 nat）。Windows Debug/Release ctest 25/25 |
+| 2026-10-31 | **#27 落地（T38）**：快重/多洞 SACK。落地再定案见 §4.1——M2 `fill_holes` 对首洞已是即时补，真缺口是①非相邻多洞的单块盲区（接收端 dup-ACK 上轮转 SACK 块 + 发送端 `sacked` 段标记防把 SACK 段当洞重发）与②补洞重传再丢被 `sack_filled_up_to_` 卡到 RTO（发送端 dup≥3 每批一次强制补 `tx_.front()`，置于 fill 之前由其 fresh 守卫防双发）。17B ACK 格式不变；尾段丢失仍归 RTO（无 dup 载体）。测试：stream_test 新增 3 场景（轮转三块/强制补洞与每批一次/无虚假触发），`TestSackFillsHoleWithoutTimeout`、`TestKarnDropsAmbiguousSamples` 精确计数随行为更新（+1 fast copy，Karn 性质不变），e2e burst 场景确定性实测 225ms→25ms（9×）并以 <200ms 守回归。M2 §7 第 2 条入档指针已加。Windows Debug/Release ctest 25/25 |

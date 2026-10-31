@@ -38,6 +38,13 @@ constexpr size_t kStreamAckLen = 17;     // type | cum | rwnd | sack_start | sac
 constexpr size_t kStreamRstLen = 2;      // type | code
 constexpr uint8_t kStreamFlagFin = 1u << 0;
 
+// M3 fast retransmit (FCP_M3_CONTROL.md §4, #27): duplicate ACKs of the same
+// cumulative point are proof the peer is buffering past a hole; the third one
+// force-retransmits the first unacked segment without waiting for the RTO or
+// the SACK-fill bookkeeping. The receiver rotates the single SACK block per
+// dup-ACK so every buffered hole gets reported within a few duplicates.
+constexpr uint32_t kDupAckThresh = 3;
+
 constexpr uint8_t kStreamRstAbort = 1;
 
 enum class StreamState : uint8_t {
@@ -135,6 +142,9 @@ class Stream {
   int64_t rto_ms() const { return rto_ms_; }
   size_t peer_window() const { return peer_rwnd_; }
   size_t send_space() const;
+  // Diagnostics: duplicate ACKs counted on the send side since the last cum
+  // advance (0 when the last ACK moved cum).
+  uint32_t dup_acks() const { return dup_acks_; }
 
  private:
   struct PendingSeg {
@@ -143,6 +153,7 @@ class Stream {
     bool fin = false;
     bool sent = false;
     bool retrans = false;
+    bool sacked = false;  // #27: covered by a SACK block; never a hole
     int64_t sent_ms = 0;
     size_t wire_len() const { return bytes.size() + (fin ? 1 : 0); }
   };
@@ -196,6 +207,12 @@ class Stream {
   bool peer_fin_ = false;
   uint32_t peer_fin_at_ = 0;         // offset where the peer's data ends
   uint32_t sack_filled_up_to_ = 0;   // never re-fill a hole below this
+  // #27: on repeated ACKs of the same cumulative point (the peer has data we
+  // do not), rotate which oob chunk the single SACK block reports, so the
+  // sender learns every hole in a few duplicates instead of one per RTT.
+  uint32_t last_ack_cum_ = 0;
+  uint32_t sack_rotate_ = 0;
+  bool have_ack_cum_ = false;
 
   int64_t srtt_ms_ = 0;
   int64_t rto_ms_ = 0;
@@ -203,6 +220,13 @@ class Stream {
   int64_t last_probe_ms_ = 0;
   bool eof_delivered_ = false;
   bool notified_ = false;            // ClosedFn fires at most once per stream
+  // #27: duplicate-ACK tracking on the send side (same cumulative point as
+  // the previous ACK while data is unacked). At kDupAckThresh, force-retransmit
+  // tx_.front() once per batch — this is the only path through the
+  // sack_filled_up_to_ guard when a repair itself was lost.
+  uint32_t last_cum_ = 0;
+  uint32_t dup_acks_ = 0;
+  bool have_cum_ = false;
 
   uint64_t bytes_queued_ = 0;
   uint64_t bytes_acked_ = 0;

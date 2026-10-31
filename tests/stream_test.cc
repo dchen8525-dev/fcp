@@ -190,6 +190,16 @@ class Fixture {
     return {};
   }
 
+  std::vector<std::vector<uint8_t>> acks_of(int from) const {
+    std::vector<std::vector<uint8_t>> out;
+    for (const std::vector<uint8_t>& seg : ends_[from].sent) {
+      if (IsAck(seg)) {
+        out.push_back(seg);
+      }
+    }
+    return out;
+  }
+
   size_t data_with_offset(int from, uint32_t offset) const {
     size_t n = 0;
     for (const std::vector<uint8_t>& seg : data_of(from)) {
@@ -331,6 +341,10 @@ void TestOutOfOrderHeldAndSackBlock() {
 }
 
 // A hole in front of a SACK block is retransmitted on the spot, before any RTO.
+// #27: the dup-ACK burst that follows the loss also triggers one forced copy
+// of the hole (kDupAckThresh duplicates arrive while the SACK repair is still
+// in flight), so the wire carries original + fill + fast retransmit, and the
+// receiver trims the redundant one.
 void TestSackFillsHoleWithoutTimeout() {
   Fixture f;
   int copies = 0;
@@ -347,9 +361,9 @@ void TestSackFillsHoleWithoutTimeout() {
   f.drain();
 
   CHECK(f.b().delivered == src);
-  CHECK_EQ(copies, 2);  // original + exactly one repair
-  CHECK_EQ(f.sa().retransmits(), 1u);
-  CHECK_EQ(f.sb().dup_bytes(), 0u);
+  CHECK_EQ(copies, 3);  // original + SACK repair + fast retransmit
+  CHECK_EQ(f.sa().retransmits(), 2u);
+  CHECK_EQ(f.sb().dup_bytes(), f.payload());
   // No RTO can have elapsed: rto is 400ms at the seeded srtt, and the repair
   // came back inside a couple of 25ms ticks.
   CHECK(f.now() - t0 < f.sa().rto_ms());
@@ -563,9 +577,9 @@ void TestKarnDropsAmbiguousSamples() {
   f.drain();
 
   CHECK(f.b().delivered == src);
-  CHECK_EQ(copies, 2);
-  CHECK_EQ(f.sa().retransmits(), 1u);
-  CHECK(f.a().rtts.empty());
+  CHECK_EQ(copies, 3);  // original + SACK repair + fast retransmit (#27)
+  CHECK_EQ(f.sa().retransmits(), 2u);
+  CHECK(f.a().rtts.empty());  // Karn: every copy of seg 0 was a retransmission
   CHECK_EQ(f.sa().srtt_ms(), f.cfg().initial_srtt_ms);
   CHECK_EQ(f.sa().bytes_acked(), src.size());
 }
@@ -760,11 +774,106 @@ void TestRandomLossEndToEnd() {
 
 }  // namespace
 
+// --- #27 fast retransmit / multi-hole SACK (FCP_M3_CONTROL.md §4) ---
+
+// The single SACK block rotates on duplicate ACKs: three disjoint holes are
+// all reported within three ACKs, and the sender repairs all of them without
+// a single tick (no RTO could have fired).
+void TestSackRotationReportsAllHoles() {
+  Fixture f;
+  f.cut_all();  // everything moves by hand; time stands still
+  const std::vector<uint8_t> src = MakeBytes(600, 11);  // 6 segments
+  CHECK_EQ(f.push(kA, src), src.size());
+  const int64_t t_pushed = f.now();  // push() ticks; remember where time froze
+  const auto segs = f.data_of(kA);
+  CHECK_EQ(segs.size(), 6u);
+  const size_t cap = f.payload();
+
+  // Holes at offsets 0, 2*cap, 4*cap; survivors buffered out of order.
+  f.feed(kB, segs[1]);
+  f.feed(kB, segs[3]);
+  f.feed(kB, segs[5]);
+  const auto acks = f.acks_of(kB);
+  CHECK_EQ(acks.size(), 3u);
+  // Three distinct SACK blocks in three duplicate ACKs — the pre-#27 sender
+  // only ever saw the front block [cap, 2*cap) until cum moved.
+  CHECK_EQ(rd32(acks[0].data() + 9), 1u * cap);
+  CHECK_EQ(rd32(acks[0].data() + 13), 2u * cap);
+  CHECK_EQ(rd32(acks[1].data() + 9), 3u * cap);
+  CHECK_EQ(rd32(acks[1].data() + 13), 4u * cap);
+  CHECK_EQ(rd32(acks[2].data() + 9), 5u * cap);
+  CHECK_EQ(rd32(acks[2].data() + 13), 6u * cap);
+
+  // The sender repairs every hole from the far blocks alone: fill_holes
+  // retransmits everything below each reported block, so blocks 2 and 3 cover
+  // the holes the front block could not mention.
+  for (const auto& ack : acks) {
+    f.feed(kA, ack);
+  }
+  CHECK_EQ(f.sa().retransmits(), 3u);
+  CHECK_EQ(f.data_with_offset(kA, 0), 2u);
+  CHECK_EQ(f.data_with_offset(kA, 2u * static_cast<uint32_t>(cap)), 2u);
+  CHECK_EQ(f.data_with_offset(kA, 4u * static_cast<uint32_t>(cap)), 2u);
+  // Time never moved: this whole repair happened without any timeout.
+  CHECK_EQ(f.now(), t_pushed);
+}
+
+// The dup-ACK path: the first SACK sighting repairs the hole via fill_holes,
+// and the third duplicate ACK adds exactly one forced copy of the first
+// unacked segment (once per batch — more duplicates need another kDupAckThresh
+// to fire again). No time passes, so nothing here can be an RTO.
+void TestDupAckForceRefill() {
+  Fixture f;
+  f.cut_all();
+  const std::vector<uint8_t> src = MakeBytes(400, 11);  // 4 segments
+  CHECK_EQ(f.push(kA, src), src.size());
+  const int64_t t_pushed = f.now();
+  const auto segs = f.data_of(kA);
+
+  for (int i = 1; i <= 3; ++i) {
+    f.feed(kB, segs[i]);
+  }
+  const auto acks = f.acks_of(kB);
+  CHECK_EQ(acks.size(), 3u);
+  f.feed(kB, segs[1]);  // a pure duplicate: one more ACK at the same cum
+  const auto acks2 = f.acks_of(kB);
+  CHECK_EQ(acks2.size(), 4u);
+  for (const auto& ack : acks2) {
+    f.feed(kA, ack);
+  }
+  // ACK 1: fill_holes repairs the hole. ACKs 2..4: dups 1..3, the third
+  // forces one extra copy of the first unacked segment.
+  CHECK_EQ(f.sa().retransmits(), 2u);
+  CHECK_EQ(f.data_with_offset(kA, 0), 3u);  // original + fill + forced copy
+  CHECK_EQ(f.now(), t_pushed);              // no timeout was involved
+
+  // Replaying the same four ACKs restarts the counter: dup 3 fires once more
+  // (fill stays blocked by sack_filled_up_to_), proving the per-batch rule.
+  for (const auto& ack : acks2) {
+    f.feed(kA, ack);
+  }
+  CHECK_EQ(f.sa().retransmits(), 3u);
+}
+
+// In-order ACKs never arm the fast-retransmit path.
+void TestNoSpuriousFastRetransmit() {
+  Fixture f;
+  const std::vector<uint8_t> src = MakeBytes(400, 11);
+  CHECK_EQ(f.push(kA, src), src.size());
+  f.drain();
+  CHECK(f.b().delivered == src);
+  CHECK_EQ(f.sa().retransmits(), 0u);
+  CHECK_EQ(f.sa().dup_acks(), 0u);
+}
+
 int main() {
   TestOrderedFlow();
   TestBidirectional();
   TestOutOfOrderHeldAndSackBlock();
   TestSackFillsHoleWithoutTimeout();
+  TestSackRotationReportsAllHoles();
+  TestDupAckForceRefill();
+  TestNoSpuriousFastRetransmit();
   TestDupAndOverlapTrimming();
   TestReceiverBufferCapAndRwnd();
   TestZeroWindowProbeUnblocks();

@@ -1,5 +1,6 @@
 #include "engine.h"
 
+#include <cstdio>
 #include <cstring>
 #include <random>
 
@@ -20,8 +21,36 @@ void drop_front(std::vector<uint8_t>* v, size_t n) {
   v->erase(v->begin(), v->begin() + static_cast<std::ptrdiff_t>(n));
 }
 
+// #29a: how long a reaped session's salt keeps absorbing the peer's tail
+// retransmissions before the routing entry is truly forgotten.
+constexpr int64_t kSaltTombstoneMs = 5000;
+
 std::string salt_key_of(const uint8_t* salt) {
   return std::string(reinterpret_cast<const char*>(salt), Envelope::kSaltLen);
+}
+
+// #29a: one JSONL controller-trace sink per session, closed with the session
+// (the shared_ptr dies with the captured lambda). Empty prefix = disabled.
+SessionConfig::TraceFn make_trace_sink(const std::string& prefix, uint64_t cid) {
+  if (prefix.empty()) {
+    return nullptr;
+  }
+  const std::string path = prefix + "." + std::to_string(cid) + ".jsonl";
+  std::shared_ptr<std::FILE> file(std::fopen(path.c_str(), "wb"),
+                                  [](std::FILE* f) {
+                                    if (f != nullptr) {
+                                      std::fclose(f);
+                                    }
+                                  });
+  if (file == nullptr || file.get() == nullptr) {
+    return nullptr;
+  }
+  return [file](const TraceEntry& e) {
+    std::string line;
+    encode_trace_line(e, &line);
+    line.push_back('\n');
+    std::fwrite(line.data(), 1, line.size(), file.get());
+  };
 }
 
 void random_salt(uint8_t out[Envelope::kSaltLen]) {
@@ -164,6 +193,19 @@ void ProxyEngine::on_wire(uint64_t peer, const uint8_t* data, size_t len, int64_
     ++counters_.unknown_salt;
     return;
   }
+  // #29a: a tombstoned salt is a dead session's tail — drop quietly. On the
+  // server this also stops a late retransmission from being mistaken for the
+  // first HELLO of a phantom session. A live session's salt never gets here:
+  // the lookup below finds it first, and reap() only tombstones salts it just
+  // removed from by_salt_.
+  const auto tomb_it = salt_tombstones_.find(salt_key_of(data));
+  if (tomb_it != salt_tombstones_.end()) {
+    if (now_ms < tomb_it->second) {
+      ++counters_.salt_tombstone;
+      return;
+    }
+    salt_tombstones_.erase(tomb_it);  // grace over: forget it for real
+  }
   Conn* c = find_by_salt(data, len);
   if (c == nullptr) {
     // Client: a salt we did not mint is not ours. Server: this may be the first
@@ -208,6 +250,15 @@ void ProxyEngine::on_app_writable(uint64_t conn, int64_t now_ms) {
 
 void ProxyEngine::on_tick(int64_t now_ms) {
   now_ms_ = now_ms;
+  // #29a: expired tombstones whose salts never see another datagram would
+  // otherwise live forever; the lookup path only prunes the one it touches.
+  for (auto it = salt_tombstones_.begin(); it != salt_tombstones_.end();) {
+    if (now_ms >= it->second) {
+      it = salt_tombstones_.erase(it);
+    } else {
+      ++it;
+    }
+  }
   std::vector<uint64_t> ids;
   ids.reserve(by_conn_.size());
   for (const auto& entry : by_conn_) {
@@ -319,6 +370,7 @@ bool ProxyEngine::create_client_conn(uint64_t id, uint64_t peer, int64_t now_ms)
   sc.ip_hdr_len = cfg_.ip_hdr_len;
   sc.pinned_k = cfg_.pinned_k;
   sc.fec_budget = cfg_.fec_budget;
+  sc.trace = make_trace_sink(cfg_.trace_prefix, id);
   // A stream numbers bytes, so a retransmission deliberately repeats an id the
   // peer has to see again; the frame-layer dedup keyed on the KCP sn would eat
   // it and stall the send window (session.h, SessionConfig::sn_of).
@@ -389,6 +441,7 @@ ProxyEngine::Conn* ProxyEngine::create_server_conn(uint64_t peer, const uint8_t*
   sc.ip_hdr_len = cfg_.ip_hdr_len;
   sc.pinned_k = cfg_.pinned_k;
   sc.fec_budget = cfg_.fec_budget;
+  sc.trace = make_trace_sink(cfg_.trace_prefix, id);
   sc.sn_of = nullptr;
   apply_prewarm(profile_for(peer, now_ms), &sc, &raw->stream_cfg);
 
@@ -867,6 +920,13 @@ void ProxyEngine::reap(int64_t now_ms) {
         const auto salt_it = by_salt_.find(conn.salt_key);
         if (salt_it != by_salt_.end() && salt_it->second == id) {
           by_salt_.erase(salt_it);
+          // #29a (M2 §8.1 tail race): the peer's retransmit tail keeps
+          // arriving after our side is gone. Keep the salt known-but-dead
+          // for a grace period so those datagrams drop as tombstones instead
+          // of counting as unknown_salt (client) or — worse on the server —
+          // being mistaken for a fresh HELLO and rebirthing a phantom
+          // session. The grace covers the peer's RTO tail (rto_max is 5s).
+          salt_tombstones_[conn.salt_key] = now_ms + kSaltTombstoneMs;
         }
       }
       by_conn_.erase(it);

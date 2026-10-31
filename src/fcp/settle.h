@@ -28,9 +28,12 @@ namespace fcp {
 constexpr int64_t kSettleTickMs = 25;
 constexpr int64_t kTailDropMs = 1000;
 constexpr int64_t kLateGuardMinMs = 100;
-constexpr int64_t kLateGuardMaxMs = 500;
+// #29a (§14.14): raised to match the handshake backoff's RTT <= ~700ms door
+// (decision #27); the old 500/1000 caps misjudged in-flight fragments as lost
+// on high-RTT links. Direction-safe: the guard only decides when to settle.
+constexpr int64_t kLateGuardMaxMs = 700;
 constexpr int64_t kTombstoneMinMs = 200;
-constexpr int64_t kTombstoneMaxMs = 1000;
+constexpr int64_t kTombstoneMaxMs = 1400;
 constexpr double kUntrustedKUnknownRatio = 0.10;
 
 // Burst detection (FCP_M3_CONTROL.md §3, #26). The reference is the exact

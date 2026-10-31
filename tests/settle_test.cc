@@ -113,12 +113,13 @@ void TestClamps() {
   CHECK_EQ(fcp::FcpSettle::late_guard_ms(50), 100);
   CHECK_EQ(fcp::FcpSettle::late_guard_ms(100), 100);
   CHECK_EQ(fcp::FcpSettle::late_guard_ms(300), 300);
-  CHECK_EQ(fcp::FcpSettle::late_guard_ms(800), 500);
+  CHECK_EQ(fcp::FcpSettle::late_guard_ms(700), 700);  // #29a: door opens to the
+  CHECK_EQ(fcp::FcpSettle::late_guard_ms(800), 700);  // handshake backoff range
 
   CHECK_EQ(fcp::FcpSettle::tombstone_ms(50), 200);
   CHECK_EQ(fcp::FcpSettle::tombstone_ms(100), 200);
   CHECK_EQ(fcp::FcpSettle::tombstone_ms(300), 600);
-  CHECK_EQ(fcp::FcpSettle::tombstone_ms(800), 1000);
+  CHECK_EQ(fcp::FcpSettle::tombstone_ms(700), 1400);
 }
 
 void TestBasicAccounting() {

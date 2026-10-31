@@ -517,6 +517,39 @@ void TestBudgetFloorStaysOne() {
   }
 }
 
+// D3 slow-link sample gate (§14.8, #29a): a near-60s forced report is
+// accepted at a quarter of the sample gate, but its entry thresholds are
+// doubled — resolution loss must not become entry chatter. Normal-cadence
+// reports keep the full gate.
+void TestSlowLinkSampleGate() {
+  // 100 packets at 2% loss (98 rx): below the full 256 gate, but inside the
+  // forced interval's quarter gate.
+  fcp::FecStrategy st;
+  fcp::FecstatPacket slow = Report(1, 100, 98);
+  slow.interval_ms = 60000;
+  st.on_report(slow, false);
+  CHECK(st.state() == fcp::FecState::kOff);  // 2% < 3% doubled single line
+  fcp::FecstatPacket slow2 = Report(2, 100, 98);
+  slow2.interval_ms = 60000;                 // also forced: 2% >= 1.6% two line
+  st.on_report(slow2, false);
+  CHECK(st.state() == fcp::FecState::kOn);
+  CHECK_EQ(st.k(), 1);
+
+  // The same 100-packet sample at the normal 2s cadence stays a small sample.
+  fcp::FecStrategy st2;
+  st2.on_report(Report(3, 100, 98), false);
+  CHECK(st2.state() == fcp::FecState::kOff);
+  CHECK_EQ(st2.small_sample_reports(), 1u);
+
+  // 4% loss (96/100) clears the doubled single-report line (3%) in one
+  // forced report.
+  fcp::FecStrategy st3;
+  fcp::FecstatPacket bursty = Report(4, 100, 96);
+  bursty.interval_ms = 60000;
+  st3.on_report(bursty, false);
+  CHECK(st3.state() == fcp::FecState::kOn);
+  CHECK_EQ(st3.k(), 1);
+}
 int main() {
   TestOffToOn();
   TestTwoReportEntry();
@@ -532,6 +565,7 @@ int main() {
   TestLedgerLiftsK();
   TestLedgerOneSided();
   TestLedgerIidStable();
+  TestSlowLinkSampleGate();
   TestLedgerGates();
   return fcp_test::finish();
 }

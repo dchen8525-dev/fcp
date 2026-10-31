@@ -82,7 +82,8 @@ struct SessionConfig {
   // #28 controller trace sink (FCP_M3_CONTROL.md §5): invoked once per
   // accepted FECSTAT report with the report, the config snapshot and the
   // decision just made. Empty = no recording.
-  std::function<void(const TraceEntry&)> trace;
+  using TraceFn = std::function<void(const TraceEntry&)>;
+  TraceFn trace;
 };
 
 class Session {

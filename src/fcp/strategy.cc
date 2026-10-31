@@ -4,6 +4,7 @@
 #include <cmath>
 
 #include "fcp/hdr.h"
+#include "fcp/reporter.h"
 
 namespace fcp {
 
@@ -117,7 +118,13 @@ void FecStrategy::on_report(const FecstatPacket& stat, bool window_queued) {
     return;
   }
   // Sample gate 2: the 60s forced report may carry too little traffic.
-  if (stat.data_expected < kMinSamplePackets) {
+  // D3 (§14.8, #29a): a near-cap interval (>= 55s — the 60s forced door) from
+  // a slow link drops the gate to 64 samples, with the OFF-entry thresholds
+  // doubled so the coarser resolution cannot cause entry chatter. Normal
+  // 2s-cadence reports keep the full gate.
+  const bool forced_interval = stat.interval_ms >= kFecstatMaxIntervalMs - 5000;
+  const uint32_t min_samples = forced_interval ? kMinSamplePackets / 4 : kMinSamplePackets;
+  if (stat.data_expected < min_samples) {
     ++small_sample_reports_;
     return;
   }
@@ -131,14 +138,14 @@ void FecStrategy::on_report(const FecstatPacket& stat, bool window_queued) {
     if (cooldown_reports_ > 0) {
       --cooldown_reports_;
       consec_ge_08_ = 0;
-      if (loss >= 0.045) {
+      if (loss >= 0.045 * (forced_interval ? 2.0 : 1.0)) {
         enter_on(loss);
       }
       return;
     }
-    if (loss >= 0.015) {
+    if (loss >= 0.015 * (forced_interval ? 2.0 : 1.0)) {
       enter_on(loss);
-    } else if (loss >= 0.008) {
+    } else if (loss >= 0.008 * (forced_interval ? 2.0 : 1.0)) {
       if (++consec_ge_08_ >= 2) {
         enter_on(loss);
       }

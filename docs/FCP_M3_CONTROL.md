@@ -150,14 +150,15 @@ M2 管线 225ms → #27 25ms（9×），`TestBurstLossExceedsFec` 以 <200ms 断
 
 ## 5. 承接小项（#29 收口时逐项处理）
 
-1. **优雅关闭与 tombstone 路由保留**（M2 §8.1 尾段竞态）：墓碑之后短暂保留 salt 路由，
-   让迟到重传不再计 `unknown_salt`。
-2. **D3 慢链路样本门**（§14.8）：`interval ≥ 60s` 强制上报时样本门降为 ≥64 并用保守
-   阈值，或按速率放大强制间隔——以慢链路仿真数据定。
-3. **`late_guard`/墓碑上限标定**（§14.14）：上限 500ms/1s 与握手退避支持的 RTT≤700ms
-   区间不自洽；按实测 srtt 缩放或提上限。
-4. **跨连接继承评估**（§14.16）：M2 预热已覆盖 k 冷启动；评估是否需要按目标地址聚合
-   丢包样本（大概率结论是"预热够了 + p_eff 校正已缓解"，入档即可）。
+1. **优雅关闭与 tombstone 路由保留**（M2 §8.1 尾段竞态）：**已随 #29a 落地**——reap 的
+   salt 进 5s 宽限墓碑，迟到重传计 `salt_tombstone` 静默丢弃，服务端不再重建幽灵会话。
+2. **D3 慢链路样本门**（§14.8）：**已随 #29a 落地**——interval ≥ 55s 的强制报告样本门
+   降至 64、入门阈值加倍（strategy_test 守卫）。
+3. **`late_guard`/墓碑上限标定**（§14.14）：**已随 #29a 落地**——上限提至 700/1400ms，
+   与握手退避的 RTT 门对齐。
+4. **跨连接继承评估**（§14.16）：**评估结论（#29a，不做）**——M2 prewarm 已覆盖 k 冷启动
+   （T33 实测省 ~25%/条），#24 的 p_eff 单侧校正缓解短连接欠保护；按目标地址聚合丢包
+   样本的增量收益不足以抵其状态复杂度，入档为已知边界。
 5. **离线重放工具**（#28）：录制（FECSTAT 报告 + 每 tick 决策 + 配置快照，JSONL）→
    离线装载重放到候选控制器参数 → 输出 k 轨迹/预算峰值对比。阈值标定（§14 第 1 条）的
    工具前提。
@@ -230,3 +231,4 @@ M2 管线 225ms → #27 25ms（9×），`TestBurstLossExceedsFec` 以 <200ms 断
 | 2026-10-31 | **#26 落地（T37 + T35 注入级）**：突发检测 = 原始游程账本 + 精确 i.i.d. 参照 + KL。`run_dist_iid`（游程 DP，P(M=l) 全分布，对 2^10 掩码穷举 1e-12）+ `burst_kl_iid`（Q 钳 1e-12，空账本返回 0）+ `FcpSettle::burst_kl()`（p 取账本总体原始丢失率）；reporter 打进 `ledger_meta` 高 16 位（0.01 nat 饱和），session 日志行加 `kl=`。**游程口径从 #24 的"结算时未恢复"改为原始丢失**——RS 全有全无修复会把 i.i.d. 链路伪装成突发；两处 #24 断言随之修正。KL 用途本里程碑定为诊断/可信度信号，不改校正门（加权留待真实轨迹标定）。session_test `Link` 加 GE 两态马尔可夫（**data-only**：丢 parity 会把 `sets_k_unknown` 顶过 10% 信任门，R(k) 反馈路径没被行使——实现期实测）；`TestLedgerLiftsKUnderBursts` 双臂对照（initial_k=2 起步、8000 段、发送与 tick 交错）：i.i.d. 臂全程 k=2；GE 臂 fail 17.5%→22%、kl 1.04→1.60，k=3 且在均值 9% 的报告上仍由 peff=0.149 顶住（二项答案 k=2）——账本而非均值在支撑 k。实现期另踩一坑：发送与 tick 不交错则首份 FECSTAT 在全部段发完后才到，全程 k=0、parity=0。settle_test 新增 3 组 KL 单测（穷举对照、KL(P=Q)=0、KL(δ)=−ln Q、场景级 clean=0 / run-of-3 > 1 nat）。Windows Debug/Release ctest 25/25 |
 | 2026-10-31 | **#27 落地（T38）**：快重/多洞 SACK。落地再定案见 §4.1——M2 `fill_holes` 对首洞已是即时补，真缺口是①非相邻多洞的单块盲区（接收端 dup-ACK 上轮转 SACK 块 + 发送端 `sacked` 段标记防把 SACK 段当洞重发）与②补洞重传再丢被 `sack_filled_up_to_` 卡到 RTO（发送端 dup≥3 每批一次强制补 `tx_.front()`，置于 fill 之前由其 fresh 守卫防双发）。17B ACK 格式不变；尾段丢失仍归 RTO（无 dup 载体）。测试：stream_test 新增 3 场景（轮转三块/强制补洞与每批一次/无虚假触发），`TestSackFillsHoleWithoutTimeout`、`TestKarnDropsAmbiguousSamples` 精确计数随行为更新（+1 fast copy，Karn 性质不变），e2e burst 场景确定性实测 225ms→25ms（9×）并以 <200ms 守回归。M2 §7 第 2 条入档指针已加。Windows Debug/Release ctest 25/25 |
 | 2026-10-31 | **#28 落地（T39 工具半边）**：`src/fcp/trace.h/.cc`（TraceEntry = 报告全字段扁平 JSONL + 生效配置快照 + 决策；严格扁平扫描解码，未知键跳过；`replay_trace` 用快照重建 FecStrategy 逐报告重放，确定性）→ `SessionConfig::trace` 录制钩子（每个 kOk 报告一条，含被门挡下的——重放时门行为同样复现；快照取协商后的 d/P'）→ `tools/fcp_replay`（装载/覆盖参数/重放，输出 k 轨迹、CAPPED 数、字节比峰值、与录制的 agree 率）。实现期修了 **FrameRx oob 回调丢 now_ms** 的老问题（分发硬编码 0，OobFn 加时间参数）——策略从不需要时间戳所以从未暴露。测试：往返/确定性复现（5/10/20% + GE 全部逐决策一致）/预算 what-if（0.10 → CAPPED 走到 k=1）/golden 文件 + ctest 冒烟。**逮住 #25 真缺陷**：线上 ratio = k/D 而非 §8.2 写的 k/(D+k)，默认 0.40 恰好绑在 k=4（20% 丢包工作点）——默认改 0.50，决策 #30 勘误入协议文档。**T39 全绿的控制器半边就此在 gate 内常驻**（5/10/20% k 稳定 + 预算不超 + GE 抬升）。**CLI/GUI 的 `--trace` 录制接线顺延 #29**（WAN 标定时随部署一起接）。Windows Debug/Release ctest 27/27（新增 replay_test 与 fcp_replay 冒烟） |
+| 2026-10-31 | **#29a 落地（本地半边）**：① **salt 路由 tombstone**（M2 §8.1 尾段竞态收口）：reap 的 salt 不再直接遗忘，进 `salt_tombstones_`（宽限 5s = 对端 RTO 尾）——迟到重传按 `salt_tombstone` 静默丢弃，客户端不再计 `unknown_salt`，**服务端不再把迟到重传误当新 HELLO 重建幽灵会话**（原缺陷此前只观察到客户端侧，服务端侧是推演出的同根缺陷）；过期项 on_tick 清扫。② **CLI `--trace=PREFIX`**：每会话一路 JSONL（`PREFIX.<cid>.jsonl`，shared_ptr 随会话销毁关文件），WAN 标定的录制入口就位（GUI 透传仍顺延）。③ **late_guard/墓碑上限 500/1000 → 700/1400ms**（§14.14，对齐握手退避的 RTT≤700ms 门）。④ **D3 慢链路样本门**（§14.8）：interval ≥ 55s 的强制报告样本门降至 64、OFF 入门阈值加倍——分辨率损失不得变成入门抖动。⑤ 跨连接继承评估入档：M2 prewarm 覆盖 k 冷启动 + #24 p_eff 单侧校正缓解短连接欠保护，按目标聚合丢包样本的收益不足以抵其复杂度，**不做，入档为已知边界**（§14.16 的结论）。测试：proxy_engine_test 新增 tombstone（双端）与 trace sink（文件存在/可解码/随会话关闭）场景；settle 钳值断言更新；strategy_test 新增 D3 场景。Windows Debug/Release ctest 27/27 |

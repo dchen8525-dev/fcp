@@ -50,6 +50,7 @@ struct Options {
   size_t send_window_bytes = 64 * 1024;
   size_t rcv_buf_bytes = 32 * 1024;
   bool prewarm = true;
+  std::string trace_prefix;  // #29a: per-session controller trace when set
 };
 
 struct DialRequest {
@@ -72,6 +73,7 @@ class Harness {
     EngineConfig cc = base;
     cc.role = EngineRole::kClient;
     cc.max_sessions = opt.client_max_sessions;
+    cc.trace_prefix = opt.trace_prefix;
     EngineConfig sc = base;
     sc.role = EngineRole::kServer;
     sc.max_sessions = opt.server_max_sessions;
@@ -699,6 +701,76 @@ void zero_window_recovery_after_partial_refusal() {
 
 }  // namespace
 
+
+// #29a (M2 §8.1 tail race): after a session dies, its salt keeps absorbing
+// the peer's tail retransmissions as tombstones — on the client instead of
+// unknown_salt, and on the server without rebirthing a phantom session from
+// a stale datagram.
+void salt_tombstone_absorbs_tail() {
+  Harness h{Options()};
+  h.local_open(kLocalConn);
+  h.local_send(kLocalConn, greeting());
+  h.local_send(kLocalConn, socks5_request(0x01, 0x01, ipv4_bytes("198.51.100.9"), 80));
+  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, 60));
+  const std::vector<uint8_t> tail = h.last_from_client;
+
+  h.local_close(kLocalConn);
+  CHECK(h.run_until([&] {
+    return h.client->counters().live == 0 && h.server->counters().live == 0;
+  }, 120));
+
+  // The client's own tail (same salt) is a tombstone now, not unknown_salt.
+  h.client->on_wire(kServerPeer, tail.data(), tail.size(), h.now_ms);
+  CHECK_EQ(h.client->counters().salt_tombstone, 1u);
+  CHECK_EQ(h.client->counters().unknown_salt, 0u);
+
+  // The server arm: the same datagram would have been mistaken for a fresh
+  // HELLO and rebirthed a phantom session before #29a.
+  h.server->on_wire(kOtherPeer, tail.data(), tail.size(), h.now_ms);
+  CHECK_EQ(h.server->counters().salt_tombstone, 1u);
+  CHECK_EQ(h.server->counters().live, 0u);
+  CHECK_EQ(h.server->counters().established, 1u);
+}
+
+// #29a: --trace wiring. A client engine with a trace prefix writes one JSONL
+// controller-trace line per accepted FECSTAT report; the file closes with the
+// session, and its lines decode back into TraceEntry.
+void trace_sink_writes_controller_trace() {
+  Options opt;
+  opt.trace_prefix = "replay_trace_test";
+  Harness h{opt};
+  h.local_open(kLocalConn);
+  h.local_send(kLocalConn, greeting());
+  h.local_send(kLocalConn, socks5_request(0x01, 0x01, ipv4_bytes("198.51.100.9"), 80));
+  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, 60));
+  // Drive >= 256 data packets through the tunnel so a report fires at the 2s
+  // cadence, then settle everything so the sink's file closes.
+  const std::vector<uint8_t> bulk(400 * 1336, 0x5A);
+  h.local_send(kLocalConn, bulk);
+  CHECK(h.run_until([&] { return h.target_bytes(h.last_dial_conn()).size() >= bulk.size(); }, 400));
+  // The in-memory transfer finishes well under the 2s report cadence; keep
+  // the tunnel alive until a report actually fires.
+  h.run_until([] { return false; }, 100);
+  h.local_close(kLocalConn);
+  CHECK(h.run_until([&] {
+    return h.client->counters().live == 0 && h.server->counters().live == 0;
+  }, 200));
+
+  std::FILE* f = std::fopen("replay_trace_test.101.jsonl", "rb");
+  CHECK(f != nullptr);
+  char line[4096];
+  CHECK(std::fgets(line, sizeof(line), f) != nullptr);
+  std::fclose(f);
+  fcp::TraceEntry e;
+  fcp::TraceConfigSnapshot snapshot{};
+  CHECK(fcp::decode_trace_line(line, &e));
+  CHECK(e.stat.data_expected >= fcp::kMinSamplePackets);
+  // The in-memory path is lossless, so the controller is rightly still OFF;
+  // what this guards is the recording plumbing, not the decision.
+  CHECK(e.k_after == 0);
+  CHECK(std::remove("replay_trace_test.101.jsonl") == 0);
+}
+
 int main() {
   socks5_round_trip();
   http_connect_round_trip();
@@ -710,5 +782,7 @@ int main() {
   short_connections_leave_no_state_behind();
   dial_timeout_and_grace_clock();
   session_limits();
+  salt_tombstone_absorbs_tail();
+  trace_sink_writes_controller_trace();
   return fcp_test::finish();
 }

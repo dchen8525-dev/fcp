@@ -57,6 +57,10 @@ struct EngineConfig {
   int pinned_k = -1;  // >= 0 bypasses the adaptive strategy (measurements)
   // M3 byte budget (FCP_M3_CONTROL.md §2), passed to SessionConfig verbatim.
   double fec_budget = 0.50;
+  // #29a controller trace: when non-empty, every session writes a JSONL
+  // controller trace (SessionConfig::trace) to `<prefix>.<cid>.jsonl` —
+  // the calibration input for tools/fcp_replay.
+  std::string trace_prefix;
   size_t send_window_bytes = 256 * 1024;
   size_t rcv_buf_bytes = 256 * 1024;
   // Teardown of a tunnel that stopped speaking (§7: dead peer detection).
@@ -150,6 +154,7 @@ class ProxyEngine {
     size_t tunnels = 0;      // OPEN_OK exchanged, both directions usable
     uint32_t salt_clash = 0;
     uint32_t unknown_salt = 0;
+    uint32_t salt_tombstone = 0;  // #29a: dropped as a dead session's tail
     uint32_t over_limit = 0;  // refused: max_sessions reached
     uint32_t bad_entry = 0;   // malformed local request
     uint32_t open_failed = 0;  // OPEN_ERR sent or received
@@ -262,6 +267,10 @@ class ProxyEngine {
   PrewarmCache prewarm_;
   std::unordered_map<uint64_t, std::unique_ptr<Conn>> by_conn_;
   std::unordered_map<std::string, uint64_t> by_salt_;
+  // #29a: salts of recently reaped sessions, expiry stamped. Their tail
+  // retransmissions are dropped as `salt_tombstone` instead of counting as
+  // unknown_salt (client) or rebirthing a phantom session (server).
+  std::unordered_map<std::string, int64_t> salt_tombstones_;
   uint64_t next_server_conn_ = 1;
   int64_t now_ms_ = 0;
   int64_t next_prune_ms_ = 0;

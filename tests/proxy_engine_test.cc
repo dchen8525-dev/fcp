@@ -162,6 +162,10 @@ class Harness {
   // log, not a queue, so a scenario can read the target after it was answered.
   std::vector<DialRequest> dials;
   std::vector<std::string> client_log, server_log;
+  // Source-address slot bookkeeping the reactor drives (engine.h peer_bound /
+  // peer_retired): one bound and one retired per server-side session.
+  std::vector<uint64_t> client_peer_bounds, client_peer_retired;
+  std::vector<uint64_t> server_peer_bounds, server_peer_retired;
   std::vector<uint8_t> last_from_client;  // for the salt replay case
   uint64_t datagrams = 0;
   bool auto_answer = true;
@@ -203,6 +207,12 @@ class Harness {
     };
     h.peer_key = [is_client](uint64_t peer) {
       return std::string(is_client ? "server:peer" : "client:peer") + std::to_string(peer);
+    };
+    h.peer_bound = [this, is_client](uint64_t peer) {
+      (is_client ? client_peer_bounds : server_peer_bounds).push_back(peer);
+    };
+    h.peer_retired = [this, is_client](uint64_t peer) {
+      (is_client ? client_peer_retired : server_peer_retired).push_back(peer);
     };
     h.new_salt = [this](uint8_t salt[Envelope::kSaltLen]) {
       std::memset(salt, 0, Envelope::kSaltLen);
@@ -864,6 +874,42 @@ void dial_backpressure_bounds_pre_tunnel_bytes() {
   CHECK_EQ(text_of(h.target_bytes(target_conn)), std::string(offered, 0x5A));
 }
 
+// engine.h peer_bound/peer_retired: the reactor keeps a source-address slot
+// only while a session routes through it. Every server-side session must be
+// announced exactly once and released exactly once -- a missed release pins a
+// slot until the table ceiling; a missed bound lets the slot be recycled under
+// a live session.
+void peer_callbacks_balance_server_sessions() {
+  Harness h{Options()};
+  h.local_open(kLocalConn);
+  h.local_send(kLocalConn, greeting());
+  h.local_send(kLocalConn, socks5_request(0x01, 0x01, ipv4_bytes("203.0.113.9"), 443));
+  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, 40));
+
+  CHECK_EQ(h.server_peer_bounds.size(), 1u);
+  CHECK_EQ(h.server_peer_bounds[0], kClientPeer);
+  CHECK(h.server_peer_retired.empty());
+  // The client has a fixed single peer and no address table to maintain.
+  CHECK(h.client_peer_bounds.empty());
+  CHECK(h.client_peer_retired.empty());
+
+  h.local_close(kLocalConn);
+  CHECK(h.run_until([&] {
+    return h.client->counters().live == 0 && h.server->counters().live == 0;
+  }, 80));
+  CHECK_EQ(h.server_peer_retired.size(), 1u);
+  CHECK_EQ(h.server_peer_retired[0], kClientPeer);
+  CHECK_EQ(h.server_peer_bounds.size(), 1u);  // no duplicate announcement
+
+  // A server session that dies before its handshake completes follows the same
+  // lifecycle: the reactor must still see the pair, or its slot leaks.
+  const std::vector<uint8_t> junk(64, 0xEE);
+  Harness bad{Options()};
+  bad.server->on_wire(kOtherPeer, junk.data(), junk.size(), bad.now_ms);
+  CHECK_EQ(bad.server_peer_bounds.size(), 1u);
+  CHECK_EQ(bad.server_peer_retired.size(), 1u);
+}
+
 int main() {
   socks5_round_trip();
   http_connect_round_trip();
@@ -880,5 +926,6 @@ int main() {
   unauthenticated_datagrams_do_not_create_sessions();
   authenticated_non_hello_session_times_out();
   dial_backpressure_bounds_pre_tunnel_bytes();
+  peer_callbacks_balance_server_sessions();
   return fcp_test::finish();
 }

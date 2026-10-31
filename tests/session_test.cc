@@ -1057,6 +1057,40 @@ void TestLedgerLiftsKUnderBursts() {
   CHECK(applied_max >= 3);    // p_eff corrections kept applying
 }
 
+// #26①/T25: the envelope refuses the 2^32nd packet. The session has to expose
+// that state so the host can disconnect instead of leaving a tunnel whose
+// every send is silently dropped (engine.cc closes on nonce_exhausted()).
+void TestSendNonceExhaustionIsObservable() {
+  Link link;
+  fcp::Session a(
+      MakeConfig(fcp::Direction::kC2S, fcp::Direction::kS2C),
+      [&link](const uint8_t* w, size_t n, fcp::SymbolType t) { link.from_a(w, n, t); },
+      [](const uint8_t*, size_t) {}, [](const std::string&) {});
+  fcp::Session b(
+      MakeConfig(fcp::Direction::kS2C, fcp::Direction::kC2S),
+      [&link](const uint8_t* w, size_t n, fcp::SymbolType t) { link.from_b(w, n, t); },
+      [](const uint8_t*, size_t) {}, [](const std::string&) {});
+  link.a = &a;
+  link.b = &b;
+  a.start(0);
+  b.start(0);
+  a.on_tick(0);
+  b.on_tick(0);
+  CHECK(a.established());
+  CHECK(!a.nonce_exhausted());
+
+  CHECK(a.set_send_nonce(fcp::Envelope::kNonceLimit - 1));
+  const uint32_t before = link.a_data;
+  const Bytes last = Segment(900);
+  a.on_kcp_output(last.data(), last.size(), link.now);
+  CHECK_EQ(link.a_data, before + 1);  // the final nonce still seals
+  CHECK(a.nonce_exhausted());
+
+  const Bytes refused = Segment(901);
+  a.on_kcp_output(refused.data(), refused.size(), link.now);
+  CHECK_EQ(link.a_data, before + 1);  // exhausted: nothing leaves the session
+}
+
 int main() {
   TestFullLoop();
   TestHandshakeRidesOob();
@@ -1072,5 +1106,6 @@ int main() {
   TestMissingFecstatWarning();
   TestSessionTable();
   TestLedgerLiftsKUnderBursts();
+  TestSendNonceExhaustionIsObservable();
   return fcp_test::finish();
 }

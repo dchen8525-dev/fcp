@@ -53,9 +53,14 @@ if(WIN32)
 endif()
 
 # fcp_replay smoke (tools/, #28): replay the checked-in golden trace and make
-# sure the tool loads it and prints its summary. The golden is regenerated
-# with `set FCP_WRITE_TRACE_GOLDEN=<path>` before running replay_test.
+# sure the tool loads it and prints its summary. --dump exercises the bare-flag
+# path (it used to be documented but rejected as "bad argument"), and
+# --require-exact turns the golden into a real determinism guard: a controller
+# change that stops reproducing the recording now fails the suite. The golden is
+# regenerated with `set FCP_WRITE_TRACE_GOLDEN=<path>` before running
+# replay_test.
 add_test(NAME replay_tool_smoke
-         COMMAND fcp_replay --trace=${CMAKE_CURRENT_SOURCE_DIR}/replay_golden.jsonl)
+         COMMAND fcp_replay --trace=${CMAKE_CURRENT_SOURCE_DIR}/replay_golden.jsonl
+                 --dump --require-exact)
 set_tests_properties(replay_tool_smoke PROPERTIES
          PASS_REGULAR_EXPRESSION "entries=[0-9]+ skipped=0")

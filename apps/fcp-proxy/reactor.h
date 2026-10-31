@@ -31,7 +31,10 @@
 #define FCP_PROXY_REACTOR_H_
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -71,6 +74,22 @@ constexpr size_t kReactorMaxReadBytes = 16 * 1024;
 // datagram is whatever the other end sends from, so the count needs a bound;
 // past it a new peer's traffic is dropped instead of being tracked.
 constexpr size_t kReactorMaxPeers = 8192;
+// At the ceiling only this many slots are examined per new source before the
+// datagram is dropped; the cursor rotates so every slot is reachable.
+constexpr size_t kPeerReclaimScan = 64;
+// Off-loop name resolution. getaddrinfo() can block for many seconds, so it
+// never runs on the select thread, and a fixed pool keeps a burst of dials from
+// spawning one thread each. Past the queue ceiling a dial fails immediately
+// instead of waiting for a resolver that may never answer.
+constexpr size_t kResolverWorkers = 4;
+constexpr size_t kResolverMaxQueued = 256;
+// A name with hundreds of records must not turn one dial into hundreds of
+// connect attempts; the resolver keeps the first this many answers.
+constexpr size_t kResolverMaxAddrs = 16;
+// One maximum-size IPv4 UDP datagram. The old 2 KiB stack buffer silently
+// truncated every symbol once --mtu exceeded ~2 KiB, which the session then
+// dropped as an authentication failure with no diagnostic.
+constexpr size_t kUdpRecvBytes = 64 * 1024;
 
 struct ReactorOptions {
   EngineRole role = EngineRole::kClient;
@@ -82,8 +101,9 @@ struct ReactorOptions {
   // Server: the UDP port to bind.
   std::string bind_addr = "0.0.0.0";
   int bind_port = 4460;
-  // TCP connect budget for a target. The engine's own dial_timeout_ms covers
-  // resolution plus connect, so this is the smaller inner clock.
+  // TCP connect budget for one resolved address. A name with several records
+  // may spend this per record; the engine's own dial_timeout_ms still bounds
+  // resolution plus all attempts from above.
   int64_t connect_timeout_ms = 5000;
   int64_t stats_ms = 0;  // 0 = no periodic stats line
   bool verbose = false;
@@ -115,14 +135,47 @@ class Reactor {
     Sock sock = kBadSock;
     int64_t deadline_ms = 0;
   };
+  struct ResolvedAddr {
+    sockaddr_storage addr{};
+    socklen_t len = 0;
+  };
   // What a getaddrinfo() worker hands back. The vector is append-only from the
   // workers and swapped out by the loop thread, so no index is ever shared
   // across the two sides.
   struct ResolveResult {
     uint64_t conn = 0;
     bool ok = false;
-    sockaddr_storage addr{};
-    socklen_t addr_len = 0;
+    // Every usable answer, in resolver order. A name is not one address:
+    // "localhost" is usually ::1 first even when the service listens on IPv4
+    // only, and a multi-homed name fails over between records.
+    std::vector<ResolvedAddr> addrs;
+  };
+  enum class ConnectAttempt : uint8_t {
+    kPending,    // non-blocking connect started
+    kConnected,  // connected on the first call
+    kFailed,     // this address failed synchronously
+    kGone,       // the engine already tore the connection down
+  };
+  struct ResolveJob {
+    uint64_t conn = 0;
+    std::string host;
+    uint16_t port = 0;
+  };
+  // Shared with the resolver threads: getaddrinfo() may outlive this Reactor,
+  // so the queue cannot be a member the workers reach through `this`.
+  struct ResolveQueue {
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::deque<ResolveJob> jobs;
+    std::vector<ResolveResult> done;
+    bool stopping = false;
+  };
+  // Server-side source-address slot. `refs` counts sessions the engine says are
+  // routed through this id; a slot with no sessions may be recycled.
+  struct PeerSlot {
+    sockaddr_in addr{};
+    uint32_t refs = 0;
+    bool used = false;
   };
 
   static EngineHost make_host(Reactor* self);
@@ -137,12 +190,26 @@ class Reactor {
   void dial(uint64_t conn, const ProxyTarget& target);
   std::string peer_key(uint64_t peer);
 
+  bool add_peer(const sockaddr_in& from, uint64_t* peer);
+  // Erase the slot's address key and mark it free; the caller either returns
+  // the id to free_peers_ or reuses it immediately.
+  void forget_peer(uint64_t peer);
+  void free_peer(uint64_t peer);
+  void peer_bound(uint64_t peer);
+  void peer_retired(uint64_t peer);
+  static void resolve_worker(std::shared_ptr<ResolveQueue> queue);
+
   // Loop steps.
   void drain_udp(int64_t now_ms);
   void accept_local(int64_t now_ms);
   void read_socket(Sock sock, uint64_t conn, bool target, int64_t now_ms);
   void flush_conn(uint64_t conn, int64_t now_ms);
-  void connect_now(uint64_t conn, const sockaddr* addr, socklen_t len, int64_t now_ms);
+  ConnectAttempt connect_once(uint64_t conn, const sockaddr* addr, socklen_t len,
+                              int64_t now_ms, int* err);
+  // Starts the next resolved address. True means an attempt is in flight or the
+  // answer was consumed (connected/gone); false means every address failed
+  // synchronously and `last_err` holds the final error.
+  bool connect_addresses(uint64_t conn, int64_t now_ms, int* last_err);
   void connect_event(Sock sock, uint64_t conn, int64_t now_ms);
   void except_event(Sock sock, uint64_t conn, int64_t now_ms);
   void expire_connects(int64_t now_ms);
@@ -165,13 +232,18 @@ class Reactor {
   Sock listener_ = kBadSock;
   // The client has exactly one peer (id 0); the server assigns an id per
   // distinct source address and keeps the addresses indexed by that id.
-  std::vector<sockaddr_in> peer_addrs_;
+  std::vector<PeerSlot> peers_;
+  std::vector<uint64_t> free_peers_;
+  size_t peer_cursor_ = 0;
   std::unordered_map<std::string, uint64_t> peer_ids_;
   std::unordered_map<uint64_t, Sock> locals_;   // client: accepted sockets
   std::unordered_map<uint64_t, Sock> targets_;  // server: connected targets
   std::unordered_map<uint64_t, Pending> pending_;
-  std::vector<ResolveResult> results_;
-  std::mutex results_mutex_;
+  // Addresses still to try for a connection whose name resolved to several.
+  // Dropped on success, on the final failure and when the conn goes away.
+  std::unordered_map<uint64_t, std::deque<ResolvedAddr>> dial_addrs_;
+  std::vector<uint8_t> udp_buf_ = std::vector<uint8_t>(kUdpRecvBytes);
+  std::shared_ptr<ResolveQueue> resolve_ = std::make_shared<ResolveQueue>();
   uint64_t next_local_conn_ = 1;
   int64_t next_tick_ms_ = 0;
   int64_t next_stats_ms_ = 0;

@@ -264,8 +264,8 @@ WAN A/B 已随 #22 收口（见 §8.1）：先 1MiB 预热传输学出 k，再 4
 | `src/fcp/proxy_proto.h/.cc` | SOCKS5 / HTTP CONNECT / OPEN 编解码（纯函数） | 仅 std |
 | `tests/stream_test.cc`、`tests/prewarm_test.cc`、`tests/proxy_proto_test.cc` | 单测，注册进 ctest 门禁 | — |
 | `apps/fcp-proxy/engine.h/.cc` → `fcp_proxy_core` | `ProxyEngine`（连接表 + salt 路由 + tick + 预热缓存）。**无 socket、无真实时钟**：宿主以 `Host` 回调注入收发与 DNS，时间全部由 `now_ms` 参数传入，因此 ctest 能直接驱动它 | `fcp` |
-| `apps/fcp-proxy/reactor.h/.cc`、`cli.h/.cc`、`main_client.cc`、`main_server.cc` | 跨平台 select 反应堆（含 Windows 非阻塞 connect 的 `exceptfds` 语义）、共用参数解析、CLI 双端入口 | `fcp_proxy_core`、`ws2_32`(Win) |
-| `tests/proxy_engine_test.cc` | 引擎级 socket-free 场景（10 个：SOCKS5/HTTP 往返、`OPEN_ERR → 本地应答`映射、畸形入口、背压、**部分拒绝后的零窗恢复**、salt 路由与重放绑定、短连接无残留、拨号超时与 grace 钟、会话上限） | `fcp_proxy_core` |
+| `apps/fcp-proxy/reactor.h/.cc`、`cli.h/.cc`、`main_client.cc`、`main_server.cc` | 跨平台 select 反应堆（Windows 非阻塞 connect 的 `exceptfds` 语义；名称解析走 4 线程池 + 全部 A/AAAA 记录顺序回退；POSIX `fd ≥ FD_SETSIZE` 守卫；64 KiB UDP 收包缓冲；服务端 peer 槽随会话销毁回收；数值参数区间校验）、共用参数解析、CLI 双端入口 | `fcp_proxy_core`、`ws2_32`(Win) |
+| `tests/proxy_engine_test.cc` | 引擎级 socket-free 场景（16 个：SOCKS5/HTTP 往返、`OPEN_ERR → 本地应答`映射、畸形入口、背压、**部分拒绝后的零窗恢复**、salt 路由与重放绑定、短连接无残留、拨号超时与 grace 钟、会话上限、tombstone 尾段吸收、trace 落盘、未认证首包不成会话、认证前非 HELLO 超时、拨号背压上限、peer 回调配平） | `fcp_proxy_core` |
 | `apps/fcp-client/proxy_host.h/.cpp` → `ProxyHost` | Qt 侧适配器：`QTcpServer` 收本地 SOCKS5/HTTP 入口、`QUdpSocket` 走 FCP wire、`QHostInfo` 解析拨号目标、25ms `QTimer` 是引擎唯一时钟；全部在 GUI 线程（与 BenchEngine 同构，两功能可共存）。`app_send` 实现为高水位写（Qt 的 `write()` 恒全量接收，按 256KiB 上限截断才能保住 §7 第 8 条的不变式），`app_close` 走 `disconnectFromHost()` 优雅排空（`abort()` 会丢掉 Qt 写缓冲里的尾字节），UDP 收发缓冲对齐 CLI 的 2MiB。页面入口见 `MainWindow::buildProxy()`（导航第 3 页），QSettings 键 `proxy/*`，`--proxy-host/--proxy-port/--proxy-listen/--proxy-psk/--proxy-autostart` 供脚本化验收 | `fcp_proxy_core`、Qt Widgets/Network |
 
 `fcp_proxy_core` 是独立静态库且在 `FCP_BUILD_PROXY`（默认 OFF）之外：Qt 客户端只链接引擎、
@@ -339,9 +339,9 @@ T31 由 `tests/proxy_proto_test.cc`（18 场景：SOCKS5 问候/请求/应答与
 HTTP 的 200/400/405/431 与 authority 各种形态（含方括号 IPv6、255B 主机名、8 KiB 预算）、
 OPEN 三种报文的往返与全部拒绝分支、`OpenError → Socks5Rep` 映射；每条报文都按"逐字节截断"
 再解一遍，短读必须是短读、消费长度必须为 0）覆盖，T31b 由
-`tests/proxy_engine_test.cc`（9 场景，客户端与服务端各一个 `ProxyEngine`，中间用内存管道
+`tests/proxy_engine_test.cc`（16 场景，客户端与服务端各一个 `ProxyEngine`，中间用内存管道
 对拷 datagram，虚拟时钟 25ms/tick）覆盖；五者都在 `build.bat` 的 ctest 门内
-（Windows Debug/Release 各 25/25，Debug 2.33s / Release 0.57s）。
+（Windows Debug/Release 各 27/27，Debug 2.33s / Release 0.57s）。
 `proxy_engine_test` 同时是 §7 第 8、10 两条不变式的守卫：`backpressure_closes_the_window`
 在真实 `send_space()` 口径错的时候报 `pushed=409600 refused=0`（即无上限堆积），
 `dial_timeout_and_grace_clock` 在 grace 分支不可达的时候让服务端 `live` 永远停在 1——
@@ -434,3 +434,56 @@ GUI 线程 25ms tick 驱动，`QTcpServer`/`QUdpSocket`/`QHostInfo` 各司其职
 
 M2 验收线 T28–T33 至此全部落地；§7 第 2 条的"最小可靠有序流"定价在修复后重测为
 8.5–10.6 Mbps（同链路、同 VPS），剩余天花板（单线程会话、单块 SACK）见 §7。
+
+### 8.3 CLI 反应堆 / 引擎 / Stream 对抗复查（#30 续，2026-10-31）
+
+M2 代理半边的第二轮对抗（首轮见 `FCP_M3_CONTROL.md` 的 #30 条）。本轮 10 轮分析中
+第 8–10 轮落在 CLI/反应堆、重放工具与端到端不变式上；以下是实锤缺陷与修法。
+
+1. **名称解析只用首条 A/AAAA（实机复现）**：`getaddrinfo("localhost")` 通常先返回
+   `::1`，目标只监听 IPv4 时非阻塞 connect 失败，服务端报 `OPEN_ERR 1`、curl 收
+   0 字节。回环冒烟（node 监听 `127.0.0.1:18080` + `curl --socks5-hostname
+   127.0.0.1:11080 http://localhost:18080/`）稳定复现。修法：解析 worker 收集全部
+   A/AAAA 记录（上限 16 条），反应堆按顺序逐条非阻塞 connect；同步失败直接下一
+   条，异步失败在 `connect_event`/`except_event` 里继续，直到成功或耗尽。每条记录
+   一份 `connect_timeout_ms`，总预算仍由引擎的 `dial_timeout_ms` 从上方封顶。复测
+   三连 64 KiB 全部 `200 / 65536`，服务端日志三条 `tunnel open`。
+2. **解析线程生命周期（UAF）**：旧实现的 detached 线程捕获 `this` 并写入
+   `results_`，Reactor 析构后仍写。改为 `shared_ptr<ResolveQueue>`（线程按值持有），
+   析构置 `stopping` 并唤醒；固定 4 worker + 256 job 上限，DNS 吊死不再按拨号数
+   起线程，队列满/关闭时立即回 `OpenError::kDns`，不占着拨号钟。
+3. **POSIX `fd_set` 越界**：旧守卫只数条目数；POSIX 的 `fd_set` 按 fd 值索引，fd ≥
+   `FD_SETSIZE` 时 `FD_SET` 越界写。现在所有 FD_SET（含 udp_/listener_）先查
+   `0 ≤ fd < FD_SETSIZE`；Windows 的 `fd_set` 是句柄数组，仍只查数量。
+4. **UDP 收包截断与参数区间**：2048B 栈缓冲在 `--mtu > ~2KiB` 时静默截断（下游只
+   表现为认证失败）；改为 64 KiB 成员缓冲，覆盖全部合法 UDP 载荷。CLI 补数值区间
+   与整串校验（`--mtu` 256..65535、`--d` 1..255、`--p/--p-max` 0..7、`--k` -1..7、
+   端口 1..65535，以及 `--window/--rcv-buf/--idle/--dial-timeout/--connect-timeout/
+   --max-sessions/--stats` 与有限 `--fec-budget`），拒绝 `--d=abc`/`--mtu=99999`
+   之类的静默截断。`--mtu` 的帮助文本同步更正为"IP packet budget incl. IP+UDP
+   headers"——实现（`compute_mtu_limits`）一直按 IP 包字节计算，旧文案 "UDP payload"
+   会让人把上界 65535 误当成 UDP 载荷。
+5. **服务端 peer 槽只增不复用**：每个新源地址追加槽位，到 8192 后新客户端全被丢，
+   NAT 端口轮换或垃圾源可长期占表。新增 `PeerSlot{refs, used}` + 空闲链表 + 轮转
+   回收（只回收 `refs == 0` 的槽），引用数由引擎 `peer_bound`/`peer_retired` 回调
+   维护（服务端会话创建/销毁成对，含未认证首包建会后立刻销毁的路径）；客户端固定
+   peer id 0。`reap()` 先拷贝 peer id 再 `erase()`——Conn 销毁后再读是 UAF。
+6. **nonce 预算耗尽的会话静默**（协议 §4.1 / T25）：旧实现只打日志并让 `seal()`
+   拒发，连接吊死。`Session::set_send_nonce()/nonce_exhausted()` 公开测试/宿主
+   接口；引擎 tick 发现耗尽即关闭应用侧——预算正是"发不出 ERROR 报文"的原因，
+   线上没有额外控制帧。`session_test` 覆盖耗尽后不再出站。
+7. **未认证首包与投递挂账**（引擎级）：服务端首包建会后认证失败必须立刻结束，不能
+   留无主会话；`flush_app` 的 `set_delivery_pending` 计入 `app_in + stream_in`，
+   否则拨号未完成时本地窗口实际可无限收字节（拨号背压场景守这条）。
+8. **Stream 关闭/SACK 复核（无新缺陷）**：对端 FIN 到达但本端未确认的数据不会被提前
+   丢弃（`TestPeerFinDoesNotDropUnackedData`）；越过 `cum`/`snd_nxt` 的 SACK 块被忽略
+   （`TestInvalidSackBlockIgnored`）。两项守卫均为已入库测试（#31），本轮回归确认。
+9. **统计计数器位宽不一致**（#31 引入）：`frame_rx` 的 `dup_after_recovered_` 成员是
+   `uint64_t`，而访问器、引擎聚合与 stats 行（`duprec=%u`）都是 `uint32_t`，读取时静默
+   截断，且每个包含该头的编译单元都报 MSVC C4244。与其余接收计数器统一为
+   `uint32_t`，代理 Release 重建后该告警消失。
+
+验证：Windows Debug/Release 均为 27/27；`--mtu=3000` 回环三连 64 KiB 字节一致；proxy_engine_test
+新增未认证首包、认证前非 HELLO 超时、拨号背压上限与 peer 回调配平四场景。本轮未在
+Linux 主机复跑（fd 守卫为 POSIX 条件编译，其余逻辑平台无关）；下次 Linux 门禁需覆盖
+`reactor.cc` 的该分支。

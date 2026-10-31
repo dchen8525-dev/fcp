@@ -1,5 +1,7 @@
 #include "cli.h"
 
+#include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -44,8 +46,6 @@ bool ParseKey(const std::string& text, uint8_t out[16]) {
   return true;
 }
 
-int64_t KiB(const std::string& v) { return static_cast<int64_t>(std::atoll(v.c_str())) * 1024; }
-
 void Usage(EngineRole role, const char* argv0) {
   const bool client = role == EngineRole::kClient;
   std::printf(
@@ -63,7 +63,7 @@ void Usage(EngineRole role, const char* argv0) {
                 "  --port=N             UDP listen port (default 4460)\n");
   }
   std::printf(
-      "  --mtu=N              UDP payload budget (default 1400)\n"
+      "  --mtu=N              IP packet budget incl. IP+UDP headers (default 1400)\n"
       "  --d=N --p=N          frame geometry (default 10/3)\n"
       "  --k=N                pinned parity per set, -1 = adaptive (default -1)\n"
       "  --fec-budget=R       redundancy ceiling parity/data per report, 0 = off (default 0.5)\n"
@@ -72,6 +72,7 @@ void Usage(EngineRole role, const char* argv0) {
       "  --rcv-buf=KiB        stream receive buffer (default 256)\n"
       "  --idle=ms            tunnel idle teardown (default 300000)\n"
       "  --dial-timeout=ms    remote resolve + connect budget (default 5000)\n"
+      "  --connect-timeout=ms per-address TCP connect budget (default 5000)\n"
       "  --max-sessions=N     concurrent sessions (default 256)\n"
       "  --no-prewarm         start every session cold (default: reuse link priors)\n"
       "  --stats=ms           print a stats line this often (default: only on exit)\n"
@@ -110,6 +111,38 @@ const std::string* Find(const std::map<std::string, std::string>& opts, const ch
   return it == opts.end() ? nullptr : &it->second;
 }
 
+// Full-string integer parse with a range check. Plain atoi() silently wrapped
+// values into the narrow wire fields (--mtu=70000 became 4464, --d=266 became
+// 10) and turned typos into zero, so every numeric option whose range is known
+// comes through here.
+bool ParseInt(const std::string& text, long lo, long hi, long* out) {
+  if (text.empty()) {
+    return false;
+  }
+  char* end = nullptr;
+  errno = 0;
+  const long value = std::strtol(text.c_str(), &end, 10);
+  if (errno != 0 || end == text.c_str() || *end != '\0' || value < lo || value > hi) {
+    return false;
+  }
+  *out = value;
+  return true;
+}
+
+bool ParseDouble(const std::string& text, double* out) {
+  if (text.empty()) {
+    return false;
+  }
+  char* end = nullptr;
+  errno = 0;
+  const double value = std::strtod(text.c_str(), &end);
+  if (errno != 0 || end == text.c_str() || *end != '\0' || !std::isfinite(value)) {
+    return false;
+  }
+  *out = value;
+  return true;
+}
+
 }  // namespace
 
 int run_proxy(EngineRole role, int argc, char** argv) {
@@ -133,40 +166,97 @@ int run_proxy(EngineRole role, int argc, char** argv) {
     return 1;
   }
   if (const std::string* v = Find(opts, "mtu")) {
-    ec.mtu = static_cast<uint16_t>(std::atoi(v->c_str()));
+    // 256..65535: below that the codec has no room for even one symbol, above
+    // it the value no longer fits the uint16 wire/field and would wrap.
+    long n = 0;
+    if (!ParseInt(*v, 256, 65535, &n)) {
+      std::fprintf(stderr, "--mtu must be an integer in 256..65535 (IP packet bytes)\n");
+      return 1;
+    }
+    ec.mtu = static_cast<uint16_t>(n);
   }
   if (const std::string* v = Find(opts, "d")) {
-    ec.d = static_cast<uint8_t>(std::atoi(v->c_str()));
+    long n = 0;
+    if (!ParseInt(*v, 1, 255, &n)) {
+      std::fprintf(stderr, "--d must be an integer in 1..255\n");
+      return 1;
+    }
+    ec.d = static_cast<uint8_t>(n);
   }
   if (const std::string* v = Find(opts, "p")) {
-    ec.p = static_cast<uint8_t>(std::atoi(v->c_str()));
+    long n = 0;
+    if (!ParseInt(*v, 0, 7, &n)) {
+      std::fprintf(stderr, "--p must be an integer in 0..7\n");
+      return 1;
+    }
+    ec.p = static_cast<uint8_t>(n);
   }
   if (const std::string* v = Find(opts, "p-max")) {
-    ec.p_max = static_cast<uint8_t>(std::atoi(v->c_str()));
+    long n = 0;
+    if (!ParseInt(*v, 0, 7, &n)) {
+      std::fprintf(stderr, "--p-max must be an integer in 0..7\n");
+      return 1;
+    }
+    ec.p_max = static_cast<uint8_t>(n);
   }
   if (const std::string* v = Find(opts, "k")) {
-    ec.pinned_k = std::atoi(v->c_str());
+    long n = 0;
+    if (!ParseInt(*v, -1, 7, &n)) {
+      std::fprintf(stderr, "--k must be -1 (adaptive) or 0..7\n");
+      return 1;
+    }
+    ec.pinned_k = static_cast<int>(n);
   }
   if (const std::string* v = Find(opts, "fec-budget")) {
-    ec.fec_budget = std::strtod(v->c_str(), nullptr);
+    double r = 0.0;
+    if (!ParseDouble(*v, &r) || r < 0.0) {
+      std::fprintf(stderr, "--fec-budget must be a number >= 0 (0 = off)\n");
+      return 1;
+    }
+    ec.fec_budget = r;
   }
   if (const std::string* v = Find(opts, "trace")) {
     ec.trace_prefix = *v;
   }
   if (const std::string* v = Find(opts, "window")) {
-    ec.send_window_bytes = static_cast<size_t>(KiB(*v));
+    long n = 0;
+    if (!ParseInt(*v, 1, 1048576, &n)) {
+      std::fprintf(stderr, "--window must be an integer in 1..1048576 KiB\n");
+      return 1;
+    }
+    ec.send_window_bytes = static_cast<size_t>(n) * 1024;
   }
   if (const std::string* v = Find(opts, "rcv-buf")) {
-    ec.rcv_buf_bytes = static_cast<size_t>(KiB(*v));
+    long n = 0;
+    if (!ParseInt(*v, 1, 1048576, &n)) {
+      std::fprintf(stderr, "--rcv-buf must be an integer in 1..1048576 KiB\n");
+      return 1;
+    }
+    ec.rcv_buf_bytes = static_cast<size_t>(n) * 1024;
   }
   if (const std::string* v = Find(opts, "idle")) {
-    ec.idle_timeout_ms = std::atoll(v->c_str());
+    long n = 0;
+    if (!ParseInt(*v, 1, 86400000, &n)) {
+      std::fprintf(stderr, "--idle must be an integer in 1..86400000 ms\n");
+      return 1;
+    }
+    ec.idle_timeout_ms = static_cast<int64_t>(n);
   }
   if (const std::string* v = Find(opts, "dial-timeout")) {
-    ec.dial_timeout_ms = std::atoll(v->c_str());
+    long n = 0;
+    if (!ParseInt(*v, 1, 600000, &n)) {
+      std::fprintf(stderr, "--dial-timeout must be an integer in 1..600000 ms\n");
+      return 1;
+    }
+    ec.dial_timeout_ms = static_cast<int64_t>(n);
   }
   if (const std::string* v = Find(opts, "max-sessions")) {
-    ec.max_sessions = static_cast<size_t>(std::atoll(v->c_str()));
+    long n = 0;
+    if (!ParseInt(*v, 1, 65536, &n)) {
+      std::fprintf(stderr, "--max-sessions must be an integer in 1..65536\n");
+      return 1;
+    }
+    ec.max_sessions = static_cast<size_t>(n);
   }
   if (Find(opts, "no-prewarm") != nullptr) {
     ec.prewarm = false;
@@ -182,27 +272,52 @@ int run_proxy(EngineRole role, int argc, char** argv) {
     }
     ro.remote_host = *host;
     if (const std::string* v = Find(opts, "port")) {
-      ro.remote_port = std::atoi(v->c_str());
+      long n = 0;
+      if (!ParseInt(*v, 1, 65535, &n)) {
+        std::fprintf(stderr, "--port must be an integer in 1..65535\n");
+        return 1;
+      }
+      ro.remote_port = static_cast<int>(n);
     }
     if (const std::string* v = Find(opts, "listen")) {
       ro.listen_addr = *v;
     }
     if (const std::string* v = Find(opts, "local-port")) {
-      ro.listen_port = std::atoi(v->c_str());
+      long n = 0;
+      if (!ParseInt(*v, 1, 65535, &n)) {
+        std::fprintf(stderr, "--local-port must be an integer in 1..65535\n");
+        return 1;
+      }
+      ro.listen_port = static_cast<int>(n);
     }
   } else {
     if (const std::string* v = Find(opts, "bind")) {
       ro.bind_addr = *v;
     }
     if (const std::string* v = Find(opts, "port")) {
-      ro.bind_port = std::atoi(v->c_str());
+      long n = 0;
+      if (!ParseInt(*v, 1, 65535, &n)) {
+        std::fprintf(stderr, "--port must be an integer in 1..65535\n");
+        return 1;
+      }
+      ro.bind_port = static_cast<int>(n);
     }
   }
   if (const std::string* v = Find(opts, "stats")) {
-    ro.stats_ms = std::atoll(v->c_str());
+    long n = 0;
+    if (!ParseInt(*v, 0, 86400000, &n)) {
+      std::fprintf(stderr, "--stats must be an integer in 0..86400000 ms\n");
+      return 1;
+    }
+    ro.stats_ms = static_cast<int64_t>(n);
   }
   if (const std::string* v = Find(opts, "connect-timeout")) {
-    ro.connect_timeout_ms = std::atoll(v->c_str());
+    long n = 0;
+    if (!ParseInt(*v, 1, 600000, &n)) {
+      std::fprintf(stderr, "--connect-timeout must be an integer in 1..600000 ms\n");
+      return 1;
+    }
+    ro.connect_timeout_ms = static_cast<int64_t>(n);
   }
   ro.verbose = Find(opts, "verbose") != nullptr;
 

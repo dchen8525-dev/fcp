@@ -57,7 +57,12 @@ struct TraceEntry {
 
 // Strict single-line serialization: `{"key":value,...}` with numeric values
 // only. decode accepts exactly the grammar encode produces (plus unknown
-// keys, which are skipped for forward compatibility).
+// keys, which are skipped for forward compatibility). Integer fields outside
+// their wire width, non-finite numbers and trailing bytes reject the line, so
+// no decoded value can drive an out-of-range cast. Doubles are written with
+// %.17g, the shortest width that round-trips a double exactly: replaying a
+// trace with its own snapshot reproduces the recording's decision even when a
+// threshold sits between two adjacent doubles.
 void encode_trace_line(const TraceEntry& entry, std::string* out);
 bool decode_trace_line(const std::string& line, TraceEntry* entry);
 

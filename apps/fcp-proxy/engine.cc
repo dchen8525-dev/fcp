@@ -589,9 +589,8 @@ void ProxyEngine::session_events(Conn& conn, int64_t now_ms) {
   // this the tunnel would keep reading the application while every datagram
   // was dropped, and only the peer's idle timer would end it.
   if (conn.session->nonce_exhausted()) {
-    if (cfg_.role == EngineRole::kClient && conn.phase != Phase::kEntry) {
-      queue_local_reply(conn, Socks5Rep::kGeneralFailure, HttpReply::kBadGateway);
-    }
+    // No reply can be sent -- the budget that would carry it is exactly what
+    // ran out -- so the application socket is simply closed.
     finish_conn(conn, now_ms, "send nonce space exhausted");
   }
 }
@@ -985,12 +984,14 @@ void ProxyEngine::reap(int64_t now_ms) {
           salt_tombstones_[conn.salt_key] = now_ms + kSaltTombstoneMs;
         }
       }
+      // save_profile / flush_report above still needed the peer's address, so
+      // the release has to wait until the connection is really gone -- and the
+      // id is copied out first, because erase() destroys the Conn.
+      const uint64_t conn_peer = conn.peer;
       by_conn_.erase(it);
       --counters_.live;
-      // save_profile / flush_report above still needed the peer's address, so
-      // the release has to wait until the connection is really gone.
       if (cfg_.role == EngineRole::kServer && host_.peer_retired) {
-        host_.peer_retired(conn.peer);
+        host_.peer_retired(conn_peer);
       }
       if (host_.app_close) {
         host_.app_close(id);

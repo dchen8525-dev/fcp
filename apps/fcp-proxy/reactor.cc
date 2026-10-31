@@ -121,6 +121,8 @@ EngineHost Reactor::make_host(Reactor* self) {
     self->dial(conn, target);
   };
   host.peer_key = [self](uint64_t peer) { return self->peer_key(peer); };
+  host.peer_bound = [self](uint64_t peer) { self->peer_bound(peer); };
+  host.peer_retired = [self](uint64_t peer) { self->peer_retired(peer); };
   host.log = [self](const std::string& line) {
     if (self->opt_.verbose) {
       std::fprintf(stderr, "%s\n", line.c_str());
@@ -130,6 +132,14 @@ EngineHost Reactor::make_host(Reactor* self) {
 }
 
 Reactor::~Reactor() {
+  // The resolver threads hold their own reference to the queue, so a
+  // getaddrinfo() still in flight at shutdown writes into memory that is
+  // still alive. They exit at their next wake once stopping is visible.
+  {
+    const std::lock_guard<std::mutex> lock(resolve_->mutex);
+    resolve_->stopping = true;
+  }
+  resolve_->wake.notify_all();
   for (const auto& e : locals_) {
     CloseSock(e.second);
   }
@@ -171,7 +181,12 @@ bool Reactor::open_udp(std::string* error) {
       *error = "udp connect: " + ErrText(SockErr());
       return false;
     }
-    peer_addrs_.push_back(remote);  // peer id 0, the only one a client has
+    // Peer id 0, the only one a client has. No session is ever released on
+    // this side, so the slot is marked in use permanently.
+    PeerSlot slot;
+    slot.addr = remote;
+    slot.used = true;
+    peers_.push_back(slot);
   } else {
     EnableReuse(udp_);
     sockaddr_in local{};
@@ -231,6 +246,9 @@ bool Reactor::start(std::string* error) {
   }
   if (opt_.role == EngineRole::kClient && !open_listener(error)) {
     return false;
+  }
+  for (size_t i = 0; i < kResolverWorkers; ++i) {
+    std::thread([queue = resolve_]() { resolve_worker(queue); }).detach();
   }
   if (opt_.role == EngineRole::kClient) {
     std::printf("client: socks5/http on %s -> fcp %s\n",
@@ -362,20 +380,30 @@ int Reactor::build_sets(fd_set* read_set, fd_set* write_set, fd_set* except_set,
                         std::unordered_map<Sock, uint64_t>* write_conn,
                         std::unordered_map<Sock, uint64_t>* except_conn) {
   int nfds = 0;
-  // FD_SET past FD_SETSIZE is not an error on Windows (the entry is silently
-  // dropped) and is a buffer overrun on Linux, so both are refused here instead:
-  // a socket that does not fit stays unmonitored for this iteration and the tick
-  // retries it. The count is per set, hence three counters.
+  // Each set holds at most FD_SETSIZE descriptors. On Windows that is a count
+  // bound only (fd_set is an array of SOCKET handles), but on POSIX fd_set is a
+  // bitmap indexed by descriptor value: a descriptor >= FD_SETSIZE overruns it
+  // no matter how few entries the set holds, so the value has to be checked
+  // there too. A socket that does not fit stays unmonitored for this iteration
+  // and the tick retries it.
   size_t nread = 0;
   size_t nwrite = 0;
   size_t nexcept = 0;
+  auto fits = [](Sock s) {
+#ifdef _WIN32
+    (void)s;
+    return true;
+#else
+    return s >= 0 && s < FD_SETSIZE;
+#endif
+  };
   auto bump = [&nfds](Sock s) {
     if (static_cast<int>(s) + 1 > nfds) {
       nfds = static_cast<int>(s) + 1;
     }
   };
   auto add_read = [&](Sock s, uint64_t conn) {
-    if (nread >= FD_SETSIZE) {
+    if (!fits(s) || nread >= FD_SETSIZE) {
       return;
     }
     ++nread;
@@ -384,7 +412,7 @@ int Reactor::build_sets(fd_set* read_set, fd_set* write_set, fd_set* except_set,
     bump(s);
   };
   auto add_write = [&](Sock s, uint64_t conn, std::unordered_map<Sock, uint64_t>* into) {
-    if (nwrite >= FD_SETSIZE) {
+    if (!fits(s) || nwrite >= FD_SETSIZE) {
       return;
     }
     ++nwrite;
@@ -393,7 +421,7 @@ int Reactor::build_sets(fd_set* read_set, fd_set* write_set, fd_set* except_set,
     bump(s);
   };
   auto add_except = [&](Sock s, uint64_t conn) {
-    if (nexcept >= FD_SETSIZE) {
+    if (!fits(s) || nexcept >= FD_SETSIZE) {
       return;
     }
     ++nexcept;
@@ -404,14 +432,14 @@ int Reactor::build_sets(fd_set* read_set, fd_set* write_set, fd_set* except_set,
   if (udp_ != kBadSock) {
     // Reserved in the count but not in read_conn: the loop services the UDP
     // socket by descriptor, since it belongs to no connection.
-    if (nread < FD_SETSIZE) {
+    if (fits(udp_) && nread < FD_SETSIZE) {
       ++nread;
       FD_SET(udp_, read_set);
       bump(udp_);
     }
   }
   if (listener_ != kBadSock) {
-    if (nread < FD_SETSIZE) {
+    if (fits(listener_) && nread < FD_SETSIZE) {
       ++nread;
       FD_SET(listener_, read_set);
       bump(listener_);
@@ -455,31 +483,25 @@ void Reactor::drain_udp(int64_t now_ms) {
   if (udp_ == kBadSock) {
     return;
   }
-  uint8_t buf[2048];
   for (int i = 0; i < 128; ++i) {  // bounded: a flood must not starve the tick
     sockaddr_in from{};
     socklen_t from_len = sizeof(from);
-    const int n = ::recvfrom(udp_, reinterpret_cast<char*>(buf), static_cast<int>(sizeof(buf)),
-                             0, reinterpret_cast<sockaddr*>(&from), &from_len);
+    const int n = ::recvfrom(udp_, reinterpret_cast<char*>(udp_buf_.data()),
+                             static_cast<int>(udp_buf_.size()), 0,
+                             reinterpret_cast<sockaddr*>(&from), &from_len);
     if (n <= 0) {
       return;
     }
     uint64_t peer = 0;
     if (opt_.role == EngineRole::kServer) {
-      const std::string key = addr_key(reinterpret_cast<sockaddr*>(&from));
-      const auto it = peer_ids_.find(key);
+      const auto it = peer_ids_.find(addr_key(reinterpret_cast<sockaddr*>(&from)));
       if (it != peer_ids_.end()) {
         peer = it->second;
-      } else {
-        if (peer_ids_.size() >= kReactorMaxPeers) {
-          continue;  // over the peer budget: drop rather than track
-        }
-        peer = peer_addrs_.size();
-        peer_addrs_.push_back(from);
-        peer_ids_.emplace(key, peer);
+      } else if (!add_peer(from, &peer)) {
+        continue;  // every slot is bound to a live session: drop, do not track
       }
     }
-    engine_.on_wire(peer, buf, static_cast<size_t>(n), now_ms);
+    engine_.on_wire(peer, udp_buf_.data(), static_cast<size_t>(n), now_ms);
   }
 }
 
@@ -540,32 +562,66 @@ void Reactor::flush_conn(uint64_t conn, int64_t now_ms) {
   engine_.on_app_writable(conn, now_ms);
 }
 
-void Reactor::connect_now(uint64_t conn, const sockaddr* addr, socklen_t len,
-                          int64_t now_ms) {
+Reactor::ConnectAttempt Reactor::connect_once(uint64_t conn, const sockaddr* addr,
+                                              socklen_t len, int64_t now_ms, int* err) {
   if (!engine_.has_connection(conn)) {
-    return;  // the tunnel was torn down while the name was being looked up
+    return ConnectAttempt::kGone;  // torn down while the name was being looked up
   }
   const Sock s = ::socket(addr->sa_family, SOCK_STREAM, IPPROTO_TCP);
   if (s == kBadSock) {
-    engine_.on_dial_result(conn, false, OpenError::kRefused, now_ms);
-    return;
+    *err = SockErr();
+    return ConnectAttempt::kFailed;
   }
-  SetNonBlocking(s);
+  if (!SetNonBlocking(s)) {
+    *err = SockErr();
+    CloseSock(s);
+    return ConnectAttempt::kFailed;
+  }
   if (::connect(s, addr, len) == 0) {
     targets_.emplace(conn, s);
     engine_.on_dial_result(conn, true, OpenError::kRefused, now_ms);
-    return;
+    return ConnectAttempt::kConnected;
   }
   const int connect_err = SockErr();
   if (!Connecting(connect_err) && !WouldBlock(connect_err)) {
     CloseSock(s);
-    engine_.on_dial_result(conn, false, OpenError::kRefused, now_ms);
-    return;
+    *err = connect_err;
+    return ConnectAttempt::kFailed;
   }
   Pending p;
   p.sock = s;
   p.deadline_ms = now_ms + opt_.connect_timeout_ms;
   pending_.emplace(conn, p);
+  return ConnectAttempt::kPending;
+}
+
+bool Reactor::connect_addresses(uint64_t conn, int64_t now_ms, int* last_err) {
+  const auto it = dial_addrs_.find(conn);
+  if (it == dial_addrs_.end()) {
+    return false;
+  }
+  std::deque<ResolvedAddr>& queue = it->second;
+  while (!queue.empty()) {
+    const ResolvedAddr a = queue.front();
+    queue.pop_front();
+    const ConnectAttempt r =
+        connect_once(conn, reinterpret_cast<const sockaddr*>(&a.addr), a.len, now_ms, last_err);
+    if (r == ConnectAttempt::kFailed) {
+      continue;
+    }
+    if (r == ConnectAttempt::kGone) {
+      dial_addrs_.erase(it);
+      return true;
+    }
+    if (queue.empty()) {
+      // The attempt in flight is the last record: a later connect failure has
+      // nothing left to try.
+      dial_addrs_.erase(it);
+    }
+    return true;
+  }
+  dial_addrs_.erase(it);
+  return false;
 }
 
 void Reactor::connect_event(Sock sock, uint64_t conn, int64_t now_ms) {
@@ -581,10 +637,14 @@ void Reactor::connect_event(Sock sock, uint64_t conn, int64_t now_ms) {
   pending_.erase(it);
   if (err == 0) {
     targets_.emplace(conn, sock);
+    dial_addrs_.erase(conn);
     engine_.on_dial_result(conn, true, OpenError::kRefused, now_ms);
     return;
   }
   CloseSock(sock);
+  if (connect_addresses(conn, now_ms, &err)) {
+    return;  // another record is in flight, or the tunnel is already gone
+  }
   engine_.on_dial_result(conn, false, open_error_for(err), now_ms);
 }
 
@@ -604,6 +664,9 @@ void Reactor::except_event(Sock sock, uint64_t conn, int64_t now_ms) {
     }
     CloseSock(sock);
     pending_.erase(pending);
+    if (connect_addresses(conn, now_ms, &err)) {
+      return;
+    }
     engine_.on_dial_result(conn, false, open_error_for(err), now_ms);
     return;
   }
@@ -636,6 +699,12 @@ void Reactor::expire_connects(int64_t now_ms) {
     }
     CloseSock(it->second.sock);
     pending_.erase(it);
+    // The budget belongs to one address attempt. Spend the remaining records
+    // before giving up with the timeout the application is owed.
+    int last_err = kErrTimeout;
+    if (connect_addresses(conn, now_ms, &last_err)) {
+      continue;
+    }
     engine_.on_dial_result(conn, false, OpenError::kTargetTimeout, now_ms);
   }
 }
@@ -652,7 +721,11 @@ void Reactor::dial(uint64_t conn, const ProxyTarget& target) {
   if (inet_pton(AF_INET, host.c_str(), &direct.sin_addr) == 1) {
     direct.sin_family = AF_INET;
     direct.sin_port = htons(port);
-    connect_now(conn, reinterpret_cast<sockaddr*>(&direct), sizeof(direct), NowMs());
+    int err = 0;
+    if (connect_once(conn, reinterpret_cast<sockaddr*>(&direct), sizeof(direct), NowMs(),
+                     &err) == ConnectAttempt::kFailed) {
+      engine_.on_dial_result(conn, false, open_error_for(err), NowMs());
+    }
     return;
   }
   in6_addr v6{};
@@ -661,49 +734,114 @@ void Reactor::dial(uint64_t conn, const ProxyTarget& target) {
     a6.sin6_family = AF_INET6;
     a6.sin6_port = htons(port);
     std::memcpy(&a6.sin6_addr, &v6, sizeof(v6));
-    connect_now(conn, reinterpret_cast<sockaddr*>(&a6), sizeof(a6), NowMs());
+    int err = 0;
+    if (connect_once(conn, reinterpret_cast<sockaddr*>(&a6), sizeof(a6), NowMs(), &err) ==
+        ConnectAttempt::kFailed) {
+      engine_.on_dial_result(conn, false, open_error_for(err), NowMs());
+    }
     return;
   }
-  // A name: resolve off the loop thread, then connect here. The worker never
-  // touches a descriptor, so the reactor stays their only owner.
-  const int service_port = static_cast<int>(port);
-  std::thread([this, conn, host, service_port]() {
+  // A name: hand it to the resolver pool, then connect on this thread when the
+  // answer lands in drain_resolves(). The workers never touch a descriptor, so
+  // the reactor stays the only socket owner.
+  ResolveJob job;
+  job.conn = conn;
+  job.host = host;
+  job.port = port;
+  bool queued = false;
+  {
+    const std::lock_guard<std::mutex> lock(resolve_->mutex);
+    if (!resolve_->stopping && resolve_->jobs.size() < kResolverMaxQueued) {
+      resolve_->jobs.push_back(std::move(job));
+      queued = true;
+    }
+  }
+  if (!queued) {
+    // Saturated or shutting down: answer now rather than leave the connection
+    // hanging until its dial deadline.
+    engine_.on_dial_result(conn, false, OpenError::kDns, NowMs());
+    return;
+  }
+  resolve_->wake.notify_one();
+}
+
+void Reactor::resolve_worker(std::shared_ptr<ResolveQueue> queue) {
+  for (;;) {
+    ResolveJob job;
+    {
+      std::unique_lock<std::mutex> lock(queue->mutex);
+      queue->wake.wait(lock, [&queue] { return queue->stopping || !queue->jobs.empty(); });
+      if (queue->stopping) {
+        return;
+      }
+      job = std::move(queue->jobs.front());
+      queue->jobs.pop_front();
+    }
     ResolveResult r;
-    r.conn = conn;
+    r.conn = job.conn;
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     char service[8];
-    std::snprintf(service, sizeof(service), "%d", service_port);
+    std::snprintf(service, sizeof(service), "%u", static_cast<unsigned>(job.port));
     addrinfo* res = nullptr;
-    if (getaddrinfo(host.c_str(), service, &hints, &res) == 0 && res != nullptr) {
-      r.ok = true;
-      std::memcpy(&r.addr, res->ai_addr, static_cast<size_t>(res->ai_addrlen));
-      r.addr_len = static_cast<socklen_t>(res->ai_addrlen);
+    if (getaddrinfo(job.host.c_str(), service, &hints, &res) == 0) {
+      // Keep every usable answer, not just the first: "localhost" is usually
+      // ::1 even when the service listens on IPv4 only, and a multi-homed
+      // name has to fail over between its records.
+      for (const addrinfo* ai = res; ai != nullptr; ai = ai->ai_next) {
+        if (ai->ai_addr == nullptr || ai->ai_addrlen > sizeof(sockaddr_storage)) {
+          continue;
+        }
+        if (ai->ai_family != AF_INET && ai->ai_family != AF_INET6) {
+          continue;
+        }
+        if (r.addrs.size() >= kResolverMaxAddrs) {
+          break;
+        }
+        ResolvedAddr a;
+        std::memcpy(&a.addr, ai->ai_addr, static_cast<size_t>(ai->ai_addrlen));
+        a.len = static_cast<socklen_t>(ai->ai_addrlen);
+        r.addrs.push_back(a);
+      }
+      r.ok = !r.addrs.empty();
     }
     if (res != nullptr) {
       freeaddrinfo(res);
     }
-    const std::lock_guard<std::mutex> lock(results_mutex_);
-    results_.push_back(r);
-  }).detach();
+    {
+      const std::lock_guard<std::mutex> lock(queue->mutex);
+      if (queue->stopping) {
+        return;
+      }
+      queue->done.push_back(r);
+    }
+  }
 }
 
 void Reactor::drain_resolves(int64_t now_ms) {
   std::vector<ResolveResult> done;
   {
-    const std::lock_guard<std::mutex> lock(results_mutex_);
-    if (results_.empty()) {
+    const std::lock_guard<std::mutex> lock(resolve_->mutex);
+    if (resolve_->done.empty()) {
       return;
     }
-    done.swap(results_);
+    done.swap(resolve_->done);
   }
   for (const ResolveResult& r : done) {
     if (!r.ok) {
       engine_.on_dial_result(r.conn, false, OpenError::kDns, now_ms);
       continue;
     }
-    connect_now(r.conn, reinterpret_cast<const sockaddr*>(&r.addr), r.addr_len, now_ms);
+    std::deque<ResolvedAddr>& queue = dial_addrs_[r.conn];
+    queue.assign(r.addrs.begin(), r.addrs.end());
+    int last_err = 0;
+    if (connect_addresses(r.conn, now_ms, &last_err)) {
+      continue;
+    }
+    // Every record failed locally (socket()/connect() error, no pending
+    // attempt): the last error is the one the application is owed.
+    engine_.on_dial_result(r.conn, false, open_error_for(last_err), now_ms);
   }
 }
 
@@ -740,6 +878,9 @@ void Reactor::app_close(uint64_t conn) {
     CloseSock(pending->second.sock);
     pending_.erase(pending);
   }
+  // A resolver result may still be in flight; drain_resolves() finds that the
+  // engine no longer knows the conn and stops there.
+  dial_addrs_.erase(conn);
 }
 
 void Reactor::wire_send(uint64_t peer, const uint8_t* wire, size_t len) {
@@ -750,20 +891,100 @@ void Reactor::wire_send(uint64_t peer, const uint8_t* wire, size_t len) {
     ::send(udp_, reinterpret_cast<const char*>(wire), static_cast<int>(len), 0);
     return;
   }
-  if (peer >= peer_addrs_.size()) {
+  if (peer >= peers_.size() || !peers_[peer].used) {
     return;
   }
-  const sockaddr_in& to = peer_addrs_[static_cast<size_t>(peer)];
+  const sockaddr_in& to = peers_[peer].addr;
   ::sendto(udp_, reinterpret_cast<const char*>(wire), static_cast<int>(len), 0,
            reinterpret_cast<const sockaddr*>(&to), sizeof(to));
 }
 
 std::string Reactor::peer_key(uint64_t peer) {
-  if (peer >= peer_addrs_.size()) {
+  if (peer >= peers_.size() || !peers_[peer].used) {
     return std::string();
   }
-  const sockaddr_in& a = peer_addrs_[static_cast<size_t>(peer)];
+  const sockaddr_in& a = peers_[peer].addr;
   return host_port(ip_text(a), ntohs(a.sin_port));
+}
+
+bool Reactor::add_peer(const sockaddr_in& from, uint64_t* peer) {
+  uint64_t id = 0;
+  if (!free_peers_.empty()) {
+    id = free_peers_.back();
+    free_peers_.pop_back();
+  } else if (peers_.size() < kReactorMaxPeers) {
+    id = peers_.size();
+    peers_.emplace_back();
+  } else {
+    // At the ceiling. A source without a session -- junk, a refused handshake,
+    // a client that has already gone -- must not pin the table and lock every
+    // new client out, which is what an append-only table did. Recycle one such
+    // slot; the scan is bounded and rotating, and if every slot still has a
+    // live session the datagram is dropped as before.
+    bool recycled = false;
+    for (size_t i = 0; i < kPeerReclaimScan && !recycled; ++i) {
+      const size_t at = peer_cursor_;
+      peer_cursor_ = (peer_cursor_ + 1) % peers_.size();
+      if (peers_[at].used && peers_[at].refs == 0) {
+        id = at;
+        recycled = true;
+      }
+    }
+    if (!recycled) {
+      return false;
+    }
+    forget_peer(id);  // reused below, so it is not returned to free_peers_
+  }
+  PeerSlot& slot = peers_[id];
+  slot.addr = from;
+  slot.refs = 0;
+  slot.used = true;
+  peer_ids_[addr_key(reinterpret_cast<const sockaddr*>(&from))] = id;
+  *peer = id;
+  return true;
+}
+
+void Reactor::forget_peer(uint64_t peer) {
+  if (peer >= peers_.size() || !peers_[peer].used) {
+    return;
+  }
+  const std::string key = addr_key(reinterpret_cast<const sockaddr*>(&peers_[peer].addr));
+  const auto it = peer_ids_.find(key);
+  if (it != peer_ids_.end() && it->second == peer) {
+    peer_ids_.erase(it);
+  }
+  peers_[peer].used = false;
+  peers_[peer].refs = 0;
+}
+
+void Reactor::free_peer(uint64_t peer) {
+  if (peer >= peers_.size() || !peers_[peer].used) {
+    return;
+  }
+  forget_peer(peer);
+  free_peers_.push_back(peer);
+}
+
+void Reactor::peer_bound(uint64_t peer) {
+  if (peer < peers_.size() && peers_[peer].used) {
+    ++peers_[peer].refs;
+  }
+}
+
+void Reactor::peer_retired(uint64_t peer) {
+  if (peer >= peers_.size() || !peers_[peer].used) {
+    return;
+  }
+  if (peers_[peer].refs > 0) {
+    --peers_[peer].refs;
+  }
+  // Eager release: the table then tracks live sessions instead of every source
+  // address the process has ever seen. A late datagram from the old address
+  // simply allocates a fresh slot (and the engine's salt tombstone deals with
+  // the tail).
+  if (peers_[peer].refs == 0) {
+    free_peer(peer);
+  }
 }
 
 std::string Reactor::addr_key(const sockaddr* sa) {

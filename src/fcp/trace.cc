@@ -19,11 +19,16 @@ struct Field {
 void append_fields(std::string* out, const std::vector<Field>& fields) {
   for (const Field& f : fields) {
     char num[32];
-    if (f.value == static_cast<int64_t>(f.value)) {
-      std::snprintf(num, sizeof(num), "%lld",
-                    static_cast<long long>(f.value));
+    // Integral doubles print as integers for readability; everything else
+    // needs %.17g, the shortest width that round-trips every double. %.9g
+    // used to drop the low bits of target_recovery/budget, so a replayed
+    // candidate could take a different branch than the recording did.
+    // The integral branch is capped at 2^53 because casting a double outside
+    // the exact-integer range (or int64) to int64 is undefined behavior.
+    if (std::fabs(f.value) <= 9007199254740992.0 && f.value == std::trunc(f.value)) {
+      std::snprintf(num, sizeof(num), "%lld", static_cast<long long>(f.value));
     } else {
-      std::snprintf(num, sizeof(num), "%.9g", f.value);
+      std::snprintf(num, sizeof(num), "%.17g", f.value);
     }
     out->append("\"");
     out->append(f.key);
@@ -112,6 +117,21 @@ double field_or(const std::vector<std::pair<std::string, double>>& fields,
   return fallback;
 }
 
+// Every integer field is range-checked before its cast: a negative count or a
+// 1e300 in a hand-edited trace would otherwise be an out-of-range double ->
+// integer conversion, which is undefined behavior. A field outside its wire
+// width rejects the whole line, like any other structural violation.
+bool field_in_range(const std::vector<std::pair<std::string, double>>& fields,
+                    const char* key, double lo, double hi, double fallback,
+                    double* out) {
+  const double v = field_or(fields, key, fallback);
+  if (!(v >= lo && v <= hi)) {
+    return false;
+  }
+  *out = v;
+  return true;
+}
+
 }  // namespace
 
 void encode_trace_line(const TraceEntry& e, std::string* out) {
@@ -172,56 +192,90 @@ bool decode_trace_line(const std::string& line, TraceEntry* e) {
   if (!scan_fields(line, &fields)) {
     return false;
   }
-  if (static_cast<int>(field_or(fields, "ver", 0)) != kTraceVersion) {
+  double v = 0;
+  if (!field_in_range(fields, "ver", 0.0, 2147483647.0, 0.0, &v) ||
+      static_cast<int>(v) != kTraceVersion) {
     return false;
   }
+  auto u8 = [&fields](const char* key, uint8_t fallback, uint8_t* out) {
+    double raw = 0;
+    if (!field_in_range(fields, key, 0.0, 255.0, fallback, &raw)) {
+      return false;
+    }
+    *out = static_cast<uint8_t>(raw);
+    return true;
+  };
+  auto u16 = [&fields](const char* key, uint16_t fallback, uint16_t* out) {
+    double raw = 0;
+    if (!field_in_range(fields, key, 0.0, 65535.0, fallback, &raw)) {
+      return false;
+    }
+    *out = static_cast<uint16_t>(raw);
+    return true;
+  };
+  auto u32 = [&fields](const char* key, uint32_t fallback, uint32_t* out) {
+    double raw = 0;
+    if (!field_in_range(fields, key, 0.0, 4294967295.0, fallback, &raw)) {
+      return false;
+    }
+    *out = static_cast<uint32_t>(raw);
+    return true;
+  };
+  auto i32 = [&fields](const char* key, int fallback, int* out) {
+    double raw = 0;
+    if (!field_in_range(fields, key, -2147483648.0, 2147483647.0, fallback, &raw)) {
+      return false;
+    }
+    *out = static_cast<int>(raw);
+    return true;
+  };
+
   *e = TraceEntry{};
   TraceConfigSnapshot& c = e->snapshot;
-  c.d = static_cast<uint8_t>(field_or(fields, "c_d", 10));
-  c.p_max = static_cast<uint8_t>(field_or(fields, "c_pmax", kDefaultPmax));
+  if (!u8("c_d", 10, &c.d) || !u8("c_pmax", kDefaultPmax, &c.p_max) ||
+      !i32("c_ik", -1, &c.initial_k) || !i32("c_pin", -1, &c.pinned)) {
+    return false;
+  }
   c.target_recovery = field_or(fields, "c_target", kTargetRecovery);
   c.budget = field_or(fields, "c_budget", 0.50);
-  c.initial_k = static_cast<int>(field_or(fields, "c_ik", -1));
-  c.pinned = static_cast<int>(field_or(fields, "c_pin", -1));
 
-  e->now_ms = static_cast<int64_t>(field_or(fields, "now", 0));
+  if (!field_in_range(fields, "now", -9007199254740992.0, 9007199254740992.0, 0.0, &v)) {
+    return false;
+  }
+  e->now_ms = static_cast<int64_t>(v);
   e->window_queued = field_or(fields, "queued", 0.0) != 0.0;
-  e->k_after = static_cast<uint8_t>(field_or(fields, "k", 0));
-  e->state_after = static_cast<FecState>(
-      static_cast<uint8_t>(field_or(fields, "state", 0)));
+  if (!u8("k", 0, &e->k_after)) {
+    return false;
+  }
+  uint8_t state = 0;
+  if (!u8("state", 0, &state)) {
+    return false;
+  }
+  e->state_after = static_cast<FecState>(state);
   e->last_loss = field_or(fields, "loss", 0.0);
 
   FecstatPacket& s = e->stat;
   s = MakeFecstatPacket(s.session_salt);
-  s.ver = static_cast<uint8_t>(field_or(fields, "s_ver", kFecstatVersion));
-  s.flg = static_cast<uint8_t>(field_or(fields, "s_flg", 0));
-  s.interval_ms = static_cast<uint16_t>(field_or(fields, "s_ivl", 0));
-  s.accounted_through_set_id =
-      static_cast<uint32_t>(field_or(fields, "s_setid", 0));
-  s.sets_expected = static_cast<uint32_t>(field_or(fields, "s_sets", 0));
-  s.data_expected = static_cast<uint32_t>(field_or(fields, "s_exp", 0));
-  s.data_rx_orig = static_cast<uint32_t>(field_or(fields, "s_rx", 0));
-  s.data_recovered_dl = static_cast<uint32_t>(field_or(fields, "s_rec", 0));
-  s.data_recovered_late =
-      static_cast<uint32_t>(field_or(fields, "s_reclate", 0));
-  s.data_delivered = static_cast<uint32_t>(field_or(fields, "s_deliv", 0));
-  s.parity_rx = static_cast<uint32_t>(field_or(fields, "s_prx", 0));
-  s.parity_expected = static_cast<uint32_t>(field_or(fields, "s_pexp", 0));
-  s.sets_k_unknown = static_cast<uint32_t>(field_or(fields, "s_kunk", 0));
-  s.sets_full = static_cast<uint32_t>(field_or(fields, "s_full", 0));
-  s.auth_fail = static_cast<uint32_t>(field_or(fields, "s_auth", 0));
-  s.late_dup = static_cast<uint32_t>(field_or(fields, "s_dup", 0));
-  s.struct_fail = static_cast<uint32_t>(field_or(fields, "s_struct", 0));
-  s.repair_lat_p50_ms = static_cast<uint16_t>(field_or(fields, "s_lat50", 0));
-  s.repair_lat_p95_ms = static_cast<uint16_t>(field_or(fields, "s_lat95", 0));
-  s.data_bytes_rx = static_cast<uint32_t>(field_or(fields, "s_dbytes", 0));
-  s.parity_bytes_rx = static_cast<uint32_t>(field_or(fields, "s_pbytes", 0));
-  s.sets_tail_dropped = static_cast<uint32_t>(field_or(fields, "s_tdrop", 0));
-  s.data_late_rx = static_cast<uint32_t>(field_or(fields, "s_late", 0));
-  s.sets_partial = static_cast<uint32_t>(field_or(fields, "s_partial", 0));
-  s.ledger_groups = static_cast<uint32_t>(field_or(fields, "s_lgroups", 0));
-  s.ledger_fail_ppm = static_cast<uint32_t>(field_or(fields, "s_lfail", 0));
-  s.ledger_meta = static_cast<uint32_t>(field_or(fields, "s_lmeta", 0));
+  if (!u8("s_ver", kFecstatVersion, &s.ver) || !u8("s_flg", 0, &s.flg) ||
+      !u16("s_ivl", 0, &s.interval_ms) ||
+      !u32("s_setid", 0, &s.accounted_through_set_id) ||
+      !u32("s_sets", 0, &s.sets_expected) || !u32("s_exp", 0, &s.data_expected) ||
+      !u32("s_rx", 0, &s.data_rx_orig) || !u32("s_rec", 0, &s.data_recovered_dl) ||
+      !u32("s_reclate", 0, &s.data_recovered_late) ||
+      !u32("s_deliv", 0, &s.data_delivered) || !u32("s_prx", 0, &s.parity_rx) ||
+      !u32("s_pexp", 0, &s.parity_expected) || !u32("s_kunk", 0, &s.sets_k_unknown) ||
+      !u32("s_full", 0, &s.sets_full) || !u32("s_auth", 0, &s.auth_fail) ||
+      !u32("s_dup", 0, &s.late_dup) || !u32("s_struct", 0, &s.struct_fail) ||
+      !u16("s_lat50", 0, &s.repair_lat_p50_ms) ||
+      !u16("s_lat95", 0, &s.repair_lat_p95_ms) ||
+      !u32("s_dbytes", 0, &s.data_bytes_rx) ||
+      !u32("s_pbytes", 0, &s.parity_bytes_rx) ||
+      !u32("s_tdrop", 0, &s.sets_tail_dropped) || !u32("s_late", 0, &s.data_late_rx) ||
+      !u32("s_partial", 0, &s.sets_partial) ||
+      !u32("s_lgroups", 0, &s.ledger_groups) ||
+      !u32("s_lfail", 0, &s.ledger_fail_ppm) || !u32("s_lmeta", 0, &s.ledger_meta)) {
+    return false;
+  }
   return true;
 }
 

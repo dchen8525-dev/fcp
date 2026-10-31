@@ -341,6 +341,12 @@ void TestTraceCodecFuzz() {
       "{\"ver\":1,\"now\":\"5\"}",         // string value
       "not json",                          // garbage
       "{\"ver\":1,\"now\":1}{\"ver\":1}",  // trailing garbage
+      // Adversarial recheck: values outside the field's wire width must
+      // reject, not wrap/truncate through an out-of-range double -> int cast.
+      "{\"ver\":1,\"s_exp\":-1}",
+      "{\"ver\":1,\"c_d\":1e300}",
+      "{\"ver\":1,\"now\":1e30}",
+      "{\"ver\":1,\"s_lat50\":70000}",
   };
   for (const char* s : bad) {
     if (fcp::decode_trace_line(s, &e)) {
@@ -372,6 +378,25 @@ void TestTraceCodecFuzz() {
   CHECK_EQ(e.now_ms, 9);
 }
 
+// Adversarial recheck: doubles must survive the text format bit-for-bit. %.9g
+// collapsed nextafter(0.8) onto 0.8, so a replayed candidate could read a
+// different target_recovery/budget than the recording and branch differently
+// right at a threshold — the opposite of what replay is for.
+void TestTraceDoubleRoundTrip() {
+  fcp::TraceEntry e;
+  e.stat = fcp::MakeFecstatPacket(kSalt);
+  e.snapshot.target_recovery = std::nextafter(0.8, 1.0);
+  e.snapshot.budget = std::nextafter(0.5, 0.0);
+  e.last_loss = std::nextafter(0.0966, 1.0);
+  std::string line;
+  fcp::encode_trace_line(e, &line);
+  fcp::TraceEntry back;
+  CHECK(fcp::decode_trace_line(line, &back));
+  CHECK(back.snapshot.target_recovery == e.snapshot.target_recovery);
+  CHECK(back.snapshot.budget == e.snapshot.budget);
+  CHECK(back.last_loss == e.last_loss);
+}
+
 // Golden trace for the fcp_replay ctest smoke: run with
 // FCP_WRITE_TRACE_GOLDEN=<path> to (re)generate.
 void MaybeWriteGolden(const std::vector<fcp::TraceEntry>& trace) {
@@ -397,6 +422,7 @@ int main() {
   TestRoundTrip();
   TestReplayReproducesRecorded();
   TestTraceCodecFuzz();
+  TestTraceDoubleRoundTrip();
 
   // The 20% arm doubles as the golden source: deterministic seed, so the
   // checked-in file only moves when the format or controller changes.

@@ -116,6 +116,12 @@ class Session {
   // of traffic instead of losing it to the < 60s cadence tail.
   void flush_report(int64_t now_ms);
 
+  // #26①/T25: restores the send counter below the 2^32 block-budget line
+  // (tests; a live session starts at 0). Once exhausted() turns true, seal()
+  // refuses and nothing more leaves -- the host must disconnect the session.
+  bool set_send_nonce(uint64_t value) { return env_.set_send_nonce(value); }
+  bool nonce_exhausted() const { return env_.exhausted(); }
+
   bool established() const { return hs_.established(); }
   HandshakeState state() const { return hs_.state(); }
   HandshakeError error() const { return hs_.error(); }

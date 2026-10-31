@@ -194,7 +194,7 @@ class FrameRx {
   uint32_t struct_fail_ = 0;
   uint32_t stale_ = 0;
   uint32_t late_dup_ = 0;
-  uint64_t dup_after_recovered_ = 0;  // #31: retransmission lost the race to parity
+  uint32_t dup_after_recovered_ = 0;  // #31: retransmission lost the race to parity
   uint32_t late_data_ = 0;
   uint32_t late_recovered_ = 0;
   uint32_t data_delivered_ = 0;

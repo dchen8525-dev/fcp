@@ -8,8 +8,11 @@
 // touching a live link.
 //
 // usage: fcp_replay --trace=FILE [--d=N] [--p-max=N] [--target=F]
-//                   [--budget=F] [--initial-k=N] [--pinned=N] [--dump]
+//                   [--budget=F] [--initial-k=N] [--pinned=N]
+//                   [--dump] [--require-exact]
 
+#include <cerrno>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -46,17 +49,44 @@ const std::string* Find(const std::map<std::string, std::string>& opts,
   return it == opts.end() ? nullptr : &it->second;
 }
 
+bool ParseLong(const char* name, const std::string& text, long lo, long hi,
+               long* out) {
+  char* end = nullptr;
+  errno = 0;
+  const long v = std::strtol(text.c_str(), &end, 10);
+  if (text.empty() || errno != 0 || end == text.c_str() || *end != '\0' ||
+      v < lo || v > hi) {
+    std::fprintf(stderr, "bad --%s value '%s' (want %ld..%ld)\n", name,
+                 text.c_str(), lo, hi);
+    return false;
+  }
+  *out = v;
+  return true;
+}
+
+bool ParseDouble(const char* name, const std::string& text, double* out) {
+  char* end = nullptr;
+  const double v = std::strtod(text.c_str(), &end);
+  if (text.empty() || end == text.c_str() || *end != '\0' || !std::isfinite(v)) {
+    std::fprintf(stderr, "bad --%s value '%s'\n", name, text.c_str());
+    return false;
+  }
+  *out = v;
+  return true;
+}
+
 void Usage(const char* argv0) {
   std::printf(
-      "usage: %s --trace=FILE [overrides] [--dump]\n"
+      "usage: %s --trace=FILE [overrides] [--dump] [--require-exact]\n"
       "  --trace=FILE      JSONL controller trace (SessionConfig::trace)\n"
-      "  --d=N             group size override\n"
-      "  --p-max=N         parity ceiling override\n"
+      "  --d=N             group size override (1..255)\n"
+      "  --p-max=N         parity ceiling override (0..7)\n"
       "  --target=F        recovery target override (default 0.8)\n"
       "  --budget=F        byte-budget ratio override (0 = off)\n"
       "  --initial-k=N     warm-up k override (-1 = cold)\n"
       "  --pinned=N        pinned k override (-1 = adaptive)\n"
-      "  --dump            print the per-report trajectory\n",
+      "  --dump            print the per-report trajectory\n"
+      "  --require-exact   exit 1 unless replay matches the recording\n",
       argv0);
 }
 
@@ -69,6 +99,10 @@ int main(int argc, char** argv) {
     if (arg == "-h" || arg == "--help") {
       Usage(argv[0]);
       return 0;
+    }
+    if (arg == "--dump" || arg == "--require-exact") {
+      opts[arg.substr(2)] = "1";
+      continue;
     }
     const size_t eq = arg.find('=');
     if (arg.rfind("--", 0) != 0 || eq == std::string::npos) {
@@ -109,22 +143,42 @@ int main(int argc, char** argv) {
   }
 
   if (const std::string* v = Find(opts, "d")) {
-    snapshot.d = static_cast<uint8_t>(std::atoi(v->c_str()));
+    long n = 0;
+    if (!ParseLong("d", *v, 1, 255, &n)) {
+      return 1;
+    }
+    snapshot.d = static_cast<uint8_t>(n);
   }
   if (const std::string* v = Find(opts, "p-max")) {
-    snapshot.p_max = static_cast<uint8_t>(std::atoi(v->c_str()));
+    long n = 0;
+    if (!ParseLong("p-max", *v, 0, 7, &n)) {
+      return 1;
+    }
+    snapshot.p_max = static_cast<uint8_t>(n);
   }
   if (const std::string* v = Find(opts, "target")) {
-    snapshot.target_recovery = std::strtod(v->c_str(), nullptr);
+    if (!ParseDouble("target", *v, &snapshot.target_recovery)) {
+      return 1;
+    }
   }
   if (const std::string* v = Find(opts, "budget")) {
-    snapshot.budget = std::strtod(v->c_str(), nullptr);
+    if (!ParseDouble("budget", *v, &snapshot.budget)) {
+      return 1;
+    }
   }
   if (const std::string* v = Find(opts, "initial-k")) {
-    snapshot.initial_k = std::atoi(v->c_str());
+    long n = 0;
+    if (!ParseLong("initial-k", *v, -1, 7, &n)) {
+      return 1;
+    }
+    snapshot.initial_k = static_cast<int>(n);
   }
   if (const std::string* v = Find(opts, "pinned")) {
-    snapshot.pinned = std::atoi(v->c_str());
+    long n = 0;
+    if (!ParseLong("pinned", *v, -1, 7, &n)) {
+      return 1;
+    }
+    snapshot.pinned = static_cast<int>(n);
   }
 
   const std::vector<fcp::ReplayStep> steps = fcp::replay_trace(entries, snapshot);
@@ -176,5 +230,10 @@ int main(int argc, char** argv) {
   std::printf("\n");
   std::printf("bytes ratio_peak=%.4f agree=%zu/%zu\n", ratio_peak, agree,
               entries.size());
+  if (Find(opts, "require-exact") != nullptr && agree != entries.size()) {
+    std::fprintf(stderr, "replay diverged: %zu/%zu steps match the recording\n",
+                 agree, entries.size());
+    return 1;
+  }
   return 0;
 }

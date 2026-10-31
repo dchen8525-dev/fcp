@@ -461,6 +461,54 @@ void TestZeroWindowProbeUnblocks() {
   CHECK_EQ(f.sa().in_flight(), 0u);
 }
 
+// A window that reopened only to a sliver -- nonzero, but smaller than one
+// segment -- used to deadlock the sender just like rwnd==0: nothing fits,
+// nothing is in flight, and the probe only fired on an exactly-zero window
+// (seen live as a loopback 2MiB freeze at peer_rwnd=906 with 1336-byte
+// segments, #23). The sliver has to be probed too.
+void TestSmallWindowProbeUnblocks() {
+  Fixture f;
+  const std::vector<uint8_t> src = MakeBytes(300, 40);
+  CHECK_EQ(f.push(kA, src), src.size());
+  f.drain();
+  const uint32_t cum = static_cast<uint32_t>(src.size());
+  const size_t segs_before = f.data_of(kA).size();
+
+  // Leave a sliver of window: nonzero, below one 117-byte wire segment.
+  const uint32_t sliver = 50;
+  f.feed(kA, MakeAck(cum, sliver, cum, cum));
+  CHECK_EQ(f.sa().peer_window(), sliver);
+
+  const std::vector<uint8_t> more = MakeBytes(4096, 90);
+  CHECK_EQ(f.sa().write(more.data(), more.size()), more.size());
+  // The peer goes quiet and drops every probe copy, so the only outbound
+  // traffic is the probe itself and its RTO retries.
+  int probe_copies = 0;
+  f.killer = [&probe_copies, cum](const Packet& p) {
+    if (p.from == kB) {
+      return true;
+    }
+    if (IsData(p.seg) && rd32(p.seg.data() + 1) == cum) {
+      ++probe_copies;
+      return true;
+    }
+    return false;
+  };
+  f.tick(25);
+  CHECK_EQ(f.data_of(kA).size(), segs_before + 1);  // the probe went out
+  CHECK_EQ(probe_copies, 1);
+
+  f.tick(3 * f.cfg().probe_ms);
+  CHECK(probe_copies >= 2);
+
+  // The peer answers with its real window and the backlog completes in order.
+  f.killer = nullptr;
+  f.drain();
+  CHECK(f.b().delivered == Concat(src, more));
+  CHECK_EQ(f.sa().peer_window(), f.cfg().rcv_buf_bytes);
+  CHECK_EQ(f.sa().in_flight(), 0u);
+}
+
 // A reader that has stopped taking bytes must bound the writer's memory.
 // pump() turns the pending queue into segments whether or not the peer's window
 // has released them, so the room a writer is offered has to be measured against
@@ -720,6 +768,7 @@ int main() {
   TestDupAndOverlapTrimming();
   TestReceiverBufferCapAndRwnd();
   TestZeroWindowProbeUnblocks();
+  TestSmallWindowProbeUnblocks();
   TestStalledReaderBoundsTheSendQueue();
   TestKarnDropsAmbiguousSamples();
   TestRtoFiresWhenPeerStopsAcking();

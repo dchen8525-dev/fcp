@@ -480,6 +480,7 @@ bad_entry=0 refused=1 hs_failed=0 reset=0 idle=0 clash=0 over=0 unknown=0`——
 
 ### 18.6 未覆盖项
 
-WAN 半边与 T33 预热 A/B 已于 2026-10-31 随 #22 收口（T32 七项全绿、T33 预热开每条
-64KB 短连接省 ~25%、Linux × Debug/Release 25/25；详见 `FCP_M2_PROXY.md` §8.1）。
-GUI 代理页与 Qt 侧适配器属 #23。
+M2 验收线已全部落地：#22（WAN 半边 + T33 预热 A/B + Linux 回归，2026-10-31，见
+`FCP_M2_PROXY.md` §8.1）与 #23（GUI 代理页 + Qt 适配器，同日，见 §8.2——顺带修掉
+子段窗口死锁与 Qt 关闭排空竞态两个真实缺陷，修复后 WAN 8MiB 由 1.29 提到
+8.5–10.6 Mbps）。后续项：快速重传/多洞 SACK（§7 第 2 条，M3）。

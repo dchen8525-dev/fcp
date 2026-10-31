@@ -265,8 +265,8 @@ WAN A/B 已随 #22 收口（见 §8.1）：先 1MiB 预热传输学出 k，再 4
 | `tests/stream_test.cc`、`tests/prewarm_test.cc`、`tests/proxy_proto_test.cc` | 单测，注册进 ctest 门禁 | — |
 | `apps/fcp-proxy/engine.h/.cc` → `fcp_proxy_core` | `ProxyEngine`（连接表 + salt 路由 + tick + 预热缓存）。**无 socket、无真实时钟**：宿主以 `Host` 回调注入收发与 DNS，时间全部由 `now_ms` 参数传入，因此 ctest 能直接驱动它 | `fcp` |
 | `apps/fcp-proxy/reactor.h/.cc`、`cli.h/.cc`、`main_client.cc`、`main_server.cc` | 跨平台 select 反应堆（含 Windows 非阻塞 connect 的 `exceptfds` 语义）、共用参数解析、CLI 双端入口 | `fcp_proxy_core`、`ws2_32`(Win) |
-| `tests/proxy_engine_test.cc` | 引擎级 socket-free 场景（9 个：SOCKS5/HTTP 往返、`OPEN_ERR → 本地应答`映射、畸形入口、背压、salt 路由与重放绑定、短连接无残留、拨号超时与 grace 钟、会话上限） | `fcp_proxy_core` |
-| `apps/fcp-client/` | 代理页 + Qt 侧适配器（`QTcpServer`/`QUdpSocket`/`QHostInfo` 驱动同一引擎） | `fcp_proxy_core`、Qt Widgets/Network |
+| `tests/proxy_engine_test.cc` | 引擎级 socket-free 场景（10 个：SOCKS5/HTTP 往返、`OPEN_ERR → 本地应答`映射、畸形入口、背压、**部分拒绝后的零窗恢复**、salt 路由与重放绑定、短连接无残留、拨号超时与 grace 钟、会话上限） | `fcp_proxy_core` |
+| `apps/fcp-client/proxy_host.h/.cpp` → `ProxyHost` | Qt 侧适配器：`QTcpServer` 收本地 SOCKS5/HTTP 入口、`QUdpSocket` 走 FCP wire、`QHostInfo` 解析拨号目标、25ms `QTimer` 是引擎唯一时钟；全部在 GUI 线程（与 BenchEngine 同构，两功能可共存）。`app_send` 实现为高水位写（Qt 的 `write()` 恒全量接收，按 256KiB 上限截断才能保住 §7 第 8 条的不变式），`app_close` 走 `disconnectFromHost()` 优雅排空（`abort()` 会丢掉 Qt 写缓冲里的尾字节），UDP 收发缓冲对齐 CLI 的 2MiB。页面入口见 `MainWindow::buildProxy()`（导航第 3 页），QSettings 键 `proxy/*`，`--proxy-host/--proxy-port/--proxy-listen/--proxy-psk/--proxy-autostart` 供脚本化验收 | `fcp_proxy_core`、Qt Widgets/Network |
 
 `fcp_proxy_core` 是独立静态库且在 `FCP_BUILD_PROXY`（默认 OFF）之外：Qt 客户端只链接引擎、
 不需要 CLI 的两个可执行文件，而门禁必须能在不开 `FCP_BUILD_PROXY` 时跑到引擎。反应堆与
@@ -373,6 +373,8 @@ ICMP 口径一度 20%）。部署注意：该
   32.2s；速率曲线是 ~1MB 突发 + ~2s 停顿，即单块 SACK 之外等 RTO 的节奏；窗口
   256KiB→2MiB 仅 +12%（排除窗口瓶颈）。同日 fcp_bench 标定（无交付义务、令牌桶匀速、
   k=3 先验）同方向 25.8 Mbps——差值即"非完整快速重传"的价格，快速重传留 M3。
+  （**勘误随 §8.2**：该"突发-停顿"节奏后被证实主要是子段窗口探针缺陷的签名而非纯
+  §7 第 2 条定价；修复后同链路 8MiB 7.84s ≈ 8.56 Mbps。）
 - **T33 预热 A/B**：每臂先 1MiB 预热传输学出 k，再 40 条 64KB 短连接（双端全新进程，
   开/关各两轮）：预热开 1.269/1.365s vs 关 1.727/1.777s（conns2+ 均值 t_total），
   **每条短连接省 ~0.43s（~25%）**；服务端 40/40 条 `FEC warmed: k=2 (prewarm)`。机制
@@ -384,3 +386,46 @@ ICMP 口径一度 20%）。部署注意：该
   裸 `--flag`（存空串，`Find` 语义不变）。
 
 Linux × Debug/Release ctest 均 25/25（与 Windows 同日四套全绿）。
+
+### 8.2 GUI 代理页与 Qt 适配器（#23，2026-10-31 收口）
+
+`apps/fcp-client/proxy_host.h/.cpp`（`ProxyHost`）+ `MainWindow::buildProxy()`（导航第 3 页：
+服务器/PSK/监听口/MTU/钉 k/预热开关 + 活动连接、隧道、上下行累计与速率曲线；QSettings
+`proxy/*`；`--proxy-autostart` 脚本化验收）。引擎仍是 socket-free 的 `fcp_proxy_core`，
+GUI 线程 25ms tick 驱动，`QTcpServer`/`QUdpSocket`/`QHostInfo` 各司其职，§7 第 11 条
+（回调不重入）靠"回调只碰 socket"守住。
+
+**联调逼出两个真实缺陷，都修了：**
+
+1. **子段窗口死锁（引擎级，`src/fcp/stream.cc`）**：发送端冻结在 `peer_rwnd=906`、
+   `in_flight=0`、199 个段待发——窗口**非零但装不下一整段**（906 < 1336B）时，
+   `probe_zero_window` 的 `peer_rwnd_ != 0` 短路让探针永不触发，且没有其他恢复路径。
+   触发链：GUI 宿主的 256KiB 高水位 `app_send` 让接收端 `app_in` 停在 261238B
+   （rwnd 广播 906），随后排空——重开的窗口没有任何 ACK 载体告知对端。修法：探针条件
+   从"窗口为 0"改为"装不下第一个未发送段"。**回环 2MiB 由 60s 冻结 → 2.2s；#22 §8.1
+   的"~1MB 突发 + ~2s 停顿"节奏即此缺陷的签名**——修复后同链路 CLI 8MiB 7.84s
+   （8.56 Mbps，对比修复前 1.29 Mbps，含当晚链路好转的成分）。回归测试两层：
+   `stream_test` 的 `TestSmallWindowProbeUnblocks`（sliver=50 < 117B 段）与
+   `proxy_engine_test` 的 `zero_window_recovery_after_partial_refusal`（部分拒绝式背压）。
+   注：T28 的原零窗测试只打了"恰好为 0"的粒度，侥幸未覆盖本态。
+2. **Qt 关闭排空竞态（宿主级，`proxy_host.cpp`）**：引擎判定隧道结束（双向 FIN）后
+   `app_close` 里 `QTcpSocket::abort()` 把 Qt 写缓冲中未落 to curl 的尾字节直接丢弃
+   （CLI 的 `closesocket()` 默认优雅排空，所以只有 GUI 中招）——WAN 上 8MiB 稳定短
+   1.7–5.5KB、短连接整条失败（响应整段死在缓冲里）。修法：`disconnectFromHost()` 优雅
+   排空，且**不得**紧跟 `deleteLater()`（会抢在排空前删掉 socket），删除交给既有的
+   `disconnected` 处理器。另：QUdpSocket 补 2MiB 收发缓冲（对齐 reactor 的 TuneUdp，
+   默认 64KiB 在窗口级突发下溢出）。
+
+**验收证据**（GUI 进程内代理，curl 直打 `127.0.0.1:1080`）：
+
+- 回环（CLI 服务端 + node origin）：GET、5400B/2MiB 逐字节一致（2.2s）、CONNECT+TLS、
+  拒绝目标 2.09s（Windows OS 口径，同 §7 第 9 条）、20 串行 + 10 并发全过。
+- WAN（VPS 服务端）：GET / HTTPS-CONNECT 内容校验过、8MiB `sha256` 与源一致
+  （6.36s ≈ 10.6 Mbps）、20 串行 0 败、10 并发 10/10；服务端收尾
+  `up=76 tunnels=76 closed=76 bad_entry=0 refused=0 hs_failed=0 reset=0 idle=0
+  clash=0 over=0 unknown=0`——零泄漏零异常。
+- 四套门禁：Windows Debug/Release + Linux Debug/Release ctest 各 25/25（新增两场景）；
+  `build_app.bat` Debug/Release 均通过并部署 Qt 运行时。
+
+M2 验收线 T28–T33 至此全部落地；§7 第 2 条的"最小可靠有序流"定价在修复后重测为
+8.5–10.6 Mbps（同链路、同 VPS），剩余天花板（单线程会话、单块 SACK）见 §7。

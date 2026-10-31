@@ -4,6 +4,7 @@
 #include <QMainWindow>
 
 #include "bench_engine.h"
+#include "proxy_host.h"
 
 class QButtonGroup;
 class QCheckBox;
@@ -30,6 +31,8 @@ class MainWindow : public QMainWindow {
  public Q_SLOTS:
   void startTest();
   void stopTest();
+  void startProxy();
+  void stopProxy();
 
  protected:
   void closeEvent(QCloseEvent* event) override;
@@ -40,6 +43,7 @@ class MainWindow : public QMainWindow {
   QWidget* buildSidebar();
   QWidget* buildOverview();
   QWidget* buildSettings();
+  QWidget* buildProxy();
   QWidget* buildLogs();
   QWidget* makeField(const QString& label, QWidget* input);
   QWidget* makeMetric(const QString& caption, QLabel** value);
@@ -50,6 +54,9 @@ class MainWindow : public QMainWindow {
   void appendLog(const QString& line);
   void onStats(const BenchEngine::Stats& stats);
   void onFinished(const BenchEngine::Result& result);
+  void onProxyStats(const ProxyHost::Stats& stats);
+  void onProxyFinished(const ProxyHost::Result& result);
+  bool collectProxyOptions(ProxyHost::Options* options, QString* error) const;
   void setStatus(const QString& text, const QString& sub, const QString& tone);
   void updateButtons();
   BenchEngine::Options collectOptions(bool* ok, QString* error) const;
@@ -102,6 +109,29 @@ class MainWindow : public QMainWindow {
   QTimer* repeatTimer_ = nullptr;
   bool suppressRepeat_ = false;
   QString lastServer_;
+
+  ProxyHost* proxy_ = nullptr;
+  QLineEdit* proxyHostEdit_ = nullptr;
+  QSpinBox* proxyPortSpin_ = nullptr;
+  QLineEdit* proxyPskEdit_ = nullptr;
+  QSpinBox* proxyListenSpin_ = nullptr;
+  QSpinBox* proxyMtuSpin_ = nullptr;
+  QSpinBox* proxyKSpin_ = nullptr;
+  QCheckBox* proxyPrewarmCheck_ = nullptr;
+  QPushButton* proxyStartBtn_ = nullptr;
+  QPushButton* proxyStopBtn_ = nullptr;
+  QLabel* proxyInfo_ = nullptr;
+  QLabel* proxyState_ = nullptr;
+  QLabel* proxyLiveValue_ = nullptr;
+  QLabel* proxyTunnelsValue_ = nullptr;
+  QLabel* proxyUpValue_ = nullptr;
+  QLabel* proxyDownValue_ = nullptr;
+  QLabel* proxyUpRate_ = nullptr;
+  QLabel* proxyDownRate_ = nullptr;
+  QLabel* proxyUpCap_ = nullptr;
+  QLabel* proxyDownCap_ = nullptr;
+  Sparkline* proxyUpSpark_ = nullptr;
+  Sparkline* proxyDownSpark_ = nullptr;
 };
 
 #endif  // FCP_CLIENT_MAIN_WINDOW_H_

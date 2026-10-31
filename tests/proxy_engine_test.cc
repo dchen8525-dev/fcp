@@ -656,6 +656,47 @@ void session_limits() {
   }
 }
 
+// #23 regression: a partially refusing reader (the Qt host's high-water write
+// cap refuses most of each app_send, like a real socket buffer) must not
+// wedge the tunnel. The reader's window closes to zero, then reopens as it
+// drains; the sender has to discover the reopen (probe or fresh ACK) and
+// finish the transfer. This is the loopback 2MiB stall seen with the GUI host.
+void zero_window_recovery_after_partial_refusal() {
+  Options opt;
+  opt.rcv_buf_bytes = 32 * 1024;
+  opt.send_window_bytes = 64 * 1024;
+  Harness h{opt};
+  h.local_open(kLocalConn);
+  h.local_send(kLocalConn, greeting());
+  h.local_send(kLocalConn, socks5_request(0x01, 0x01, ipv4_bytes("198.51.100.9"), 80));
+  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, 60));
+  const uint64_t target_conn = h.first_dial_conn();
+
+  // The reader drains slowly: every app_send takes at most 4 KiB, which
+  // regularly refuses the rest and drives the advertised window to zero.
+  h.client_accept_limit = 4 * 1024;
+  const std::vector<uint8_t> chunk(2048, 0x5A);
+  size_t pushed = 0;
+  for (int i = 0; i < 150; ++i) {
+    h.step();
+    pushed += h.target_send(target_conn, chunk);
+  }
+  CHECK(pushed > 64 * 1024);  // the transfer got well past one window
+
+  // The reader catches up; everything pushed has to arrive, in order.
+  h.client_accept_limit = kNoLimit;
+  const size_t want = pushed;
+  CHECK(h.run_until([&] { return h.app_bytes(kLocalConn).size() >= 12 + want; }, 4000));
+  CHECK_EQ(h.app_bytes(kLocalConn).size(), 12 + want);
+  CHECK_EQ(text_of(h.app_bytes(kLocalConn)).substr(12), std::string(want, 0x5A));
+  CHECK(!logged(h.client_log, "closed"));
+
+  h.local_close(kLocalConn);
+  CHECK(h.run_until([&] {
+    return h.client->counters().live == 0 && h.server->counters().live == 0;
+  }, 120));
+}
+
 }  // namespace
 
 int main() {
@@ -664,6 +705,7 @@ int main() {
   open_error_maps_to_the_local_reply();
   malformed_local_requests();
   backpressure_closes_the_window();
+  zero_window_recovery_after_partial_refusal();
   salt_routing_and_replay_binding();
   short_connections_leave_no_state_behind();
   dial_timeout_and_grace_clock();

@@ -25,5 +25,9 @@ int main(int argc, char** argv) {
   if (QCoreApplication::arguments().contains("--autostart")) {
     QTimer::singleShot(400, &window, &MainWindow::startTest);
   }
+  // Same idea for the proxy page (used for scripted curl runs through the GUI).
+  if (QCoreApplication::arguments().contains("--proxy-autostart")) {
+    QTimer::singleShot(800, &window, &MainWindow::startProxy);
+  }
   return app.exec();
 }

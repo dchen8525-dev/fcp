@@ -2,3 +2,4 @@ build/
 .workbuddy/
 .cache/
 *.log
+.zcode/

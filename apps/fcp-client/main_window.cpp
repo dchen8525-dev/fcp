@@ -137,6 +137,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
   stack_ = new QStackedWidget;
   stack_->addWidget(buildOverview());
   stack_->addWidget(buildSettings());
+  stack_->addWidget(buildProxy());
   stack_->addWidget(buildLogs());
   bodyLayout->addWidget(stack_, 1);
   outer->addWidget(body, 1);
@@ -151,6 +152,11 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
   connect(engine_, &BenchEngine::logLine, this, &MainWindow::appendLog);
   connect(engine_, &BenchEngine::finished, this, &MainWindow::onFinished);
 
+  proxy_ = new ProxyHost(this);
+  connect(proxy_, &ProxyHost::statsUpdated, this, &MainWindow::onProxyStats);
+  connect(proxy_, &ProxyHost::logLine, this, &MainWindow::appendLog);
+  connect(proxy_, &ProxyHost::finished, this, &MainWindow::onProxyFinished);
+
   repeatTimer_ = new QTimer(this);
   repeatTimer_->setSingleShot(true);
   connect(repeatTimer_, &QTimer::timeout, this, &MainWindow::startTest);
@@ -158,6 +164,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
   loadSettings();
   showView(0);
   onStats(BenchEngine::Stats{});
+  onProxyStats(ProxyHost::Stats{});
   updateButtons();
   appendLog("就绪：服务端运行 fcp_bench server 后点击「开始测试」");
 }
@@ -225,7 +232,7 @@ QWidget* MainWindow::buildSidebar() {
 
   nav_ = new QButtonGroup(this);
   nav_->setExclusive(true);
-  const QStringList names = {"概览", "连接设置", "运行日志"};
+  const QStringList names = {"概览", "连接设置", "代理", "运行日志"};
   for (int i = 0; i < names.size(); ++i) {
     auto* button = new QPushButton(names[i], side);
     button->setObjectName("navBtn");
@@ -544,6 +551,253 @@ QWidget* MainWindow::buildSettings() {
   return page;
 }
 
+QWidget* MainWindow::buildProxy() {
+  auto* page = new QWidget;
+  page->setObjectName("viewPage");
+  auto* layout = new QVBoxLayout(page);
+  layout->setContentsMargins(40, 26, 40, 24);
+  layout->setSpacing(0);
+
+  auto* title = new QLabel("代理", page);
+  title->setObjectName("viewTitle");
+  auto* subtitle = new QLabel(
+      "本进程内建 SOCKS5 / HTTP CONNECT 入口，经 FCP 隧道转发；每个应用连接一条会话。",
+      page);
+  subtitle->setObjectName("viewSub");
+  subtitle->setContentsMargins(0, 6, 0, 0);
+  subtitle->setWordWrap(true);
+  layout->addWidget(title);
+  layout->addWidget(subtitle);
+
+  proxyHostEdit_ = new QLineEdit(page);
+  proxyHostEdit_->setPlaceholderText("FCP 服务器 IP 或域名");
+  proxyPortSpin_ = new QSpinBox(page);
+  proxyPortSpin_->setRange(1, 65535);
+  proxyPortSpin_->setValue(40000);
+  proxyPskEdit_ = new QLineEdit(page);
+  proxyPskEdit_->setObjectName("monoInput");
+  proxyPskEdit_->setMaxLength(32);
+  proxyPskEdit_->setPlaceholderText("32 位十六进制（16 字节 PSK）");
+  proxyListenSpin_ = new QSpinBox(page);
+  proxyListenSpin_->setRange(1, 65535);
+  proxyListenSpin_->setValue(1080);
+  proxyMtuSpin_ = new QSpinBox(page);
+  proxyMtuSpin_->setRange(576, 1400);
+  proxyMtuSpin_->setValue(1400);
+  proxyMtuSpin_->setSuffix(" B");
+  proxyKSpin_ = new QSpinBox(page);
+  proxyKSpin_->setRange(-1, 7);
+  proxyKSpin_->setValue(-1);
+  proxyKSpin_->setToolTip("-1 = 自适应；≥1 = 固定每组 parity 数");
+  proxyPrewarmCheck_ = new QCheckBox("链路预热（跨连接继承 k/RTT 先验）", page);
+
+  auto* grid = new QGridLayout;
+  grid->setContentsMargins(0, 20, 0, 0);
+  grid->setHorizontalSpacing(22);
+  grid->setVerticalSpacing(16);
+  grid->addWidget(makeField("FCP 服务器", proxyHostEdit_), 0, 0);
+  grid->addWidget(makeField("FCP 端口 (UDP)", proxyPortSpin_), 0, 1);
+  grid->addWidget(makeField("PSK", proxyPskEdit_), 1, 0);
+  grid->addWidget(makeField("本地监听端口", proxyListenSpin_), 1, 1);
+  grid->addWidget(makeField("MTU", proxyMtuSpin_), 2, 0);
+  grid->addWidget(makeField("钉 k", proxyKSpin_), 2, 1);
+  grid->setColumnStretch(0, 1);
+  grid->setColumnStretch(1, 1);
+  layout->addLayout(grid);
+
+  proxyPrewarmCheck_->setContentsMargins(0, 16, 0, 0);
+  layout->addWidget(proxyPrewarmCheck_);
+
+  auto* stateRow = new QWidget(page);
+  auto* stateLayout = new QHBoxLayout(stateRow);
+  stateLayout->setContentsMargins(0, 14, 0, 0);
+  stateLayout->setSpacing(10);
+  auto* dot = new QLabel(stateRow);
+  dot->setObjectName("statusDot");
+  dot->setFixedSize(10, 10);
+  dot->setProperty("tone", "idle");
+  proxyState_ = dot;
+  proxyInfo_ = new QLabel("未运行", stateRow);
+  proxyInfo_->setObjectName("statusText");
+  stateLayout->addWidget(proxyState_);
+  stateLayout->addWidget(proxyInfo_);
+  stateLayout->addStretch();
+  layout->addWidget(stateRow);
+
+  auto* metricGrid = new QGridLayout;
+  metricGrid->setContentsMargins(0, 14, 0, 0);
+  metricGrid->setHorizontalSpacing(40);
+  metricGrid->setVerticalSpacing(12);
+  metricGrid->addWidget(makeMetric("活动连接", &proxyLiveValue_), 0, 0);
+  metricGrid->addWidget(makeMetric("隧道累计", &proxyTunnelsValue_), 0, 1);
+  metricGrid->addWidget(makeMetric("上行累计", &proxyUpValue_), 1, 0);
+  metricGrid->addWidget(makeMetric("下行累计", &proxyDownValue_), 1, 1);
+  layout->addLayout(metricGrid);
+
+  auto* actions = new QWidget(page);
+  auto* actionLayout = new QHBoxLayout(actions);
+  actionLayout->setContentsMargins(0, 18, 0, 0);
+  actionLayout->setSpacing(12);
+  proxyStartBtn_ = new QPushButton("启动代理", actions);
+  proxyStartBtn_->setObjectName("btnPrimary");
+  proxyStartBtn_->setCursor(Qt::PointingHandCursor);
+  proxyStopBtn_ = new QPushButton("停止", actions);
+  proxyStopBtn_->setObjectName("btnGhost");
+  proxyStopBtn_->setCursor(Qt::PointingHandCursor);
+  actionLayout->addWidget(proxyStartBtn_);
+  actionLayout->addWidget(proxyStopBtn_);
+  actionLayout->addStretch();
+  layout->addWidget(actions);
+
+  auto* card = new QFrame(page);
+  card->setObjectName("card");
+  auto* cardLayout = new QHBoxLayout(card);
+  cardLayout->setContentsMargins(22, 16, 22, 16);
+  cardLayout->setSpacing(26);
+  auto cell = [&](bool down, QLabel** rate, QLabel** cap, Sparkline** spark) {
+    auto* cellWidget = new QWidget(card);
+    auto* cellLayout = new QVBoxLayout(cellWidget);
+    cellLayout->setContentsMargins(0, 0, 0, 0);
+    cellLayout->setSpacing(4);
+    auto* dir = new QLabel(down ? "↓ 隧道下行" : "↑ 隧道上行", cellWidget);
+    dir->setObjectName("trafficDir");
+    auto* rateLabel = new QLabel("0.00 Mbps", cellWidget);
+    rateLabel->setObjectName("trafficRate");
+    auto* sparkline = new Sparkline(down ? QColor(0x2e, 0x5f, 0x74) : QColor(0x47, 0x68, 0x5a),
+                                    cellWidget);
+    auto* capLabel = new QLabel("累计 0 B", cellWidget);
+    capLabel->setObjectName("trafficCap");
+    cellLayout->addWidget(dir);
+    cellLayout->addWidget(rateLabel);
+    cellLayout->addWidget(sparkline, 1);
+    cellLayout->addWidget(capLabel);
+    *rate = rateLabel;
+    *cap = capLabel;
+    *spark = sparkline;
+    return cellWidget;
+  };
+  cardLayout->addWidget(cell(true, &proxyDownRate_, &proxyDownCap_, &proxyDownSpark_), 1);
+  auto* divider = new QFrame(card);
+  divider->setObjectName("trafficDivider");
+  divider->setFixedWidth(1);
+  cardLayout->addWidget(divider);
+  cardLayout->addWidget(cell(false, &proxyUpRate_, &proxyUpCap_, &proxyUpSpark_), 1);
+  auto* cardWrap = new QWidget(page);
+  auto* cardWrapLayout = new QVBoxLayout(cardWrap);
+  cardWrapLayout->setContentsMargins(0, 18, 0, 0);
+  cardWrapLayout->addWidget(card);
+  layout->addWidget(cardWrap);
+  layout->addStretch();
+
+  connect(proxyStartBtn_, &QPushButton::clicked, this, &MainWindow::startProxy);
+  connect(proxyStopBtn_, &QPushButton::clicked, this, &MainWindow::stopProxy);
+  return page;
+}
+
+bool MainWindow::collectProxyOptions(ProxyHost::Options* options, QString* error) const {
+  if (proxyHostEdit_->text().trimmed().isEmpty()) {
+    *error = QStringLiteral("请填写 FCP 服务器地址");
+    return false;
+  }
+  static const QRegularExpression kHex32("^[0-9A-Fa-f]{32}$");
+  const QString psk = proxyPskEdit_->text().trimmed();
+  if (!kHex32.match(psk).hasMatch()) {
+    *error = QStringLiteral("PSK 须为 32 位十六进制字符");
+    return false;
+  }
+  options->server = proxyHostEdit_->text().trimmed();
+  options->port = static_cast<quint16>(proxyPortSpin_->value());
+  options->key = QByteArray::fromHex(psk.toLatin1());
+  options->listen_port = static_cast<quint16>(proxyListenSpin_->value());
+  options->mtu = proxyMtuSpin_->value();
+  options->pinned_k = proxyKSpin_->value();
+  options->prewarm = proxyPrewarmCheck_->isChecked();
+  return true;
+}
+
+void MainWindow::startProxy() {
+  if (proxy_->running()) {
+    return;
+  }
+  ProxyHost::Options options;
+  QString error;
+  if (!collectProxyOptions(&options, &error)) {
+    proxyInfo_->setText(error);
+    appendLog(QStringLiteral("代理参数错误：%1").arg(error));
+    return;
+  }
+  proxyDownSpark_->clear();
+  proxyUpSpark_->clear();
+  proxyDownRate_->setText("0.00 Mbps");
+  proxyUpRate_->setText("0.00 Mbps");
+  appendLog(QStringLiteral("启动代理 → FCP %1:%2 · 本地 SOCKS5/HTTP 127.0.0.1:%3")
+                .arg(options.server)
+                .arg(options.port)
+                .arg(options.listen_port));
+  proxy_->start(options);
+  updateButtons();
+}
+
+void MainWindow::stopProxy() {
+  proxy_->stop();
+  updateButtons();
+}
+
+void MainWindow::onProxyStats(const ProxyHost::Stats& stats) {
+  const bool running = stats.state != ProxyHost::State::kIdle;
+  QString text;
+  QString tone = "run";
+  switch (stats.state) {
+    case ProxyHost::State::kIdle:
+      text = "未运行";
+      tone = "idle";
+      break;
+    case ProxyHost::State::kStarting:
+      text = "解析 FCP 服务器…";
+      break;
+    case ProxyHost::State::kRunning:
+      text = QStringLiteral("代理运行中 · SOCKS5/HTTP 127.0.0.1:%1")
+                 .arg(stats.listen_port);
+      break;
+  }
+  proxyInfo_->setText(text);
+  proxyState_->setProperty("tone", tone);
+  proxyState_->style()->unpolish(proxyState_);
+  proxyState_->style()->polish(proxyState_);
+
+  proxyLiveValue_->setText(QString::number(stats.live));
+  proxyTunnelsValue_->setText(QString::number(stats.tunnels));
+  proxyUpValue_->setText(humanBytes(stats.up_bytes));
+  proxyDownValue_->setText(humanBytes(stats.down_bytes));
+  proxyDownRate_->setText(QStringLiteral("%1 Mbps").arg(stats.down_mbps, 0, 'f', 2));
+  proxyUpRate_->setText(QStringLiteral("%1 Mbps").arg(stats.up_mbps, 0, 'f', 2));
+  proxyDownCap_->setText(
+      QStringLiteral("累计 %1 · 异常 %2")
+          .arg(humanBytes(stats.down_bytes))
+          .arg(stats.bad_entry + stats.open_failed + stats.handshake_failed));
+  proxyUpCap_->setText(
+      QStringLiteral("累计 %1 · salt 冲突 %2")
+          .arg(humanBytes(stats.up_bytes))
+          .arg(stats.salt_clash));
+  if (running) {
+    proxyDownSpark_->push(stats.down_mbps);
+    proxyUpSpark_->push(stats.up_mbps);
+  }
+  updateButtons();
+}
+
+void MainWindow::onProxyFinished(const ProxyHost::Result& result) {
+  if (!result.ok) {
+    proxyInfo_->setText(result.error);
+    appendLog(QStringLiteral("代理异常退出：%1").arg(result.error));
+  } else if (result.error == QStringLiteral("已停止")) {
+    appendLog("代理已停止");
+  } else {
+    appendLog(QStringLiteral("代理已结束：%1").arg(result.error));
+  }
+  updateButtons();
+}
+
 QWidget* MainWindow::buildLogs() {
   auto* page = new QWidget;
   page->setObjectName("viewPage");
@@ -586,6 +840,14 @@ void MainWindow::loadSettings() {
   kSpin_->setValue(settings.value("test/pinned_k", 3).toInt());
   kSpin_->setEnabled(fecMode_->currentIndex() == 1);
   repeatCheck_->setChecked(settings.value("test/repeat", false).toBool());
+  proxyHostEdit_->setText(settings.value("proxy/host").toString());
+  proxyPortSpin_->setValue(settings.value("proxy/port", 40000).toInt());
+  proxyPskEdit_->setText(
+      settings.value("proxy/psk", "2B7E151628AED2A6ABF7158809CF4F3C").toString());
+  proxyListenSpin_->setValue(settings.value("proxy/listen_port", 1080).toInt());
+  proxyMtuSpin_->setValue(settings.value("proxy/mtu", 1400).toInt());
+  proxyKSpin_->setValue(settings.value("proxy/pinned_k", -1).toInt());
+  proxyPrewarmCheck_->setChecked(settings.value("proxy/prewarm", true).toBool());
 }
 
 void MainWindow::saveSettings() {
@@ -600,6 +862,13 @@ void MainWindow::saveSettings() {
   settings.setValue("test/fec_mode", fecMode_->currentIndex());
   settings.setValue("test/pinned_k", kSpin_->value());
   settings.setValue("test/repeat", repeatCheck_->isChecked());
+  settings.setValue("proxy/host", proxyHostEdit_->text().trimmed());
+  settings.setValue("proxy/port", proxyPortSpin_->value());
+  settings.setValue("proxy/psk", proxyPskEdit_->text().trimmed());
+  settings.setValue("proxy/listen_port", proxyListenSpin_->value());
+  settings.setValue("proxy/mtu", proxyMtuSpin_->value());
+  settings.setValue("proxy/pinned_k", proxyKSpin_->value());
+  settings.setValue("proxy/prewarm", proxyPrewarmCheck_->isChecked());
 }
 
 void MainWindow::applyArgumentOverrides() {
@@ -610,6 +879,14 @@ void MainWindow::applyArgumentOverrides() {
       portSpin_->setValue(arg.mid(7).toInt());
     } else if (arg.startsWith("--mbps=")) {
       mbpsSpin_->setValue(arg.mid(7).toDouble());
+    } else if (arg.startsWith("--proxy-host=")) {
+      proxyHostEdit_->setText(arg.mid(13));
+    } else if (arg.startsWith("--proxy-port=")) {
+      proxyPortSpin_->setValue(arg.mid(13).toInt());
+    } else if (arg.startsWith("--proxy-listen=")) {
+      proxyListenSpin_->setValue(arg.mid(15).toInt());
+    } else if (arg.startsWith("--proxy-psk=")) {
+      proxyPskEdit_->setText(arg.mid(12));
     }
   }
 }
@@ -720,6 +997,11 @@ void MainWindow::updateButtons() {
   const bool running = engine_->running();
   startBtn_->setEnabled(!running);
   stopBtn_->setEnabled(running);
+  const bool proxyRunning = proxy_ != nullptr && proxy_->running();
+  if (proxyStartBtn_ != nullptr) {
+    proxyStartBtn_->setEnabled(!proxyRunning);
+    proxyStopBtn_->setEnabled(proxyRunning);
+  }
 }
 
 void MainWindow::onStats(const BenchEngine::Stats& stats) {
@@ -851,6 +1133,9 @@ void MainWindow::closeEvent(QCloseEvent* event) {
   saveSettings();
   if (engine_->running()) {
     engine_->stop();
+  }
+  if (proxy_ != nullptr && proxy_->running()) {
+    proxy_->stop();
   }
   QMainWindow::closeEvent(event);
 }

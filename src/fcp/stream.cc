@@ -462,11 +462,31 @@ void Stream::retransmit_timeouts(int64_t now_ms) {
 }
 
 void Stream::probe_zero_window(int64_t now_ms) {
-  if (peer_rwnd_ != 0 || in_flight_ != 0) {
-    return;
+  if (in_flight_ != 0) {
+    return;  // something is already outstanding; its ack or RTO moves us
   }
-  if (tx_.empty() && tx_pending_.empty()) {
-    return;
+  // The first unsent segment sets the bar. A peer window that cannot carry it
+  // deadlocks the sender even when the window is not zero: no segment fits,
+  // nothing is in flight, and only an arriving segment can make the peer
+  // advertise again (seen live as a freeze at peer_rwnd=906 with 1336-byte
+  // segments). Probe exactly as for the classic rwnd==0 case.
+  size_t next_len = 0;
+  if (!tx_.empty()) {
+    for (const PendingSeg& seg : tx_) {
+      if (!seg.sent) {
+        next_len = seg.wire_len();
+        break;
+      }
+    }
+  } else if (!tx_pending_.empty()) {
+    next_len = std::min(tx_pending_.size(),
+                        cfg_.max_segment > kStreamDataHdrLen
+                            ? cfg_.max_segment - kStreamDataHdrLen
+                            : tx_pending_.size()) +
+               kStreamDataHdrLen;
+  }
+  if (next_len == 0 || peer_rwnd_ >= next_len) {
+    return;  // the window can carry the next segment; not stuck
   }
   if (last_probe_ms_ != 0 && now_ms - last_probe_ms_ < cfg_.probe_ms) {
     return;

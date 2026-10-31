@@ -252,8 +252,12 @@ void TestKcpOutputIsAlwaysData() {
   Fixture f(10, 1400, 20);
   f.tx.set_k(2);
 
+  // R3-1: a HELLO carries a nonce now; the point of this test is only that
+  // the KCP path does not sniff the magic, so any well-formed bytes do.
+  const uint8_t draw[fcp::kHandshakeNonceLen] = {1, 2, 3, 4, 5, 6, 7, 8,
+                                                 9, 10, 11, 12, 13, 14, 15, 16};
   uint8_t hello[fcp::kHelloLen];
-  fcp::build_hello(fcp::HandshakeCaps{1, 10, 3, fcp::kLocalFlagsM1}, hello);
+  fcp::build_hello(fcp::HandshakeCaps{1, 10, 3, fcp::kLocalFlagsM1}, draw, hello);
   const std::vector<uint8_t> hello_bytes(hello, hello + sizeof(hello));
 
   f.send_bytes(hello_bytes, 0);

@@ -191,6 +191,14 @@ int run_proxy(EngineRole role, int argc, char** argv) {
     }
     ec.p = static_cast<uint8_t>(n);
   }
+  // P8-4: D + P <= 256 is a protocol hard limit (the symbol table index is
+  // u8); each flag is in range above, but the pair can still be illegal. Fail
+  // at startup instead of on every tunnel's first handshake.
+  if (static_cast<uint16_t>(ec.d) + ec.p > 256) {
+    std::fprintf(stderr, "--d + --p must not exceed 256 (got %u + %u)\n",
+                 static_cast<unsigned>(ec.d), static_cast<unsigned>(ec.p));
+    return 1;
+  }
   if (const std::string* v = Find(opts, "p-max")) {
     long n = 0;
     if (!ParseInt(*v, 0, 7, &n)) {
@@ -209,8 +217,10 @@ int run_proxy(EngineRole role, int argc, char** argv) {
   }
   if (const std::string* v = Find(opts, "fec-budget")) {
     double r = 0.0;
-    if (!ParseDouble(*v, &r) || r < 0.0) {
-      std::fprintf(stderr, "--fec-budget must be a number >= 0 (0 = off)\n");
+    // P6' N12: the controller's domain is R in [0,1] (0 = off). A value above
+    // 1 used to pass and silently disable the cap (ratio can never exceed it).
+    if (!ParseDouble(*v, &r) || r < 0.0 || r > 1.0) {
+      std::fprintf(stderr, "--fec-budget must be a number in 0..1 (0 = off)\n");
       return 1;
     }
     ec.fec_budget = r;

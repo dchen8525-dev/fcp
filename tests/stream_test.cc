@@ -960,6 +960,90 @@ void TestPeerFinDoesNotDropUnackedData() {
   CHECK_EQ(f.a().closes.size(), 1u);
 }
 
+// A4: the lie guard must compare against the highest byte that reached the
+// wire, not snd_nxt_ (segmentation runs ahead of the send window). Otherwise a
+// cum covering segmented-but-unsent bytes pops them silently and the
+// application's data is gone.
+void TestAckBeyondSentIgnored() {
+  Fixture f;
+  f.cut_all();
+  const std::vector<uint8_t> src = MakeBytes(4096, 21);
+  CHECK_EQ(f.sa().write(src.data(), src.size()), src.size());
+  f.tick(25);  // segment everything; the peer window withholds the tail
+  const size_t unacked = f.sa().unacked_segs();
+  const size_t inflight = f.sa().in_flight();
+  CHECK_EQ(unacked, 41u);  // 40 full + one 96-byte segment
+  CHECK(inflight < src.size());
+
+  // cum == snd_nxt_: inside the old bound, but past every byte ever sent.
+  f.feed(kA, MakeAck(static_cast<uint32_t>(src.size()), 4096, 0, 0));
+  CHECK_EQ(f.sa().bad_segs(), 1u);
+  CHECK_EQ(f.sa().unacked_segs(), unacked);
+  CHECK_EQ(f.sa().in_flight(), inflight);
+  CHECK_EQ(f.sa().bytes_acked(), 0u);
+
+  // The queue is intact: with the path restored every byte still arrives.
+  f.killer = nullptr;
+  f.drain();
+  CHECK(f.b().delivered == src);
+}
+
+// A4 follow-up: the SACK half of the same lie. A block may only describe bytes
+// that reached the wire (<= snd_max_), not the segmentation cursor (snd_nxt_),
+// or one forged ACK marks never-sent segments as SACKed and jumps the fill gate
+// past every real hole -- the repair path then waits a full RTO forever.
+void TestSackBeyondSentIgnored() {
+  Fixture f;
+  f.cut_all();
+  const std::vector<uint8_t> src = MakeBytes(4096, 22);
+  CHECK_EQ(f.sa().write(src.data(), src.size()), src.size());
+  f.tick(25);  // segments everything; the peer window withholds the tail
+  const uint32_t sent = static_cast<uint32_t>(f.sa().in_flight());
+  CHECK(sent > 0u);
+  CHECK(sent < static_cast<uint32_t>(src.size()));
+
+  // The block lies above snd_max_ but below snd_nxt_: the old bound accepted it.
+  f.feed(kA, MakeAck(0, f.cfg().rcv_buf_bytes, sent + 50, sent + 150));
+  CHECK_EQ(f.sa().bad_segs(), 1u);
+  CHECK_EQ(f.sa().retransmits(), 0u);
+
+  // The rejected block did not poison the fill gate: a real block below
+  // snd_max_ still repairs the hole at offset 0 immediately.
+  f.feed(kA, MakeAck(0, f.cfg().rcv_buf_bytes, 1, sent));
+  CHECK(f.sa().retransmits() >= 1u);
+}
+
+// A22: the peer's fin offset is fixed once seen. A later fin at another offset
+// must not move the end of the stream -- doing so keeps the EOF from ever being
+// delivered and the fin from ever being cumulatively acked.
+void TestFinOffsetRewriteRejected() {
+  Fixture f;
+  const std::vector<uint8_t> head = MakeBytes(10, 31);
+  f.feed(kA, MakeData(0, head, true));  // fin at offset 10
+  CHECK(f.a().delivered == head);
+  CHECK_EQ(f.a().eof_count, 1);
+  CHECK_EQ(f.sa().state(), StreamState::kPeerClosed);
+  const auto acks = f.acks_of(kA);
+  CHECK(!acks.empty());
+  CHECK_EQ(rd32(acks.back().data() + 1), 11u);  // the pseudo byte is acked
+
+  // A different fin offset is a protocol violation: dropped, never written.
+  f.feed(kA, MakeData(20, {}, true));
+  CHECK_EQ(f.sa().bad_segs(), 1u);
+  CHECK_EQ(f.a().eof_count, 1);
+  CHECK_EQ(rd32(f.acks_of(kA).back().data() + 1), 11u);
+
+  // Data reaching past the known end is rejected the same way.
+  f.feed(kA, MakeData(8, std::vector<uint8_t>(4, 0x33), false));
+  CHECK_EQ(f.sa().bad_segs(), 2u);
+  CHECK_EQ(f.a().delivered.size(), head.size());
+
+  // Repeating the real fin is a duplicate, not a violation, and still acks.
+  f.feed(kA, MakeData(10, {}, true));
+  CHECK_EQ(f.sa().bad_segs(), 2u);
+  CHECK_EQ(rd32(f.acks_of(kA).back().data() + 1), 11u);
+}
+
 int main() {
   TestOrderedFlow();
   TestBidirectional();
@@ -980,8 +1064,11 @@ int main() {
   TestRstAborts();
   TestIdleTimeout();
   TestAckBeyondSndNxtIgnored();
+  TestAckBeyondSentIgnored();
+  TestSackBeyondSentIgnored();
   TestInvalidSackBlockIgnored();
   TestPeerFinDoesNotDropUnackedData();
+  TestFinOffsetRewriteRejected();
   TestMalformedSegments();
   TestRandomLossEndToEnd();
   return fcp_test::finish();

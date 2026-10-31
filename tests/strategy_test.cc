@@ -415,6 +415,28 @@ void TestLedgerGates() {
   CHECK_EQ(st.k(), 2);
 }
 
+// P6-2: a usable ledger lifts p_eff, but the next report without the ledger
+// bit (peer stopped sending one) must retire it -- otherwise k stays pinned on
+// stale evidence after the link improves, the redundancy feedback loop §14.11
+// warns about.
+void TestLedgerFlagDropClearsPEff() {
+  fcp::FecStrategy st;
+  uint32_t id = 0;
+  DriveToK2(&st, &id);
+  const double bursty_fail = 1.0 - fcp::binom_cdf(2, 12, 0.15);
+  st.on_report(LedgerReport(++id, 0.10, 200, bursty_fail, 2), false);
+  CHECK(st.ledger_active());
+  CHECK_EQ(st.k(), 3);
+
+  // The link improves, but this report carries no ledger: p_eff must fall away
+  // and k must step down toward k_for(0.01).
+  st.on_report(LedgerReport(++id, 0.01, 200, bursty_fail, 2, false), false);
+  CHECK(!st.ledger_active());
+  CHECK_EQ(st.k(), 2);
+  st.on_report(LedgerReport(++id, 0.01, 200, bursty_fail, 2, false), false);
+  CHECK_EQ(st.k(), 1);
+}
+
 // --- M3 byte budget / kCapped (FCP_M3_CONTROL.md §2) ---
 
 constexpr uint32_t kDataBytes = 140000;  // ~1000 full-size data packets
@@ -587,6 +609,52 @@ void TestLedgerFieldExtremes() {
   CHECK_EQ(st3.k(), 2);
 }
 
+// R3-13: the byte budget can be set below 1/D, which the k == 1 floor (§14.11)
+// can never meet. The controller used to sit in CAPPED forever on such a
+// configuration — no amount of cleanliness could reach OFF, so every later
+// loss event was evaluated against a stale k that never went away.
+void TestCappedFloorReachesOff() {
+  fcp::FecStrategyConfig cfg;
+  cfg.budget_ratio = 0.01;  // unmeetable: k/D is 0.1 even at the floor
+  fcp::FecStrategy st(cfg);
+  uint32_t id = 0;
+
+  fcp::FecstatPacket s = LossReport(++id, 0.20);
+  s.data_bytes_rx = 100000;
+  s.parity_bytes_rx = 20000;  // peer measured 0.20 redundancy
+  st.on_report(s, false);
+  CHECK(st.state() == fcp::FecState::kOn);
+  CHECK_EQ(st.k(), 4);
+
+  // Over budget: one parity per report, down to the floor.
+  for (int i = 0; i < 3; ++i) {
+    fcp::FecstatPacket p = LossReport(++id, 0.20);
+    p.data_bytes_rx = 100000;
+    p.parity_bytes_rx = 20000;
+    st.on_report(p, false);
+  }
+  CHECK(st.state() == fcp::FecState::kCapped);
+  CHECK_EQ(st.k(), 1);
+
+  // Still over budget at the floor, but the link is genuinely clean: the floor
+  // holds (k never rises against the budget) and OFF is reachable again.
+  for (int i = 0; i < 4; ++i) {
+    fcp::FecstatPacket p = LossReport(++id, 0.0);
+    p.data_bytes_rx = 100000;
+    p.parity_bytes_rx = 10000;
+    st.on_report(p, false);
+  }
+  CHECK(st.state() == fcp::FecState::kCapped);  // 4 clean reports is not 5
+  CHECK_EQ(st.k(), 1);
+
+  fcp::FecstatPacket last = LossReport(++id, 0.0);
+  last.data_bytes_rx = 100000;
+  last.parity_bytes_rx = 10000;
+  st.on_report(last, false);
+  CHECK(st.state() == fcp::FecState::kOff);
+  CHECK_EQ(st.k(), 0);
+}
+
 int main() {
   TestOffToOn();
   TestTwoReportEntry();
@@ -605,5 +673,7 @@ int main() {
   TestSlowLinkSampleGate();
   TestLedgerFieldExtremes();
   TestLedgerGates();
+  TestLedgerFlagDropClearsPEff();
+  TestCappedFloorReachesOff();
   return fcp_test::finish();
 }

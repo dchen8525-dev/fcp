@@ -214,6 +214,13 @@ class ProxyEngine {
     bool closing = false;  // OPEN_ERR went out: flush, then tear down
     bool want_fin = false;   // close the stream once both buffers are empty
     bool established_seen = false;
+    // A1 follow-up: only a session that once presented a valid GCM tag may
+    // leave a salt tombstone. Untagged traffic must not grow that table.
+    bool authenticated_once = false;
+    // flush_app re-entrancy: app_send may emit bytesWritten synchronously,
+    // which re-enters on_app_writable -> flush_app while the outer loop is
+    // still holding the accepted/taken bookkeeping.
+    bool in_flush_app = false;
 
     std::vector<uint8_t> entry;      // local request bytes, still being parsed
     std::vector<uint8_t> to_stream;  // queued for Stream::write, window-bound

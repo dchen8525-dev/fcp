@@ -87,8 +87,9 @@ FecStrategy::FecStrategy(const FecStrategyConfig& config)
       initial_k_(config.pinned_k >= 0 || config.initial_k < 0
                      ? -1
                      : std::min(config.initial_k, static_cast<int>(p_max_))),
-      // Negative budgets are config noise, not "more off than off".
-      budget_ratio_(std::max(0.0, config.budget_ratio)) {
+      // Negative budgets are config noise, not "more off than off"; anything
+      // above 1 is likewise unmeetable and would silently disable the cap.
+      budget_ratio_(std::min(1.0, std::max(0.0, config.budget_ratio))) {
   if (pinned_k_ > 0) {
     state_ = FecState::kOn;
     k_ = static_cast<uint8_t>(pinned_k_);
@@ -164,9 +165,25 @@ void FecStrategy::on_report(const FecstatPacket& stat, bool window_queued) {
     const double ratio =
         static_cast<double>(stat.parity_bytes_rx) / static_cast<double>(stat.data_bytes_rx);
     if (ratio > budget_ratio_) {
+      if (k_ > 1) {
+        state_ = FecState::kCapped;
+        k_ = static_cast<uint8_t>(k_ - 1);
+        clean_streak_ = 0;
+        return;
+      }
+      // P7' #2: k == 1 is the §14.11 floor. A budget below 1/D can never be
+      // met by lowering k again, and returning unconditionally used to pin the
+      // controller in CAPPED forever — a clean link could never reach OFF.
+      // Keep the floor (do not raise k against the budget) but let the OFF
+      // entry logic run on genuine cleanliness.
       state_ = FecState::kCapped;
-      k_ = std::max<uint8_t>(1, static_cast<uint8_t>(k_ - 1));
-      clean_streak_ = 0;
+      if (loss < 0.003) {
+        if (++clean_streak_ >= 5) {
+          enter_off();
+        }
+      } else {
+        clean_streak_ = 0;
+      }
       return;
     }
     if (state_ == FecState::kCapped) {
@@ -236,6 +253,10 @@ void FecStrategy::enter_off() {
 
 void FecStrategy::update_p_eff(const FecstatPacket& stat) {
   if ((stat.flg & kFlgLedger) == 0) {
+    // P6-2 / §1.2: a report without a ledger is a gate that is not satisfied,
+    // so the controller must fall back to the observed loss. Keeping the last
+    // usable p_eff here pinned k on stale evidence indefinitely.
+    have_p_eff_ = false;
     return;  // pre-M3 peer; normal, not counted as a skip
   }
   have_p_eff_ = false;

@@ -74,6 +74,9 @@ struct SessionConfig {
   // #28③ (F2): pre-negotiation data cache limits (see handshake.h defaults).
   size_t handshake_cache_segments = kHandshakeMaxCachedSegments;
   size_t handshake_cache_bytes = kHandshakeMaxCachedBytes;
+  // R3-1: our handshake nonce. All-zero means "draw it from the OS CSPRNG",
+  // which is what every host wants; a test can pin it to reproduce a vector.
+  uint8_t handshake_nonce[16] = {};
   // Dedup key for delivered payloads, or empty to switch the cross-set dedup
   // off. FCP-STREAM must run with an empty one: it numbers bytes, so a
   // retransmission deliberately repeats an id the peer has to see in order to
@@ -100,8 +103,12 @@ class Session {
 
   void start(int64_t now_ms);
 
-  // Authenticates and routes one inbound datagram.
-  void on_wire(const uint8_t* wire, size_t len, int64_t now_ms);
+  // Authenticates and routes one inbound datagram. Returns true only when the
+  // envelope authenticated: a false result means the datagram carried no valid
+  // GCM tag (wrong key, corrupted, or a replayed counter) and changed nothing
+  // except the auth_fail counter. Hosts that route by the plaintext salt use
+  // this to keep unauthenticated traffic away from any peer binding (A1).
+  bool on_wire(const uint8_t* wire, size_t len, int64_t now_ms);
 
   // One KCP output segment; every segment is data (handshake traffic uses oob).
   void on_kcp_output(const uint8_t* seg, size_t len, int64_t now_ms);
@@ -130,6 +137,14 @@ class Session {
   uint8_t k() const { return strategy_ ? strategy_->k() : 0; }
 
   const uint8_t* salt() const { return cfg_.salt; }
+  // R3-1: this end's handshake draw. Diagnostics, and the handle a test needs
+  // to build the ACK that answers this session's challenge (the echo check
+  // rejects anything else, which is the point).
+  const uint8_t* handshake_nonce() const { return hs_.local_nonce(); }
+  // R3-1: ACKs whose echoed nonce did not match the challenge this end issued
+  // (a replayed or cross-session ACK). Non-zero means the echo check is what
+  // kept the session from establishing on someone else's transcript.
+  uint32_t nonce_mismatch() const { return hs_.nonce_mismatch(); }
   const MtuLimits& mtu_limits() const { return limits_; }
   bool config_valid() const { return limits_.valid; }
 
@@ -151,6 +166,11 @@ class Session {
   uint32_t fecstat_rx() const { return fecstat_rx_; }
   uint32_t last_pre_ppm() const { return last_pre_ppm_; }
   uint32_t last_usable_ppm() const { return last_usable_ppm_; }
+  // Cumulative received data-symbol payload bytes (wire length minus the
+  // envelope/FEC header and the 2-byte symbol length). Benchmarks need this to
+  // separate real payload from parity: both datagram types share one wire
+  // length, so counting by size alone inflated every `--k > 0` run by 1+k/D.
+  uint64_t data_payload_rx() const { return data_payload_rx_; }
 
   const FrameTx* tx() const { return tx_.get(); }
   const FrameRx* rx() const { return rx_.get(); }
@@ -165,8 +185,10 @@ class Session {
   void on_oob(const uint8_t* payload, size_t len, int64_t now_ms);
   void sync_report_counters();
 
-  void emit_symbol(const TxSymbol& symbol);
-  void send_oob(const uint8_t* msg, size_t len);
+  void emit_symbol(const TxSymbol& symbol, bool bootstrap = false);
+  // `bootstrap` routes the frame through the handshake envelope instead of the
+  // data envelope (HELLO/HELLO_ACK only).
+  void send_oob(const uint8_t* msg, size_t len, bool bootstrap = false);
 
   void log(const std::string& line) const {
     if (log_) {
@@ -180,7 +202,13 @@ class Session {
   // trace sink (negotiated D / P' included — replaying with the configured
   // values instead would drift whenever negotiation clamps them).
   TraceConfigSnapshot trace_cfg_{};
+  // R3-1: two key epochs. `hs_env_` is keyed by (PSK, salt) and carries only
+  // HELLO/HELLO_ACK, for the whole life of the session -- that is what keeps a
+  // retried HELLO readable after the data epoch moved on. `env_` carries
+  // everything else and is rekeyed once, at handshake completion, onto the
+  // nonce-bound session key.
   Envelope env_;
+  Envelope hs_env_;
   SendFn send_;
   DeliverFn deliver_;
   LogFn log_;
@@ -204,6 +232,7 @@ class Session {
 
   uint32_t auth_fail_ = 0;
   uint32_t pre_struct_fail_ = 0;
+  uint64_t data_payload_rx_ = 0;
   uint32_t fecstat_dropped_ = 0;
   uint32_t fecstat_stale_ = 0;
   uint32_t fecstat_dup_ = 0;

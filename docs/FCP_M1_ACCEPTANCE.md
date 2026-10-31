@@ -28,17 +28,17 @@ cmd /c build.bat Debug
 | `fcp_aes_test` | 2 | FIPS 197 附录 C.1、AES-NI/T-table 双路径一致 |
 | `fcp_ghash_test` | 2 | GF(2^128) 性质、GHASH golden |
 | `fcp_gcm_test` | 2 | NIST GCM 向量、往返与篡改 |
-| `fcp_envelope_test` | 7 | 28B 信封、篡改/盐隔离、重放、nonce 上限（收发两侧）、方向密钥隔离（#26）、**会话密钥按会话派生（#28①）** |
+| `fcp_envelope_test` | 10 | 28B 信封、篡改/盐隔离、重放、nonce 上限（收发两侧）、方向密钥隔离（#26）、**会话密钥按会话派生（#28①）**、**v7 黄金向量（#31）**、`rekey` 归零、CSPRNG 可用性 |
 | `fcp_hdr_test` | 3 | 6B 头 golden、全字段往返、校验顺序 |
 | `fcp_fecstat_test` | 3 | 128B 布局 golden、四类丢弃、单调键 |
 | `fcp_kfor_test` | 3 | T20 反解表、CDF 参考值、边界 |
 | `fcp_strategy_test` | 11 | OFF/ON 迁移、护栏、clean 5、防抖、pin、样本门 |
-| `fcp_handshake_test` | 12 | 线格式 golden、互握手、caps、超时（退避口径）、重传退避 T26、幂等、协商前缓存 |
+| `fcp_handshake_test` | 17 | 线格式 golden（36/52 字节，v3 magic 不识别）、互握手、caps、超时（退避口径）、重传退避 T26、幂等、协商前缓存、**密钥协商一致（#31）**、**ACK echo 不匹配拒收**、**已建立会话拒新 HELLO（R3-24）**、**零 nonce 拒绝**、**nonce 随机性** |
 | `fcp_frame_tx_test` | 10 | MTU、满组/空闲/异常闭合、k_eff、KCP 输出恒为 data（无内容分类）、T_flush |
 | `fcp_frame_rx_test` | 12 | 位图分离、n 由 parity、幽灵 parity、struct_fail、未定义 type 拒收、锚点不被畸形帧推进、去重窗口、容量淘汰 |
 | `fcp_settle_test` | 9 | 相位机、尾丢、k_unknown 与不可信门、迟到记账、恒等式 fuzz |
 | `fcp_reporter_test` | 6 | 2s/256 包节奏、60s 强制、空闲抑制、flg、分位数 |
-| `fcp_session_test` | 12 | 内存回环全闭环、握手/ACK 走 oob、非法本地 caps、pin 夹到 P'、握手超时、协商前（出站）缓存与超 MTU 拒收、协商前入站 data/parity 丢弃（不反射）、排队护栏 min_rtt 基线、无 FECSTAT 看门狗、SessionTable |
+| `fcp_session_test` | 16 | 内存回环全闭环、握手/ACK 走 oob、非法本地 caps、pin 夹到 P'、握手超时、协商前（出站）缓存与超 MTU 拒收、协商前入站 data/parity 丢弃（不反射）、排队护栏 min_rtt 基线、无 FECSTAT 看门狗、SessionTable、**录制握手重放不能复活会话（#31）** |
 | `fcp_e2e_test` | 6 | T3/T7/T8/T10 + 20% 丢包 ARQ fuzz（真实 UDP 回环）+ burst 注入实测（E2） |
 | `fcp_soak_test` | 3 档 | 0%/5%/20% 双向长跑（见 §6） |
 
@@ -70,7 +70,7 @@ cmd /c build.bat Debug
 | T20 | `k_for` 反解表 1/1/2/3/4/4，20% 不回落 3 | `fcp_kfor_test`：`TestKForTable` / `TestCdfReference` / `TestKForEdges` | ✅ |
 | T21 | 协商前 data 缓存、完成按序进集合、超限/失败丢弃 | `fcp_handshake_test`：`TestDataCache` / `TestCacheLimits`；`fcp_session_test`：`TestPreNegotiationCache` | ✅ |
 | T22 | `rx + rec + lost + late = expect` fuzz 恒成立 | `fcp_settle_test`：`TestIdentityFuzz`；`fcp_rs_test`：`TestGhostParity`；`fcp_e2e_test`：`TestFuzzLoss20Percent` | ✅ |
-| T23 | 握手 oob 化：HELLO/ACK type=2、`set_id=index=0`；type=3 未定义即 struct_fail；无内容分类；重传 Established 即停 | `fcp_handshake_test`：`TestWireGolden`（20B/20B）/ `TestAckStopsRetries`；`fcp_session_test`：`TestHandshakeRidesOob` / `TestHandshakeAckRidesOob`；`fcp_frame_tx_test`：`TestKcpOutputIsAlwaysData`；`fcp_frame_rx_test`：`TestInvalidTypeAndOobBypass`；`fcp_adv_test` R2.5 | ✅ |
+| T23 | 握手 oob 化：HELLO/ACK type=2、`set_id=index=0`；type=3 未定义即 struct_fail；无内容分类；重传 Established 即停 | `fcp_handshake_test`：`TestWireGolden`（36B/52B，#31 后）/ `TestAckStopsRetries`；`fcp_session_test`：`TestHandshakeRidesOob` / `TestHandshakeAckRidesOob`；`fcp_frame_tx_test`：`TestKcpOutputIsAlwaysData`；`fcp_frame_rx_test`：`TestInvalidTypeAndOobBypass`；`fcp_adv_test` R2.5 | ✅ |
 
 ---
 
@@ -86,7 +86,7 @@ cmd /c build.bat Debug
 | `tests/envelope_test.cc:22` `TestEmptyAndRoundTrip` | 28B 空明文信封、tag 12、IV 方向隔离 | 规格 §4.1 |
 | `tests/hdr_test.cc:7` `TestPackGolden` | `type_k = (k<<5)\|(j<<2)\|type` 的 0x20/0x21/0x25/0x89/0xFD 与 6B 头字节 | 规格 §4.2 |
 | `tests/fecstat_test.cc:54` `TestGoldenLayout` | 128B FECSTAT 全字段字面偏移镜像（含 `data_late_rx@100`、`sets_partial@104`） | 规格 §7.1 |
-| `tests/handshake_test.cc:38` `TestWireGolden` | HELLO/ACK 20/20 字节十六进制 golden（16B magic + 4B caps，#25） | 规格 §6.1 |
+| `tests/handshake_test.cc` `TestWireGolden` | HELLO/ACK **36/52** 字节十六进制 golden（16B magic + 16B×1/2 nonce + 4B caps，#31）；同用例断言 `FCP_HELLO_V3` 不再被识别 | 规格 §6.1 |
 | `tests/kfor_test.cc:14` `TestKForTable` | loss→k 反解表与单组修复率参考值 | 规格 §8 |
 | `src/fcp/frame_tx.h:57` `static_assert` | MTU 派生常量 1336/1312、1316/1292 | 规格 §4.1 表 |
 
@@ -365,6 +365,8 @@ GCC（`-Wall -Wextra -Wpedantic`）额外暴露 2 个仅 Linux 可见的测试�
 
 部署发现：该云商在入方向拦截 UDP/53 与 UDP/443（报文到达网卡但不进 socket，iptables/nftables/rp_filter 均正常），UDP/40000 直通，基准因此使用 40000。Windows Debug/Release 与 Linux Debug/Release 四套 ctest 均 20/20（本工具仅改 `tools/fcp_bench.cc`，未触碰 `src/fcp/`）。
 
+对抗审查后（2026-10-31，A2/A10/A20/P8-3/P8-5）：会合改为客户端发 16B（`FCPBENCH` + 8B 随机 salt）、服务端回 8B 魔法并采用该 salt，双方以同一 salt 建会话（原写死 salt 会导致跨轮 GCM (key,IV) 重用）；新增 `--key=HEX32`；`--seg` 限 16..1200、`--port/--mbps` 等数值全串解析并拒绝越界；RESULT 吞吐只计 `send()` 成功的报文。**新旧版本会合格式不兼容，不能混跑**。上表为改动前的历史数据。
+
 ---
 
 ## 17. Qt 桌面客户端（`apps/fcp-client`，2026-10-30）
@@ -484,3 +486,67 @@ M2 验收线已全部落地：#22（WAN 半边 + T33 预热 A/B + Linux 回归�
 `FCP_M2_PROXY.md` §8.1）与 #23（GUI 代理页 + Qt 适配器，同日，见 §8.2——顺带修掉
 子段窗口死锁与 Qt 关闭排空竞态两个真实缺陷，修复后 WAN 8MiB 由 1.29 提到
 8.5–10.6 Mbps）。后续项：快速重传/多洞 SACK（§7 第 2 条，M3）。
+
+---
+
+## 19. R3-1「握手无新鲜性」关闭（v7 密钥编排 + 握手 V4，2026-10-31）
+
+来源：`docs/FCP_ADVERSARIAL_REVIEW.md` 第二轮对抗分析 R3-1（当时唯一未关的 Critical），
+与 R3-23（salt 仅 64 位）、R3-24（已建立会话被一个 HELLO 打死）同批处理。
+
+### 19.1 缺陷本质
+
+v6 的 `session_key = AES128(PSK, salt‖0×8)` **只依赖 `(PSK, salt)`**，而 salt 是线上明文字段
+（§4.1 的会话查找键）。攻击者录下一条完整握手后重放：
+
+1. 双方按同一 `(PSK, salt)` 派生出**同一把** `session_key`；
+2. 反重放窗口是**每会话新建**的（256 槽、`highest=0`），历史密文整段落回窗口内；
+3. 结果：历史密文可被重放、被解密（若攻击者还知道任一明文块）、甚至伪造报文注入。
+
+"缩小窗口""加大 salt"类修补全部无效——窗口本来就是新的，salt 也本来就在线上。
+唯一出路是让密钥依赖**本次运行新抽的随机量**，因此必须动线格式。
+
+### 19.2 落地内容
+
+| # | 改动 | 位置 |
+|---|---|---|
+| 1 | `random_bytes` / `random_u32`（Windows `BCryptGenRandom`、POSIX `/dev/urandom`；失败返回 false，不静默降级） | `src/fcp/random.h`、`random.cc`（新增），`CMakeLists.txt` 链接 `bcrypt` |
+| 2 | `derive_session_key_v7(psk, salt, c_nonce, s_nonce, out)`：三块定长 CBC-MAC | `envelope.h/.cc` |
+| 3 | `Envelope::rekey(session_key)`：装新键并归零 `send_nonce_` / 重放窗口 | `envelope.h/.cc` |
+| 4 | 握手 V4 线格式（36/52 字节）、`build_hello` / `build_hello_ack`、`HandshakeRole`、`kBadNonce` | `handshake.h` |
+| 5 | 状态机：nonce 抽取与校验、ACK echo 绑定、established 拒新 nonce（R3-24）、零 nonce 拒绝 | `handshake.cc`（重写） |
+| 6 | 双 envelope：`hs_env_`（键 = `(PSK,salt)`，只收发 HELLO/ACK，永不 rekey）+ `env_`（`configure()` 时 rekey） | `session.h/.cc` |
+| 7 | `on_wire` 两次尝试（先数据后握手），握手命中的只放行 oob 握手载荷；`emit_symbol`/`send_oob` 按 epoch 分流 | `session.cc` |
+| 8 | 握手信封发送计数器起点 `random_u32()`（防重放 HELLO 让同一 (key, IV) 封出第二条 ACK） | `session.cc` 构造函数 |
+| 9 | `SessionConfig.handshake_nonce[16]`（全零 = 让 CSPRNG 抽）、`handshake_nonce()` / `nonce_mismatch()` 诊断口 | `session.h` |
+
+### 19.3 验证
+
+| 门禁 | 结果 |
+|---|---|
+| `fcp_envelope_test` | PASS（10 例：v7 黄金向量 + `(0,0)`/交换 nonce 反例 + `rekey` 归零 + CSPRNG 可用性） |
+| `fcp_handshake_test` | PASS（17 例：密钥协商一致、echo 不匹配、established 拒新 HELLO、零 nonce、随机性、36/52 golden、v3 不识别） |
+| `fcp_session_test` | PASS（16 例：含新增 `TestReplayCannotReviveSession`） |
+| `ctest -C Debug` | **27/27 通过**（15.5 s） |
+| `ctest -C Release` | **27/27 通过**（3.7 s） |
+| `FCP_BUILD_PROXY=ON` 构建 | 通过（`build/proxy-check`，Debug 全目标，无 error） |
+
+**黄金向量**（外部 openssl 独立算出，锁在 `envelope_test.cc::TestV7KeyVector`）：
+psk `0f1e…e1f0`、salt `1122334455667788`、c `0001…0e0f`、s `f0e0…1000` →
+`X0 = 18e6cda19e4e7799e2f2e18874e4c2d6`、`v7 = 54986bbc5ccc12b8666f56c7a5d6eb8d`、
+交换 nonce = `fce3349c24a2ee4b0a0a4c096c1f55af`、双零 nonce = `7363d57e850ce2d2f301b80bae264112`。
+
+**变异验证**（证明重放用例真的在测这件事）：把 `handshake.cc` 的 echo 校验临时改成
+`if (false && ...)`，`TestReplayCannotReviveSession` 立刻报 `!a2.established()` 失败；
+恢复后复绿。
+
+### 19.4 代价与兼容性
+
+- **v7 与 v6 不互通**，两端必须同时升级（magic V3 → V4 硬断，无降级协商）。
+  升级顺序与误混版本的两种症状见 `DEPLOY.md` §1.1。
+- **salt 宽度维持 8B**（决策：不加宽到 16B）——KDF 已混入双向 16B nonce，salt 只承担会话查找键，
+  加宽只增线上字节、不增实际安全性。
+- **PSK 与配网零改动**：密钥材料、端口、MTU、参数全不变，只换二进制。
+- 仍无前向保密（PSK 泄露 → 历史全解），与 v6 一致，已作为接受取舍入档（规格 §6.0）。
+- 残余：服务端对重放的 HELLO 仍会建立一个"空会话"（它用自己抽的 `s_nonce`，与录制方不同键，
+  送不进任何数据），成本等价于伪造 HELLO（需 PSK），由 `max_sessions` + idle 回收承担。

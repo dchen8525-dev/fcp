@@ -138,6 +138,7 @@ class ProxyHost : public QObject {
   std::string peer_key_;
   uint64_t next_local_conn_ = 1;
   bool resolving_ = false;
+  quint64 resolve_gen_ = 0;  // P4-3: only the newest start() owns DNS results
 
   std::vector<std::vector<uint8_t>> wire_backlog_;  // before the address is known
 

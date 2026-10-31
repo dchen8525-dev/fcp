@@ -189,17 +189,24 @@ void encode_trace_line(const TraceEntry& e, std::string* out) {
 
 bool decode_trace_line(const std::string& line, TraceEntry* e) {
   std::vector<std::pair<std::string, double>> fields;
+  // P8' N9: a failed decode used to leave the previous entry's ver intact while
+  // every other failure cleared it. Make the contract uniform: failure leaves a
+  // default-initialised entry.
+  if (e != nullptr) {
+    *e = TraceEntry{};
+  }
   if (!scan_fields(line, &fields)) {
     return false;
   }
   double v = 0;
   if (!field_in_range(fields, "ver", 0.0, 2147483647.0, 0.0, &v) ||
-      static_cast<int>(v) != kTraceVersion) {
+      v != std::trunc(v) || static_cast<int>(v) != kTraceVersion) {
     return false;
   }
   auto u8 = [&fields](const char* key, uint8_t fallback, uint8_t* out) {
     double raw = 0;
-    if (!field_in_range(fields, key, 0.0, 255.0, fallback, &raw)) {
+    if (!field_in_range(fields, key, 0.0, 255.0, fallback, &raw) ||
+        raw != std::trunc(raw)) {
       return false;
     }
     *out = static_cast<uint8_t>(raw);
@@ -207,7 +214,8 @@ bool decode_trace_line(const std::string& line, TraceEntry* e) {
   };
   auto u16 = [&fields](const char* key, uint16_t fallback, uint16_t* out) {
     double raw = 0;
-    if (!field_in_range(fields, key, 0.0, 65535.0, fallback, &raw)) {
+    if (!field_in_range(fields, key, 0.0, 65535.0, fallback, &raw) ||
+        raw != std::trunc(raw)) {
       return false;
     }
     *out = static_cast<uint16_t>(raw);
@@ -215,7 +223,8 @@ bool decode_trace_line(const std::string& line, TraceEntry* e) {
   };
   auto u32 = [&fields](const char* key, uint32_t fallback, uint32_t* out) {
     double raw = 0;
-    if (!field_in_range(fields, key, 0.0, 4294967295.0, fallback, &raw)) {
+    if (!field_in_range(fields, key, 0.0, 4294967295.0, fallback, &raw) ||
+        raw != std::trunc(raw)) {
       return false;
     }
     *out = static_cast<uint32_t>(raw);
@@ -223,14 +232,14 @@ bool decode_trace_line(const std::string& line, TraceEntry* e) {
   };
   auto i32 = [&fields](const char* key, int fallback, int* out) {
     double raw = 0;
-    if (!field_in_range(fields, key, -2147483648.0, 2147483647.0, fallback, &raw)) {
+    if (!field_in_range(fields, key, -2147483648.0, 2147483647.0, fallback, &raw) ||
+        raw != std::trunc(raw)) {
       return false;
     }
     *out = static_cast<int>(raw);
     return true;
   };
 
-  *e = TraceEntry{};
   TraceConfigSnapshot& c = e->snapshot;
   if (!u8("c_d", 10, &c.d) || !u8("c_pmax", kDefaultPmax, &c.p_max) ||
       !i32("c_ik", -1, &c.initial_k) || !i32("c_pin", -1, &c.pinned)) {
@@ -250,6 +259,9 @@ bool decode_trace_line(const std::string& line, TraceEntry* e) {
   uint8_t state = 0;
   if (!u8("state", 0, &state)) {
     return false;
+  }
+  if (state > static_cast<uint8_t>(FecState::kCapped)) {
+    return false;  // P8' N8: reject a non-enum state instead of casting it
   }
   e->state_after = static_cast<FecState>(state);
   e->last_loss = field_or(fields, "loss", 0.0);

@@ -22,7 +22,11 @@ void xor_scaled(uint8_t* dst, const uint8_t* src, size_t len, uint8_t coeff) {
 
 void encode(const uint8_t* const* data, size_t n, size_t k, size_t symbol_max,
             uint8_t** parity_out) {
-  if (k == 0 || n == 0) {
+  // P7' #7: mirror decode()'s geometry guard. cauchy_coeff truncates (k+c) to
+  // uint8_t, so n+k > 255 silently produces a zero column and a permanently
+  // unsolvable group. Today only Session's d+p check keeps callers honest;
+  // rs.h is public.
+  if (k == 0 || n == 0 || n + k > kRsMaxShards) {
     return;
   }
   for (size_t r = 0; r < k; ++r) {

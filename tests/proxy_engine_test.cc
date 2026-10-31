@@ -518,9 +518,9 @@ void backpressure_closes_the_window() {
   }, 120));
 }
 
-// §3: the plaintext salt routes a datagram to its session, and the source
-// address binds it -- the envelope would authenticate either way, so the binding
-// is the only thing that makes a hijacked salt useless.
+// §3 + A1: the plaintext salt routes a datagram to its session, but only the
+// envelope can say who sent it. The source address binds a session only after
+// the datagram authenticates; a bare salt prefix must not be able to kill it.
 void salt_routing_and_replay_binding() {
   Harness h{Options()};
   h.local_open(kLocalConn);
@@ -531,9 +531,26 @@ void salt_routing_and_replay_binding() {
   CHECK_EQ(h.client->counters().unknown_salt, 0u);
   CHECK_EQ(h.server->counters().salt_clash, 0u);
 
-  // A live session's datagram, replayed from a different address.
+  // A1: a captured datagram replayed from another address carries a valid tag
+  // but a nonce the replay window has already seen. Authentication rejects it,
+  // so it never reaches the source binding and the tunnel stays up.
   const std::vector<uint8_t> stolen = h.last_from_client;
   h.server->on_wire(kOtherPeer, stolen.data(), stolen.size(), h.now_ms);
+  CHECK_EQ(h.server->counters().salt_clash, 0u);
+  CHECK_EQ(h.server->counters().live, 1u);
+
+  // A fresh datagram that only the session key could have sealed is a genuine
+  // hijack of the salt: that is where the address binding is enforceable.
+  uint8_t salt[Envelope::kSaltLen];
+  std::memcpy(salt, stolen.data(), sizeof(salt));
+  uint8_t key[16];
+  std::memset(key, 0x2A, sizeof(key));  // Harness PSK
+  Envelope hijacker(key, salt, Direction::kC2S, Direction::kS2C);
+  CHECK(hijacker.set_send_nonce(5000));
+  std::vector<uint8_t> hijack;
+  const std::vector<uint8_t> payload{0xAA, 0xBB};
+  CHECK(hijacker.seal(payload.data(), payload.size(), &hijack));
+  h.server->on_wire(kOtherPeer, hijack.data(), hijack.size(), h.now_ms);
   CHECK_EQ(h.server->counters().salt_clash, 1u);
   CHECK_EQ(h.server->counters().live, 0u);
   CHECK(logged(h.server_log, "salt re-bound to a new address"));

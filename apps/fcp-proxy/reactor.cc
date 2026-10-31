@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <thread>
+#include <utility>
 
 #include "fcp/session.h"
 
@@ -169,17 +170,24 @@ bool Reactor::open_udp(std::string* error) {
     return false;
   }
   TuneUdp(udp_);
+  // P5-09: a failed start must not leak the descriptor it already created.
+  auto fail = [this, error](std::string message) {
+    *error = std::move(message);
+    if (udp_ != kBadSock) {
+      CloseSock(udp_);
+      udp_ = kBadSock;
+    }
+    return false;
+  };
   if (opt_.role == EngineRole::kClient) {
     sockaddr_in remote{};
     remote.sin_family = AF_INET;
     remote.sin_port = htons(static_cast<uint16_t>(opt_.remote_port));
     if (inet_pton(AF_INET, opt_.remote_host.c_str(), &remote.sin_addr) != 1) {
-      *error = "--remote must be an IPv4 address, got '" + opt_.remote_host + "'";
-      return false;
+      return fail("--remote must be an IPv4 address, got '" + opt_.remote_host + "'");
     }
     if (::connect(udp_, reinterpret_cast<sockaddr*>(&remote), sizeof(remote)) != 0) {
-      *error = "udp connect: " + ErrText(SockErr());
-      return false;
+      return fail("udp connect: " + ErrText(SockErr()));
     }
     // Peer id 0, the only one a client has. No session is ever released on
     // this side, so the slot is marked in use permanently.
@@ -195,15 +203,17 @@ bool Reactor::open_udp(std::string* error) {
     if (opt_.bind_addr.empty() || opt_.bind_addr == "0.0.0.0") {
       local.sin_addr.s_addr = htonl(INADDR_ANY);
     } else if (inet_pton(AF_INET, opt_.bind_addr.c_str(), &local.sin_addr) != 1) {
-      *error = "--bind must be an IPv4 address, got '" + opt_.bind_addr + "'";
-      return false;
+      return fail("--bind must be an IPv4 address, got '" + opt_.bind_addr + "'");
     }
     if (::bind(udp_, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) {
-      *error = "udp bind " + host_port(opt_.bind_addr, opt_.bind_port) + ": " + ErrText(SockErr());
-      return false;
+      return fail("udp bind " + host_port(opt_.bind_addr, opt_.bind_port) + ": " +
+                  ErrText(SockErr()));
     }
   }
-  return SetNonBlocking(udp_);
+  if (!SetNonBlocking(udp_)) {
+    return fail("udp nonblocking: " + ErrText(SockErr()));
+  }
+  return true;
 }
 
 bool Reactor::open_listener(std::string* error) {
@@ -213,23 +223,31 @@ bool Reactor::open_listener(std::string* error) {
     return false;
   }
   EnableReuse(listener_);
+  auto fail = [this, error](std::string message) {
+    *error = std::move(message);
+    if (listener_ != kBadSock) {
+      CloseSock(listener_);
+      listener_ = kBadSock;
+    }
+    return false;
+  };
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_port = htons(static_cast<uint16_t>(opt_.listen_port));
   if (inet_pton(AF_INET, opt_.listen_addr.c_str(), &addr.sin_addr) != 1) {
-    *error = "--listen must be an IPv4 address, got '" + opt_.listen_addr + "'";
-    return false;
+    return fail("--listen must be an IPv4 address, got '" + opt_.listen_addr + "'");
   }
   if (::bind(listener_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-    *error = "listener bind " + host_port(opt_.listen_addr, opt_.listen_port) + ": " +
-             ErrText(SockErr());
-    return false;
+    return fail("listener bind " + host_port(opt_.listen_addr, opt_.listen_port) + ": " +
+                ErrText(SockErr()));
   }
   if (::listen(listener_, 64) != 0) {
-    *error = "listen: " + ErrText(SockErr());
-    return false;
+    return fail("listen: " + ErrText(SockErr()));
   }
-  return SetNonBlocking(listener_);
+  if (!SetNonBlocking(listener_)) {
+    return fail("listener nonblocking: " + ErrText(SockErr()));
+  }
+  return true;
 }
 
 bool Reactor::start(std::string* error) {
@@ -245,6 +263,10 @@ bool Reactor::start(std::string* error) {
     return false;
   }
   if (opt_.role == EngineRole::kClient && !open_listener(error)) {
+    if (udp_ != kBadSock) {
+      CloseSock(udp_);
+      udp_ = kBadSock;
+    }
     return false;
   }
   for (size_t i = 0; i < kResolverWorkers; ++i) {
@@ -260,6 +282,13 @@ bool Reactor::start(std::string* error) {
   std::fflush(stdout);
   std::signal(SIGINT, OnSignal);
   std::signal(SIGTERM, OnSignal);
+#ifndef _WIN32
+  // A7: a local application that closes its TCP socket turns the next send()
+  // into EPIPE plus SIGPIPE, whose default action kills the whole proxy (and
+  // every other tunnel with it). app_send already treats the -1 as a retryable
+  // 0; the signal just must not terminate the process.
+  std::signal(SIGPIPE, SIG_IGN);
+#endif
   started_ms_ = NowMs();
   next_tick_ms_ = started_ms_;
   next_stats_ms_ = opt_.stats_ms != 0 ? started_ms_ + opt_.stats_ms : 0;
@@ -342,14 +371,28 @@ void Reactor::run() {
       // Anything the engine still owes an application socket gets another try
       // here, whether or not select reported it: the pending byte count is the
       // engine's, so this is the only place a stalled write can be retried.
+      // P4' N4: same hazard as A5 in the Qt host — flush_conn can synchronously
+      // reach app_close(), which erases from these maps. Walk an id snapshot
+      // and re-find each entry (reactor has no nested loop today, but the
+      // invariant should not rest on that).
+      std::vector<uint64_t> local_ids;
+      local_ids.reserve(locals_.size());
       for (const auto& e : locals_) {
-        if (engine_.pending_app_bytes(e.first) != 0) {
-          flush_conn(e.first, now);
+        local_ids.push_back(e.first);
+      }
+      for (uint64_t id : local_ids) {
+        if (locals_.find(id) != locals_.end() && engine_.pending_app_bytes(id) != 0) {
+          flush_conn(id, now);
         }
       }
+      std::vector<uint64_t> target_ids;
+      target_ids.reserve(targets_.size());
       for (const auto& e : targets_) {
-        if (engine_.pending_app_bytes(e.first) != 0) {
-          flush_conn(e.first, now);
+        target_ids.push_back(e.first);
+      }
+      for (uint64_t id : target_ids) {
+        if (targets_.find(id) != targets_.end() && engine_.pending_app_bytes(id) != 0) {
+          flush_conn(id, now);
         }
       }
     }
@@ -513,7 +556,12 @@ void Reactor::accept_local(int64_t now_ms) {
     if (s == kBadSock) {
       return;
     }
-    SetNonBlocking(s);
+    // P5' N3: a blocking accepted socket would stall the single-threaded
+    // reactor inside the next recv(), letting one client freeze every tunnel.
+    if (!SetNonBlocking(s)) {
+      CloseSock(s);
+      continue;
+    }
     const uint64_t conn = next_local_conn_++;
     locals_.emplace(conn, s);
     engine_.on_local_open(conn, 0, now_ms);

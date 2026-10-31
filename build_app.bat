@@ -30,9 +30,10 @@ set "PATH=%VSDIR%\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;%VSDIR%\Com
 
 rem --- vcpkg: prefer a vcpkg that actually has Qt installed ---
 rem A Visual Studio installation exports its own VCPKG_ROOT, which has no Qt;
-rem switch to the local checkout when that one carries qt6.
+rem switch to the local checkout when that one carries qt6. vcpkg's qtbase
+rem installs the config tree as share\Qt6 (capital Q), so check that spelling.
 if not defined VCPKG_ROOT set "VCPKG_ROOT=D:\work\vcpkg"
-if not exist "%VCPKG_ROOT%\installed\x64-windows\share\qt6" if exist "D:\work\vcpkg\installed\x64-windows\share\qt6" set "VCPKG_ROOT=D:\work\vcpkg"
+if not exist "%VCPKG_ROOT%\installed\x64-windows\share\Qt6" if exist "D:\work\vcpkg\installed\x64-windows\share\Qt6" set "VCPKG_ROOT=D:\work\vcpkg"
 if not exist "%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake" (
   echo [fcp-app] vcpkg not found: set VCPKG_ROOT to your vcpkg checkout
   exit /b 1

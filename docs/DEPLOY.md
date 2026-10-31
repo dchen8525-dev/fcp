@@ -18,6 +18,26 @@
 - Linux 没有 release 构建预设：手动 `-DCMAKE_BUILD_TYPE=Release` 配第二棵构建树。
 - Qt 客户端只链 `fcp_proxy_core`（引擎库，默认随 tests/apps 构建），不依赖 CLI 的两个可执行文件。
 
+### 1.1 版本兼容（v7 硬断 v6，R3-1）
+
+**v7 与 v6 不能互通，升级必须两端同时替换。** 这不是"协商降级"，两端各自拒绝对方：
+
+| 层 | v6 | v7 | 表现 |
+|---|---|---|---|
+| 握手 magic | `FCP_HELLO_V3` | `FCP_HELLO_V4` | magic 兼作握手版本号；旧 magic 一律不识别 → 3 次重试后 `V4 no ACK after 3 tries` |
+| HELLO 长度 | 20 | 36（多 16B 发送方 nonce） | 长度门限不符，直接丢弃 |
+| HELLO_ACK 长度 | 20 | 52（回显 c_nonce + s_nonce） | 同上 |
+| 会话密钥 | `AES_psk(salt‖0^8)` | `AES_psk(AES_psk(AES_psk(salt‖0^8) ⊕ c_nonce) ⊕ s_nonce)` | 密钥不同 → 数据面全丢（`auth_fail` 陡增） |
+| 数据密文 | 同一把密钥 | 与握手密钥分离（双 envelope） | 旧版本用握手密钥解数据 → 全丢 |
+
+升级步骤（**不能滚动升级**）：
+1. 窗口期停服务端 → 换 `fcp-proxy-server` → 换全部 `fcp-proxy-client`/Qt 客户端 → 起服务端。
+2. 若误混版本，症状是**握手失败**（日志 `V4 no ACK`）或**握手成功但 0 吞吐**（`auth_fail` 持续增长）。
+   两者都不是网络/防火墙问题，先核对版本。
+3. `fcp_bench` 的会合格式未变（salt 交换仍在会合包里），但两端都必须是 v7 才有意义。
+4. PSK 与 salt 宽度未变（16B / 8B）：**不需要改任何配网或密钥材料**。
+
+
 ## 2. 二进制与角色
 
 | 文件 | 角色 |
@@ -32,6 +52,9 @@
 
 - **PSK**：16 字节，两端一致；CLI 用 `--key=HEX32`（32 位十六进制）。生成：
   `openssl rand -hex 16`。会话密钥按 salt 派生（§6.0），PSK 轮换归运维。
+  仓库不内置任何默认 PSK。Qt GUI 每次启动用 CSPRNG 生成随机 PSK 且**不写入 QSettings**；
+  连已有服务端时把服务端 `--key` 填进界面（脚本化用 `--proxy-psk` 覆盖），两端一致才可通。
+  会话 salt 由程序每连接随机生成，GUI 不提供配置项。
 - **UDP 端口**：默认 4460。**部署前实测云商防火墙**——部分云商只放行特定 UDP 端口
   （#22 实测：UDP/40001 报文到网卡但不进 socket，最终只能用 UDP/40000）。端口试探：
   服务端起在候选端口 → 本地 `ss -uln` 确认监听 → 客户端小流量实测。
@@ -80,8 +103,9 @@ curl --socks5-hostname 127.0.0.1:1080 https://<目标>/   # CONNECT + TLS，证�
 
 ### 5.2 Qt GUI
 
-- 代理页字段：服务器 / PSK / 本地监听 / MTU / 钉 k / 预热 / **FEC 预算** / **轨迹前缀**
-  （QSettings 键 `proxy/fec_budget`、`proxy/trace_prefix`）。
+- 代理页字段：服务器 / PSK（每次启动随机、不落盘） / 本地监听 / MTU / 钉 k / 预热 /
+  **FEC 预算** / **轨迹前缀**（QSettings 键 `proxy/fec_budget`、`proxy/trace_prefix`）。
+  测速页同规则：PSK 随机生成、不持久化；连固定服务端时手工填入其 `--key`。
 - 脚本化验收参数：`--proxy-host/--proxy-port/--proxy-listen/--proxy-psk/
   --proxy-fec-budget/--proxy-trace/--proxy-autostart`。
 - 分发：`build_app.bat` 末尾的 windeployqt 部署 Qt 运行时；拷贝整个输出目录即可。
@@ -128,6 +152,17 @@ fcp_replay --trace=srv.101.jsonl --budget=0.10   # what-if：候选参数重放
 ```
 
 `agree=N/M` 是重放与录制的逐决策一致率——恒等（阈值标定的基线）。
+
+### 6.4 吞吐标定（`fcp_bench`）
+
+```bash
+fcp_bench server --port=47123 [--key=HEX32] [--mbps=M] [--seg=N] [--k=K]
+fcp_bench client --host=<服务端IP> --port=47123 [--key=HEX32] ...
+```
+
+两端 PSK 必须一致（缺省为工具内置测试键，生产标定请显式给 `--key`）。客户端每轮生成
+随机 salt 并经会合包交给服务端，**新旧版本会合格式不同，不能混跑**。RESULT 的吞吐只计
+`send()` 成功的报文，失败单独计入 `tx_fail`（对抗审查 A2/A20）。
 
 ## 7. 已知部署坑（全部实测过）
 

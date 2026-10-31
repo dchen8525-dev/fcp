@@ -25,22 +25,57 @@
 
 namespace {
 
-std::vector<std::string> ReadLines(const char* path) {
-  std::vector<std::string> lines;
+// P5-11: read errors must not look like an empty trace, and a line longer than
+// the 4 KiB chunk must be reassembled instead of being split into bogus lines.
+// P8' N5: the reassembly buffer needs a ceiling — one unterminated 2 GB line
+// used to grow `pending` until std::bad_alloc escaped main().
+bool ReadLines(const char* path, std::vector<std::string>* lines, int* err_out) {
+  if (err_out != nullptr) {
+    *err_out = 0;
+  }
   std::FILE* f = std::fopen(path, "rb");
   if (f == nullptr) {
-    return lines;
-  }
-  char buf[4096];
-  while (std::fgets(buf, sizeof(buf), f) != nullptr) {
-    std::string line(buf);
-    while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
-      line.pop_back();
+    if (err_out != nullptr) {
+      *err_out = errno;
     }
-    lines.push_back(line);
+    return false;
+  }
+  constexpr size_t kMaxLineBytes = 1u << 20;  // far above any real trace line
+  char buf[4096];
+  std::string pending;
+  bool ok = true;
+  while (std::fgets(buf, sizeof(buf), f) != nullptr) {
+    pending += buf;
+    if (pending.size() > kMaxLineBytes) {
+      std::fprintf(stderr, "trace %s: line longer than %zu bytes, giving up\n", path,
+                   kMaxLineBytes);
+      ok = false;
+      break;
+    }
+    if (!pending.empty() && pending.back() != '\n' && !std::feof(f)) {
+      continue;
+    }
+    while (!pending.empty() && (pending.back() == '\n' || pending.back() == '\r')) {
+      pending.pop_back();
+    }
+    lines->push_back(std::move(pending));
+    pending.clear();
+  }
+  if (ok) {
+    ok = std::ferror(f) == 0;
+    if (!ok && err_out != nullptr) {
+      // ferror does not promise a useful errno; keep the message honest.
+      *err_out = errno != 0 ? errno : EIO;
+    }
+  } else if (err_out != nullptr) {
+    *err_out = EOVERFLOW;
+  }
+  if (ok && !pending.empty()) {
+    // A final line without a newline is still a line.
+    lines->push_back(std::move(pending));
   }
   std::fclose(f);
-  return lines;
+  return ok;
 }
 
 const std::string* Find(const std::map<std::string, std::string>& opts,
@@ -122,7 +157,14 @@ int main(int argc, char** argv) {
   fcp::TraceConfigSnapshot snapshot{};
   size_t skipped = 0;
   bool have_snapshot = false;
-  for (const std::string& line : ReadLines(path->c_str())) {
+  std::vector<std::string> lines;
+  int read_err = 0;
+  if (!ReadLines(path->c_str(), &lines, &read_err)) {
+    std::fprintf(stderr, "cannot read trace %s: %s\n", path->c_str(),
+                 std::strerror(read_err != 0 ? read_err : EIO));
+    return 1;
+  }
+  for (const std::string& line : lines) {
     if (line.empty() || line[0] == '#') {
       continue;
     }

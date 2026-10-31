@@ -18,7 +18,7 @@
 
 namespace {
 
-constexpr size_t kUdpBufBytes = 2048;        // one wire datagram
+constexpr size_t kUdpBufBytes = 64 * 1024;   // one maximum-size IPv4 UDP datagram
 constexpr int kMaxUdpPerDrain = 128;         // a flood must not starve the tick
 constexpr int kReadBufBytes = 16 * 1024;     // one socket read
 constexpr int kMaxReadsPerReady = 16;        // per socket per readiness
@@ -67,6 +67,12 @@ void ProxyHost::start(const Options& options) {
     return;
   }
   opt_ = options;
+  // P1-2: the Options contract says 16 bytes, but only the UI regex enforces
+  // it; constData() is not readable past the array length.
+  if (opt_.key.size() != 16) {
+    Q_EMIT finished(Result{false, QStringLiteral("PSK 长度无效（需 16 字节）"), Stats{}});
+    return;
+  }
 
   cfg_ = fcp::EngineConfig{};
   cfg_.role = fcp::EngineRole::kClient;
@@ -75,8 +81,11 @@ void ProxyHost::start(const Options& options) {
   cfg_.pinned_k = opt_.pinned_k;
   cfg_.prewarm = opt_.prewarm;
   cfg_.fec_budget = opt_.fec_budget;
-  cfg_.trace = fcp::make_trace_sink(opt_.trace_prefix.toLocal8Bit().toStdString(),
-                                    1 /* single client session */);
+  // #35 renamed the engine field: EngineConfig carries the prefix and the
+  // engine builds one per-session sink itself (engine.cc create_*_conn). The
+  // old `cfg_.trace = make_trace_sink(...)` no longer compiles and would have
+  // opened an extra file for connection id 1.
+  cfg_.trace_prefix = opt_.trace_prefix.toLocal8Bit().toStdString();
   if (opt_.window_kib > 0) {
     const size_t bytes = static_cast<size_t>(opt_.window_kib) * 1024;
     cfg_.send_window_bytes = bytes;
@@ -124,8 +133,11 @@ void ProxyHost::start(const Options& options) {
   };
   host.peer_key = [this](uint64_t peer) { return peerKey(peer); };
   host.new_salt = [](uint8_t salt[fcp::Envelope::kSaltLen]) {
+    // P2' N3: global() is a deterministic PRNG; the salt ships in every
+    // datagram, so a few connections would expose its state. The client salt
+    // is the session's only identity — use the OS CSPRNG, like bench_engine.
     for (size_t i = 0; i < fcp::Envelope::kSaltLen; ++i) {
-      salt[i] = static_cast<uint8_t>(QRandomGenerator::global()->generate() & 0xFF);
+      salt[i] = static_cast<uint8_t>(QRandomGenerator::system()->generate() & 0xFF);
     }
   };
   host.log = [this](const std::string& line) {
@@ -155,6 +167,8 @@ void ProxyHost::start(const Options& options) {
                      .arg(listener_->serverPort())
                      .arg(opt_.server)
                      .arg(opt_.port));
+  ++resolve_gen_;  // P4-3: invalidate any lookup still in flight from a
+                   // previous start(); its answer must never bind this run.
   resolveServer();
 }
 
@@ -181,8 +195,14 @@ void ProxyHost::resolveServer() {
   }
   resolving_ = true;
   const QString name = opt_.server;
+  const quint64 gen = resolve_gen_;
   QHostInfo::lookupHost(
-      name, this, [this, name](const QHostInfo& info) {
+      name, this, [this, name, gen](const QHostInfo& info) {
+        // P4-3: stop()/start(B) while A's lookup is in flight must not let A's
+        // answer overwrite B's server_addr_ while the PSK/port belong to B.
+        if (gen != resolve_gen_) {
+          return;
+        }
         resolving_ = false;
         if (engine_ == nullptr) {
           return;
@@ -541,31 +561,45 @@ void ProxyHost::onTick() {
   // bytes left behind by a closed stream window (or a burst above the per-event
   // read budget) are picked up here once the window reopens.
   drainUdp();
-  for (auto it = locals_.constBegin(); it != locals_.constEnd(); ++it) {
+  // A5: engine callbacks run synchronously inside readLocal/readTarget/
+  // on_app_writable and can call appClose(), which erases from these hashes.
+  // Iterate a key snapshot, and re-find each entry because an earlier callback
+  // may already have removed it.
+  const QList<uint64_t> local_ids = locals_.keys();
+  for (uint64_t conn : local_ids) {
+    const auto it = locals_.constFind(conn);
+    if (it == locals_.constEnd()) {
+      continue;
+    }
     QTcpSocket* sock = it.value();
     if (sock != nullptr && sock->bytesAvailable() > 0 &&
-        engine_->wants_local_read(it.key())) {
-      readLocal(it.key());
+        engine_->wants_local_read(conn)) {
+      readLocal(conn);
     }
   }
-  for (auto it = targets_.constBegin(); it != targets_.constEnd(); ++it) {
+  const QList<uint64_t> target_ids = targets_.keys();
+  for (uint64_t conn : target_ids) {
+    const auto it = targets_.constFind(conn);
+    if (it == targets_.constEnd()) {
+      continue;
+    }
     QTcpSocket* sock = it.value().sock;
     if (sock != nullptr && sock->bytesAvailable() > 0 &&
-        engine_->wants_target_read(it.key())) {
-      readTarget(it.key());
+        engine_->wants_target_read(conn)) {
+      readTarget(conn);
     }
   }
   sweepDials();
   // A window that reopened between events still has to make progress (same
   // reason the reactor flushes every tick, engine.h on_app_writable).
-  for (auto it = locals_.constBegin(); it != locals_.constEnd(); ++it) {
-    if (engine_->pending_app_bytes(it.key()) != 0) {
-      engine_->on_app_writable(it.key(), now);
+  for (uint64_t conn : local_ids) {
+    if (locals_.contains(conn) && engine_->pending_app_bytes(conn) != 0) {
+      engine_->on_app_writable(conn, now);
     }
   }
-  for (auto it = targets_.constBegin(); it != targets_.constEnd(); ++it) {
-    if (engine_->pending_app_bytes(it.key()) != 0) {
-      engine_->on_app_writable(it.key(), now);
+  for (uint64_t conn : target_ids) {
+    if (targets_.contains(conn) && engine_->pending_app_bytes(conn) != 0) {
+      engine_->on_app_writable(conn, now);
     }
   }
   engine_->on_tick(now);
@@ -588,6 +622,9 @@ void ProxyHost::sweepDials() {
   for (uint64_t conn : dead) {
     Q_UNUSED(now);
     auto it = targets_.constFind(conn);
+    if (it == targets_.constEnd()) {
+      continue;  // removed by a nested callback before this pass reached it
+    }
     QTcpSocket* sock = it.value().sock;
     targets_.erase(it);
     if (sock != nullptr) {
@@ -610,11 +647,18 @@ void ProxyHost::finishEngine(bool ok, const QString& why) {
   }
   udp_.close();
   auto killSockets = [](QHash<uint64_t, QTcpSocket*>& m) {
-    for (auto it = m.begin(); it != m.end(); ++it) {
-      it.value()->abort();
-      it.value()->deleteLater();
+    // A6: abort() emits disconnected() synchronously, and that handler erases
+    // from m -- so take the entry out first and never touch the iterator after
+    // the abort.
+    while (!m.isEmpty()) {
+      auto it = m.begin();
+      QTcpSocket* sock = it.value();
+      m.erase(it);
+      if (sock != nullptr) {
+        sock->abort();
+        sock->deleteLater();
+      }
     }
-    m.clear();
   };
   killSockets(locals_);
   QHash<uint64_t, QTcpSocket*> target_socks;

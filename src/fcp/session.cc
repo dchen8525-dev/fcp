@@ -6,6 +6,8 @@
 #include <utility>
 #include <vector>
 
+#include "fcp/random.h"
+
 namespace fcp {
 namespace {
 
@@ -56,6 +58,16 @@ bool mtu_fits_largest_oob(const SessionConfig& cfg) {
   return cfg.mtu >= oob_wire;
 }
 
+// R3-1: an all-zero configured nonce means "let the handshake draw one". The
+// distinction only exists so a test can pin the value.
+const uint8_t* nonce_or_null(const uint8_t nonce[16]) {
+  uint8_t acc = 0;
+  for (size_t i = 0; i < 16; ++i) {
+    acc |= nonce[i];
+  }
+  return acc == 0 ? nullptr : nonce;
+}
+
 }  // namespace
 
 // See session.h: the default dedup key, read out of a KCP segment header.
@@ -74,14 +86,25 @@ Session::Session(const SessionConfig& config, SendFn send, DeliverFn deliver, Lo
     : cfg_(config),
       limits_(compute_mtu_limits(config.mtu, config.ip_hdr_len)),
       env_(config.key, config.salt, config.send_direction, config.recv_direction),
+      hs_env_(config.key, config.salt, config.send_direction, config.recv_direction),
       send_(std::move(send)),
       deliver_(std::move(deliver)),
       log_(std::move(log)),
       hs_(config.d, config.p,
-          [this](const uint8_t* data, size_t len) { send_oob(data, len); },
-          kLocalFlagsM1, config.handshake_cache_segments,
-          config.handshake_cache_bytes),
-      srtt_ms_(config.initial_srtt_ms > 0 ? config.initial_srtt_ms : kDefaultSrttMs) {}
+          [this](const uint8_t* data, size_t len) { send_oob(data, len, true); },
+          config.send_direction == Direction::kC2S ? HandshakeRole::kClient
+                                                   : HandshakeRole::kServer,
+          nonce_or_null(config.handshake_nonce), kLocalFlagsM1,
+          config.handshake_cache_segments, config.handshake_cache_bytes),
+      srtt_ms_(config.initial_srtt_ms > 0 ? config.initial_srtt_ms : kDefaultSrttMs) {
+  // R3-1: the handshake envelope keeps the (PSK, salt) key for the whole life
+  // of the session, so its counter must not restart at 0. A replayed HELLO
+  // makes us seal a fresh ACK under that same key; with a fixed start that
+  // would be a GCM (key, IV) reuse with a known plaintext prefix. A random
+  // 32-bit start makes every session's pair distinct, and the handshake only
+  // spends a handful of counters before it is done.
+  hs_env_.set_send_nonce(random_u32());
+}
 
 void Session::start(int64_t now_ms) {
   if (!limits_.valid) {
@@ -99,12 +122,21 @@ void Session::start(int64_t now_ms) {
   hs_.start(now_ms);
 }
 
-void Session::on_wire(const uint8_t* wire, size_t len, int64_t now_ms) {
+bool Session::on_wire(const uint8_t* wire, size_t len, int64_t now_ms) {
+  // R3-1: two key epochs reach this entry point. Data symbols use the rekeyed
+  // envelope; HELLO/HELLO_ACK still travel under the (PSK, salt) bootstrap key
+  // so a retried handshake stays readable after the data epoch moved on. The
+  // second attempt only runs when the first fails, so a steady-state datagram
+  // is authenticated exactly once.
   std::vector<uint8_t> plain;
+  bool bootstrap = false;
   if (!env_.open(wire, len, &plain)) {
-    ++auth_fail_;
-    sync_report_counters();
-    return;
+    if (!hs_env_.open(wire, len, &plain)) {
+      ++auth_fail_;
+      sync_report_counters();
+      return false;
+    }
+    bootstrap = true;
   }
 
   // Authenticated but outside the MTU budget every conforming peer obeys
@@ -113,24 +145,51 @@ void Session::on_wire(const uint8_t* wire, size_t len, int64_t now_ms) {
   if (limits_.valid && plain.size() > kFecHdrLen + limits_.symbol_max) {
     ++pre_struct_fail_;
     sync_report_counters();
-    return;
+    return true;
+  }
+
+  if (bootstrap) {
+    // Only handshake messages may travel under the bootstrap key. Anything
+    // else that authenticates with it is a peer that never left the handshake
+    // epoch (or a sealing bug); it is dropped rather than fed to the frame
+    // layer, which would accept data the session key never protected.
+    if (plain.size() < kFecHdrLen) {
+      ++pre_struct_fail_;
+      sync_report_counters();
+      return true;
+    }
+    const uint8_t* symbol = plain.data() + kFecHdrLen;
+    const size_t symbol_len = plain.size() - kFecHdrLen;
+    FecHdr hdr{};
+    if (parse_hdr(plain.data(), plain.size(), &hdr) &&
+        hdr_type(hdr.type_k) == SymbolType::kOob &&
+        (is_hello(symbol, symbol_len) || is_hello_ack(symbol, symbol_len))) {
+      on_oob(symbol, symbol_len, now_ms);
+    }
+    sync_report_counters();
+    return true;
   }
 
   if (rx_) {
-    if (reporter_ != nullptr) {
-      FecHdr hdr{};
-      if (parse_hdr(plain.data(), plain.size(), &hdr)) {
-        const SymbolType type = hdr_type(hdr.type_k);
-        if (type == SymbolType::kData) {
+    FecHdr hdr{};
+    if (parse_hdr(plain.data(), plain.size(), &hdr)) {
+      const SymbolType type = hdr_type(hdr.type_k);
+      // Reuse the shared constant from frame_tx.h instead of shadowing it:
+      // get_limits() derives payload_max from the same value, so the two must
+      // never drift apart.
+      if (type == SymbolType::kData) {
+        data_payload_rx_ +=
+            len > kDataWireOverhead ? len - kDataWireOverhead : 0;
+        if (reporter_ != nullptr) {
           reporter_->add_data_bytes(static_cast<uint32_t>(len));
-        } else if (type == SymbolType::kParity) {
-          reporter_->add_parity_bytes(static_cast<uint32_t>(len));
         }
+      } else if (type == SymbolType::kParity && reporter_ != nullptr) {
+        reporter_->add_parity_bytes(static_cast<uint32_t>(len));
       }
     }
     rx_->on_datagram(plain.data(), plain.size(), now_ms);
     sync_report_counters();
-    return;
+    return true;
   }
 
   // Before negotiation only oob (including HELLO/ACK) is actionable (§6.2).
@@ -141,7 +200,7 @@ void Session::on_wire(const uint8_t* wire, size_t len, int64_t now_ms) {
   if (!parse_hdr(plain.data(), plain.size(), &hdr)) {
     ++pre_struct_fail_;
     sync_report_counters();
-    return;
+    return true;
   }
   const uint8_t* symbol = plain.data() + kFecHdrLen;
   const size_t symbol_len = plain.size() - kFecHdrLen;
@@ -177,6 +236,7 @@ void Session::on_wire(const uint8_t* wire, size_t len, int64_t now_ms) {
       break;
   }
   sync_report_counters();
+  return true;
 }
 
 void Session::on_kcp_output(const uint8_t* seg, size_t len, int64_t now_ms) {
@@ -285,6 +345,14 @@ bool Session::ensure_configured(int64_t now_ms) {
 void Session::configure(int64_t now_ms) {
   const NegotiatedParams np = hs_.params();
 
+  // R3-1: from here on the data epoch is bound to both handshake draws. The
+  // rekey resets the counters, which is only sound because the key changes
+  // with them; the bootstrap envelope keeps running untouched.
+  uint8_t session_key[16];
+  derive_session_key_v7(cfg_.key, cfg_.salt, hs_.client_nonce(), hs_.server_nonce(),
+                        session_key);
+  env_.rekey(session_key);
+
   tx_ = std::make_unique<FrameTx>(np.d, limits_,
                                   [this](const TxSymbol& symbol) { emit_symbol(symbol); });
   tx_->set_srtt_ms(srtt_ms_);
@@ -368,8 +436,11 @@ void Session::configure(int64_t now_ms) {
 
 void Session::on_oob(const uint8_t* payload, size_t len, int64_t now_ms) {
   // Erratum #25: HELLO/HELLO_ACK arrive as oob frames and are dispatched by
-  // their 16-byte magic before the FECSTAT validator ever sees them.
-  if (len >= kHelloAckLen && payload != nullptr &&
+  // their 16-byte magic before the FECSTAT validator ever sees them. The length
+  // gate must be the *shortest* handshake message: HELLO (36) is shorter than
+  // HELLO_ACK (52) since R3-1 added the nonce pair, and gating on the ACK size
+  // silently dropped every HELLO that arrived on the data-envelope path.
+  if (len >= kHelloLen && payload != nullptr &&
       (is_hello(payload, len) || is_hello_ack(payload, len))) {
     if (hs_.on_oob(payload, len) == HandshakeStatus::kProtocolFailure) {
       log(std::string("FEC handshake failed: ") + handshake_error_text(hs_.error()));
@@ -517,7 +588,7 @@ void Session::sync_report_counters() {
   }
 }
 
-void Session::emit_symbol(const TxSymbol& symbol) {
+void Session::emit_symbol(const TxSymbol& symbol, bool bootstrap) {
   if (!send_) {
     return;
   }
@@ -530,8 +601,9 @@ void Session::emit_symbol(const TxSymbol& symbol) {
   if (!symbol.symbol.empty()) {
     std::memcpy(plain.data() + kFecHdrLen, symbol.symbol.data(), symbol.symbol.size());
   }
+  Envelope& env = bootstrap ? hs_env_ : env_;
   std::vector<uint8_t> wire;
-  if (!env_.seal(plain.data(), plain.size(), &wire)) {
+  if (!env.seal(plain.data(), plain.size(), &wire)) {
     if (!nonce_exhausted_logged_) {
       nonce_exhausted_logged_ = true;
       log("FCP session exhausted nonce space");
@@ -541,7 +613,7 @@ void Session::emit_symbol(const TxSymbol& symbol) {
   send_(wire.data(), wire.size(), hdr_type(symbol.type_k));
 }
 
-void Session::send_oob(const uint8_t* msg, size_t len) {
+void Session::send_oob(const uint8_t* msg, size_t len, bool bootstrap) {
   if (msg == nullptr && len != 0) {
     return;
   }
@@ -552,7 +624,7 @@ void Session::send_oob(const uint8_t* msg, size_t len) {
   if (len != 0) {
     symbol.symbol.assign(msg, msg + len);
   }
-  emit_symbol(symbol);
+  emit_symbol(symbol, bootstrap);
 }
 
 bool SessionTable::add(Session* session) {

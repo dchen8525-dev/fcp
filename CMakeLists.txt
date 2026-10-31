@@ -25,6 +25,7 @@ add_library(fcp
   src/fcp/ghash.cc
   src/fcp/gcm.cc
   src/fcp/envelope.cc
+  src/fcp/random.cc
   src/fcp/hdr.cc
   src/fcp/fecstat.cc
   src/fcp/frame_tx.cc
@@ -45,6 +46,13 @@ target_include_directories(fcp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 # AES-NI intrinsics. MSVC enables them for x64 by default; GCC/Clang need -maes.
 if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i.86")
   target_compile_options(fcp PRIVATE -maes)
+endif()
+
+# random.cc uses the OS CSPRNG: BCryptGenRandom on Windows, /dev/urandom
+# elsewhere. Public because the proxy/Qt/tools hosts link this library and may
+# call random_bytes() for their own salts.
+if(WIN32)
+  target_link_libraries(fcp PUBLIC bcrypt)
 endif()
 
 # 覆盖率门禁：line ≥ 90 / branch ≥ 80（gcc/clang；MSVC 用 OpenCPP 或单独跑）。

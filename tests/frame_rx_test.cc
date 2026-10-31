@@ -5,6 +5,7 @@
 
 #include "fcp/frame_tx.h"
 #include "fcp/hdr.h"
+#include "fcp/rs.h"
 #include "test_util.h"
 
 namespace {
@@ -243,7 +244,10 @@ void TestGhostParity() {
   const auto tx = BuildSet(10, 4, segs);
   CHECK_EQ(tx.size(), 10u);  // 7 data + 3 parity
 
-  Fixture f(10, 3);
+  // P' must be at least the sender's planned k; a session never negotiates a
+  // smaller cap than the parity it plans to use (A9 made the receiver enforce
+  // that, so k = 4 > p = 3 is no longer a legal geometry).
+  Fixture f(10, 4);
   size_t parity_seen = 0;
   for (const auto& s : tx) {
     if (IsParity(s)) {
@@ -443,11 +447,20 @@ void TestMalformedDoesNotMoveAnchor() {
   CHECK_EQ(f.rx.struct_fail(), 3u);
   CHECK_EQ(f.rx.active_sets(), 1u);
 
-  // A well-formed symbol at the same far-future id still moves the window.
+  // A single well-formed symbol at a far-future id is not enough to move the
+  // window: the anchor is the staleness baseline, so an unconfirmed jump would
+  // make every genuine set look stale (A8). The next consecutive id confirms
+  // the discontinuity and re-anchors.
   f.feed(900, 0, fcp::pack_type_k(2, 0, 0), sym);
-  CHECK_EQ(f.rx.anchor(), 900u);
+  CHECK_EQ(f.rx.anchor(), 5u);
+  CHECK_EQ(f.rx.ahead_dropped(), 1u);
+  CHECK_EQ(f.rx.active_sets(), 1u);
   fcp::RxSetView v;
-  CHECK(f.rx.view(900, &v));
+  CHECK(!f.rx.view(900, &v));
+
+  f.feed(901, 0, fcp::pack_type_k(2, 0, 0), sym);
+  CHECK_EQ(f.rx.anchor(), 901u);
+  CHECK(f.rx.view(901, &v));
 }
 
 void TestCapacityEviction() {
@@ -534,6 +547,156 @@ void TestDupAfterRecovered() {
   CHECK_EQ(f.rx.late_dup(), 2u);
 }
 
+// A9: the sender's k may never exceed the negotiated P'. Without the clamp the
+// first symbol's k wins (note_k) and every honest symbol behind it is dropped
+// as a k mismatch, so the whole set becomes undecodable.
+void TestKClampedToNegotiatedP() {
+  std::vector<std::vector<uint8_t>> segs;
+  for (uint32_t i = 0; i < 10; ++i) {
+    segs.push_back(SegPayload(900 + i, 20));
+  }
+  const auto tx = BuildSet(10, 3, segs);
+  Fixture f(10, 3);
+
+  for (const auto& s : tx) {
+    if (IsData(s) && s.index == 0) {
+      // Claim k = 7 although the session negotiated P' = 3.
+      f.feed(s.set_id, s.index, fcp::pack_type_k(7, fcp::hdr_j(s.type_k), 0), s.symbol);
+      continue;
+    }
+    if (IsData(s) && Erased(s.index, 2, 7)) {
+      continue;
+    }
+    f.feed_tx(s);
+  }
+  CHECK_EQ(f.rx.struct_fail(), 0u);
+  fcp::RxSetView v;
+  CHECK(f.rx.view(0, &v));
+  CHECK_EQ(v.k, 3);  // clamped to P'
+  CHECK_EQ(f.rx.recovered(), 2u);
+  CHECK_EQ(f.delivered.size(), 10u);
+}
+
+// A23: a structurally rejected reconstruction must not close that slot for
+// good. The first attempt here is poisoned by a corrupted parity row (the
+// recovered symbols carry non-zero padding tails); when the genuine data
+// symbol later arrives, the retry decodes from the clean row and repairs the
+// other slot.
+void TestDecodeRetriesAfterStructuralReject() {
+  const size_t kMax = 20;
+  auto make_data = [](uint32_t tag, size_t len) {
+    std::vector<uint8_t> out(len, 0);
+    out[0] = static_cast<uint8_t>(len);
+    out[1] = static_cast<uint8_t>(len >> 8);
+    out[2] = static_cast<uint8_t>(tag);
+    out[3] = static_cast<uint8_t>(tag >> 8);
+    for (size_t i = 4; i < len; ++i) {
+      out[i] = static_cast<uint8_t>(tag + 13 * i);
+    }
+    return out;
+  };
+  const std::vector<uint8_t> d0 = make_data(700, kMax);
+  const std::vector<uint8_t> d1 = make_data(701, 12);
+  const std::vector<uint8_t> d2 = make_data(702, 12);
+
+  std::vector<std::vector<uint8_t>> padded(3, std::vector<uint8_t>(kMax, 0));
+  std::memcpy(padded[0].data(), d0.data(), d0.size());
+  std::memcpy(padded[1].data(), d1.data(), d1.size());
+  std::memcpy(padded[2].data(), d2.data(), d2.size());
+  std::vector<uint8_t> p0(kMax), p1(kMax);
+  const uint8_t* data_ptrs[3] = {padded[0].data(), padded[1].data(), padded[2].data()};
+  uint8_t* parity_ptrs[2] = {p0.data(), p1.data()};
+  fcp::encode(data_ptrs, 3, 2, kMax, parity_ptrs);
+  for (size_t i = 13; i < kMax; ++i) {
+    p1[i] ^= 0xFF;
+  }
+
+  Fixture f(10, 3);
+  f.feed(0, 0, fcp::pack_type_k(2, 0, 0), d0);
+  f.feed(0, 3, fcp::pack_type_k(2, 0, 1), p0);
+  f.feed(0, 4, fcp::pack_type_k(2, 1, 1), p1);
+  CHECK(f.rx.struct_fail() >= 1u);
+  CHECK_EQ(f.rx.recovered(), 0u);
+  fcp::RxSetView v;
+  CHECK(f.rx.view(0, &v));
+  CHECK_EQ(v.recov_mask.count(), 0u);
+
+  // The real data symbol arrives: missing drops to one and the clean parity row
+  // alone reconstructs slot 1 -- possible only because the failed attempt left
+  // the slot open for a retry.
+  f.feed(0, 2, fcp::pack_type_k(2, 0, 0), d2);
+  CHECK_EQ(f.rx.recovered(), 1u);
+  CHECK(f.rx.view(0, &v));
+  CHECK(v.recov_mask.test(1));
+  CHECK_EQ(f.delivered.size(), 3u);
+  const std::vector<uint8_t> d1_payload(d1.begin() + 2, d1.end());
+  CHECK(f.saw_payload(d1_payload));
+}
+
+// A8 follow-up: a real discontinuity arrives as a whole set whose symbols share
+// one id. Waiting for id+1 threw that first set away; a second symbol of the
+// same id must confirm, and a sparse stream needs a time-based fallback.
+void TestSameSetConfirmsReanchor() {
+  Fixture f(10, 3);
+  const std::vector<uint8_t> sym = {6, 0, 1, 2, 3, 4};
+  f.feed(10, 0, fcp::pack_type_k(0, 0, 0), sym);
+  CHECK_EQ(f.rx.anchor(), 10u);
+
+  f.feed(1000, 0, fcp::pack_type_k(0, 0, 0), sym);
+  CHECK_EQ(f.rx.anchor(), 10u);
+  CHECK_EQ(f.rx.ahead_dropped(), 1u);
+
+  f.feed(1000, 1, fcp::pack_type_k(0, 0, 0), sym);
+  CHECK_EQ(f.rx.anchor(), 1000u);
+  fcp::RxSetView v;
+  CHECK(f.rx.view(1000, &v));
+
+  // One symbol per set never produces a second fragment or id+1. After the
+  // confirmation timeout the jump is accepted instead of blackholing forever.
+  f.feed(5000, 0, fcp::pack_type_k(0, 0, 0), sym, 1000);
+  CHECK_EQ(f.rx.anchor(), 1000u);
+  CHECK_EQ(f.rx.ahead_dropped(), 2u);
+  f.feed(9000, 0, fcp::pack_type_k(0, 0, 0), sym, 3000);  // pending expired
+  CHECK_EQ(f.rx.anchor(), 9000u);
+}
+
+// n is learned from parity, but data may arrive first. A parity whose implied
+// n does not cover already-delivered indexes must not lock a smaller geometry:
+// settlement would count fewer expected bytes than were delivered.
+void TestNMustCoverSeenData() {
+  Fixture f(10, 3);
+  const std::vector<uint8_t> data = {6, 0, 1, 2, 3, 4};
+  f.feed(0, 8, fcp::pack_type_k(1, 0, 0), data);  // index 8 before n is known
+  const uint32_t before = f.rx.struct_fail();
+
+  f.feed(0, 5, fcp::pack_type_k(1, 0, 1), {6, 0, 9, 9, 9, 9});  // n = 5 < 8
+  CHECK_EQ(f.rx.struct_fail(), before + 1);
+  fcp::RxSetView v;
+  CHECK(f.rx.view(0, &v));
+  CHECK(!v.n_known);
+
+  f.feed(0, 9, fcp::pack_type_k(1, 0, 1), {6, 0, 9, 9, 9, 9});  // n = 9 >= 8
+  CHECK(f.rx.view(0, &v));
+  CHECK(v.n_known);
+  CHECK_EQ(v.n, 9u);
+}
+
+// A23 retries must not inflate struct_fail: one bad index counted once, not
+// once per parity that triggers another attempt.
+void TestStructuralFailureCountedOnce() {
+  Fixture f(10, 3);
+  const std::vector<uint8_t> data = {6, 0, 1, 2, 3, 4};
+  f.feed(0, 1, fcp::pack_type_k(2, 0, 0), data);
+  f.feed(0, 2, fcp::pack_type_k(2, 0, 1), {0, 0, 0, 0, 0, 0});  // n = 2, bad recon
+  const uint32_t after_first = f.rx.struct_fail();
+  CHECK(after_first >= 1u);
+  CHECK_EQ(f.rx.recovered(), 0u);
+
+  f.feed(0, 3, fcp::pack_type_k(2, 1, 1), {0, 0, 0, 0, 0, 0});
+  CHECK_EQ(f.rx.struct_fail(), after_first);
+  CHECK_EQ(f.rx.recovered(), 0u);
+}
+
 int main() {
   TestDataDeliveryAndDedup();
   TestNoParityNoDecode();
@@ -548,5 +711,10 @@ int main() {
   TestCapacityEviction();
   TestZeroK();
   TestDupAfterRecovered();
+  TestKClampedToNegotiatedP();
+  TestDecodeRetriesAfterStructuralReject();
+  TestSameSetConfirmsReanchor();
+  TestNMustCoverSeenData();
+  TestStructuralFailureCountedOnce();
   return fcp_test::finish();
 }

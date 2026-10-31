@@ -192,6 +192,7 @@ void Stream::pump(int64_t now_ms) {
     seg.sent = true;
     seg.sent_ms = now_ms;
     in_flight_ += seg.wire_len();
+    snd_max_ = seg.offset + static_cast<uint32_t>(seg.wire_len());
     emit_seg(seg);
   }
 }
@@ -274,8 +275,20 @@ void Stream::handle_data(const uint8_t* seg, size_t len, int64_t now_ms) {
   if (seq_dist(offset, rcv_nxt_) > static_cast<int64_t>(cfg_.rcv_buf_bytes)) {
     return;  // beyond the advertised window; the sender recovers by timeout
   }
-  if (peer_fin_ && seq_after(offset, peer_fin_at_)) {
-    return;  // data after the peer's fin is a protocol violation
+  // A22: the peer's fin offset is a fixed property of its stream; retransmissions
+  // repeat the same pseudo byte. A fin at a different offset (or data reaching
+  // past one already seen) is a protocol violation -- letting it rewrite
+  // peer_fin_at_ would move the end of the stream and keep both the EOF
+  // delivery and the cumulative fin ack from ever matching.
+  if (peer_fin_) {
+    if (fin && data_end != peer_fin_at_) {
+      ++bad_segs_;
+      return;
+    }
+    if (!fin && seq_after(data_end, peer_fin_at_)) {
+      ++bad_segs_;
+      return;
+    }
   }
 
   const uint8_t* payload = seg + kStreamDataHdrLen;
@@ -384,28 +397,30 @@ void Stream::deliver_prefix(int64_t now_ms) {
 void Stream::handle_ack(const uint8_t* seg, size_t len, int64_t now_ms) {
   (void)len;
   const uint32_t cum = get_u32(seg + 1);
-  // #30 adversarial hardening: the peer can never legitimately acknowledge
-  // bytes we have not sent. Accepting such a cum would pop every unacked
-  // segment and strand the data for good (the receiver does not have it
-  // either). A lying oversized rwnd is harmless — send_space() is clamped by
-  // our own send window — but a lying cum is data loss.
-  if (seq_after(cum, snd_nxt_)) {
+  // #30 adversarial hardening, corrected by A4: the bound must be the highest
+  // byte that actually reached the wire, not snd_nxt_ (segmentation runs ahead
+  // of the send window). Accepting cum beyond snd_max_ would pop unsent
+  // segments and strand their bytes for good. A lying oversized rwnd is
+  // harmless — send_space() is clamped by our own send window — but a lying
+  // cum is data loss.
+  if (seq_after(cum, snd_max_)) {
     ++bad_segs_;
     return;
   }
   peer_rwnd_ = get_u32(seg + 5);
   uint32_t sack_start = get_u32(seg + 9);
   uint32_t sack_end = get_u32(seg + 13);
-  // #30 hardening, same rule as cum below: the block must describe a non-empty
-  // range above the cumulative point that we could actually have sent. A lying
-  // range used to jump sack_filled_up_to_ past every real hole (disabling the
-  // only repair path that beats the RTO) and to mark unacked segments as
-  // SACKed; an inverted block is malformed outright. Ignore the SACK half of
-  // such an ACK but keep its cumulative point and window, which are bounded and
-  // useful on their own.
+  // #30 hardening, same rule as cum above (A4 follow-up): the block must
+  // describe a non-empty range above the cumulative point that actually
+  // reached the wire. snd_nxt_ is the segmentation cursor and runs ahead of
+  // the send window, so accepting a block beyond snd_max_ let one ACK mark
+  // never-sent segments as SACKed (fill_holes then skipped them forever) and
+  // jump sack_filled_up_to_ past every real hole. An inverted block is
+  // malformed outright. Ignore the SACK half of such an ACK but keep its
+  // cumulative point and window, which are bounded and useful on their own.
   if (sack_start != sack_end &&
       (!seq_at_or_after(sack_start, cum) || !seq_after(sack_end, sack_start) ||
-       seq_after(sack_end, snd_nxt_))) {
+       seq_after(sack_start, snd_max_) || seq_after(sack_end, snd_max_))) {
     ++bad_segs_;
     sack_start = cum;
     sack_end = cum;
@@ -445,15 +460,16 @@ void Stream::handle_ack(const uint8_t* seg, size_t len, int64_t now_ms) {
       if (seq_after(front_end, cum)) {
         break;  // still partly unacked
       }
-      if (front.sent) {
-        in_flight_ = in_flight_ >= front.wire_len() ? in_flight_ - front.wire_len() : 0;
-        if (front.retrans) {
-          popped_retrans = true;
-        } else if (front.sent_ms > 0) {
-          sample_ms = now_ms - front.sent_ms;  // keep the newest clean sample
-        }
-        bytes_acked_ += front.bytes.size();
+      if (!front.sent) {
+        break;  // A4: never pop a segment that has not been on the wire
       }
+      in_flight_ = in_flight_ >= front.wire_len() ? in_flight_ - front.wire_len() : 0;
+      if (front.retrans) {
+        popped_retrans = true;
+      } else if (front.sent_ms > 0) {
+        sample_ms = now_ms - front.sent_ms;  // keep the newest clean sample
+      }
+      bytes_acked_ += front.bytes.size();
       tx_.pop_front();
     }
     snd_una_ = cum;

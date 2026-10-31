@@ -14,10 +14,13 @@
 // measure FEC overhead on the same path.
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -51,13 +54,18 @@ using Sock = int;
 constexpr Sock kBadSock = -1;
 #endif
 
-const uint8_t kKey[16] = {0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
-                          0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C};
-const uint8_t kSalt[8] = {0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x07, 0x18};
-
+// A3 follow-up (P2' N7): there is no default PSK. The FIPS-197 vector this
+// used to ship is a public test key, and a benchmark that silently encrypts
+// with it is worse than one that refuses to start. `--key` is mandatory.
 constexpr int64_t kUpStartMs = 1000;
 constexpr int64_t kUpEndMs = 8000;
 constexpr double kPhaseSeconds = (kUpEndMs - kUpStartMs) / 1000.0;
+
+// The benchmark's fixed FEC geometry. It is a compile-time constant, so --k can
+// be validated against it *before* the rendezvous loop: otherwise a bad --k
+// waits out the full rendezvous timeout (or a whole run) before failing.
+constexpr unsigned kBenchD = 10;
+constexpr unsigned kBenchP = 3;
 
 struct Options {
   std::string role;
@@ -66,6 +74,7 @@ struct Options {
   double mbps = 30.0;
   size_t seg = 1200;
   int k = -1;
+  std::string key_hex;
   bool progress = false;
 };
 
@@ -75,6 +84,57 @@ int64_t NowMs() {
 }
 
 void SleepMs(int64_t ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
+
+// A10/P8-3/P8-5: the old atoi/atof parsing let --seg=-1 become SIZE_MAX and
+// --port=70000 wrap to 4464; reject anything that does not round-trip.
+bool ParseLong(const char* flag, const char* text, long lo, long hi, long* out) {
+  char* end = nullptr;
+  errno = 0;
+  const long v = std::strtol(text, &end, 10);
+  if (text == nullptr || *text == '\0' || errno != 0 || end == text || *end != '\0' ||
+      v < lo || v > hi) {
+    std::fprintf(stderr, "%s must be an integer in %ld..%ld (got '%s')\n", flag, lo, hi,
+                 text == nullptr ? "" : text);
+    return false;
+  }
+  *out = v;
+  return true;
+}
+
+bool ParseDouble(const char* flag, const char* text, double lo, double hi, double* out) {
+  char* end = nullptr;
+  errno = 0;
+  const double v = std::strtod(text, &end);
+  if (text == nullptr || *text == '\0' || errno != 0 || end == text || *end != '\0' ||
+      !std::isfinite(v) || v < lo || v > hi) {
+    std::fprintf(stderr, "%s must be a number in %g..%g (got '%s')\n", flag, lo, hi,
+                 text == nullptr ? "" : text);
+    return false;
+  }
+  *out = v;
+  return true;
+}
+
+bool ParseKey(const char* text, uint8_t out[16]) {
+  if (text == nullptr || std::strlen(text) != 32) {
+    return false;
+  }
+  auto hex = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+  };
+  for (size_t i = 0; i < 16; ++i) {
+    const int hi = hex(text[2 * i]);
+    const int lo = hex(text[2 * i + 1]);
+    if (hi < 0 || lo < 0) {
+      return false;
+    }
+    out[i] = static_cast<uint8_t>((hi << 4) | lo);
+  }
+  return true;
+}
 
 bool SetNonBlocking(Sock s) {
 #ifdef _WIN32
@@ -224,17 +284,32 @@ bool ParseOptions(int argc, char** argv, Options* opt) {
     const char* v_mbps = value("--mbps=");
     const char* v_seg = value("--seg=");
     const char* v_k = value("--k=");
+    const char* v_key = value("--key=");
     const bool v_progress = arg == "--progress";
+    long n = 0;
     if (v_host != nullptr) {
       opt->host = v_host;
     } else if (v_port != nullptr) {
-      opt->port = std::atoi(v_port);
+      if (!ParseLong("--port", v_port, 1, 65535, &n)) {
+        return false;
+      }
+      opt->port = static_cast<int>(n);
     } else if (v_mbps != nullptr) {
-      opt->mbps = std::atof(v_mbps);
+      if (!ParseDouble("--mbps", v_mbps, 0.1, 10000.0, &opt->mbps)) {
+        return false;
+      }
     } else if (v_seg != nullptr) {
-      opt->seg = static_cast<size_t>(std::atoi(v_seg));
+      if (!ParseLong("--seg", v_seg, 16, 1200, &n)) {
+        return false;
+      }
+      opt->seg = static_cast<size_t>(n);
     } else if (v_k != nullptr) {
-      opt->k = std::atoi(v_k);
+      if (!ParseLong("--k", v_k, -1, 7, &n)) {
+        return false;
+      }
+      opt->k = static_cast<int>(n);
+    } else if (v_key != nullptr) {
+      opt->key_hex = v_key;
     } else if (v_progress) {
       opt->progress = true;
     } else {
@@ -251,9 +326,24 @@ int main(int argc, char** argv) {
   Options opt;
   if (!ParseOptions(argc, argv, &opt)) {
     std::fprintf(stderr,
-                 "usage: %s server --port=P [--mbps=M] [--seg=N] [--k=K]\n"
-                 "       %s client --host=IP --port=P [--mbps=M] [--seg=N] [--k=K]\n",
+                 "usage: %s server --port=P [--mbps=M] [--seg=N] [--k=K] [--key=HEX32]\n"
+                 "       %s client --host=IP --port=P [--mbps=M] [--seg=N] [--k=K] [--key=HEX32]\n",
                  argv[0], argv[0]);
+    return 1;
+  }
+  uint8_t key[16];
+  if (opt.key_hex.empty()) {
+    std::fprintf(stderr, "--key=HEX32 is required (the PSK shared by both ends)\n");
+    return 1;
+  }
+  if (!ParseKey(opt.key_hex.c_str(), key)) {
+    std::fprintf(stderr, "--key must be 32 hex digits (16 bytes)\n");
+    return 1;
+  }
+  // P8' N12: --k above the negotiated P' is silently clamped by the session and
+  // the benchmark would report a k it never ran. Validate before doing any I/O.
+  if (opt.k > static_cast<int>(kBenchP)) {
+    std::fprintf(stderr, "--k=%d exceeds --p=%u\n", opt.k, kBenchP);
     return 1;
   }
 #ifdef _WIN32
@@ -289,49 +379,31 @@ int main(int argc, char** argv) {
   size_t rx_min_len = static_cast<size_t>(-1);
   size_t rx_max_len = 0;
 
-  fcp::SessionConfig cfg;
-  std::memcpy(cfg.key, kKey, sizeof(kKey));
-  std::memcpy(cfg.salt, kSalt, sizeof(cfg.salt));
-  cfg.send_direction = server ? fcp::Direction::kS2C : fcp::Direction::kC2S;
-  cfg.recv_direction = server ? fcp::Direction::kC2S : fcp::Direction::kS2C;
-  cfg.d = 10;
-  cfg.p = 3;
-  cfg.mtu = 1400;
-  cfg.pinned_k = opt.k;
-
-  fcp::Session session(
-      cfg,
-      [&](const uint8_t* wire, size_t len, fcp::SymbolType type) {
-        if (type == fcp::SymbolType::kData) {
-          tx_wire_bytes += len;
-        } else if (type == fcp::SymbolType::kParity) {
-          ++tx_parity_segs;
-        } else {
-          ++tx_oob;
-        }
-        if (ep.server && ep.peer.sin_port == 0) {
-          return;  // no peer address yet (cannot happen before the first HELLO)
-        }
-        if (!ep.Send(wire, len)) {
-          ++tx_fail;
-        }
-      },
-      [&](const uint8_t* payload, size_t len) {
-        rx_data_bytes += len;
-        ++rx_data_segs;
-        if (!PayloadOk(payload, len, opt.seg)) {
-          ++rx_corrupt;
-        }
-      },
-      [](const std::string& line) { std::printf("LOG %s\n", line.c_str()); });
+  // A2: a fresh salt per run. The client picks it with the OS CSPRNG and
+  // announces it in the rendezvous datagram; the server adopts the announced
+  // salt. There is no constant fallback (P2' N7): a fixed salt across runs was
+  // exactly the cross-session (key, IV) reuse A2 removed, and DEPLOY §6.4
+  // already declares the 8-byte meet format incompatible.
+  uint8_t salt[8] = {};
+  bool salt_adopted = false;
+  if (!server) {
+    std::random_device rd;
+    for (size_t i = 0; i < sizeof(salt); ++i) {
+      salt[i] = static_cast<uint8_t>(rd() & 0xFF);
+    }
+  }
 
   // The V3 handshake gives each side only three HELLOs (~2.1s) before it
   // fails, so two processes started a few seconds apart can never establish.
   // Rendezvous outside the protocol first: both sides send a magic datagram
   // every 100ms until each has seen the peer's, then start their sessions
-  // together. Stray magics still in flight authenticate as nothing and count
-  // as auth_fail, which the result line reports.
+  // together. The client's datagram also carries the run's session salt.
+  // Stray magics still in flight authenticate as nothing and count as
+  // auth_fail, which the result line reports.
   static const uint8_t kMeet[8] = {'F', 'C', 'P', 'B', 'E', 'N', 'C', 'H'};
+  uint8_t client_meet[sizeof(kMeet) + sizeof(salt)];
+  std::memcpy(client_meet, kMeet, sizeof(kMeet));
+  std::memcpy(client_meet + sizeof(kMeet), salt, sizeof(salt));
   bool met = false;
   uint64_t meet_rx = 0;
   int meet_sent = 0;
@@ -341,8 +413,19 @@ int main(int argc, char** argv) {
     size_t mlen = 0;
     while (ep.Recv(mbuf, sizeof(mbuf), &mlen)) {
       ++meet_rx;
-      if (mlen == sizeof(kMeet) && std::memcmp(mbuf, kMeet, sizeof(kMeet)) == 0) {
-        met = true;
+      if (mlen >= sizeof(kMeet) && std::memcmp(mbuf, kMeet, sizeof(kMeet)) == 0) {
+        if (server) {
+          // P2' N7: adopt the FIRST client salt exactly once. A later datagram
+          // can no longer rewrite it, and an 8-byte legacy magic is only a
+          // liveness hint -- it carries no salt, so it cannot start a run.
+          if (mlen == sizeof(kMeet) + sizeof(salt) && !salt_adopted) {
+            std::memcpy(salt, mbuf + sizeof(kMeet), sizeof(salt));
+            salt_adopted = true;
+            met = true;
+          }
+        } else {
+          met = true;
+        }
       }
     }
     // Seeing the peer's magic is not enough: it is still waiting for ours, so
@@ -352,7 +435,11 @@ int main(int argc, char** argv) {
       break;
     }
     if (!ep.server || ep.peer.sin_port != 0) {
-      ep.Send(kMeet, sizeof(kMeet));
+      if (server) {
+        ep.Send(kMeet, sizeof(kMeet));
+      } else {
+        ep.Send(client_meet, sizeof(client_meet));
+      }
       ++meet_sent;
     }
     SleepMs(50);
@@ -363,6 +450,51 @@ int main(int argc, char** argv) {
                  static_cast<unsigned>(ntohs(ep.peer.sin_port)));
     return 4;
   }
+
+  fcp::SessionConfig cfg;
+  std::memcpy(cfg.key, key, sizeof(cfg.key));
+  std::memcpy(cfg.salt, salt, sizeof(cfg.salt));
+  cfg.send_direction = server ? fcp::Direction::kS2C : fcp::Direction::kC2S;
+  cfg.recv_direction = server ? fcp::Direction::kC2S : fcp::Direction::kS2C;
+  cfg.d = kBenchD;
+  cfg.p = kBenchP;
+  cfg.mtu = 1400;
+  // (--k > p is rejected in main, before the rendezvous.)
+  cfg.pinned_k = opt.k;
+
+  fcp::Session session(
+      cfg,
+      [&](const uint8_t* wire, size_t len, fcp::SymbolType type) {
+        if (ep.server && ep.peer.sin_port == 0) {
+          return;  // no peer address yet (cannot happen before the first HELLO)
+        }
+        if (!ep.Send(wire, len)) {
+          ++tx_fail;
+          return;
+        }
+        // A20: only datagrams the kernel accepted count toward throughput; the
+        // old code booked them before ::send, so a full send buffer inflated
+        // exactly the runs that were under pressure.
+        if (type == fcp::SymbolType::kData) {
+          tx_wire_bytes += len;
+          ++tx_data_segs;
+          if (len > 36) {
+            tx_data_bytes += len - 36;
+          }
+        } else if (type == fcp::SymbolType::kParity) {
+          ++tx_parity_segs;
+        } else {
+          ++tx_oob;
+        }
+      },
+      [&](const uint8_t* payload, size_t len) {
+        rx_data_bytes += len;
+        ++rx_data_segs;
+        if (!PayloadOk(payload, len, opt.seg)) {
+          ++rx_corrupt;
+        }
+      },
+      [](const std::string& line) { std::printf("LOG %s\n", line.c_str()); });
 
   const int64_t t0 = NowMs();
   int64_t now = 0;
@@ -504,15 +636,13 @@ int main(int argc, char** argv) {
 
     if (up_sending || down_sending) {
       tokens = std::min(tokens + rate_bytes_per_s * static_cast<double>(now - token_ms) / 1000.0,
-                        rate_bytes_per_s * 0.05);
+                        std::max(rate_bytes_per_s * 0.05, wire_per_seg));
       token_ms = now;
       int burst = 0;
       while (tokens >= wire_per_seg && burst < 4000) {
         MakeSegment(sn, opt.seg, &segment);
         session.on_kcp_output(segment.data(), segment.size(), now);
         ++sn;
-        ++tx_data_segs;
-        tx_data_bytes += segment.size();
         tokens -= wire_per_seg;
         ++burst;
       }
@@ -521,12 +651,13 @@ int main(int argc, char** argv) {
     SleepMs(1);
   }
 
-  // Upload bytes: client transmitter, server wire arrivals (payload bytes).
-  // Download bytes: server transmitter, client delivered payload. Each side
-  // divides by the fixed 7s send window.
-  const double up_bytes = server
-                              ? static_cast<double>(up_wire_segs) * static_cast<double>(opt.seg)
-                              : static_cast<double>(tx_data_bytes);
+  // Upload bytes: client transmitter, server data-symbol payload (P9' N1: the
+  // server used to classify by datagram length, but data and parity are both
+  // 36+seg bytes, so every --k>0 run was inflated by 1+k/D). Download bytes:
+  // server transmitter, client delivered payload. Each side divides by the
+  // fixed 7s send window.
+  const double up_bytes = server ? static_cast<double>(session.data_payload_rx())
+                                 : static_cast<double>(tx_data_bytes);
   const double down_bytes = server ? static_cast<double>(tx_data_bytes)
                                    : static_cast<double>(rx_data_bytes);
   const uint64_t up_tx_segs = server ? 0 : tx_data_segs;
@@ -575,5 +706,13 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
   WSACleanup();
 #endif
+  // P5' N6: a run where most sends failed is not a measurement. Exit non-zero
+  // so automation does not ingest a zero-throughput sample as success.
+  if (tx_data_segs > 0 && tx_fail * 2 > tx_data_segs) {
+    std::fprintf(stderr, "benchmark invalid: %llu of %llu datagrams failed to send\n",
+                 static_cast<unsigned long long>(tx_fail),
+                 static_cast<unsigned long long>(tx_data_segs + tx_fail));
+    return 5;
+  }
   return 0;
 }

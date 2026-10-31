@@ -1,7 +1,8 @@
 # FCP 对抗分析报告（10 轮）
 
-> 本文档只记录问题与涉及代码，**未修改任何源代码**。
+> 本文档只记录问题与涉及代码，**审查当时未修改任何源代码**。
 > 文中所有代码片段均为从仓库原文摘录，行号对应下文「审查基线」。
+> 2026-10-31 的复核与处置（修了哪些、哪些接受/延后）见 §7；前文保持审查原文。
 
 ---
 
@@ -2299,8 +2300,248 @@ constexpr int64_t kDefaultSrttMs = 200;
 
 ---
 
-*本报告由 10 轮独立对抗分析汇总而成。所有代码片段摘录自基线 commit `1fcdebe` 的工作区状态；行号以该状态为准。审查过程未修改任何源代码。*
+## 7. 处置记录（2026-10-31 复核）
 
+复核在 HEAD `2276a68` 的工作区进行：逐条重开源码核对，能构造的补回归测试；修复后
+Windows Debug/Release ctest **27/27**，代理层另以 `FCP_BUILD_PROXY=ON` 编译通过，
+`fcp_bench` 回环实测通过。本节记录复核后的实际处置（含前一轮已落地、尚未提交的核心修复）；
+前文保持审查当时的原始状态。
 
+### 7.1 已确认存在并修复
 
+| 发现 | 处置 | 验证 |
+|---|---|---|
+| A1 (Critical) 预认证 salt 杀会话 | `Session::on_wire` 返回“信封是否认证”；引擎只在认证通过后执行源地址绑定与 salt 冲突判定；未认证首包直接销毁，随机 salt 也不再能占满会话表 | `proxy_engine_test::salt_routing_and_replay_binding`：地址不符的**重放**不杀会话；持 PSK 的新鲜报文才计 `salt_clash` |
+| A2 (Critical) bench 固定 salt → 跨会话 (key,IV) 重用 | CLI/GUI bench 每轮 CSPRNG 生成 salt；`fcp_bench` 会合包携带 salt（客户端 16B = 魔法+salt，服务端回 8B 并采用）；删除 `Options.salt` 与 GUI salt 字段 | 回环实测握手成功、`tx_fail=0`；新旧会合格式不兼容已入 `DEPLOY.md` §6.4 |
+| A3 (High) 公开默认 PSK + 明文落盘 | 删除 FIPS-197 默认键；GUI 每次启动随机 PSK、不写 QSettings；`--proxy-psk` 保留为脚本入口 | 本机无 Qt6，静态核对 |
+| A4 (High) ACK 谎报防线上界错误 | 新增 `snd_max_`（实际最高上线 offset）；`cum > snd_max_` 拒绝；弹段循环跳过未发送段 | `stream_test::TestAckBeyondSentIgnored` |
+| A5/A6 (High) Qt 迭代器失效 | `onTick` 先快照 id 再逐项 `constFind`/`contains`；`killSockets` 先 `erase` 再 `abort`/`deleteLater` | 本机无 Qt6，静态核对 |
+| A7 (High) SIGPIPE | POSIX 启动时忽略 SIGPIPE | `FCP_BUILD_PROXY=ON` 编译通过 |
+| A8 (High) 锚点无界前跳 | 单个远期 `set_id` 只挂起并丢弃；连续第二个才重锚 | `frame_rx_test::TestMalformedDoesNotMoveAnchor`（`ahead_dropped` 断言） |
+| A9 (High) `k` 未受 `P'` 约束 | 入站 `note_k(min(k_field, p_))`；`n + k > kRsMaxShards` 不分配 | `frame_rx_test::TestKClampedToNegotiatedP` |
+| A22 (High) FIN 偏移覆盖 | `peer_fin_at_` 首次置位后校验一致性，不一致按坏段处理 | `stream_test::TestFinOffsetRewriteRejected` |
+| A23 (High) 解码闩锁 | 结构性失败不再置 `decoded_once`，新 parity 可重试 | `frame_rx_test::TestDecodeRetriesAfterStructuralReject` |
+| A20/P9-5 (High) bench 吞吐虚高 | CLI/GUI 只在 `send()` 成功后计吞吐（减 36B 头），失败计 `tx_fail` | 回环实测；GUI 静态核对 |
+| A10/P8-3/P8-5 bench 数值 | 全串解析 + 区间 + 有限性；`--seg` 16..1200、`--port` 1..65535、`--mbps` 0.1..10000；新增 `--key=HEX32` | `--seg=-1` / `--port=70000` / `--mbps=nan` 均 exit 1 |
+| P1-1 Qt UDP 2 KiB 截断 | 收包缓冲改 64 KiB（覆盖最大 IPv4 UDP） | 静态核对 |
+| P1-2 PSK 长度未校验 | `start()` 校验 16 字节，否则 `finished(false)` | 静态核对 |
+| P4-3/P4-4 DNS ABA | 每次 `start()` 递增 generation，回调只认最新一代 | 静态核对 |
+| P5-09 打开失败 fd 泄漏 | reactor `open_udp`/`open_listener` 失败路径统一关闭 | `FCP_BUILD_PROXY=ON` 编译通过 |
+| P5-11 重放读取错误/长行 | 检查 `ferror`、跨块拼接长行、半行不投递 | 既有 `replay_tool_smoke` |
+| P6-2 `p_eff` 过期钉死 k | 无账本标志的报告清除 `have_p_eff_` | `strategy_test::TestLedgerFlagDropClearsPEff` |
+| P8-4 `d + p > 256` | CLI 直接拒绝（协议上限，否则每隧道握手必败） | `--d=250 --p=7` → exit 1 |
 
+### 7.2 确认存在、本轮接受或延后
+
+| 发现 | 状态 | 理由 |
+|---|---|---|
+| A11/P6-3 `dup_after_recovered` 生产路径不可达 | 延后 | 需要的不是补一个计数，而是按 KCP/Stream 序号重定义“重复修复”；M4 已关闭，重启该候选前必须先改仪器 |
+| A12 GHASH 时序侧信道 | 接受（记录） | 常数时间实现是独立工程；部署前提是受控链路 + PSK 不泄露 |
+| A13/A15 字段镜像、`SessionConfig` 重复装配 | 延后 | 结构性重构，风险/收益需单独评估 |
+| A14/A24 loss 与不可信样本口径分裂 | 延后 | 统一口径牵动策略阈值与协议文档，需先定语义 |
+| A16–A19 热路径分配/搬移 | 延后 | 性能重构，当前 WAN 瓶颈不在这些点（#33 已证） |
+| A21/P9-6 GUI 线程内 GCM+FEC | 接受 | 单会话 GUI 模型；移线程需重设计宿主与状态机 |
+| P2-06 `--key` 经命令行可见 | 接受 | 运维面权衡；进程表可见，后续可加文件/环境变量入口 |
+| B2/B7/B14/B16 等测试盲区 | 部分 | 本次只补了修复点对应的回归；B 系列整体仍待补 |
+
+### 7.3 验证限制
+
+- Qt 客户端（`apps/fcp-client`）在本机无法编译：`build/windows-x64-app` 的
+  `Qt6_DIR-NOTFOUND`，vcpkg/VS 均无 Qt6。A3/A5/A6/P1-1/P1-2/P4-3/P4-4/A20(GUI)
+  的改动为静态核对，需在有 Qt6 的环境补跑构建与代理/测速冒烟。
+- `fcp_bench` 会合格式已变：新旧版本不能混跑（见 `DEPLOY.md` §6.4）。
+
+---
+
+## 8. 第二轮对抗分析（2026-10-31 同日复核，基线 `2276a68` + §7 未提交工作区）
+
+### 8.1 目标与方法差异
+
+第一轮（§2）审的是"代码写得对不对"，本轮刻意换了靶子：**审 §7 那批修复本身**。
+同一套 10 轮视角重跑一遍，但每轮先假设 §7 的改动是错的，去找它的反例。结果证明
+这个换靶是对的——本轮最重的三条发现全部是 §7 引入或半途而废的：
+
+- **A4 只修了 `cum`，没修 SACK 块**（§7 明确写了"SACK 同规则"，实现却仍拿
+  `snd_nxt_` 当上界）。
+- **A8 修得过头**：为防止"单个远期 `set_id` 劫持锚点"，改成"丢弃首个远期 set 的
+  全部符号"，在稀疏流（丢包率 > 50% 或大窗口跳号）下等于永久黑洞。
+- **A9 的 `k` 钳制方向对、时机错**：先到 data 后到 parity 时会把 `n` 锁得比已交付
+  的 index 还小，破坏 `delivered <= expected` 这个 settle 层不变量。
+
+同时本轮确认：**§7 的修复没有一条是靠"加一层 if"蒙过去的**，都在对应层做了，
+所以本轮新发现主要落在"跨模块口径不一致"和"状态机边界补全"这两类，而非
+"防线方向反了"。
+
+### 8.2 旧修复自身的缺陷：已修
+
+| 发现 | 问题 | 处置 | 验证 |
+|---|---|---|---|
+| A4 残余（High） | `handle_ack` 的 SACK 块上界仍是 `snd_nxt_`（分段游标，领先于发送窗口）。一个谎报块可把从未发送的段标成 SACKed，`fill_holes` 此后永久跳过它们，并把 `sack_filled_up_to_` 顶过所有真实空洞——比谎报 `cum` 更隐蔽，因为它不触发数据丢失告警，只是静默放弃修复 | 上界改 `snd_max_`，并对 `sack_start`/`sack_end` 双向校验 | 新增 `stream_test::TestSackBeyondSentIgnored`：在 `snd_max_` 与 `snd_nxt_` 之间伪造块，断言 `bad_segs()==1`、`retransmits()==0`；再喂真实块，断言仍能补洞 |
+| A8 过修（High） | 重锚规则退化为"首个远期 set 一律整组丢弃"。丢包率高的链路里 set_id 稀疏跳号是常态，被丢弃的那组符号永远不会重发（FEC 无重传），该组覆盖的 KCP 段只能等 RTO 逐段恢复 | 引入 `pending_ahead_` 三态确认：**同 id 第二个符号 / 相邻 id / 2s 超时**任一成立即重锚；否则只挂起并丢弃当前符号（`kAheadConfirmTimeoutMs=2000`） | 新增 `frame_rx_test::TestSameSetConfirmsReanchor`；原 `TestMalformedDoesNotMoveAnchor` 仍绿（挂起语义未变） |
+| A9 残余（High） | `note_k` 只做了 `min(k_field, p_)`，没有约束 `n`。先到 data 符号会把 `n` 定为 `index+1`；后到的 parity 若声明更小的 `n`，`delivered <= expected` 被破坏，settle 侧要么少结算要么多结算 | `n` 首次学习后回查：`max_data_index >= n_new` 直接 `++struct_fail_` 拒绝，不再改写 | 新增 `frame_rx_test::TestNMustCoverSeenData` |
+| A23 残余（Low） | 去掉 `decoded_once` 闩锁后，同一个坏重构会被每个后续到达的符号重复判失败并重复计入 `struct_fail_`（一个中毒 set 能让计数器涨 p 倍），污染"M4 结构错误率"这一观测口径 | `RxSet` 增加 `std::bitset<kMaxS> bad_recon`，每个坏重构索引只计一次；成功解码时 `reset(i)` | 新增 `frame_rx_test::TestStructuralFailureCountedOnce` |
+| A13 残余（Low） | `RxSetView::decoded_once` 在 `view()` 里已无来源，字段成死代码，读起来像还有闩锁 | 删除 `RxSetView::decoded_once` 与 `RxSet::decoded_once` | 编译通过（全仓库无引用） |
+
+### 8.3 本轮新发现：已修
+
+| ID | 级别 | 问题 | 处置 | 验证 |
+|---|---|---|---|---|
+| R3-1 | **Critical（延后）** | 见 §8.4 | — | — |
+| R3-2 | High | `ProxyEngine` 的 salt 墓碑只在 `reap()` 里过期回收，且**任何会话**（含未认证）都入表。一个扫描器用随机 salt 建连即可让墓碑表无界增长（每条约 100B 级），且 5s TTL 内碰撞即误杀 | TTL 5000ms → `5*60*1000`（覆盖同机重连/时钟抖动）；`Conn` 增 `authenticated_once`，只有认证过的会话才留墓碑；新增 `kSaltTombstoneMax=8192`，超限淘汰最早条目 | `proxy_engine_test` 全绿（含 salt 路由/重放用例） |
+| R3-3 | High | `make_trace_sink` 在**建连接时**就 `fopen` 产出 `.jsonl`。一个纯扫描器每来一个未认证报文就留下一个空文件，代理目录迅速堆成 inode 炸弹 | 改惰性建文件：首个真正写入的 trace 条目才 `fopen` | `proxy_engine_test`、`fcp-proxy` 编译通过 |
+| R3-4 | High | `ProxyEngine::flush_app` 无重入守卫。宿主在 `app_recv` 回调里同步再调 `flush_app`（Qt `readyRead` 链）会造成 `app_in` 边迭代边追加，表现为偶发重复投递与游标错位 | `Conn::in_flush_app` 守卫，进入即返回 | `proxy_engine_test`（含 `flush_app` 相关用例） |
+| R3-5 | High | `apps/fcp-client/proxy_host.cpp` 用 `cfg_.trace = make_trace_sink(...)`，而 `EngineConfig` 只有 `trace_prefix` —— **整个 Qt 目标在当前工作区编译不过**，即 §7.3 记为"静态核对"的那些修复实际上从未被编译器校验过一次 | 改 `cfg_.trace_prefix` | 本机仍无 Qt6；静态核对 + 与 `engine.h` 字段逐一比对 |
+| R3-6 | High | GUI 的 `host.new_salt` 用 `QRandomGenerator::global()`。它不是 CSPRNG（确定性播种，可预测），把它当会话 salt 等于把 §7 A2 的修复在 GUI 路径上撤销 | 改 `system()`（`std::random_device` 后端） | 静态核对 |
+| R3-7 | Medium | `ProxyHost::sweepDials` 未处理 `targets_.constFind()` 返回 `constEnd()`：拨号过程中目标被 `app_close` 移除后，下一轮 sweep 解引用 `end()` | 补 `if (it == targets_.constEnd()) continue;` | 静态核对 |
+| R3-8 | Medium | GUI 两个 PSK 输入框 `echoMode` 为默认 `Normal`，PSK 明文常驻屏幕（截图/录屏/肩窥） | 改 `QLineEdit::Password` | 静态核对 |
+| R3-9 | Medium | `MainWindow::~MainWindow()` 是 `= default`：成员析构顺序里 `ProxyHost::~ProxyHost()→stop()→emit finished()`，槽函数仍指向已析构的 `logView_`/`engine_` | 析构函数先 `blockSignals(true)` 再显式 `stop()` 两个宿主 | 静态核对 |
+| R3-10 | Medium | `Reactor` tick 尾部的 flush 循环用 range-for 遍历 `locals_`，而引擎回调可 `app_close` 掉当前元素——与 A5 同型的迭代器失效，只是发生在 CLI 宿主上（A5 只修了 Qt 宿主） | 改为 id 快照 + `find()` 复查 | `FCP_BUILD_PROXY=ON` 编译通过 |
+| R3-11 | Medium | `Reactor::accept_local` 忽略 `SetNonBlocking` 返回值。失败时新 socket 是阻塞的，单线程 reactor 会在下一次 `write` 上挂死整个代理进程 | 失败即 `CloseSock` 并 `continue` | 编译通过 |
+| R3-12 | Medium | `FecstatValidator` 只有"下界"（`set_id_after` 单调）没有前向上界。一份谎报 `last = base + 2^31-1` 的报告能让 `accounted_through_set_id` 冻结到 u32 回绕（数小时），期间控制器的 R(k) 账本完全不更新 | 新增 `kFecstatMaxForwardSets = 1<<20`；超限计 `future_rejects_` 并返回 `kStale` | `reporter_test`/`adv_test` 全绿 |
+| R3-13 | Medium | `Strategy` 的 CAPPED 分支在 `k_ == 1`（§14.11 地板）时既不能降 k 也不换状态，形成吸收态：一旦预算比 `R < 1/D`，控制器永久卡在 `kCapped`，链路变干净也不回 ON | `k_ > 1` 时才降 k 并返回；`k_ == 1` 时保持 `kCapped`，但允许在 `loss < 0.003` 连续 5 次后 `enter_off()` | 新增 `strategy_test::TestCappedFloorReachesOff`：`budget_ratio=0.01` 下从 k=4 降到 k=1、再喂 5 个干净报告，断言恰好第 5 个才转 OFF（旧代码在此永不退出） |
+| R3-14 | Medium | `Strategy` 构造期未校验 `budget_ratio_`。`--fec-budget 5` 会让 `budget = 5×`，预算约束整体失效（且 `cli.cc` 只校验了 `>= 0`） | 构造期夹到 `[0,1]`；`cli.cc` 校验区间 `0..1` | `adv_test`/`cli` 全绿 |
+| R3-15 | Medium | `rs::decode` 有 `n+k > kRsMaxShards` 守卫，`rs::encode` 没有。`k+c` 超 256 时矩阵被截断成零列，产出"看起来正常"的奇偶符号，整组永久不可解且无任何报错 | `encode()` 补对称守卫 | `rs_test` 全绿 |
+| R3-16 | Medium | `decode_trace_line` 三处不健壮：① ver 校验失败提前 return 时 `*e` 保留上一条内容，调用方误当有效条目；② 整型字段直接 `static_cast<int>`，`"c_d":10.9` 被静默截断成 10；③ `state` 越界时 `static_cast<FecState>` 产出非法枚举值 | 入口统一 `*e = TraceEntry{}`；所有整型访问器加 `raw != std::trunc(raw)` 拒绝；`state` 超 `kCapped` 直接拒绝 | `replay_test`/`replay_tool_smoke` 全绿 |
+| R3-17 | Medium | `fcp_replay` 的 `ReadLines` 无行长上限：一条 2GB 无换行的坏 trace 会 `bad_alloc` → `terminate`（`ferror` 检查救不了 `bad_alloc`） | 加 `kMaxLineBytes = 1MiB`，超限即报错 | `replay_tool_smoke` 全绿 |
+| R3-18 | Medium | `fcp_bench` 计量与门禁的四处失真：① 服务端 `up_bytes` 按长度累计，把 parity 当数据（`--k=3` 虚高约 30%）；② `--k > cfg.p` 被 session 静默夹到 3，报告却按请求值解释；③ `--mbps=0.1` 时令牌桶上限 625B < 单段 1236B，一个包都发不出去；④ 失败发送无失败率门禁，全失败也 exit 0 | ① 新增 `Session::data_payload_rx()`，按 `hdr_type` 只计数据符号净荷；② `--k > --p` 在建立套接字前直接报错（FEC 几何是编译期常量，原来却要等会合循环走完才判）；③ 上限取 `max(rate*0.05, wire_per_seg)`；④ `tx_fail*2 > tx_data_segs` 时 exit 5 | 回环实测 `--k=3`：服务端 `up_bytes=13196400` 与客户端逐字节相等，而 `up_wire_segs=14297` / `up_delivered=10997` —— parity 2664 段已从净荷计量中剔除；两端 `tx_fail=0`；`--k=5` → exit 1（无网络 I/O）；`--mbps=nan` → exit 1 |
+| R3-19 | Medium | `fcp_bench` 里还挂着公开的 FIPS-197 测试向量 `kKey`/`kSalt`（§7 A3 只在 GUI 侧删了），任何人都能推出现在 bench 用的是哪对键——它仍是默认 PSK | 删除两个常量，`--key=HEX32` 改必填；服务端 salt 改为"首个带 salt 的会合包采纳一次"，无常量回退 | `fcp-bench` 无 `--key` 时 exit 1 |
+| R3-20 | Low | `tests/CMakeLists.txt` 的 `replay_tool_smoke` 用 `PASS_REGULAR_EXPRESSION`：cmake 一旦匹配该表达式就**忽略退出码**，这个"门禁"永远绿 | 改 `FAIL_REGULAR_EXPRESSION "replay diverged"`，不再覆盖退出码 | 改后用例仍绿（说明原有正常路径未变），退出码恢复为生效判据 |
+| R3-21 | Low | 全部测试无 `TIMEOUT`。任一死循环（如 reactor 阻塞 accept）会让 CI 挂到全局超时，看不出是哪个用例 | 统一 `TIMEOUT 300`，`soak_test` 900 | ctest 全绿（无用例触及 300s） |
+| R3-22 | Low | `session.cc` 的局部 `kDataWireOverhead` 遮蔽 `frame_tx.h` 的同名常量（C4459）。两处一旦漂移，`get_limits()` 算出的 `payload_max` 与实际计费口径就不一致 | 删除局部常量，复用 `fcp::kDataWireOverhead` | 重新编译，C4459 消失 |
+
+#### 一条被证伪的"修复"（记录，避免下一轮重犯）
+
+本轮一度认为"尾丢集合（`release_set` 或容量逐出时仍未结算）应标记 retired，防止迟到
+parity 再次结算"，并加了 `TestTailDropIsFinal()`。实际跑出 4 条断言失败，根因是
+`settle_test::TestNoReaccountAfterRelease` 明确要求**尾丢集合可被迟到 parity 重建并
+结算一次**——这是 FEC 在"最后几包丢失"场景下唯一的修复路径，退休它等于让尾部永久
+丢数据。改动已整体回退，`retired` 只赋予 `kAccounted` 集合。
+**结论：`kAccounted` 才是"已结算"的唯一判据，`release_set` 不是。**
+
+### 8.4 本轮识别但延后
+
+> 2026-10-31 更新：R3-1 / R3-23 / R3-24 已在 §9 关闭（v7 密钥编排 + 握手 V4），下表保留当时判断。
+
+| ID | 级别 | 问题 | 为何不在本轮修 |
+|---|---|---|---|
+| ~~R3-1~~ | **Critical** → 已关闭 §9 | **握手无新鲜性**：`HELLO/HELLO_ACK` 只有 `salt`，没有 challenge。攻击者录下完整握手后重放，双方都会接受同一个 salt 并重建**同一对 (key, IV)**，且反重放窗口是"每会话新建"的，重放的历史数据包全部落在窗口内 → 整段会话可被复活并重放（含已提交的应用数据） | 需要协议改版：`HELLO` 带 16B 客户端 nonce，`HELLO_ACK` 回 16B 服务端 nonce，`session_key = KDF(psk, salt‖c_nonce‖s_nonce)`。牵动线格式、`DEPLOY.md` 兼容矩阵、bench 会合格式、`handshake_test` 全套向量。**本轮只做了缓解**：墓碑 TTL 提到 5 分钟、只有认证过的会话才入表、表有硬上限——把"随机 salt 洪泛"关掉，但录制重放仍需上面的协议修复 |
+| ~~R3-23~~ | High → 已关闭 §9 | salt 仅 64 位：`2^32` 个会话后生日碰撞概率到 50%。规范把"salt 唯一性"当密钥隔离前提，却没有会话数上限或宽度检查 | 与 R3-1 同一处改版；单独加宽会再次打断线格式兼容 |
+| ~~R3-24~~ | High → 已关闭 §9 | `Handshake::on_oob` 对已建立会话仍接受 `HELLO`：一个持 PSK 的（或重放的）HELLO 能把 `kEstablished` 打成 `kFailed`，会话被单包打死 | 属于 R3-1 改版范围（需要在 HELLO 里带可验证的新鲜性才能区分"重连"与"攻击"），单独加状态判断会误伤合法的重启逻辑 |
+| R3-25 | High | `FrameRx::try_decode` 每个到达符号都做一次全量重构（p 次 `rs::decode`，每次 O(D×n)）。`--d=250 --p=7` 时单 set 单符号是毫秒级 CPU，攻击者可用合法数据符号放大 | 性能重构，需要引入"增量编码/惰性重构"；当前 WAN 瓶颈不在 CPU（§2 P9 已证），M4 也未复现 |
+| R3-26 | Medium | `A16–A19` 热路径分配与 §8.3 的 `bad_recon`/`pending_ahead_` 都还在 `RxSet` 的按 set 结构里，`kMaxActiveSets=256` × 6KB 头部的放大仍在（§2 P5-08） | 与 §2 同一延后项，需整体改 set 存储布局 |
+| R3-27 | Low | GHASH 时序侧信道（§2 P2-01）依旧：本轮只确认了它没有随修复劣化 | 既定接受 |
+
+### 8.5 验证记录
+
+| 门禁 | 命令 | 结果 |
+|---|---|---|
+| Debug 构建 | `cmake --build build/windows-x64 --config Debug` | 30/30 目标成功 |
+| Debug 测试 | `ctest -C Debug` | **27/27 通过**，约 16s |
+| Release 构建 | `cmake --build build/windows-x64 --config Release` | 58/58 目标成功；**告警仅剩 C4996**（MSVC 对 `fopen`/`getenv`/`sscanf` 的 CRT 弃用提示，仓库既有风格），C4459 已清除 |
+| Release 测试 | `ctest -C Release` | **27/27 通过**，约 3.8s |
+| 代理层 | `cmake --build build/proxy-check --config Debug`（`FCP_BUILD_PROXY=ON`） | `fcp-proxy-client/server`、`fcp-proxy` 核心、`fcp_bench`、`fcp_replay` 全部链接成功，无告警 |
+| 回环实测 | `fcp_bench server/client --mbps=20 --k=3`（本机双进程，随机 PSK） | 握手 32ms 建立，两端 `tx_fail=0`、`auth_fail=0`、`struct_fail=0`；`identity_ok=1`、`delivered_le_sum=1`；`--k=3` 下服务端净荷计入与客户端逐字节相等（parity 不计入数据量） |
+
+`build.bat` 在本机沙箱内不可用：它经 `vswhere` 调用 `reg.exe`，被安全策略拦截
+（`PROGRAM BLOCKED BY SECURITY POLICY`）。上述构建均以手工导出
+`PATH/INCLUDE/LIB`（MSVC 14.51.36231 + Windows SDK 10.0.26100.0）后直接调用
+VS 自带的 `cmake.exe` 完成，与 `build.bat` 等价。
+
+### 8.6 测试盲区增补情况
+
+本轮新增 5 个回归用例，全部直接对应 §8.2/§8.3 的修复点：
+
+| 用例 | 覆盖 |
+|---|---|
+| `stream_test::TestSackBeyondSentIgnored` | SACK 块谎报上界（A4 残余） |
+| `frame_rx_test::TestSameSetConfirmsReanchor` | 重锚确认（A8 过修） |
+| `frame_rx_test::TestNMustCoverSeenData` | `n` 学习回查（A9 残余） |
+| `frame_rx_test::TestStructuralFailureCountedOnce` | `struct_fail` 去重（A23 残余） |
+| `strategy_test::TestCappedFloorReachesOff` | 预算吸收态（R3-13） |
+
+§3 的 B 系列盲区整体仍在：B2（loss 同源）、B7（`field_in_range` 自身）、B14（非法几何）、
+B16（`dup_after_recovered` 可达性）一处未动 —— 它们需要的是重新定义观测口径
+（§7.2 A11/A14 的延后项），而不是补用例。
+
+### 8.7 三轮累计
+
+- 第一轮 103 条；§7 落地 19 行处置（其中 A5/A6、P4-3/P4-4 各算一行）；本轮（§8）再落地
+  **26 条**（§8.2 的 5 条 + §8.3 的 21 条），其中 **5 条是修正上一轮的修复本身**。
+- **当时唯一未关的 Critical 是 R3-1（握手新鲜性）**，它同时也是 §7 A1 的根：A1 修掉了
+  "用 salt 找会话"，但没修掉"用 salt 复活会话"。**2026-10-31 已关闭**（v7 密钥编排 + 握手 V4，
+  见 §9），部署侧"PSK 不泄露 + 链路受控"的硬前提随之解除为常规要求。
+- 本轮的负结果同样有意义：**没有再发现可由网络输入触发的新增越界读写**，说明 §7
+  在 `src/fcp` 核心库上补的护栏是有效的；新问题集中在**宿主生命周期**
+  （R3-4/R3-9/R3-10/R3-11）与**观测口径**（R3-12/R3-16/R3-18/R3-20）。
+
+---
+
+## 9. R3-1 / R3-23 / R3-24 关闭记录（2026-10-31，v7 密钥编排 + 握手 V4）
+
+§8.7 收尾时唯一未关的 Critical 是 **R3-1（握手无新鲜性）**，R3-23/R3-24 是它的两个附属
+（salt 宽度、已建立会话被 HELLO 打死）。本节记录三者的关闭方式与验证。
+
+### 9.1 为什么必须动线格式
+
+根因不是"窗口太小"也不是"salt 太短"，而是 **`session_key` 的函数定义域里没有新鲜量**：
+
+```text
+v6:  session_key = AES128(PSK, salt ‖ 0×8)        # 输入全部来自线上/配置，重放必然复制
+```
+
+一条录制的握手重放给新会话，双方得到的 `session_key` 与录制时逐字节相同；而反重放窗口
+（§4.1，256 槽）是**每会话新建**的 `highest=0`，历史密文因此整段落回窗口内。窗口类、
+salt 加宽类的补丁全部绕不过这一点，所以必须让密钥依赖"本次运行才产生的随机量"。
+
+### 9.2 处置
+
+| ID | 处置 | 结果 |
+|---|---|---|
+| **R3-1** | `HELLO` 带 16B 客户端 CSPRNG nonce、`HELLO_ACK` 回显 c+s 双 nonce（36/52 字节，magic V3→V4）；`session_key` 改三块定长 CBC-MAC（`AES(PSK,salt‖0⁸)` → `⊕c` → `⊕s`）；双 envelope（握手键永不 rekey、数据键 `configure()` 时 rekey）；ACK 侧 echo 校验把 ACK 绑定到本端挑战 | **已关闭** |
+| **R3-23** | 维持 salt 8B（决策），把唯一性责任交给 KDF 的新鲜量：salt 只承担会话查找键，密钥隔离改由双向 nonce 保证 | **已关闭**（换个修法，不加宽） |
+| **R3-24** | `kEstablished` 收到**相同** nonce 的 HELLO → 重发 ACK（幂等，覆盖丢包）；**不同** nonce → 计 `hello_refused`、状态不动、不回 ACK | **已关闭** |
+
+### 9.3 关键实现事实（供后续审计复核）
+
+1. **角色由发送方向决定**：`send_direction == kC2S` 的一端是客户端（抽 c_nonce）。
+   两端同时发 HELLO 不会分叉——角色不靠"谁先发"。
+2. **握手信封存在是必然的**：salt 发现必须在握手成功之前可用，此时数据密钥还不存在，
+   只能依赖 `(PSK, salt)`。所以 `hs_env_` 用 `X0`、永不 rekey，且**只**收发 HELLO/ACK；
+   `on_wire` 先试 `env_` 再试 `hs_env_`（稳态流量不付第二次尝试的代价）。
+3. **握手信封的发送计数器起点必须随机**：重放的 HELLO 会让对端重发 ACK，若起点固定，
+   同一 (key, IV) 会封出第二条明文不同的 ACK → GCM 密钥流重用。`hs_env_.set_send_nonce(random_u32())`。
+4. **echo 校验是唯一绑定**：客户端必须看到 `ACK.client_nonce == local_nonce_`，服务端必须看到
+   `ACK.server_nonce == local_nonce_`。没有它，录制的 ACK 会替客户端"作证"一个它从未发起的挑战。
+5. **零 nonce 拒绝**（`kBadNonce`）：`(c,s)=(0,0)` 在 KDF 里也**不等于** v6 键（第二块用 `X0` 掩码），
+   但全零挑战本身等于"无挑战"，仍必须显式拒绝并响亮失败。
+
+### 9.4 验证
+
+| 证据 | 内容 |
+|---|---|
+| 黄金向量 | 外部 openssl 独立算出：`X0=18e6cda1…c2d6`、`v7=54986bbc…eb8d`、交换 nonce `fce3349c…55af`、双零 `7363d57e…4112`，锁在 `envelope_test::TestV7KeyVector` |
+| 重放用例 | `session_test::TestReplayCannotReviveSession`：录制整条双向 transcript（9 条 a→b、1 条 b→a），用**同 PSK 同 salt** 的新会话重放 → 客户端 `!established()`、`nonce_mismatch()>0`、双向零交付、服务端 `auth_fail()>0`；再重放一次仍无效 |
+| **变异验证** | 把 echo 校验改成 `if (false && ...)` → 该用例立刻红（`!a2.established()` 失败）；恢复后复绿。证明用例真的在测 echo 绑定，而不是被别的机制顺带兜住 |
+| 状态机 | `handshake_test`：`TestKeyAgreement`（两端派生一致）、`TestAckEchoMismatch`、`TestEstablishedRefusesNewHello`、`TestZeroNonceRejected`、`TestNonceIsRandom`、`TestWireGolden`（36/52 字节 + v3 magic 不再识别） |
+| 全量门禁 | `ctest -C Debug` **27/27**、`ctest -C Release` **27/27**；`FCP_BUILD_PROXY=ON` 全目标链接通过 |
+
+### 9.5 代价（明确接受）
+
+- **v6 硬断**：两端必须同时升级，无降级协商。`DEPLOY.md` §1.1 给了升级顺序与"误混版本"
+  的两种症状（握手失败 `V4 no ACK` / 握手成功但 0 吞吐且 `auth_fail` 上涨）。
+- **每会话多 32 字节握手开销**（HELLO 16 → 36、ACK 20 → 52），一次性，不影响稳态 MTU。
+- **仍无前向保密**：PSK 泄露 → 该 PSK 下全部历史可解，与 v6 一致。
+- **残余**：服务端对重放的 HELLO 仍会建立一个会话（它抽自己的 `s_nonce`，键与录制方不同，
+  数据全部 `auth_fail`，2.1s 内或 idle 后回收）。成本与"伪造 HELLO"等价（后者需 PSK），
+  由 `max_sessions` + idle 回收承担；要彻底消除需服务端侧挑战-响应去重表，性价比不成立。
+
+### 9.6 同批延后（未变）
+
+R3-25（`try_decode` 每符号全量重构）、R3-26（按 set 结构的内存放大）、R3-27（GHASH 时序侧信道）
+状态不变，理由同 §8.4。
+
+---
+
+*本报告由 10 轮独立对抗分析汇总而成。§2 的代码片段摘录自基线 commit `1fcdebe` 的工作区
+状态，行号以该状态为准；§7 为 `2276a68` 工作区的第一轮处置；§8 为同一工作区上的第二轮
+对抗复核（含对 §7 修复本身的回归审查）；§9 为其后对 R3-1 的协议改版与关闭验证。

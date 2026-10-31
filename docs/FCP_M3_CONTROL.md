@@ -69,7 +69,10 @@ k_target  = k_for(p_use, ...)               # 其余状态机逻辑不变
 - **单侧的理由**：§14.10 已证失效模式是"欠保护"（突发）；"好于 i.i.d."没有对应的已证
   机制，按运气处理——若允许下调，64 组的小样本运气会让 k 抖动。上调方向受 ±1 限速与
   `p_max` 封顶，风险有界。
-- 门全部不满足（旧端、样本不足、k 错位）⇒ 行为与 M1 完全一致（`p_use = p_observed`）。
+- 门全部不满足（旧端、样本不足、k 错位）⇒ 行为与 M1 完全一致（`p_use = p_observed`）：
+  任一门不满足都会**清除已持有的 p_eff**（`have_p_eff_ = false`），只有成功更新才落新值。
+  早期实现漏了"报告无 `flg bit3`"这一路——一次校正后的 p_eff 会被后续无账本报告无限沿用、
+  把 k 钉在高位（对抗审查 P6-2；`TestLedgerFlagDropClearsPEff` 守卫）。
 
 ### 1.3 账本的已知偏差
 
@@ -235,3 +238,4 @@ M2 管线 225ms → #27 25ms（9×），`TestBurstLossExceedsFec` 以 <200ms 断
 | 2026-10-31 | **#29b 落地（Linux 门禁 + 局域网双机联调）**：环境为局域网 Ubuntu 22.04 测试机（g++ 11.4/cmake 3.22/ninja，地址不入库，git archive 传输）。① **Linux × Debug/Release ctest 27/27**（Release 为手动配置——presets 只有 linux-x64-debug 构建预设）——**四套门禁齐**（Windows/Linux × Debug/Release）。② **LAN 双机联调七项全过**（Windows 客户端 ↔ Ubuntu 服务端，SOCKS5 + python http.server 源站）：GET、8MiB SHA256 逐字节一致、**68.9 Mbps**（0.974s，无损链路 k=0 纯吞吐）、HTTP CONNECT + TLS（外网 200）、拒绝目标（curl exit 97 = SOCKS 失败应答）、20 串行 + 10 并发全过；双端收尾 `live=0 refused=1 bad_entry=0 clash=0 unknown=0 tomb=0` 零泄漏零异常（LAN 无损无尾段重传，tomb=0 符合预期，逻辑由 gate 的 `salt_tombstone_absorbs_tail` 守卫）。③ **实机 trace/重放闭环**：双端 `--trace` 各写 37 个会话文件（短会话 0 行符合报告节奏），`fcp_replay` 在 Ubuntu 上回放实机轨迹 agree 2/2、`--budget=0.10` what-if 正常出 CAPPED。④ 修掉 stats 行 `tomb=` 字段——#29a 提交时编辑脚本静默失配未入库，实机验证发现并补上（实机跑一遍的价值）。**遗留**：跨 WAN 复测吞吐（180ms/10% 丢包真链路上 #27 快重与 #24 校正的收益标定）仍需真实 VPS 环境 |
 | 2026-10-31 | **#30 落地（M3 代码对抗复查）**：M1/M2 都过过对抗轮（F1–F5、adv_test），M3 新增面照做一遍，抓到三处真缺陷并修掉：① **stream ACK 谎报防线缺失**——`cum > snd_nxt` 的 ACK 会弹光全部未确认段并把数据永久搁浅（接收端也没有那些字节）；`handle_ack` 入口拒绝并计 `bad_segs_`（谎报 rwnd 无害：`send_space` 被本端窗口钳住，测试注释留档）。② **trace 解码器两处**——`1e999` → HUGE_VAL → int 转换 UB（非有限值拒绝整行）、闭括号后尾随垃圾与重复键取首个（对象必须终结该行、重复键按 JSON 语义取末个）。③ **§14.6 关闭时 FECSTAT 补发落地**：`Session::flush_report` 挂在引擎 reap（唯一销毁点），有内容的区间立即上报——对端的墓碑窗口（#29a 的 5s）保证报文仍可路由；短会话的 trace 文件由此必有内容。测试：stream `TestAckBeyondSndNxtIgnored`、reporter `TestFlushOnTeardown`、replay `TestTraceCodecFuzz`（14 个坏行 + 3 个容忍档 + 大数往返 + 重复键）、strategy `TestLedgerFieldExtremes`（fail_ppm 42x钳制无 NaN / k=9 拒收 / 4G 组数过门）。Windows Debug/Release ctest 27/27。复查中也校准了两处测试自身的错误预期（`{"ver":1}` 是合法默认值行、0.20 丢失在 k=2 的失败率就是 44%） |
 | 2026-10-31 | **#30 续（对抗复查二轮：重放/确定性）**：① **trace 浮点不是无损格式**——`%.9g` 把 `nextafter(0.8)` 折叠回 `0.8`，配置快照经 encode→decode 后可能与录制时不同，回放恰在阈值附近会分叉；改用 `%.17g`（精确整数范围内仍输出整数），`TestTraceDoubleRoundTrip` 用三个邻接 double 守卫。② **解码器整数字段越界 UB**——`-1`/`1e300`/`70000` 这类值原先经 double→uint8/16/32 转换（C++17 下越界为 UB）；现在每个整数字段先做线宽区间检查，越界拒绝整行，`TestTraceCodecFuzz` 增加 4 条坏行。③ **`fcp_replay --dump` 文档承诺但不可用**——参数解析要求所有选项带 `=`，裸旗标直接 "bad argument"；解析器现接受裸 `--dump`/`--require-exact`。④ **golden 冒烟只查退出码**：新增 `--require-exact`（agree 不等于条目数时退出 1），ctest 冒烟改为 `--dump --require-exact`，黄金轨迹从"能加载"升级为"逐决策复现录制"的真回归门（当前 5/5）。⑤ 工具的覆盖参数补整串/区间校验（`--d=abc` 不再静默变 0，`--budget=nan` 拒绝）。其余发现（反应堆/引擎）与 Stream 守卫复核见 `FCP_M2_PROXY.md` §8.3。Windows Debug/Release 均 27/27 |
+| 2026-10-31 | **对抗审查报告核实与落地**（`FCP_ADVERSARIAL_REVIEW.md` §7 处置记录）：M3 相关一条——**P6-2 p_eff 过期钉死**：无账本标志的报告现在清除 `have_p_eff_`（此前该路径直接 return，一次校正值可跨报告无限沿用）；`strategy_test` 新增 `TestLedgerFlagDropClearsPEff`（账本把 k 抬到 3 → 无标志 1% 报告 k 落回 2 → 再落 1）。§1.2 口径同步。Windows Debug/Release ctest 27/27 |

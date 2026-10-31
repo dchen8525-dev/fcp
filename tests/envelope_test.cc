@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "fcp/gcm.h"
+#include "fcp/random.h"
 #include "test_util.h"
 
 namespace {
@@ -278,6 +279,111 @@ void TestSessionKeyDerivation() {
   CHECK_EQ(plain[0], 4);
 }
 
+// R3-1: the v7 session key must bind fresh material from both ends.
+//
+// Every constant below was computed independently of this implementation with
+// `openssl enc -aes-128-ecb -nopad -K <psk>` over the three chained blocks, so
+// the test cannot pass just because the code agrees with itself.
+void TestV7KeyVector() {
+  uint8_t psk[16];
+  uint8_t salt[8];
+  uint8_t c_nonce[16];
+  uint8_t s_nonce[16];
+  CHECK(fcp_test::unhex("0f1e2d3c4b5a69788796a5b4c3d2e1f0", psk, 16));
+  CHECK(fcp_test::unhex("1122334455667788", salt, 8));
+  CHECK(fcp_test::unhex("000102030405060708090a0b0c0d0e0f", c_nonce, 16));
+  CHECK(fcp_test::unhex("f0e0d0c0b0a090807060504030201000", s_nonce, 16));
+
+  // Block 0 is the v6 value; v7 must not stop there.
+  uint8_t v6[16];
+  fcp::derive_session_key(psk, salt, v6);
+  CHECK_EQ(fcp_test::hex(v6, 16), "18e6cda19e4e7799e2f2e18874e4c2d6");
+
+  uint8_t key[16];
+  fcp::derive_session_key_v7(psk, salt, c_nonce, s_nonce, key);
+  CHECK_EQ(fcp_test::hex(key, 16), "54986bbc5ccc12b8666f56c7a5d6eb8d");
+  CHECK(std::memcmp(key, v6, 16) != 0);
+
+  // The two nonces are not interchangeable: which side contributes which is
+  // fixed by Direction, and a swapped pair must not collide.
+  uint8_t swapped[16];
+  fcp::derive_session_key_v7(psk, salt, s_nonce, c_nonce, swapped);
+  CHECK_EQ(fcp_test::hex(swapped, 16), "fce3349c24a2ee4b0a0a4c096c1f55af");
+
+  // An all-zero pair (a peer that sent no freshness) is still not the v6 key.
+  const uint8_t zero[16] = {};
+  uint8_t degenerate[16];
+  fcp::derive_session_key_v7(psk, salt, zero, zero, degenerate);
+  CHECK_EQ(fcp_test::hex(degenerate, 16), "7363d57e850ce2d2f301b80bae264112");
+  CHECK(std::memcmp(degenerate, v6, 16) != 0);
+
+  // Same nonces under a different salt is a different session, as before.
+  uint8_t salt2[8];
+  CHECK(fcp_test::unhex("8877665544332211", salt2, 8));
+  uint8_t other[16];
+  fcp::derive_session_key_v7(psk, salt2, c_nonce, s_nonce, other);
+  CHECK(std::memcmp(other, key, 16) != 0);
+}
+
+// A rekeyed envelope must restart at counter 0 under the new key, and the
+// bootstrap instance must keep opening the pre-rekey datagrams -- that is what
+// makes a retried HELLO readable after the data epoch moved on.
+void TestRekey() {
+  fcp::Envelope client = MakeClient();
+  fcp::Envelope server = MakeServer();
+
+  uint8_t c_nonce[16];
+  uint8_t s_nonce[16];
+  uint8_t session_key[16];
+  CHECK(fcp_test::unhex("000102030405060708090a0b0c0d0e0f", c_nonce, 16));
+  CHECK(fcp_test::unhex("f0e0d0c0b0a090807060504030201000", s_nonce, 16));
+  fcp::derive_session_key_v7(kKey, kSalt, c_nonce, s_nonce, session_key);
+
+  const uint8_t payload[4] = {1, 2, 3, 4};
+  std::vector<uint8_t> before;
+  CHECK(client.seal(payload, sizeof(payload), &before));
+  CHECK_EQ(client.send_nonce(), 1u);
+
+  client.rekey(session_key);
+  server.rekey(session_key);
+  CHECK_EQ(client.send_nonce(), 0u);
+  CHECK_EQ(server.send_nonce(), 0u);
+
+  // The bootstrap-epoch datagram no longer authenticates under the new key.
+  std::vector<uint8_t> plain;
+  CHECK(!server.open(before.data(), before.size(), &plain));
+
+  // The new epoch round-trips from counter 0, so the wire is reused only with a
+  // new key (never the same (key, IV) pair twice).
+  std::vector<uint8_t> after;
+  CHECK(client.seal(payload, sizeof(payload), &after));
+  CHECK(server.open(after.data(), after.size(), &plain));
+  CHECK_EQ(plain.size(), sizeof(payload));
+  CHECK_EQ(plain[0], 1);
+
+  // A fresh bootstrap instance still opens the old datagram.
+  fcp::Envelope bootstrap = MakeServer();
+  CHECK(bootstrap.open(before.data(), before.size(), &plain));
+  CHECK_EQ(plain[0], 1);
+}
+
+// The OS CSPRNG is the only source of salts/nonces/counter seeds; a silent
+// failure there would seed a session from zeros.
+void TestRandomSource() {
+  uint8_t a[32];
+  uint8_t b[32];
+  CHECK(fcp::random_bytes(a, sizeof(a)));
+  CHECK(fcp::random_bytes(b, sizeof(b)));
+  CHECK(std::memcmp(a, b, sizeof(a)) != 0);
+  int acc = 0;
+  for (size_t i = 0; i < sizeof(a); ++i) {
+    acc |= a[i];
+  }
+  CHECK(acc != 0);  // 32 zero bytes from a CSPRNG: never happens legitimately
+  CHECK(fcp::random_bytes(a, 0));  // empty request is a no-op, not a failure
+  CHECK(!fcp::random_bytes(nullptr, 4));
+}
+
 }  // namespace
 
 int main() {
@@ -288,5 +394,8 @@ int main() {
   TestRecvNonceLimit();
   TestDirectionKeyIsolation();
   TestSessionKeyDerivation();
+  TestV7KeyVector();
+  TestRekey();
+  TestRandomSource();
   return fcp_test::finish();
 }

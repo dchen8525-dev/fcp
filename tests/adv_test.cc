@@ -1340,6 +1340,14 @@ void ProbeR8Strategy() {
 
 // ---------------------------------------------------------------- R9 -------
 
+// R3-1: every handshake message carries a nonce now, and the ACK echoes the
+// client's. The probes below pin both draws so their caps/state assertions stay
+// deterministic.
+const uint8_t kProbeNonce[16] = {1, 2,  3,  4,  5,  6,  7,  8,
+                                 9, 10, 11, 12, 13, 14, 15, 16};
+const uint8_t kPeerNonce[16] = {0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
+                                0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F, 0x30};
+
 void ProbeR9Handshake() {
   using fcp::Handshake;
   using fcp::HandshakeCaps;
@@ -1347,9 +1355,9 @@ void ProbeR9Handshake() {
   // R9.1 caps validation fuzz (§6.2: ver==1, data>=1, parity<=7,
   // u16(data)+parity<=256, reserved flag bits zero).
   auto check_caps = [](uint8_t ver, uint8_t data, uint8_t parity, uint8_t flags) {
-    Handshake hs(10, 3, nullptr);
+    Handshake hs(10, 3, nullptr, fcp::HandshakeRole::kServer, kProbeNonce);
     std::vector<uint8_t> msg(fcp::kHelloLen);
-    fcp::build_hello(HandshakeCaps{ver, data, parity, flags}, msg.data());
+    fcp::build_hello(HandshakeCaps{ver, data, parity, flags}, kProbeNonce, msg.data());
     const fcp::HandshakeStatus st = hs.on_oob(msg.data(), msg.size());
     const bool accepted = st == fcp::HandshakeStatus::kConsumed &&
                           hs.state() == fcp::HandshakeState::kEstablished;
@@ -1378,9 +1386,9 @@ void ProbeR9Handshake() {
 
   // R9.2 bad caps after establishment must not corrupt a live session.
   {
-    Handshake hs(10, 3, nullptr);
+    Handshake hs(10, 3, nullptr, fcp::HandshakeRole::kServer, kProbeNonce);
     std::vector<uint8_t> good(fcp::kHelloLen);
-    fcp::build_hello(HandshakeCaps{1, 10, 3, 0x07}, good.data());
+    fcp::build_hello(HandshakeCaps{1, 10, 3, 0x07}, kProbeNonce, good.data());
     CHECK(hs.on_oob(good.data(), good.size()) == fcp::HandshakeStatus::kConsumed);
     CHECK(hs.established());
     // a duplicate HELLO re-ACKs and keeps the session alive
@@ -1388,16 +1396,16 @@ void ProbeR9Handshake() {
     CHECK(hs.established());
     // now a malformed HELLO: protocol failure
     std::vector<uint8_t> bad(fcp::kHelloLen);
-    fcp::build_hello(HandshakeCaps{9, 10, 3, 0}, bad.data());
+    fcp::build_hello(HandshakeCaps{9, 10, 3, 0}, kProbeNonce, bad.data());
     CHECK(hs.on_oob(bad.data(), bad.size()) == fcp::HandshakeStatus::kProtocolFailure);
     CHECK(hs.state() == fcp::HandshakeState::kFailed);
   }
 
   // R9.3 ACK before any HELLO (stray) is swallowed; wrong lengths are ignored.
   {
-    Handshake hs(10, 3, nullptr);
+    Handshake hs(10, 3, nullptr, fcp::HandshakeRole::kServer, kProbeNonce);
     std::vector<uint8_t> ack(fcp::kHelloAckLen);
-    fcp::build_hello_ack(HandshakeCaps{1, 10, 3, 0x07}, ack.data());
+    fcp::build_hello_ack(HandshakeCaps{1, 10, 3, 0x07}, kProbeNonce, kPeerNonce, ack.data());
     CHECK(hs.on_oob(ack.data(), ack.size()) == fcp::HandshakeStatus::kConsumed);
     CHECK(hs.state() == fcp::HandshakeState::kIdle);
     std::vector<uint8_t> short_hello(fcp::kHelloLen - 1, 'A');
@@ -1405,7 +1413,7 @@ void ProbeR9Handshake() {
           fcp::HandshakeStatus::kNotHandshake);
     std::vector<uint8_t> hello_plus = [&] {
       std::vector<uint8_t> m(fcp::kHelloLen);
-      fcp::build_hello(HandshakeCaps{}, m.data());
+      fcp::build_hello(HandshakeCaps{}, kProbeNonce, m.data());
       m.push_back(0xAA);  // trailing junk: exact-length matching rejects it
       return m;           // requires the exact length
     }();
@@ -1418,7 +1426,8 @@ void ProbeR9Handshake() {
   // 0/300/900, failure check on the tick at 2100 (no 4th HELLO).
   {
     int sent = 0;
-    Handshake hs(10, 3, [&](const uint8_t*, size_t) { ++sent; });
+    Handshake hs(10, 3, [&](const uint8_t*, size_t) { ++sent; },
+                 fcp::HandshakeRole::kClient, kProbeNonce);
     hs.start(0);
     hs.on_tick(0);
     CHECK_EQ(sent, 1);
@@ -1440,10 +1449,10 @@ void ProbeR9Handshake() {
 
   // R9.5 negotiation result: min on both sides; stats mode when P' = 0.
   {
-    Handshake a(10, 3, nullptr);
-    Handshake b(20, 0, nullptr);
+    Handshake a(10, 3, nullptr, fcp::HandshakeRole::kServer, kProbeNonce);
+    Handshake b(20, 0, nullptr, fcp::HandshakeRole::kClient, kPeerNonce);
     std::vector<uint8_t> hello(fcp::kHelloLen);
-    fcp::build_hello(HandshakeCaps{1, 20, 0, 0x07}, hello.data());
+    fcp::build_hello(HandshakeCaps{1, 20, 0, 0x07}, kPeerNonce, hello.data());
     CHECK(a.on_oob(hello.data(), hello.size()) == fcp::HandshakeStatus::kConsumed);
     CHECK(a.established());
     CHECK_EQ(a.params().d, uint8_t{10});
@@ -1456,14 +1465,15 @@ void ProbeR9Handshake() {
   // (segments), and the byte ceiling. Limits are explicit here to pin the
   // boundary; the default is 512 segs / 512 KiB (#28③ F2).
   {
-    Handshake hs(10, 3, nullptr, fcp::kLocalFlagsM1, 64, 64 * 1024);
+    Handshake hs(10, 3, nullptr, fcp::HandshakeRole::kClient, kProbeNonce,
+                 fcp::kLocalFlagsM1, 64, 64 * 1024);
     for (int i = 0; i < 10; ++i) {
       std::vector<uint8_t> seg(8, static_cast<uint8_t>(i));
       CHECK(hs.cache_data(std::move(seg)));
     }
     CHECK_EQ(hs.cached_segments(), size_t{10});
     std::vector<uint8_t> hello(fcp::kHelloLen);
-    fcp::build_hello(HandshakeCaps{1, 10, 3, 0x07}, hello.data());
+    fcp::build_hello(HandshakeCaps{1, 10, 3, 0x07}, kProbeNonce, hello.data());
     CHECK(hs.on_oob(hello.data(), hello.size()) == fcp::HandshakeStatus::kConsumed);
     const auto drained = hs.take_cached_data();
     CHECK_EQ(drained.size(), size_t{10});
@@ -1472,7 +1482,8 @@ void ProbeR9Handshake() {
     }
   }
   {
-    Handshake hs(10, 3, nullptr, fcp::kLocalFlagsM1, 64, 64 * 1024);
+    Handshake hs(10, 3, nullptr, fcp::HandshakeRole::kClient, kProbeNonce,
+                 fcp::kLocalFlagsM1, 64, 64 * 1024);
     for (int i = 0; i < 64; ++i) {
       CHECK(hs.cache_data(std::vector<uint8_t>(8, 0)));
     }
@@ -1481,7 +1492,8 @@ void ProbeR9Handshake() {
     CHECK(hs.error() == fcp::HandshakeError::kCacheOverflow);
   }
   {
-    Handshake hs(10, 3, nullptr, fcp::kLocalFlagsM1, 64, 64 * 1024);
+    Handshake hs(10, 3, nullptr, fcp::HandshakeRole::kClient, kProbeNonce,
+                 fcp::kLocalFlagsM1, 64, 64 * 1024);
     const size_t big = 8 * 1024;
     for (int i = 0; i < 8; ++i) {  // 8 x 8 KiB = 64 KiB exactly
       CHECK(hs.cache_data(std::vector<uint8_t>(big, 0)));
@@ -1553,8 +1565,17 @@ void ProbeR10Session() {
     }
     CHECK_EQ(h.corrupt_b, uint32_t{0});
 
+    // R3-1: the rogue must speak the v7 *session* key, not the bootstrap one.
+    // It knows the PSK and the salt (it is a rogue implementation), and it
+    // watched the handshake go by, so it holds the same session key B uses.
     fcp::Envelope rogue(kFuzzKey, kFuzzSalt, fcp::Direction::kC2S,
                         fcp::Direction::kS2C);
+    {
+      uint8_t session_key[16];
+      fcp::derive_session_key_v7(kFuzzKey, kFuzzSalt, h.a->handshake_nonce(),
+                                 h.b->handshake_nonce(), session_key);
+      rogue.rekey(session_key);
+    }
     uint64_t rogue_ctr = 500;  // above A's traffic, inside B's replay window
     auto sealed = [&rogue, &rogue_ctr](const Bytes& plain) {
       Bytes wire;

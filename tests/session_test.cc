@@ -56,6 +56,29 @@ fcp::SessionConfig MakeConfig(fcp::Direction send, fcp::Direction recv,
   return cfg;
 }
 
+// R3-1: a hand-made HELLO has to carry a non-zero draw. Sessions still
+// draw their own from the CSPRNG, so an ACK built here must echo
+// `session.handshake_nonce()` -- see the ACK call sites.
+const uint8_t* PeerDraw() {
+  static const uint8_t kPeer[fcp::kHandshakeNonceLen] = {
+      0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
+      0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x40};
+  return kPeer;
+}
+
+// R3-1: after the handshake the data envelope is keyed by both draws, so a
+// test that peeks at a session's output has to derive the same key. Handshake
+// messages still use the bootstrap key, hence the plain readers further down.
+fcp::Envelope DataReader(fcp::Direction send, fcp::Direction recv,
+                         const uint8_t client_nonce[16],
+                         const uint8_t server_nonce[16]) {
+  fcp::Envelope env(kKey, kSalt, send, recv);
+  uint8_t key[16];
+  fcp::derive_session_key_v7(kKey, kSalt, client_nonce, server_nonce, key);
+  env.rekey(key);
+  return env;
+}
+
 bool HasLine(const std::vector<std::string>& logs, const std::string& want) {
   for (const std::string& line : logs) {
     if (line == want) {
@@ -343,7 +366,8 @@ void TestFullLoop() {
   // Decode the second report end to end and check the fields the design §11
   // line and the strategy rely on. b_oob_wires[0] is the handshake ACK; [1]/[2]
   // are the two copies of report 1, [3]/[4] of report 2 (#28⑤ F3).
-  fcp::Envelope reader(kKey, kSalt, fcp::Direction::kS2C, fcp::Direction::kS2C);
+  fcp::Envelope reader = DataReader(fcp::Direction::kS2C, fcp::Direction::kS2C,
+                                  a.handshake_nonce(), b.handshake_nonce());
   Bytes plain;
   CHECK(reader.open(link.b_oob_wires[3].data(), link.b_oob_wires[3].size(), &plain));
   fcp::FecHdr hdr{};
@@ -367,7 +391,8 @@ void TestFullLoop() {
 
   // The first interval has no parity at all; the byte counters must reflect the
   // inbound wire budget (28B envelope + 6B header + 2B len + 16B payload = 52B).
-  fcp::Envelope reader0(kKey, kSalt, fcp::Direction::kS2C, fcp::Direction::kS2C);
+  fcp::Envelope reader0 = DataReader(fcp::Direction::kS2C, fcp::Direction::kS2C,
+                                   a.handshake_nonce(), b.handshake_nonce());
   Bytes plain0;
   CHECK(reader0.open(link.b_oob_wires[1].data(), link.b_oob_wires[1].size(), &plain0));
   fcp::FecHdr hdr0{};
@@ -429,7 +454,8 @@ void TestHandshakeRidesOob() {
   // A KCP output segment that happens to start with the HELLO magic is data:
   // it lands in the pre-negotiation cache, no oob is emitted for it.
   uint8_t fake[fcp::kHelloLen];
-  fcp::build_hello(fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, fcp::kLocalFlagsM1}, fake);
+  fcp::build_hello(fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, fcp::kLocalFlagsM1},
+                   PeerDraw(), fake);
   s.on_kcp_output(fake, sizeof(fake), 0);
   CHECK_EQ(s.cached_segments(), 1u);
   CHECK_EQ(sent.size(), 1u);
@@ -448,7 +474,8 @@ void TestHandshakeAckRidesOob() {
   b.start(0);
 
   uint8_t hello[fcp::kHelloLen];
-  fcp::build_hello(fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, fcp::kLocalFlagsM1}, hello);
+  fcp::build_hello(fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, fcp::kLocalFlagsM1},
+                   PeerDraw(), hello);
   Bytes plain(fcp::kFecHdrLen + sizeof(hello));
   fcp::pack_hdr(
       fcp::FecHdr{0, 0, fcp::pack_type_k(0, 0, static_cast<uint8_t>(fcp::SymbolType::kOob))},
@@ -463,6 +490,8 @@ void TestHandshakeAckRidesOob() {
   CHECK_EQ(sent.size(), 1u);
   CHECK(sent[0].second == fcp::SymbolType::kOob);
 
+  // The ACK still rides the bootstrap key: it is sealed before the session key
+  // exists, which is exactly why the handshake keeps its own envelope.
   fcp::Envelope reader(kKey, kSalt, fcp::Direction::kS2C, fcp::Direction::kS2C);
   Bytes ack_plain;
   CHECK(reader.open(sent[0].first.data(), sent[0].first.size(), &ack_plain));
@@ -498,7 +527,8 @@ void TestInvalidLocalCaps() {
 
   // A valid peer HELLO may negotiate on paper, but no codec is built either.
   uint8_t hello[fcp::kHelloLen];
-  fcp::build_hello(fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, fcp::kLocalFlagsM1}, hello);
+  fcp::build_hello(fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, fcp::kLocalFlagsM1},
+                   PeerDraw(), hello);
   Bytes plain(fcp::kFecHdrLen + sizeof(hello));
   fcp::pack_hdr(
       fcp::FecHdr{0, 0, fcp::pack_type_k(0, 0, static_cast<uint8_t>(fcp::SymbolType::kOob))},
@@ -566,7 +596,7 @@ void TestHandshakeTimeout() {
   s.on_tick(2100);
   CHECK(s.state() == fcp::HandshakeState::kFailed);
   CHECK(s.error() == fcp::HandshakeError::kNoAck);
-  CHECK(HasLine(logs, "FEC handshake failed: V3 no ACK after 3 tries"));
+  CHECK(HasLine(logs, "FEC handshake failed: V4 no ACK after 3 tries"));
 }
 
 void TestPreNegotiationCache() {
@@ -586,7 +616,8 @@ void TestPreNegotiationCache() {
 
   uint8_t ack[fcp::kHelloAckLen];
   fcp::build_hello_ack(
-      fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, fcp::kLocalFlagsM1}, ack);
+      fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, fcp::kLocalFlagsM1},
+      s.handshake_nonce(), PeerDraw(), ack);
   Bytes plain(fcp::kFecHdrLen + sizeof(ack));
   fcp::pack_hdr(
       fcp::FecHdr{0, 0, fcp::pack_type_k(0, 0, static_cast<uint8_t>(fcp::SymbolType::kOob))},
@@ -603,7 +634,9 @@ void TestPreNegotiationCache() {
   CHECK_EQ(sent.size(), 1u);  // the cached segment is replayed after setup
   CHECK(sent[0].second == fcp::SymbolType::kData);
 
-  fcp::Envelope reader(kKey, kSalt, fcp::Direction::kC2S, fcp::Direction::kC2S);
+  fcp::Envelope reader =
+      DataReader(fcp::Direction::kC2S, fcp::Direction::kC2S, s.handshake_nonce(),
+                 PeerDraw());
   Bytes data_plain;
   CHECK(reader.open(sent[0].first.data(), sent[0].first.size(), &data_plain));
   fcp::FecHdr hdr{};
@@ -746,7 +779,8 @@ void TestPreNegotiationInboundDropped() {
 
   uint8_t ack[fcp::kHelloAckLen];
   fcp::build_hello_ack(
-      fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, fcp::kLocalFlagsM1}, ack);
+      fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, fcp::kLocalFlagsM1},
+      s.handshake_nonce(), PeerDraw(), ack);
   Bytes ack_plain(fcp::kFecHdrLen + sizeof(ack));
   fcp::pack_hdr(
       fcp::FecHdr{0, 0, fcp::pack_type_k(0, 0, static_cast<uint8_t>(fcp::SymbolType::kOob))},
@@ -758,7 +792,9 @@ void TestPreNegotiationInboundDropped() {
   CHECK(s.established());
   CHECK_EQ(sent.size(), 1u);  // only our segment: nothing was reflected
   CHECK(sent[0].second == fcp::SymbolType::kData);
-  fcp::Envelope reader(kKey, kSalt, fcp::Direction::kC2S, fcp::Direction::kC2S);
+  fcp::Envelope reader =
+      DataReader(fcp::Direction::kC2S, fcp::Direction::kC2S, s.handshake_nonce(),
+                 PeerDraw());
   Bytes out_plain;
   CHECK(reader.open(sent[0].first.data(), sent[0].first.size(), &out_plain));
   fcp::FecHdr hdr{};
@@ -780,16 +816,22 @@ void TestQueuedGuardrailUsesObservedMinRtt() {
                  nullptr, nullptr);
   s.start(0);
 
-  fcp::Envelope peer(kKey, kSalt, fcp::Direction::kS2C, fcp::Direction::kS2C);
-  auto feed = [&peer, &s](const Bytes& plain) {
+  // Two epochs: the HELLO_ACK rides the bootstrap (psk, salt) envelope, while
+  // every FECSTAT after establishment rides the v7 data envelope. `active` is
+  // switched right after the ACK — feeding reports through the bootstrap key
+  // would make them fail authentication and leave the ledger empty.
+  fcp::Envelope boot(kKey, kSalt, fcp::Direction::kS2C, fcp::Direction::kS2C);
+  fcp::Envelope* active = &boot;
+  auto feed = [&active, &s](const Bytes& plain) {
     Bytes wire;
-    CHECK(peer.seal(plain.data(), plain.size(), &wire));
+    CHECK(active->seal(plain.data(), plain.size(), &wire));
     s.on_wire(wire.data(), wire.size(), 10);
   };
 
   uint8_t ack[fcp::kHelloAckLen];
   fcp::build_hello_ack(
-      fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, fcp::kLocalFlagsM1}, ack);
+      fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, fcp::kLocalFlagsM1},
+      s.handshake_nonce(), PeerDraw(), ack);
   Bytes ack_plain(fcp::kFecHdrLen + sizeof(ack));
   fcp::pack_hdr(
       fcp::FecHdr{0, 0, fcp::pack_type_k(0, 0, static_cast<uint8_t>(fcp::SymbolType::kOob))},
@@ -797,6 +839,10 @@ void TestQueuedGuardrailUsesObservedMinRtt() {
   std::memcpy(ack_plain.data() + fcp::kFecHdrLen, ack, sizeof(ack));
   feed(ack_plain);
   CHECK(s.established());
+
+  fcp::Envelope data_env = DataReader(fcp::Direction::kS2C, fcp::Direction::kS2C,
+                                      s.handshake_nonce(), PeerDraw());
+  active = &data_env;
 
   auto report = [&feed](uint32_t key, uint32_t expect, uint32_t rx) {
     fcp::FecstatPacket p = fcp::MakeFecstatPacket(kSalt);
@@ -1091,6 +1137,121 @@ void TestSendNonceExhaustionIsObservable() {
   CHECK_EQ(link.a_data, before + 1);  // exhausted: nothing leaves the session
 }
 
+// R3-1: a recorded handshake must not revive a session.
+//
+// Phase 1 records every datagram in both directions during a real handshake and
+// a few data segments. Phase 2 rebuilds the two sessions with the SAME PSK and
+// the SAME salt -- exactly the attacker's input, since the salt is on the wire
+// and the PSK is the shared secret he already needs -- and replays the
+// recording at them. Under the v6 derivation this re-established the session
+// and re-delivered every payload (same key, same IVs, fresh replay window).
+// The nonce pair is what makes the replay useless now: the server draws a new
+// nonce, so the recorded ciphertext no longer authenticates, and the recorded
+// ACK echoes a challenge the fresh client never issued.
+void TestReplayCannotReviveSession() {
+  std::vector<Bytes> a_to_b;
+  std::vector<Bytes> b_to_a;
+  std::vector<Bytes> delivered_b;
+  fcp::Session* pa = nullptr;
+  fcp::Session* pb = nullptr;
+
+  fcp::Session a(
+      MakeConfig(fcp::Direction::kC2S, fcp::Direction::kS2C),
+      [&](const uint8_t* w, size_t n, fcp::SymbolType) {
+        a_to_b.emplace_back(w, w + n);
+        if (pb != nullptr) {
+          pb->on_wire(w, n, 0);
+        }
+      },
+      [](const uint8_t*, size_t) {}, [](const std::string&) {});
+  fcp::Session b(
+      MakeConfig(fcp::Direction::kS2C, fcp::Direction::kC2S),
+      [&](const uint8_t* w, size_t n, fcp::SymbolType) {
+        b_to_a.emplace_back(w, w + n);
+        if (pa != nullptr) {
+          pa->on_wire(w, n, 0);
+        }
+      },
+      [&delivered_b](const uint8_t* p, size_t n) { delivered_b.emplace_back(p, p + n); },
+      [](const std::string&) {});
+  pa = &a;
+  pb = &b;
+
+  a.start(0);
+  b.start(0);
+  a.on_tick(0);
+  b.on_tick(0);
+  CHECK(a.established());
+  CHECK(b.established());
+
+  for (uint32_t sn = 0; sn < 8; ++sn) {
+    const Bytes seg = Segment(sn);
+    a.on_kcp_output(seg.data(), seg.size(), 0);
+  }
+  for (int64_t t = 25; t <= 400; t += fcp::kSessionTickMs) {
+    a.on_tick(t);
+    b.on_tick(t);
+  }
+  CHECK(!delivered_b.empty());   // the honest run delivers
+  CHECK(!a_to_b.empty());
+  CHECK(!b_to_a.empty());
+
+  // Phase 2: two fresh sessions, same PSK, same salt, replayed transcript.
+  std::vector<Bytes> delivered_b2;
+  std::vector<Bytes> delivered_a2;
+  fcp::Session a2(
+      MakeConfig(fcp::Direction::kC2S, fcp::Direction::kS2C),
+      [](const uint8_t*, size_t, fcp::SymbolType) {},
+      [&delivered_a2](const uint8_t* p, size_t n) { delivered_a2.emplace_back(p, p + n); },
+      [](const std::string&) {});
+  fcp::Session b2(
+      MakeConfig(fcp::Direction::kS2C, fcp::Direction::kC2S),
+      [](const uint8_t*, size_t, fcp::SymbolType) {},
+      [&delivered_b2](const uint8_t* p, size_t n) { delivered_b2.emplace_back(p, p + n); },
+      [](const std::string&) {});
+  a2.start(0);
+  b2.start(0);
+  a2.on_tick(0);
+  b2.on_tick(0);
+  for (const Bytes& w : a_to_b) {
+    b2.on_wire(w.data(), w.size(), 0);
+  }
+  for (const Bytes& w : b_to_a) {
+    a2.on_wire(w.data(), w.size(), 0);
+  }
+  for (int64_t t = 25; t <= 400; t += fcp::kSessionTickMs) {
+    a2.on_tick(t);
+    b2.on_tick(t);
+  }
+
+  // The recorded ACK answers a challenge this client never issued, so the echo
+  // check rejects it and the client never establishes.
+  CHECK(!a2.established());
+  CHECK(a2.nonce_mismatch() > 0);
+  // The recorded data was sealed under (salt, c_recorded, s_recorded); the
+  // fresh server drew a different nonce, so none of it authenticates.
+  CHECK(delivered_b2.empty());
+  CHECK(delivered_a2.empty());
+  CHECK(b2.auth_fail() > 0);
+  // The fresh server *does* complete V4 off the replayed HELLO — it is
+  // authentic for epoch 1 — but it draws its own nonce, so its v7 session key
+  // is not the recorded one and not one byte of recorded data authenticates.
+  // That is the whole point: re-keying is what kills the replay, and the echo
+  // check is what keeps the client from believing it.
+  CHECK(b2.established());
+
+  // Replaying the transcript a second time changes nothing.
+  for (const Bytes& w : a_to_b) {
+    b2.on_wire(w.data(), w.size(), 0);
+  }
+  for (int64_t t = 425; t <= 800; t += fcp::kSessionTickMs) {
+    a2.on_tick(t);
+    b2.on_tick(t);
+  }
+  CHECK(delivered_b2.empty());
+  CHECK(!a2.established());
+}
+
 int main() {
   TestFullLoop();
   TestHandshakeRidesOob();
@@ -1107,5 +1268,6 @@ int main() {
   TestSessionTable();
   TestLedgerLiftsKUnderBursts();
   TestSendNonceExhaustionIsObservable();
+  TestReplayCannotReviveSession();
   return fcp_test::finish();
 }

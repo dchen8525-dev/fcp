@@ -94,6 +94,33 @@ void derive_direction_keys(const uint8_t session_key[16],
   kdf_ctr_aes128(session_key, "fcp-s2", 6, key_s2c, 16);
 }
 
+// R3-1: see envelope.h. CBC-MAC over (salt || 0^8, client_nonce, server_nonce)
+// keyed by the PSK. Only the AES primitive is used -- no hash is pulled in, and
+// the chain is three fixed-size blocks so no padding rule exists to get wrong.
+void derive_session_key_v7(const uint8_t psk[16], const uint8_t salt[8],
+                           const uint8_t client_nonce[16],
+                           const uint8_t server_nonce[16], uint8_t out[16]) {
+  Aes128Key aes_key;
+  aes128_expand_key(psk, &aes_key);
+
+  uint8_t block[16];
+  static_assert(Envelope::kSaltLen == 8, "derive_session_key_v7 assumes 8B salt");
+  std::memcpy(block, salt, Envelope::kSaltLen);
+  std::memset(block + Envelope::kSaltLen, 0, 16 - Envelope::kSaltLen);
+  uint8_t chain[16];
+  aes128_encrypt_block(aes_key, block, chain);  // X0, == derive_session_key()
+
+  for (int i = 0; i < 16; ++i) {
+    block[i] = static_cast<uint8_t>(chain[i] ^ client_nonce[i]);
+  }
+  aes128_encrypt_block(aes_key, block, chain);  // X1
+
+  for (int i = 0; i < 16; ++i) {
+    block[i] = static_cast<uint8_t>(chain[i] ^ server_nonce[i]);
+  }
+  aes128_encrypt_block(aes_key, block, out);  // X2
+}
+
 Envelope::Envelope(const uint8_t key[16], const uint8_t salt[kSaltLen],
                    Direction send_direction, Direction recv_direction)
     : send_key_{},
@@ -109,12 +136,24 @@ Envelope::Envelope(const uint8_t key[16], const uint8_t salt[kSaltLen],
   // keys from it — same computation on both ends, zero wire change.
   uint8_t session_key[16];
   derive_session_key(key, salt, session_key);
+  install_keys(session_key);
+  std::memcpy(salt_, salt, kSaltLen);
+}
+
+void Envelope::install_keys(const uint8_t session_key[16]) {
   uint8_t key_c2s[16];
   uint8_t key_s2c[16];
   derive_direction_keys(session_key, key_c2s, key_s2c);
-  std::memcpy(send_key_, send_direction == Direction::kC2S ? key_c2s : key_s2c, 16);
-  std::memcpy(recv_key_, recv_direction == Direction::kC2S ? key_c2s : key_s2c, 16);
-  std::memcpy(salt_, salt, kSaltLen);
+  std::memcpy(send_key_, send_direction_ == Direction::kC2S ? key_c2s : key_s2c, 16);
+  std::memcpy(recv_key_, recv_direction_ == Direction::kC2S ? key_c2s : key_s2c, 16);
+  send_nonce_ = 0;
+  recv_has_nonce_ = false;
+  recv_highest_ = 0;
+  recv_seen_.reset();
+}
+
+void Envelope::rekey(const uint8_t session_key[16]) {
+  install_keys(session_key);
 }
 
 bool Envelope::seal(const uint8_t* plain, size_t len, std::vector<uint8_t>* wire) {

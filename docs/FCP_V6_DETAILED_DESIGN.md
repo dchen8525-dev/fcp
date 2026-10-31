@@ -121,6 +121,19 @@ direction: c2s = 0x01，s2c = 0x02（会话角色决定，不上线）
   （重连/多客户端共用配置）方向密钥相同、计数器都从 0 起 → GCM (key, IV) 跨会话重用
   （规格 §6.0）。修复零线上改动，两端各自本地计算；**已实现：`derive_session_key`（`envelope.cc`）+ 构造函数重接，T27
   （`envelope_test TestSessionKeyDerivation`）绿**。
+- **v7：`session_key` 再接双向 nonce（#31 / R3-1，已落地）**：上式只依赖 `(PSK, salt)`，
+  两者都在线上/配置里 → 录制握手重放即可复现同一把密钥。故 v7 改为三块定长 CBC-MAC：
+  ```text
+  X0          = AES128(PSK, salt(8) ‖ 0×8)     # 上式，v7 里只作握手信封键（bootstrap）
+  X1          = AES128(PSK, X0 ⊕ c_nonce(16))  # c_nonce = 客户端在 HELLO 里抽的
+  session_key = AES128(PSK, X1 ⊕ s_nonce(16))  # s_nonce = 服务端在 HELLO_ACK 里抽的
+  ```
+  `derive_session_key_v7()`，黄金向量在 `envelope_test TestV7KeyVector`。
+- **双信封（#31）**：`hs_env_`（键 = `X0`，只收发 HELLO/ACK，永不 rekey）与 `env_`
+  （`configure()` 时 `rekey(session_key)`，`send_nonce_`/重放窗口一并归零）。
+  `on_wire` **先 `env_.open` 再 `hs_env_.open`**；握手信封命中时只放行 `type=oob` 且载荷为
+  HELLO/HELLO_ACK 的报文，其余计 `struct_fail`。`hs_env_` 的发送计数器起点取 `random_u32()`
+  ——否则重放的 HELLO 会让同一 (key, IV) 封出第二条明文不同的 ACK（GCM 密钥流重用）。
 - **方向密钥（#26②，M1 强制）**：`derive_direction_keys(session_key)` 按 SP 800-108 计数器 KDF
   （AES-128 作 PRF，label `fcp-c2`/`fcp-s2`，恰 16 字节输入块）派生 `send_key_`/`recv_key_`；
   seal 用 send_key、open 用 recv_key。ikm = session_key（#28① 前 ikm 实为配置 PSK）。
@@ -498,16 +511,33 @@ k_for(loss):                                # 目标修复率 0.80（M3 可配�
 
 ---
 
-## 10. 握手（`fcp_handshake`）
+## 10. 握手（`fcp_handshake`，v7 线格式 V4）
 
 ```text
+线格式（#31）:
+  HELLO_V4     = "FCP_HELLO_V4\0\0\0\0"(16) || sender_nonce(16) || caps(4)         # 36B
+  HELLO_ACK_V4 = "FCP_HELLO_ACK_V4"(16)     || client_nonce(16) || server_nonce(16) || caps(4)  # 52B
+  角色: send_direction == c2s → kClient（抽 client_nonce），否则 kServer（抽 server_nonce）
+  nonce: 16B CSPRNG（src/fcp/random.h）；全零无效 → kBadNonce，握手直接失败
+
 状态: Idle → HelloSent → Established / Failed
 
+构造:           抽 local_nonce；random_bytes 失败或全零 → fail(kBadNonce)，start() 不再发包
 start():        schedule_hello(); state = HelloSent
 on_tick():      HelloSent 且 now ≥ next_retry:
-                  if retries ≥ 3: ERROR("V3 no ACK after 3 tries"); 断连
+                  if retries ≥ 3: ERROR("V4 no ACK after 3 tries"); 断连
                   else: oob.send(HELLO); retries += 1; next_retry = now + 300ms × 2^retries   # 退避：300/600/1200（#27①）
-on_oob(sym): 按 HELLO / HELLO_ACK 分派；重复 HELLO 重发 ACK（幂等协商；此前 ACK 可能已丢），重复 ACK 吞掉
+on_oob(sym):  HELLO:
+                 Idle/HelloSent 首次 → 学习 peer_nonce，回 ACK，establish
+                 之后 nonce 不同       → ++hello_refused，丢弃（不回 ACK；R3-24）
+                 Established 且 nonce 相同 → 重发 ACK（幂等）
+                 Established 且 nonce 不同 → ++hello_refused，状态不动（R3-24）
+              HELLO_ACK:
+                 own  = (role==kClient) ? c_nonce : s_nonce     # 本端贡献的那 16B
+                 peer = 另一端
+                 own != local_nonce → ++nonce_mismatch，丢弃（不 establish）  # R3-1 的唯一绑定
+                 否则建立 peer_nonce = peer，establish
+              其余重复 ACK 吞掉
 
 协商（两侧对称）:
   校验 caps: ver==1、data ≥ 1、parity ≤ 7、data + parity ≤ 256（u16 中间量！勘误 #7）、
@@ -518,6 +548,7 @@ on_oob(sym): 按 HELLO / HELLO_ACK 分派；重复 HELLO 重发 ACK（幂等协�
 
 Established 时动作:
   frame_tx.mss = payload_max − 24
+  derive_session_key_v7(psk, salt, c_nonce, s_nonce, k); env_.rekey(k)   # #31 数据面换键 + 计数归零
   勘误 #4：协商完成前只放行 oob（握手报文）；data 段缓存
   （上限默认 **512 段 / 512KB，经 `SessionConfig.handshake_cache_*` 可配置**，#28③/F2；超限或握手失败 → 丢弃并 ERROR，缓存随握手结果落盘或释放）
 ```
@@ -525,8 +556,11 @@ Established 时动作:
 - HELLO/ACK 经 oob 发送（#25）：每次发送（含重发）都是独立 oob 报文；重传由握手层定时器承担
   （`on_tick` **指数退避 300/600/1200ms**，#27①：握手阶段无 RTT 样本，固定 900ms 总预算在
   RTT > 450ms 链路上会"ACK 未到先判死"；Established 即停），无 KCP 残留重传窗口；独占段/内容分类断言删除。
+- **握手报文一律走握手信封（`hs_env_`，键 = `X0`）**，数据信封在 `configure()` 之后才换键（#31）；
+  因此重放的 HELLO 能建立会话，但派生键与服务端当次抽的 `s_nonce` 绑定，录制数据一律 `auth_fail`。
 - ~~在途消息登记~~（勘误 #9/#23①）：随 #25 oob 化**作废**——成帧层不再需要任何握手状态。
-- 双方同时发 HELLO：各自收到对端 HELLO 即回 ACK，协商一次；重复 HELLO 重发 ACK，重复 ACK 吞掉。
+- 双方同时发 HELLO：各自收到对端 HELLO 即回 ACK，协商一次；重复 HELLO（同一 nonce）重发 ACK，
+  不同 nonce 拒绝（R3-24），重复 ACK 吞掉。
   本端 HELLO 重传由握手定时器承担、Established 即停，不存在"Established 后的 KCP 残留重传"窗口。
 
 ---
@@ -534,13 +568,13 @@ Established 时动作:
 ## 11. 日志（规格 §10）
 
 ```text
-FCP v6 negotiated: data=10 parity=3 pmax=4 flags=framed,stats (peer V3)
+FCP v6 negotiated: data=10 parity=3 pmax=4 flags=framed,stats (peer V4)
 FECSTAT sets=1250 expect=10000 rx=9850 rec=60 late=40 lost=50 pre=15000ppm usable=9000ppm -> k=2 state=ON
 FEC off: pre<0.30% for 5 reports (last 0.20%)
 FEC pinned: k=2 (operator)
 FECSTAT dropped: reason=stale count=1
 FEC sample untrusted: k_unknown=40/300 (>10%)
-FEC handshake failed: V3 no ACK after 3 tries (peer=<addr>)
+FEC handshake failed: V4 no ACK after 3 tries (peer=<addr>)
 ```
 
 `lost = data_expected − data_rx_orig − data_recovered_dl − data_late_rx`（**完全未收到**的包数；
@@ -549,7 +583,7 @@ FEC handshake failed: V3 no ACK after 3 tries (peer=<addr>)
 
 ---
 
-## 12. 测试计划（对齐规格 §13 T1–T27）
+## 12. 测试计划（对齐规格 §13 T1–T28）
 
 | # | 用例 | 关键断言（新增/修订部分） |
 |---|---|---|
@@ -580,6 +614,7 @@ FEC handshake failed: V3 no ACK after 3 tries (peer=<addr>)
 | T25 | 终止线 + 方向密钥派生 | `nonce_ctr ≥ 2^32` 封包/收包双向拒绝（#26①）；`derive_direction_keys` 确定性、两方向互异、异于原始会话密钥（envelope_test TestDirectionKeyIsolation） |
 | T26 | 握手重传退避（#27①） | 重传间隔 300→600→1200ms 递增（`next_retry_ms` 序列）；ACK 在任意退避阶段到达即停；3 个 HELLO 后 ERROR；RTT=500ms 仿真握手成功（固定 900ms 预算下必失败）；重复 HELLO 仍重发 ACK（幂等不受退避影响）——已落地：`handshake_test TestRetryBackoff`/`TestTimeout`、adv R9.4、session `TestHandshakeTimeout` |
 | T27 | 会话密钥按会话派生（#28①） | 同 PSK 不同 salt → `session_key` 互异；同 PSK 同 salt → 两端派生逐字节一致；方向密钥从 session_key 派生；旧方案（密钥=PSK）手工报文拒收——已落地：`envelope_test TestSessionKeyDerivation`（TestRecvNonceLimit 同步） |
+| T28 | v7 密钥编排 + 握手 V4（#31 / R3-1 / R3-24） | ① v7 黄金向量（外部 openssl 独立算出，含 `(c,s)=(0,0)` 与交换 nonce 两个反例）；② `rekey` 后计数器与重放窗口归零、旧键报文拒收；③ 两端派生一致；④ ACK echo 不匹配 → 不建立且 `nonce_mismatch` 增长；⑤ 已建立会话收到不同 nonce 的 HELLO → 状态不动、`hello_refused` 增长；⑥ 全零 nonce → `kBadNonce`；⑦ 两次构造抽取的 nonce 不同（CSPRNG）；⑧ 线格式 36/52 字节 golden、`FCP_HELLO_V3` 不再识别；⑨ 录制整条 transcript 重放 → 客户端 `!established`、双向零交付、服务端 `auth_fail` 增长（变异验证：注掉 echo 校验即红）——已落地：`envelope_test TestV7KeyVector/TestRekey/TestRandomSource`、`handshake_test TestKeyAgreement/TestAckEchoMismatch/TestEstablishedRefusesNewHello/TestZeroNonceRejected/TestNonceIsRandom/TestWireGolden`、`session_test TestReplayCannotReviveSession` |
 
 T6/T17/T21/T22 是勘误的直接回归；golden 数据全部由参考实现生成后**冻结**进仓库。
 
@@ -604,5 +639,6 @@ T6/T17/T21/T22 是勘误的直接回归；golden 数据全部由参考实现生�
 | 13 | 2026-10-30 设计分叉（规格 #25） | control 走 KCP 需 TX 侧内容分类，是 #6/#13/第一轮 #8/#9/#22①/#23① 全部缺陷的根源；唯一收益（复用 KCP 重传）与握手层自带 3×300ms 定时器冗余；AEAD 保护不依赖 KCP | HELLO/ACK 改走 oob（type=2）：HELLO magic 补齐 16B（线上 16→20B、ACK 不变）、type=3 取消（未定义，收到按 struct_fail 丢弃）、删除内容分类/登记/注销机制、握手层自管重传；§2/§5.2/§6.2/§10/§12 同步 |
 | 14 | 2026-10-30 网络协议评审（规格 #27） | 握手固定 3×300ms：总预算 900ms，RTT > 450ms 链路（卫星/跨洲）会"ACK 未到先判死"——链路正常、握手失败；握手阶段无 RTT 样本，`max(3×srtt,…)` 不可用 | 重传间隔指数退避 300/600/1200ms（总等待 ~2.1s，覆盖 RTT ≤ ~700ms；§5.2/§10/§12 T26）；虚假重传由"重复 HELLO 必须重发 ACK"幂等兜底。`k_for` i.i.d. 假设、拥塞冗余正反馈、无 PMTU 发现三项边界入档规格 §14.10–14.12，设计不变 |
 | 15 | 2026-10-30 第二轮对抗复查（规格 #28） | P0：规格原文"salt 是 KDF 熵源"与实现不符——`derive_direction_keys` 只用配置 PSK，salt 未参与任何派生，同一 PSK 的两会话方向密钥相同、IV 从 0 重叠 → GCM (key, IV) 跨会话重用（多客户端共用 PSK 部署下可互相解密/伪造）；且重放窗口 256 槽覆盖数字算错（13–19 Mbps，非 25 Mbps） | §6.0 新增密钥来源与信任模型：`session_key = AES128(PSK, salt‖0×8)` 按会话派生（零线上改动，**实现待落地·任务 F1，T27 随之**）；§4.1 salt 职责与重放窗口覆盖更正；握手缓存溢出×退避、late_guard 上限口径、FECSTAT 无重传、短连接盲区四项入档规格 §14.13–14.16；**F2/F3 已落地**：缓存默认 512 段/512KB 可配置、FECSTAT 连发两份 + `kDuplicate`（`fecstat_dup` 计数） |
+| 16 | 2026-10-31 R3-1 关闭（规格 #31） | `session_key` 的函数定义域里没有新鲜量：只依赖 `(PSK, salt)`，两者都在线上/配置里。录一条完整握手重放给新会话，双方派生同一把密钥，而反重放窗口每会话新建 → 历史密文整段落回窗口内（重放/解密/注入）。salt 加宽、窗口收紧均无效 | ① 握手线格式 V4：HELLO 36B（+16B `sender_nonce`）、HELLO_ACK 52B（+16B×2 回显），magic V3→V4 硬断；② `session_key` 改三块定长 CBC-MAC `X0→⊕c→⊕s`，v6 值降级为握手信封键；③ 双信封（`hs_env_` 永不 rekey / `env_` 在 `configure()` rekey 并归零计数器与窗口），`on_wire` 先数据后握手；④ ACK echo 校验把 ACK 绑定到本端挑战；⑤ 已建立会话拒绝不同 nonce 的 HELLO（R3-24）；⑥ CSPRNG 落地 `src/fcp/random.cc`（`BCryptGenRandom`/`/dev/urandom`，核心库 nonce 与握手信封计数器起点只走这里）；⑦ 握手信封发送计数器起点每会话随机；⑧ 全零 nonce → `kBadNonce`。T28 覆盖，Debug/Release 27/27 |
 
 规格回改后，勘误表保留在本设计文档里作为决策记录；规格附录 C 以对应条目指向本表（#1–#8 → 附录 C #21，#9–#11 → 附录 C #22）。

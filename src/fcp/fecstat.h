@@ -14,6 +14,10 @@ namespace fcp {
 
 constexpr size_t kFecstatLen = 128;
 constexpr uint8_t kFecstatVersion = 6;
+// A report's key may lead the last accepted one by at most this many sets.
+// One interval cannot settle more groups than the active-set window even at
+// line rate; anything larger is a stale/forged neighbour, not progress.
+constexpr uint32_t kFecstatMaxForwardSets = 1u << 20;
 constexpr char kFecstatMagic[16] = "FCP_FECSTAT_V6";
 
 // flg bit3: the M3 ledger fields (ledger_groups/fail_ppm/meta) are valid.
@@ -131,9 +135,14 @@ class FecstatValidator {
   FecstatStatus validate(const uint8_t* in, size_t len, const uint8_t salt[8],
                          FecstatPacket* out);
 
+  // Reports rejected for jumping implausibly far ahead (kept apart from the
+  // stale counter so "behind" and "from the future" stay distinguishable).
+  uint32_t future_rejects() const { return future_rejects_; }
+
  private:
   bool have_last_ = false;
   uint32_t last_set_id_ = 0;
+  uint32_t future_rejects_ = 0;
 };
 
 }  // namespace fcp

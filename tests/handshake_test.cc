@@ -1,72 +1,125 @@
 #include "fcp/handshake.h"
 
+#include <cstring>
 #include <string>
 #include <vector>
 
+#include "fcp/envelope.h"
 #include "test_util.h"
 
 namespace {
 
 using Bytes = std::vector<uint8_t>;
+using fcp::HandshakeRole;
+using fcp::HandshakeStatus;
 
+Bytes Nonce(uint8_t fill) { return Bytes(fcp::kHandshakeNonceLen, fill); }
+
+Bytes MakeHello(const Bytes& sender_nonce, uint8_t ver = 1, uint8_t data = 10,
+                uint8_t parity = 3, uint8_t flags = 0x07) {
+  Bytes out(fcp::kHelloLen);
+  fcp::build_hello(fcp::HandshakeCaps{ver, data, parity, flags}, sender_nonce.data(),
+                   out.data());
+  return out;
+}
+
+Bytes MakeAck(const Bytes& c_nonce, const Bytes& s_nonce, uint8_t ver = 1,
+              uint8_t data = 10, uint8_t parity = 3, uint8_t flags = 0x07) {
+  Bytes out(fcp::kHelloAckLen);
+  fcp::build_hello_ack(fcp::HandshakeCaps{ver, data, parity, flags}, c_nonce.data(),
+                       s_nonce.data(), out.data());
+  return out;
+}
+
+// `nonce` must be declared before `hs`: the send callback captures `this`, and
+// hs's constructor is handed nonce.data().
 struct Peer {
   std::vector<Bytes> sent;
+  Bytes nonce;
   fcp::Handshake hs;
 
-  explicit Peer(uint8_t d, uint8_t p, uint8_t flags = fcp::kLocalFlagsM1)
-      : hs(d, p,
+  Peer(uint8_t d, uint8_t p, HandshakeRole role, uint8_t fill,
+       uint8_t flags = fcp::kLocalFlagsM1,
+       size_t segs = fcp::kHandshakeMaxCachedSegments,
+       size_t bytes = fcp::kHandshakeMaxCachedBytes)
+      : sent(),
+        nonce(Nonce(fill)),
+        hs(d, p,
            [this](const uint8_t* data, size_t len) {
              sent.emplace_back(data, data + len);
            },
-           flags) {}
+           role, nonce.data(), flags, segs, bytes) {}
 
-  fcp::HandshakeStatus deliver(const Bytes& msg) { return hs.on_oob(msg.data(), msg.size()); }
+  HandshakeStatus deliver(const Bytes& msg) { return hs.on_oob(msg.data(), msg.size()); }
+
+  bool is_client() const { return hs.role() == HandshakeRole::kClient; }
+
+  // HELLO carrying this peer's own draw.
+  Bytes hello(uint8_t ver = 1, uint8_t data = 10, uint8_t parity = 3,
+              uint8_t flags = 0x07) const {
+    return MakeHello(nonce, ver, data, parity, flags);
+  }
+
+  // The ACK this peer would send in answer to a peer that drew `peer_nonce`.
+  Bytes ack(const Bytes& peer_nonce, uint8_t ver = 1, uint8_t data = 10,
+            uint8_t parity = 3, uint8_t flags = 0x07) const {
+    const Bytes& c = is_client() ? nonce : peer_nonce;
+    const Bytes& s = is_client() ? peer_nonce : nonce;
+    return MakeAck(c, s, ver, data, parity, flags);
+  }
 };
 
-Bytes Hello(uint8_t ver, uint8_t data, uint8_t parity, uint8_t flags) {
-  Bytes out(fcp::kHelloLen);
-  fcp::build_hello(fcp::HandshakeCaps{ver, data, parity, flags}, out.data());
-  return out;
-}
-
-Bytes HelloAck(uint8_t ver, uint8_t data, uint8_t parity, uint8_t flags) {
-  Bytes out(fcp::kHelloAckLen);
-  fcp::build_hello_ack(fcp::HandshakeCaps{ver, data, parity, flags}, out.data());
-  return out;
-}
-
 void TestWireGolden() {
-  CHECK_EQ(fcp::kHelloLen, 20u);
-  CHECK_EQ(fcp::kHelloAckLen, 20u);
+  CHECK_EQ(fcp::kHelloLen, 36u);
+  CHECK_EQ(fcp::kHelloAckLen, 52u);
   CHECK_EQ(static_cast<int>(fcp::kLocalFlagsM1), 0x07);
 
-  const Bytes hello = Hello(1, 10, 3, 0x07);
-  // "FCP_HELLO_V3" + 4 NUL padding (16-byte oob magic, erratum #25) + caps.
+  // "FCP_HELLO_V4" + 4 NUL padding (16-byte oob magic, erratum #25) |
+  // sender nonce (16) | caps (4).
+  const Bytes hello = MakeHello(Nonce(0x11));
   CHECK_EQ(fcp_test::hex(hello.data(), hello.size()),
-           "4643505f48454c4c4f5f563300000000010a0307");
+           "4643505f48454c4c4f5f563400000000"
+           "11111111111111111111111111111111"
+           "010a0307");
 
-  const Bytes ack = HelloAck(1, 10, 3, 0x07);
+  // ... and the ACK repeats the client's draw before its own.
+  const Bytes ack = MakeAck(Nonce(0x11), Nonce(0x22));
   CHECK_EQ(fcp_test::hex(ack.data(), ack.size()),
-           "4643505f48454c4c4f5f41434b5f5633010a0307");
+           "4643505f48454c4c4f5f41434b5f5634"
+           "11111111111111111111111111111111"
+           "22222222222222222222222222222222"
+           "010a0307");
 
   CHECK(fcp::is_hello(hello.data(), hello.size()));
   CHECK(!fcp::is_hello_ack(hello.data(), hello.size()));
   CHECK(fcp::is_hello_ack(ack.data(), ack.size()));
   CHECK(!fcp::is_hello(ack.data(), ack.size()));
 
+  // The magic doubles as the handshake version: a v3 message is not a v4
+  // HELLO, so a replayed v3 handshake cannot be replayed into the old key
+  // schedule.
+  Bytes v3(20);
+  std::memcpy(v3.data(), "FCP_HELLO_V3\0\0\0\0", 16);
+  v3[16] = 1;
+  v3[17] = 10;
+  v3[18] = 3;
+  v3[19] = 0x07;
+  CHECK(!fcp::is_hello(v3.data(), v3.size()));
+
   CHECK(!fcp::is_hello(hello.data(), hello.size() - 1));
   CHECK(!fcp::is_hello_ack(ack.data(), ack.size() - 1));
+  CHECK(!fcp::is_hello(nullptr, hello.size()));
 
-  const Bytes junk(20, 0xAA);
-  Peer p(10, 3);
-  CHECK(p.deliver(junk) == fcp::HandshakeStatus::kNotHandshake);
-  CHECK(p.deliver(hello) == fcp::HandshakeStatus::kConsumed);
+  const Bytes junk(fcp::kHelloLen, 0xAA);
+  Peer p(10, 3, HandshakeRole::kServer, 0x22);
+  CHECK(p.deliver(junk) == HandshakeStatus::kNotHandshake);
+  CHECK(p.deliver(hello) == HandshakeStatus::kConsumed);
   CHECK(p.hs.established());
 }
 
 void TestMutualHandshake() {
-  Peer a(10, 3);
-  Peer b(10, 3);
+  Peer a(10, 3, HandshakeRole::kClient, 0x11);
+  Peer b(10, 3, HandshakeRole::kServer, 0x22);
   a.hs.start(0);
   b.hs.start(0);
   a.hs.on_tick(0);
@@ -76,7 +129,7 @@ void TestMutualHandshake() {
   CHECK(fcp::is_hello(a.sent[0].data(), a.sent[0].size()));
 
   // B sees A's HELLO: ACK + establish.
-  CHECK(b.deliver(a.sent[0]) == fcp::HandshakeStatus::kConsumed);
+  CHECK(b.deliver(a.sent[0]) == HandshakeStatus::kConsumed);
   CHECK(b.hs.established());
   CHECK_EQ(b.sent.size(), 2u);
   CHECK(fcp::is_hello_ack(b.sent[1].data(), b.sent[1].size()));
@@ -84,17 +137,24 @@ void TestMutualHandshake() {
   CHECK_EQ(b.hs.params().p, 3);
   CHECK(b.hs.params().mode == fcp::SessionMode::kFramedRepair);
 
-  // A sees B's HELLO (simultaneous open): ACK + establish.
-  CHECK(a.deliver(b.sent[0]) == fcp::HandshakeStatus::kConsumed);
+  // A sees B's HELLO (simultaneous open): it now knows both draws and
+  // establishes, then ACKs with the pair it already has.
+  CHECK(a.deliver(b.sent[0]) == HandshakeStatus::kConsumed);
   CHECK(a.hs.established());
   CHECK_EQ(a.sent.size(), 2u);
   CHECK(fcp::is_hello_ack(a.sent[1].data(), a.sent[1].size()));
 
   // Crossed ACKs are duplicates.
-  CHECK(a.deliver(b.sent[1]) == fcp::HandshakeStatus::kConsumed);
-  CHECK(b.deliver(a.sent[1]) == fcp::HandshakeStatus::kConsumed);
+  CHECK(a.deliver(b.sent[1]) == HandshakeStatus::kConsumed);
+  CHECK(b.deliver(a.sent[1]) == HandshakeStatus::kConsumed);
   CHECK(a.hs.established());
   CHECK(b.hs.established());
+  CHECK_EQ(a.hs.hello_refused(), 0u);
+  CHECK_EQ(b.hs.hello_refused(), 0u);
+
+  // Both ends agree on the nonce pair even though the exchange crossed.
+  CHECK(std::memcmp(a.hs.client_nonce(), b.hs.client_nonce(), 16) == 0);
+  CHECK(std::memcmp(a.hs.server_nonce(), b.hs.server_nonce(), 16) == 0);
 
   // No retries after establishment.
   a.hs.on_tick(10000);
@@ -102,36 +162,134 @@ void TestMutualHandshake() {
   CHECK(a.hs.error() == fcp::HandshakeError::kNone);
 }
 
+// The whole point of the nonces: the two ends must derive the same key even
+// when neither ACK is needed to complete the exchange.
+void TestKeyAgreement() {
+  const uint8_t psk[16] = {0x0F, 0x1E, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78,
+                           0x87, 0x96, 0xA5, 0xB4, 0xC3, 0xD2, 0xE1, 0xF0};
+  const uint8_t salt[8] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88};
+
+  Peer a(10, 3, HandshakeRole::kClient, 0x11);
+  Peer b(10, 3, HandshakeRole::kServer, 0x22);
+  a.hs.start(0);
+  b.hs.start(0);
+  a.hs.on_tick(0);
+  b.hs.on_tick(0);
+  CHECK(b.deliver(a.sent[0]) == HandshakeStatus::kConsumed);
+  CHECK(a.deliver(b.sent[0]) == HandshakeStatus::kConsumed);
+  CHECK(a.hs.established());
+  CHECK(b.hs.established());
+
+  uint8_t key_a[16];
+  uint8_t key_b[16];
+  fcp::derive_session_key_v7(psk, salt, a.hs.client_nonce(), a.hs.server_nonce(),
+                             key_a);
+  fcp::derive_session_key_v7(psk, salt, b.hs.client_nonce(), b.hs.server_nonce(),
+                             key_b);
+  CHECK(std::memcmp(key_a, key_b, 16) == 0);
+}
+
+// R3-1: an ACK that does not echo our own draw belongs to someone else's
+// handshake (typically a recording). It must not establish anything.
+void TestAckEchoMismatch() {
+  Peer p(10, 3, HandshakeRole::kClient, 0x11);
+  p.hs.start(0);
+  p.hs.on_tick(0);
+  const Bytes stale_s = Nonce(0x33);
+
+  // Echoes a challenge we never issued.
+  CHECK(p.deliver(MakeAck(Nonce(0x99), stale_s)) == HandshakeStatus::kConsumed);
+  CHECK(!p.hs.established());
+  CHECK_EQ(p.hs.nonce_mismatch(), 1u);
+  CHECK(p.hs.state() == fcp::HandshakeState::kHelloSent);
+
+  // The real ACK (echoing our draw) still completes the handshake.
+  CHECK(p.deliver(MakeAck(p.nonce, stale_s)) == HandshakeStatus::kConsumed);
+  CHECK(p.hs.established());
+  CHECK_EQ(p.hs.nonce_mismatch(), 1u);
+}
+
+// R3-24: an established session must not be restarted by a HELLO carrying a
+// different draw -- that is what a replayed recording looks like.
+void TestEstablishedRefusesNewHello() {
+  Peer p(10, 3, HandshakeRole::kServer, 0x22);
+  CHECK(p.deliver(MakeHello(Nonce(0x11))) == HandshakeStatus::kConsumed);
+  CHECK(p.hs.established());
+  CHECK_EQ(p.sent.size(), 1u);
+  const fcp::NegotiatedParams params = p.hs.params();
+
+  // A different draw: refused, state untouched, no ACK (an ACK would carry the
+  // new pair and desync the live peer).
+  CHECK(p.deliver(MakeHello(Nonce(0x44))) == HandshakeStatus::kConsumed);
+  CHECK(p.hs.established());
+  CHECK_EQ(p.hs.hello_refused(), 1u);
+  CHECK_EQ(p.sent.size(), 1u);
+  CHECK_EQ(p.hs.params().d, params.d);
+  CHECK_EQ(p.hs.params().p, params.p);
+
+  // The same draw is a duplicate whose ACK was lost: re-ACK, unchanged.
+  CHECK(p.deliver(MakeHello(Nonce(0x11))) == HandshakeStatus::kConsumed);
+  CHECK_EQ(p.sent.size(), 2u);
+  CHECK(p.hs.established());
+  CHECK_EQ(p.hs.hello_refused(), 1u);
+  CHECK(std::memcmp(p.hs.peer_nonce(), Nonce(0x11).data(), 16) == 0);
+}
+
+// A draw of all zeros carries no freshness; accepting it would let a forgery
+// claim the same "challenge" without guessing anything.
+void TestZeroNonceRejected() {
+  const uint8_t zero[16] = {};
+  fcp::Handshake hs(10, 3, nullptr, HandshakeRole::kClient, zero);
+  CHECK(hs.state() == fcp::HandshakeState::kFailed);
+  CHECK(hs.error() == fcp::HandshakeError::kBadNonce);
+  hs.start(0);
+  hs.on_tick(0);
+  CHECK(hs.state() == fcp::HandshakeState::kFailed);
+
+  Peer p(10, 3, HandshakeRole::kServer, 0x22);
+  CHECK(p.deliver(MakeHello(Nonce(0))) == HandshakeStatus::kProtocolFailure);
+  CHECK(p.hs.state() == fcp::HandshakeState::kFailed);
+  CHECK(p.hs.error() == fcp::HandshakeError::kBadNonce);
+  CHECK_EQ(p.sent.size(), 0u);  // never ACK an unusable HELLO
+
+  // Same on the ACK path: a zero server draw is unusable.
+  Peer q(10, 3, HandshakeRole::kClient, 0x11);
+  q.hs.start(0);
+  q.hs.on_tick(0);
+  CHECK(q.deliver(MakeAck(q.nonce, Nonce(0))) == HandshakeStatus::kProtocolFailure);
+  CHECK(q.hs.error() == fcp::HandshakeError::kBadNonce);
+}
+
 void TestCapsNegotiation() {
   // min(D), min(P), AND(flags); bit3 is dropped because M1 does not set it.
-  Peer a(10, 4, 0x0F);
-  Peer b(8, 2, 0x03);
+  Peer a(10, 4, HandshakeRole::kClient, 0x11, 0x0F);
+  Peer b(8, 2, HandshakeRole::kServer, 0x22, 0x03);
   a.hs.start(0);
   a.hs.on_tick(0);
   b.hs.start(0);
   b.hs.on_tick(0);
-  CHECK(b.deliver(a.sent[0]) == fcp::HandshakeStatus::kConsumed);
+  CHECK(b.deliver(a.sent[0]) == HandshakeStatus::kConsumed);
   CHECK_EQ(b.hs.params().d, 8);
   CHECK_EQ(b.hs.params().p, 2);
   CHECK_EQ(static_cast<int>(b.hs.params().flags), 0x03);
   CHECK(b.hs.params().mode == fcp::SessionMode::kFramedRepair);
 
-  Peer c(10, 3);
+  Peer c(10, 3, HandshakeRole::kClient, 0x33);
   c.hs.start(0);
   c.hs.on_tick(0);
-  CHECK(c.deliver(b.sent[0]) == fcp::HandshakeStatus::kConsumed);
+  CHECK(c.deliver(b.sent[0]) == HandshakeStatus::kConsumed);
   CHECK_EQ(c.hs.params().d, 8);
   CHECK_EQ(c.hs.params().p, 2);
 }
 
 void TestStatsMode() {
-  Peer a(10, 3);
-  Peer b(10, 0);
+  Peer a(10, 3, HandshakeRole::kClient, 0x11);
+  Peer b(10, 0, HandshakeRole::kServer, 0x22);
   a.hs.start(0);
   b.hs.start(0);
   a.hs.on_tick(0);
   b.hs.on_tick(0);
-  CHECK(a.deliver(b.sent[0]) == fcp::HandshakeStatus::kConsumed);
+  CHECK(a.deliver(b.sent[0]) == HandshakeStatus::kConsumed);
   CHECK(a.hs.established());
   CHECK_EQ(a.hs.params().p, 0);
   CHECK(a.hs.params().mode == fcp::SessionMode::kFramedStats);
@@ -153,52 +311,55 @@ void TestInvalidCaps() {
       {1, 10, 3, 0x87},   // reserved high bit
   };
   for (const Case& c : kCases) {
-    Peer p(10, 3);
+    Peer p(10, 3, HandshakeRole::kServer, 0x22);
     p.hs.start(0);
     p.hs.on_tick(0);
     const size_t before = p.sent.size();
-    CHECK(p.deliver(Hello(c.ver, c.data, c.parity, c.flags)) ==
-          fcp::HandshakeStatus::kProtocolFailure);
+    CHECK(p.deliver(MakeHello(Nonce(0x11), c.ver, c.data, c.parity, c.flags)) ==
+          HandshakeStatus::kProtocolFailure);
     CHECK(p.hs.state() == fcp::HandshakeState::kFailed);
     CHECK(p.hs.error() == fcp::HandshakeError::kBadCaps);
     CHECK_EQ(p.sent.size(), before);  // never ACK an invalid HELLO
   }
 
   // Bad caps also fail through the ACK path.
-  Peer p(10, 3);
+  Peer p(10, 3, HandshakeRole::kClient, 0x11);
   p.hs.start(0);
   p.hs.on_tick(0);
-  CHECK(p.deliver(HelloAck(1, 0, 3, 0x07)) == fcp::HandshakeStatus::kProtocolFailure);
+  CHECK(p.deliver(MakeAck(p.nonce, Nonce(0x22), 1, 0, 3, 0x07)) ==
+        HandshakeStatus::kProtocolFailure);
   CHECK(p.hs.error() == fcp::HandshakeError::kBadCaps);
 
   // Boundary: D + P == 256 is legal.
-  Peer q(10, 3);
+  Peer q(10, 3, HandshakeRole::kServer, 0x22);
   q.hs.start(0);
   q.hs.on_tick(0);
-  CHECK(q.deliver(Hello(1, 249, 7, 0x07)) == fcp::HandshakeStatus::kConsumed);
+  CHECK(q.deliver(MakeHello(Nonce(0x11), 1, 249, 7, 0x07)) == HandshakeStatus::kConsumed);
   CHECK(q.hs.established());
   CHECK_EQ(q.hs.params().d, 10);
   CHECK_EQ(q.hs.params().p, 3);
 }
 
 void TestMissingCapability() {
-  Peer p(10, 3);
+  Peer p(10, 3, HandshakeRole::kServer, 0x22);
   p.hs.start(0);
   p.hs.on_tick(0);
   const size_t before = p.sent.size();
-  CHECK(p.deliver(Hello(1, 10, 3, 0x06)) == fcp::HandshakeStatus::kProtocolFailure);  // no framing
+  CHECK(p.deliver(MakeHello(Nonce(0x11), 1, 10, 3, 0x06)) ==
+        HandshakeStatus::kProtocolFailure);  // no framing
   CHECK(p.hs.error() == fcp::HandshakeError::kMissingCapability);
   CHECK_EQ(p.sent.size(), before);
 
-  Peer q(10, 3);
+  Peer q(10, 3, HandshakeRole::kServer, 0x22);
   q.hs.start(0);
   q.hs.on_tick(0);
-  CHECK(q.deliver(Hello(1, 10, 3, 0x05)) == fcp::HandshakeStatus::kProtocolFailure);  // no FECSTAT
+  CHECK(q.deliver(MakeHello(Nonce(0x11), 1, 10, 3, 0x05)) ==
+        HandshakeStatus::kProtocolFailure);  // no FECSTAT
   CHECK(q.hs.error() == fcp::HandshakeError::kMissingCapability);
 }
 
 void TestTimeout() {
-  Peer p(10, 3);
+  Peer p(10, 3, HandshakeRole::kClient, 0x11);
   p.hs.start(0);
   CHECK_EQ(p.hs.retries(), 0);
   p.hs.on_tick(0);
@@ -222,7 +383,7 @@ void TestTimeout() {
   CHECK(p.hs.state() == fcp::HandshakeState::kFailed);
   CHECK(p.hs.error() == fcp::HandshakeError::kNoAck);
   CHECK_EQ(p.sent.size(), 3u);
-  CHECK(std::string(fcp::handshake_error_text(p.hs.error())) == "V3 no ACK after 3 tries");
+  CHECK(std::string(fcp::handshake_error_text(p.hs.error())) == "V4 no ACK after 3 tries");
 
   // A late tick after failure stays quiet.
   p.hs.on_tick(5000);
@@ -235,7 +396,7 @@ void TestTimeout() {
 void TestRetryBackoff() {
   // Gap sequence: 300 after the first send, then 600, then failure check 1200
   // after the third send (no 4th HELLO).
-  Peer p(10, 3);
+  Peer p(10, 3, HandshakeRole::kClient, 0x11);
   p.hs.start(0);
   p.hs.on_tick(0);
   CHECK_EQ(p.hs.retries(), 1);
@@ -249,7 +410,8 @@ void TestRetryBackoff() {
   CHECK_EQ(p.sent.size(), 3u);
 
   // An ACK arriving during any backoff stage stops the timer permanently.
-  CHECK(p.deliver(HelloAck(1, 10, 3, 0x07)) == fcp::HandshakeStatus::kConsumed);
+  const Bytes server_draw = Nonce(0x33);
+  CHECK(p.deliver(MakeAck(p.nonce, server_draw)) == HandshakeStatus::kConsumed);
   CHECK(p.hs.established());
   p.hs.on_tick(2100);
   p.hs.on_tick(100000);
@@ -258,29 +420,30 @@ void TestRetryBackoff() {
   // RTT=500ms link, first two HELLOs lost: sends at 0 (lost) and 300 (lost);
   // the third send at 900 gets its ACK at 1400 — established, no failure.
   // The old fixed budget declared failure at 900ms before the ACK arrived.
-  Peer q(10, 3);
+  Peer q(10, 3, HandshakeRole::kClient, 0x44);
   q.hs.start(0);
   q.hs.on_tick(0);    // lost
   q.hs.on_tick(300);  // lost
   q.hs.on_tick(900);  // delivered; ACK arrives at 1400
-  CHECK(q.deliver(HelloAck(1, 10, 3, 0x07)) == fcp::HandshakeStatus::kConsumed);
+  CHECK(q.deliver(MakeAck(q.nonce, server_draw)) == HandshakeStatus::kConsumed);
   CHECK(q.hs.established());
   q.hs.on_tick(2100);
   q.hs.on_tick(100000);
   CHECK_EQ(q.sent.size(), 3u);
 
-  // Duplicate HELLO handling is unaffected by the backoff: still re-ACKed.
-  CHECK(p.deliver(Hello(1, 10, 3, 0x07)) == fcp::HandshakeStatus::kConsumed);
+  // Duplicate HELLO handling is unaffected by the backoff: the same draw is
+  // re-ACKed (the peer may still be retrying because our ACK was lost).
+  CHECK(p.deliver(MakeHello(server_draw)) == HandshakeStatus::kConsumed);
   CHECK_EQ(p.sent.size(), 4u);
   CHECK(fcp::is_hello_ack(p.sent.back().data(), p.sent.back().size()));
 }
 
 void TestAckStopsRetries() {
-  Peer p(10, 3);
+  Peer p(10, 3, HandshakeRole::kClient, 0x11);
   p.hs.start(0);
   p.hs.on_tick(0);
   CHECK_EQ(p.sent.size(), 1u);
-  CHECK(p.deliver(HelloAck(1, 10, 3, 0x07)) == fcp::HandshakeStatus::kConsumed);
+  CHECK(p.deliver(MakeAck(p.nonce, Nonce(0x22))) == HandshakeStatus::kConsumed);
   CHECK(p.hs.established());
   p.hs.on_tick(600);
   p.hs.on_tick(10000);
@@ -289,33 +452,33 @@ void TestAckStopsRetries() {
 }
 
 void TestIdempotent() {
-  Peer p(10, 3);
-  const Bytes hello = Hello(1, 10, 3, 0x07);
-  CHECK(p.deliver(hello) == fcp::HandshakeStatus::kConsumed);
+  Peer p(10, 3, HandshakeRole::kServer, 0x22);
+  const Bytes hello = MakeHello(Nonce(0x11));
+  CHECK(p.deliver(hello) == HandshakeStatus::kConsumed);
   CHECK(p.hs.established());
   CHECK_EQ(p.sent.size(), 1u);  // one ACK
   const auto params = p.hs.params();
 
   // Duplicate HELLO: no renegotiation, but the ACK is resent.
-  CHECK(p.deliver(hello) == fcp::HandshakeStatus::kConsumed);
+  CHECK(p.deliver(hello) == HandshakeStatus::kConsumed);
   CHECK_EQ(p.sent.size(), 2u);
   CHECK_EQ(p.hs.params().d, params.d);
   CHECK_EQ(p.hs.params().p, params.p);
 
   // Duplicate ACK: swallowed.
-  const Bytes ack = HelloAck(1, 10, 3, 0x07);
-  CHECK(p.deliver(ack) == fcp::HandshakeStatus::kConsumed);
+  const Bytes ack = MakeAck(Nonce(0x11), Nonce(0x22));
+  CHECK(p.deliver(ack) == HandshakeStatus::kConsumed);
   CHECK_EQ(p.sent.size(), 2u);
 
   // A stray ACK before start() does not establish anything.
-  Peer q(10, 3);
-  CHECK(q.deliver(ack) == fcp::HandshakeStatus::kConsumed);
+  Peer q(10, 3, HandshakeRole::kClient, 0x33);
+  CHECK(q.deliver(ack) == HandshakeStatus::kConsumed);
   CHECK(q.hs.state() == fcp::HandshakeState::kIdle);
   CHECK_EQ(q.sent.size(), 0u);
 }
 
 void TestDataCache() {
-  Peer p(10, 3);
+  Peer p(10, 3, HandshakeRole::kServer, 0x22);
   p.hs.start(0);
   CHECK(p.hs.buffering_data());
   CHECK(p.hs.cache_data(Bytes{'a'}));
@@ -325,7 +488,7 @@ void TestDataCache() {
   CHECK_EQ(p.hs.cached_bytes(), 6u);
   CHECK(p.hs.take_cached_data().empty());  // not established yet
 
-  CHECK(p.deliver(Hello(1, 10, 3, 0x07)) == fcp::HandshakeStatus::kConsumed);
+  CHECK(p.deliver(MakeHello(Nonce(0x11))) == HandshakeStatus::kConsumed);
   CHECK(p.hs.established());
   CHECK(!p.hs.buffering_data());
   auto drained = p.hs.take_cached_data();
@@ -344,8 +507,10 @@ void TestDataCache() {
 void TestCacheLimits() {
   // #28③ (F2): limits are per-handshake configurable; small explicit values
   // pin the boundary semantics.
+  const uint8_t nonce[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
   {
-    fcp::Handshake p(10, 3, nullptr, fcp::kLocalFlagsM1, 4, 16);
+    fcp::Handshake p(10, 3, nullptr, HandshakeRole::kClient, nonce, fcp::kLocalFlagsM1,
+                     4, 16);
     p.start(0);
     for (size_t i = 0; i < 4; ++i) {
       CHECK(p.cache_data(Bytes(1, static_cast<uint8_t>(i))));
@@ -357,21 +522,23 @@ void TestCacheLimits() {
     CHECK_EQ(p.cached_segments(), 0u);  // dropped on failure
   }
   {
-    fcp::Handshake q(10, 3, nullptr, fcp::kLocalFlagsM1, 4, 16);
+    fcp::Handshake q(10, 3, nullptr, HandshakeRole::kClient, nonce, fcp::kLocalFlagsM1,
+                     4, 16);
     q.start(0);
     CHECK(q.cache_data(Bytes(16, 0x11)));  // byte cap, exactly
     CHECK(!q.cache_data(Bytes(1, 0x22)));
     CHECK(q.error() == fcp::HandshakeError::kCacheOverflow);
 
     // A single oversize segment fails immediately.
-    fcp::Handshake r(10, 3, nullptr, fcp::kLocalFlagsM1, 4, 16);
+    fcp::Handshake r(10, 3, nullptr, HandshakeRole::kClient, nonce, fcp::kLocalFlagsM1,
+                     4, 16);
     r.start(0);
     CHECK(!r.cache_data(Bytes(17, 0x33)));
     CHECK(r.error() == fcp::HandshakeError::kCacheOverflow);
   }
   {
     // Default limits (512 segs / 512 KiB, #28③ F2): 512 x 1 KiB fits exactly.
-    fcp::Handshake d(10, 3, nullptr);
+    fcp::Handshake d(10, 3, nullptr, HandshakeRole::kClient, nonce);
     d.start(0);
     for (size_t i = 0; i < fcp::kHandshakeMaxCachedSegments; ++i) {
       CHECK(d.cache_data(Bytes(1024, 0)));
@@ -382,7 +549,7 @@ void TestCacheLimits() {
   }
 
   // A failed handshake drops whatever was buffered.
-  Peer s(10, 3);
+  Peer s(10, 3, HandshakeRole::kClient, 0x55);
   s.hs.start(0);
   CHECK(s.hs.cache_data(Bytes(10, 0x44)));
   s.hs.on_tick(0);
@@ -394,11 +561,31 @@ void TestCacheLimits() {
   CHECK(s.hs.take_cached_data().empty());
 }
 
+// The default (nullptr) nonce comes from the OS CSPRNG: two handshakes must not
+// share a draw, or two sessions under one PSK would collide on the key.
+void TestNonceIsRandom() {
+  fcp::Handshake a(10, 3, nullptr, HandshakeRole::kClient);
+  fcp::Handshake b(10, 3, nullptr, HandshakeRole::kClient);
+  CHECK(a.state() == fcp::HandshakeState::kIdle);
+  CHECK(b.state() == fcp::HandshakeState::kIdle);
+  CHECK(std::memcmp(a.local_nonce(), b.local_nonce(), 16) != 0);
+
+  uint8_t acc = 0;
+  for (size_t i = 0; i < 16; ++i) {
+    acc |= a.local_nonce()[i];
+  }
+  CHECK(acc != 0);
+}
+
 }  // namespace
 
 int main() {
   TestWireGolden();
   TestMutualHandshake();
+  TestKeyAgreement();
+  TestAckEchoMismatch();
+  TestEstablishedRefusesNewHello();
+  TestZeroNonceRejected();
   TestCapsNegotiation();
   TestStatsMode();
   TestInvalidCaps();
@@ -409,5 +596,6 @@ int main() {
   TestIdempotent();
   TestDataCache();
   TestCacheLimits();
+  TestNonceIsRandom();
   return fcp_test::finish();
 }

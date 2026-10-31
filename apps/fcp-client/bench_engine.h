@@ -41,7 +41,6 @@ class BenchEngine : public QObject {
     QString host;
     quint16 port = 40000;
     QByteArray key;   // 16 bytes
-    QByteArray salt;  // 8 bytes
     double mbps = 20.0;
     int seg = 1200;   // must match the server's --seg (default 1200)
     int mtu = 1400;
@@ -138,6 +137,10 @@ class BenchEngine : public QObject {
   bool met_ = false;
   int meet_sent_ = 0;
   qint64 next_magic_ms_ = 0;
+  // A2: one random salt per run, announced in the rendezvous datagram so the
+  // server can derive the same session keys.
+  quint8 session_salt_[8] = {};
+  quint64 run_gen_ = 0;  // P4-4: only the newest start() owns DNS results
 
   double tokens_ = 0.0;
   qint64 token_ms_ = 0;

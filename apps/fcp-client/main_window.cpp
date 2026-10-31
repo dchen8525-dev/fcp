@@ -17,6 +17,7 @@
 #include <QPainter>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QRandomGenerator>
 #include <QRegularExpression>
 #include <QResizeEvent>
 #include <QSettings>
@@ -56,6 +57,18 @@ QString humanBytes(quint64 bytes) {
     return QString("%1 MB").arg(mb, 0, 'f', 1);
   }
   return QString("%1 GB").arg(mb / 1024.0, 0, 'f', 2);
+}
+
+// A3: no shipped PSK. Every launch starts from a CSPRNG key so that copying
+// the repository never yields a key that decrypts anyone's tunnels. The key is
+// deliberately not persisted: QSettings is a plaintext store, and this form is
+// the one place the user can still type a key shared with the peer.
+QString randomHex(int bytes) {
+  QByteArray raw(bytes, 0);
+  for (int i = 0; i < bytes; ++i) {
+    raw[i] = static_cast<char>(QRandomGenerator::system()->generate() & 0xFF);
+  }
+  return QString::fromLatin1(raw.toHex());
 }
 
 class Logo : public QWidget {
@@ -169,7 +182,22 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
   appendLog("就绪：服务端运行 fcp_bench server 后点击「开始测试」");
 }
 
-MainWindow::~MainWindow() = default;
+MainWindow::~MainWindow() {
+  // P4' N2: closing the window used to destroy the widgets first and the
+  // ProxyHost last; ~ProxyHost calls stop(), which emits statsUpdated/finished
+  // synchronously and reached slots that dereference the already-deleted
+  // engine_, logView_ and buttons. Stop both hosts while the UI is still
+  // alive, and mute their signals: nothing on screen needs the teardown
+  // events of a window that is going away.
+  if (engine_ != nullptr) {
+    engine_->blockSignals(true);
+    engine_->stop();
+  }
+  if (proxy_ != nullptr) {
+    proxy_->blockSignals(true);
+    proxy_->stop();
+  }
+}
 
 QWidget* MainWindow::buildTitleBar() {
   auto* bar = new TitleBar(this);
@@ -476,11 +504,11 @@ QWidget* MainWindow::buildSettings() {
   pskEdit_ = new QLineEdit(page);
   pskEdit_->setObjectName("monoInput");
   pskEdit_->setMaxLength(32);
+  // P2' N10: the PSK is a secret; never render it in clear text (shoulder
+  // surfing, screen recording, remote support sessions).
+  pskEdit_->setEchoMode(QLineEdit::Password);
   pskEdit_->setPlaceholderText("32 位十六进制（16 字节 PSK）");
-  saltEdit_ = new QLineEdit(page);
-  saltEdit_->setObjectName("monoInput");
-  saltEdit_->setMaxLength(16);
-  saltEdit_->setPlaceholderText("16 位十六进制（8 字节 salt）");
+  pskEdit_->setToolTip("须与服务端一致；每次启动随机生成，不写入配置文件");
   segSpin_ = new QSpinBox(page);
   segSpin_->setRange(64, 1200);
   segSpin_->setValue(1200);
@@ -514,9 +542,8 @@ QWidget* MainWindow::buildSettings() {
   grid->addWidget(makeField("目标上行速率", mbpsSpin_), 1, 0);
   grid->addWidget(makeField("分段大小", segSpin_), 1, 1);
   grid->addWidget(makeField("PSK", pskEdit_), 2, 0);
-  grid->addWidget(makeField("Salt", saltEdit_), 2, 1);
-  grid->addWidget(makeField("MTU", mtuSpin_), 3, 0);
-  grid->addWidget(makeField("FEC 模式", fecRow), 3, 1);
+  grid->addWidget(makeField("MTU", mtuSpin_), 2, 1);
+  grid->addWidget(makeField("FEC 模式", fecRow), 3, 0);
   grid->setColumnStretch(0, 1);
   grid->setColumnStretch(1, 1);
   layout->addLayout(grid);
@@ -577,6 +604,7 @@ QWidget* MainWindow::buildProxy() {
   proxyPskEdit_ = new QLineEdit(page);
   proxyPskEdit_->setObjectName("monoInput");
   proxyPskEdit_->setMaxLength(32);
+  proxyPskEdit_->setEchoMode(QLineEdit::Password);
   proxyPskEdit_->setPlaceholderText("32 位十六进制（16 字节 PSK）");
   proxyListenSpin_ = new QSpinBox(page);
   proxyListenSpin_->setRange(1, 65535);
@@ -839,12 +867,16 @@ QWidget* MainWindow::buildLogs() {
 
 void MainWindow::loadSettings() {
   QSettings settings;
+  // A3: the old factory default was the public FIPS-197 test key, and old
+  // builds persisted PSKs in plaintext settings. Drop both: generate a fresh
+  // key for this launch and never write it back.
+  settings.remove("crypto/psk");
+  settings.remove("crypto/salt");
+  settings.remove("proxy/psk");
   hostEdit_->setText(settings.value("server/host").toString());
   portSpin_->setValue(settings.value("server/port", 40000).toInt());
   mbpsSpin_->setValue(settings.value("test/mbps", 20.0).toDouble());
-  pskEdit_->setText(
-      settings.value("crypto/psk", "2B7E151628AED2A6ABF7158809CF4F3C").toString());
-  saltEdit_->setText(settings.value("crypto/salt", "A1B2C3D4E5F60718").toString());
+  pskEdit_->setText(randomHex(16));
   segSpin_->setValue(settings.value("test/seg", 1200).toInt());
   mtuSpin_->setValue(settings.value("test/mtu", 1400).toInt());
   fecMode_->setCurrentIndex(settings.value("test/fec_mode", 0).toInt());
@@ -853,8 +885,8 @@ void MainWindow::loadSettings() {
   repeatCheck_->setChecked(settings.value("test/repeat", false).toBool());
   proxyHostEdit_->setText(settings.value("proxy/host").toString());
   proxyPortSpin_->setValue(settings.value("proxy/port", 40000).toInt());
-  proxyPskEdit_->setText(
-      settings.value("proxy/psk", "2B7E151628AED2A6ABF7158809CF4F3C").toString());
+  proxyPskEdit_->setText(randomHex(16));
+  proxyPskEdit_->setToolTip("须与服务端 --key 一致；每次启动随机生成，不写入配置文件");
   proxyListenSpin_->setValue(settings.value("proxy/listen_port", 1080).toInt());
   proxyMtuSpin_->setValue(settings.value("proxy/mtu", 1400).toInt());
   proxyKSpin_->setValue(settings.value("proxy/pinned_k", -1).toInt());
@@ -868,8 +900,6 @@ void MainWindow::saveSettings() {
   settings.setValue("server/host", hostEdit_->text().trimmed());
   settings.setValue("server/port", portSpin_->value());
   settings.setValue("test/mbps", mbpsSpin_->value());
-  settings.setValue("crypto/psk", pskEdit_->text().trimmed());
-  settings.setValue("crypto/salt", saltEdit_->text().trimmed());
   settings.setValue("test/seg", segSpin_->value());
   settings.setValue("test/mtu", mtuSpin_->value());
   settings.setValue("test/fec_mode", fecMode_->currentIndex());
@@ -877,7 +907,6 @@ void MainWindow::saveSettings() {
   settings.setValue("test/repeat", repeatCheck_->isChecked());
   settings.setValue("proxy/host", proxyHostEdit_->text().trimmed());
   settings.setValue("proxy/port", proxyPortSpin_->value());
-  settings.setValue("proxy/psk", proxyPskEdit_->text().trimmed());
   settings.setValue("proxy/listen_port", proxyListenSpin_->value());
   settings.setValue("proxy/mtu", proxyMtuSpin_->value());
   settings.setValue("proxy/pinned_k", proxyKSpin_->value());
@@ -919,17 +948,10 @@ BenchEngine::Options MainWindow::collectOptions(bool* ok, QString* error) const 
     return options;
   }
   static const QRegularExpression kHex32("^[0-9A-Fa-f]{32}$");
-  static const QRegularExpression kHex16("^[0-9A-Fa-f]{16}$");
   const QString psk = pskEdit_->text().trimmed();
-  const QString salt = saltEdit_->text().trimmed();
   if (!kHex32.match(psk).hasMatch()) {
     *ok = false;
     *error = QStringLiteral("PSK 须为 32 位十六进制字符");
-    return options;
-  }
-  if (!kHex16.match(salt).hasMatch()) {
-    *ok = false;
-    *error = QStringLiteral("Salt 须为 16 位十六进制字符");
     return options;
   }
   options.port = static_cast<quint16>(portSpin_->value());
@@ -937,7 +959,6 @@ BenchEngine::Options MainWindow::collectOptions(bool* ok, QString* error) const 
   options.seg = segSpin_->value();
   options.mtu = mtuSpin_->value();
   options.key = QByteArray::fromHex(psk.toLatin1());
-  options.salt = QByteArray::fromHex(salt.toLatin1());
   options.pinned_k = fecMode_->currentIndex() == 1 ? kSpin_->value() : -1;
   if (options.seg + 36 > options.mtu - 20) {
     *ok = false;

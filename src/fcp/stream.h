@@ -187,6 +187,7 @@ class Stream {
   LogFn log_;
 
   uint32_t snd_nxt_ = 0;   // next byte offset to assign
+  uint32_t snd_max_ = 0;   // highest offset ever put on the wire (A4)
   uint32_t snd_una_ = 0;   // lowest unacked byte offset
   StreamState state_ = StreamState::kOpen;
   CloseReason reason_ = CloseReason::kNone;

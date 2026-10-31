@@ -4,6 +4,8 @@
 #include <cstring>
 #include <utility>
 
+#include "fcp/random.h"
+
 namespace fcp {
 namespace {
 
@@ -36,6 +38,17 @@ void write_caps(const HandshakeCaps& caps, uint8_t* out) {
   out[3] = caps.flags;
 }
 
+// An all-zero nonce is what a peer that never drew one sends, and it is what an
+// attacker can put in a forgery without guessing anything. It contributes no
+// freshness, so it is rejected instead of being folded into the key schedule.
+bool nonce_valid(const uint8_t nonce[kHandshakeNonceLen]) {
+  uint8_t acc = 0;
+  for (size_t i = 0; i < kHandshakeNonceLen; ++i) {
+    acc |= nonce[i];
+  }
+  return acc != 0;
+}
+
 }  // namespace
 
 const char* handshake_error_text(HandshakeError error) {
@@ -43,25 +56,33 @@ const char* handshake_error_text(HandshakeError error) {
     case HandshakeError::kNone:
       return "none";
     case HandshakeError::kNoAck:
-      return "V3 no ACK after 3 tries";
+      return "V4 no ACK after 3 tries";
     case HandshakeError::kBadCaps:
       return "invalid caps";
     case HandshakeError::kMissingCapability:
       return "missing required capability";
     case HandshakeError::kCacheOverflow:
       return "pre-negotiation data cache overflow";
+    case HandshakeError::kBadNonce:
+      return "invalid handshake nonce";
   }
   return "unknown";
 }
 
-void build_hello(const HandshakeCaps& caps, uint8_t out[kHelloLen]) {
+void build_hello(const HandshakeCaps& caps, const uint8_t sender_nonce[16],
+                 uint8_t out[kHelloLen]) {
   std::memcpy(out, kHelloMagic, kHelloMagicLen);
-  write_caps(caps, out + kHelloMagicLen);
+  std::memcpy(out + kHelloMagicLen, sender_nonce, kHandshakeNonceLen);
+  write_caps(caps, out + kHelloMagicLen + kHandshakeNonceLen);
 }
 
-void build_hello_ack(const HandshakeCaps& caps, uint8_t out[kHelloAckLen]) {
+void build_hello_ack(const HandshakeCaps& caps, const uint8_t client_nonce[16],
+                     const uint8_t server_nonce[16], uint8_t out[kHelloAckLen]) {
   std::memcpy(out, kHelloAckMagic, kHelloAckMagicLen);
-  write_caps(caps, out + kHelloAckMagicLen);
+  std::memcpy(out + kHelloAckMagicLen, client_nonce, kHandshakeNonceLen);
+  std::memcpy(out + kHelloAckMagicLen + kHandshakeNonceLen, server_nonce,
+              kHandshakeNonceLen);
+  write_caps(caps, out + kHelloAckMagicLen + 2 * kHandshakeNonceLen);
 }
 
 bool is_hello(const uint8_t* data, size_t len) {
@@ -75,18 +96,36 @@ bool is_hello_ack(const uint8_t* data, size_t len) {
 }
 
 Handshake::Handshake(uint8_t local_d, uint8_t local_p, SendFn send,
+                     HandshakeRole role, const uint8_t* local_nonce,
                      uint8_t local_flags, size_t max_cached_segments,
                      size_t max_cached_bytes)
     : local_d_(local_d),
       local_p_(local_p),
       local_flags_(local_flags),
       send_(std::move(send)),
+      role_(role),
       max_cached_segments_(max_cached_segments),
-      max_cached_bytes_(max_cached_bytes) {}
+      max_cached_bytes_(max_cached_bytes),
+      local_nonce_{},
+      peer_nonce_{} {
+  if (local_nonce != nullptr) {
+    std::memcpy(local_nonce_, local_nonce, kHandshakeNonceLen);
+  } else if (!random_bytes(local_nonce_, kHandshakeNonceLen)) {
+    // A predictable or zero nonce is precisely what R3-1 is about, so a failed
+    // CSPRNG fails the handshake instead of falling back to something weaker.
+    fail(HandshakeError::kBadNonce);
+  }
+  if (!nonce_valid(local_nonce_)) {
+    fail(HandshakeError::kBadNonce);
+  }
+}
 
 void Handshake::start(int64_t now_ms) {
   if (state_ != HandshakeState::kIdle) {
     return;
+  }
+  if (error_ == HandshakeError::kBadNonce) {
+    return;  // construction already failed; nothing to send
   }
   state_ = HandshakeState::kHelloSent;
   retries_ = 0;
@@ -114,16 +153,41 @@ HandshakeStatus Handshake::on_oob(const uint8_t* data, size_t len) {
     if (state_ == HandshakeState::kFailed) {
       return HandshakeStatus::kConsumed;
     }
-    const HandshakeCaps peer = parse_caps(data + kHelloMagicLen);
+    const uint8_t* sender_nonce = data + kHelloMagicLen;
+    const HandshakeCaps peer = parse_caps(data + kHelloMagicLen + kHandshakeNonceLen);
     if (!caps_valid(peer)) {
       fail(HandshakeError::kBadCaps);
       return HandshakeStatus::kProtocolFailure;
     }
-    // Duplicate HELLOs are swallowed, but the ACK is repeated: the peer may
-    // still be retrying because our previous ACK was lost.
+    if (!nonce_valid(sender_nonce)) {
+      fail(HandshakeError::kBadNonce);
+      return HandshakeStatus::kProtocolFailure;
+    }
     if (state_ == HandshakeState::kEstablished) {
-      send_hello_ack();
+      // Duplicate HELLO (our ACK was lost): repeat it, unchanged.
+      if (have_peer_nonce_ &&
+          std::memcmp(peer_nonce_, sender_nonce, kHandshakeNonceLen) == 0) {
+        send_hello_ack();
+        return HandshakeStatus::kConsumed;
+      }
+      // R3-24: a different nonce means "restart the session". A replay of an
+      // old handshake looks identical, and honouring it would let one packet
+      // kill a live session. Refuse and leave every bit of state alone; the
+      // peer times out and reconnects with a fresh salt.
+      ++hello_refused_;
       return HandshakeStatus::kConsumed;
+    }
+    // Idle / HelloSent: the peer's draw is immutable for the life of this
+    // object, or an injected HELLO could move the key out from under datagrams
+    // that are already in flight.
+    if (have_peer_nonce_) {
+      if (std::memcmp(peer_nonce_, sender_nonce, kHandshakeNonceLen) != 0) {
+        ++hello_refused_;
+        return HandshakeStatus::kConsumed;
+      }
+    } else {
+      std::memcpy(peer_nonce_, sender_nonce, kHandshakeNonceLen);
+      have_peer_nonce_ = true;
     }
     if (!negotiate(peer)) {
       return HandshakeStatus::kProtocolFailure;
@@ -136,10 +200,34 @@ HandshakeStatus Handshake::on_oob(const uint8_t* data, size_t len) {
     if (state_ != HandshakeState::kHelloSent) {
       return HandshakeStatus::kConsumed;  // duplicate, or stray in Idle/Failed
     }
-    const HandshakeCaps peer = parse_caps(data + kHelloAckMagicLen);
+    const uint8_t* c_nonce = data + kHelloAckMagicLen;
+    const uint8_t* s_nonce = c_nonce + kHandshakeNonceLen;
+    const HandshakeCaps peer = parse_caps(s_nonce + kHandshakeNonceLen);
     if (!caps_valid(peer)) {
       fail(HandshakeError::kBadCaps);
       return HandshakeStatus::kProtocolFailure;
+    }
+    if (!nonce_valid(c_nonce) || !nonce_valid(s_nonce)) {
+      fail(HandshakeError::kBadNonce);
+      return HandshakeStatus::kProtocolFailure;
+    }
+    // The ACK must answer *our* challenge: `own_echo` is the field that has to
+    // repeat our draw, `peer_draw` the one that has to carry the peer's.
+    const uint8_t* own_echo = role_ == HandshakeRole::kClient ? c_nonce : s_nonce;
+    const uint8_t* peer_draw = role_ == HandshakeRole::kClient ? s_nonce : c_nonce;
+    if (std::memcmp(own_echo, local_nonce_, kHandshakeNonceLen) != 0) {
+      // A recorded ACK replayed at a fresh client echoes the wrong challenge.
+      ++nonce_mismatch_;
+      return HandshakeStatus::kConsumed;
+    }
+    if (have_peer_nonce_) {
+      if (std::memcmp(peer_nonce_, peer_draw, kHandshakeNonceLen) != 0) {
+        ++hello_refused_;
+        return HandshakeStatus::kConsumed;
+      }
+    } else {
+      std::memcpy(peer_nonce_, peer_draw, kHandshakeNonceLen);
+      have_peer_nonce_ = true;
     }
     if (!negotiate(peer)) {
       return HandshakeStatus::kProtocolFailure;
@@ -178,16 +266,18 @@ void Handshake::send_hello() {
     return;
   }
   uint8_t msg[kHelloLen];
-  build_hello(HandshakeCaps{kCapsVersion, local_d_, local_p_, local_flags_}, msg);
+  build_hello(HandshakeCaps{kCapsVersion, local_d_, local_p_, local_flags_},
+              local_nonce_, msg);
   send_(msg, sizeof(msg));
 }
 
 void Handshake::send_hello_ack() {
-  if (!send_) {
+  if (!send_ || !have_peer_nonce_) {
     return;
   }
   uint8_t msg[kHelloAckLen];
-  build_hello_ack(HandshakeCaps{kCapsVersion, local_d_, local_p_, local_flags_}, msg);
+  build_hello_ack(HandshakeCaps{kCapsVersion, local_d_, local_p_, local_flags_},
+                  client_nonce(), server_nonce(), msg);
   send_(msg, sizeof(msg));
 }
 

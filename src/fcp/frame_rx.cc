@@ -112,6 +112,38 @@ void FrameRx::on_datagram(const uint8_t* plaintext, size_t len, int64_t now_ms) 
 
   // The symbol is well formed: only now may it create set state and move the
   // window (plus materialise gap placeholders).
+  //
+  // A8: the anchor is the staleness baseline for every later set, so one
+  // symbol far ahead of it must not move the anchor by itself -- a single
+  // far-future set_id would make all genuine traffic look stale for as long as
+  // the jump. A real discontinuity (long outage) arrives as a whole set whose
+  // symbols share one id, so a second symbol of the SAME set is as good a
+  // confirmation as the next consecutive id. A sparse source that emits one
+  // symbol per set would never produce either signal; the 2s timeout keeps it
+  // from blackholing forever (a peer that holds the PSK can already re-anchor
+  // with two consecutive ids, so the timeout adds no new capability).
+  if (anchor_valid_ && set_id_after(anchor_, hdr.set_id) &&
+      static_cast<uint32_t>(hdr.set_id - anchor_) > kMaxGapPlaceholders) {
+    const bool same_pending = pending_ahead_valid_ && hdr.set_id == pending_ahead_;
+    const bool consecutive =
+        pending_ahead_valid_ && set_id_after(pending_ahead_, hdr.set_id) &&
+        static_cast<uint32_t>(hdr.set_id - pending_ahead_) <= kMaxGapPlaceholders;
+    const bool expired =
+        pending_ahead_valid_ && now_ms - pending_ahead_ms_ >= kAheadConfirmTimeoutMs;
+    if (same_pending || consecutive || expired) {
+      anchor_ = hdr.set_id;
+      pending_ahead_valid_ = false;
+      prune_retired();
+    } else {
+      pending_ahead_ = hdr.set_id;
+      pending_ahead_valid_ = true;
+      pending_ahead_ms_ = now_ms;
+      ++ahead_dropped_;
+      return;
+    }
+  } else {
+    pending_ahead_valid_ = false;  // traffic near the anchor cancels the jump
+  }
   const bool had_anchor = anchor_valid_;
   const uint32_t prev_anchor = anchor_;
   if (!anchor_valid_ || set_id_after(anchor_, hdr.set_id)) {
@@ -124,7 +156,11 @@ void FrameRx::on_datagram(const uint8_t* plaintext, size_t len, int64_t now_ms) 
   }
 
   RxSet& set = get_or_create(hdr.set_id, now_ms);
-  if (!note_k(&set, k_field)) {
+  // A9: k is the sender's parity count for this set, but the peer may only
+  // choose it within the negotiated P'. Clamping keeps a lying k from poisoning
+  // the set against the honest k (note_k is first-wins) and from inflating the
+  // RS geometry past what the session agreed to.
+  if (!note_k(&set, std::min<uint8_t>(k_field, p_))) {
     ++struct_fail_;
     return;
   }
@@ -157,6 +193,16 @@ void FrameRx::on_datagram(const uint8_t* plaintext, size_t len, int64_t now_ms) 
   // Parity: n = index - j, and this is the only source of n.
   if (set.parity_mask.test(hdr.index)) {
     return;  // duplicate fragment: no store, no re-decode
+  }
+  // n must cover every data index already accepted. hdr.cc only checks the
+  // other direction (a data index past a known n), so parity arriving after
+  // out-of-order data could otherwise lock n below max_data_index. Settlement
+  // would then count fewer expected bytes than were delivered and break the
+  // delivered <= expected invariant. Reject this parity and wait for one whose
+  // geometry covers what we already have.
+  if (!set.n_known && set.max_data_index >= n_new) {
+    ++struct_fail_;
+    return;
   }
   set.n = n_new;
   set.n_known = true;
@@ -203,6 +249,11 @@ bool FrameRx::release_set(uint32_t set_id) {
   if (it == sets_.end()) {
     return false;
   }
+  // Only an accounted set is final (§5.3). A tail-dropped set is a heuristic
+  // verdict (1s without parity); a late parity may legitimately rebuild it and
+  // settle it once, which is what TestNoReaccountAfterRelease's tail half and
+  // the M2 recovery path expect. Capacity eviction of an accounted set is
+  // handled in get_or_create, where the same rule applies.
   if (it->second.phase == SetPhase::kAccounted) {
     retired_.insert(set_id);
     prune_retired();
@@ -270,7 +321,6 @@ bool FrameRx::view(uint32_t set_id, RxSetView* out) const {
   out->orig_mask = s.orig_mask;
   out->recov_mask = s.recov_mask;
   out->parity_mask = s.parity_mask;
-  out->decoded_once = s.decoded_once;
   return true;
 }
 
@@ -372,22 +422,23 @@ void FrameRx::try_decode(RxSet* set, int64_t now_ms) {
   }
 
   std::vector<size_t> missing;
-  bool any_untried = false;
   for (size_t i = 0; i < set->n; ++i) {
     if (!set->orig_mask.test(i) && !set->recov_mask.test(i)) {
       missing.push_back(i);
-      if (!set->decoded_once.test(i)) {
-        any_untried = true;
-      }
     }
   }
-  if (missing.empty() || !any_untried) {
+  if (missing.empty()) {
     return;
   }
 
   const size_t n = set->n;
   const size_t k = set->k;
   if (missing.size() > k || set->symbol_max < 2) {
+    return;
+  }
+  // A9: an n + k above the shard limit cannot decode (rs.cc rejects it), so
+  // never allocate the padded buffers for geometry the codec cannot handle.
+  if (n + k > kRsMaxShards) {
     return;
   }
   const size_t symbol_max = set->symbol_max;
@@ -421,13 +472,17 @@ void FrameRx::try_decode(RxSet* set, int64_t now_ms) {
   }
 
   for (const size_t i : missing) {
-    if (set->decoded_once.test(i)) {
-      continue;  // structurally rejected earlier; never retried
-    }
-    set->decoded_once.set(i);
     const std::vector<uint8_t>& s = recovered[i];
     if (s.size() != symbol_max) {
-      ++struct_fail_;
+      // A23: a structurally unusable reconstruction is not final (§4.5 makes
+      // decoding a retry: every new symbol may recover a different set of
+      // erasures). Leave the index open so later parity can still repair it,
+      // but count each bad index once -- retries must not inflate the
+      // struct_fail that the peer sees in FECSTAT.
+      if (!set->bad_recon.test(i)) {
+        set->bad_recon.set(i);
+        ++struct_fail_;
+      }
       continue;
     }
     const size_t declared = static_cast<size_t>(s[0]) | (static_cast<size_t>(s[1]) << 8);
@@ -438,9 +493,13 @@ void FrameRx::try_decode(RxSet* set, int64_t now_ms) {
       }
     }
     if (!ok) {
-      ++struct_fail_;
+      if (!set->bad_recon.test(i)) {
+        set->bad_recon.set(i);
+        ++struct_fail_;
+      }
       continue;
     }
+    set->bad_recon.reset(i);
     set->recov_mask.set(i);
     ++recovered_;
     const int64_t waited = now_ms - set->t_first_ms;

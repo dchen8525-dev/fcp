@@ -40,6 +40,13 @@
 > **握手协商前缓存溢出与退避的交互入档**（#28③，§14.13）；**late_guard/墓碑上限与 #27① 高 RTT
 > 口径不一致入档**（#28④，§14.14）；**FECSTAT 自身无重传入档**（#28⑤，§14.15）；
 > **短生命周期流自适应盲区入档**（#28⑥，§14.16）。
+> 修订：2026-10-31 v7 密钥编排 + 握手 V4（#31，**关闭 R3-1「握手无新鲜性」与 R3-24**）——
+> **HELLO/ACK 各带 16B CSPRNG nonce，线格式 20 → 36/52 字节，magic V3 → V4 硬断**（§6.1）；
+> **`session_key` 改为三块定长 CBC-MAC：`X0=AES(PSK,salt‖0^8) → X1=AES(PSK,X0⊕c_nonce) → AES(PSK,X1⊕s_nonce)`**
+> （§6.0，v6 值降级为握手信封键）；**双信封**：握手信封只收发 HELLO/ACK 且永不 rekey，数据信封在
+> `configure()` 时 rekey 并归零计数器/窗口（§4.1）；**ACK echo 校验**把 ACK 绑定到本端挑战、
+> **已建立会话拒绝不同 nonce 的 HELLO**（§6.1）；握手信封发送计数器起点每会话随机（防 GCM 密钥流重用）。
+> 兼容性：**v7 与 v6 不互通，两端必须同时升级**（`DEPLOY.md` §1.1）。验收：Debug/Release 各 27/27。
 > 正文中的 "FEC" 指协议内的纠删机制、"FECSTAT" 指其状态报文，二者随协议名沿用，不再改称呼。
 
 ## 0. 决策记录
@@ -141,9 +148,21 @@
   在单次会话生命周期内不可达。不得再截短到 64/32 位（那需要严格的调用次数上限，不适用于公网代理）。
 - **salt 为 8 字节**：服务端会话查找键 + **会话密钥派生输入**（#28①：会话密钥按会话派生
   `session_key = AES128(PSK, salt ‖ 0×8)`，见 §6.0——规格此前虽写"salt 是 KDF 熵源"，
-  实现已按 #28① 派生（`derive_session_key`），缺口已消除）。见 §14.7 的安全余量说明。
+  实现已按 #28① 派生（`derive_session_key`），缺口已消除）。v7 起这把密钥**只用于握手信封**，
+  数据面另用 §6.0 的三块派生键。见 §14.7 的安全余量说明。
   `nonce` 计数器**每方向独立、从 0 起**（#24①：原文"三合一"把计数器起值也算作 salt 的职责，
   与实现不符——实现为 `send_nonce_(0)`，salt 不参与计数器起值）。
+- **双信封（v7，R3-1）**：同一会话并存在两把数据面密钥、两条独立计数器/重放窗口——
+  - **握手信封** `hs_env`：键 = `AES128(PSK, salt‖0×8)`，**只承载 HELLO / HELLO_ACK**，
+    永不 rekey。所有发往未知名 salt 的报文都必须能用它解开，这是 salt 发现路径，不能依赖握手结果。
+  - **数据信封** `env`：键 = §6.0 的 v7 三块派生键，握手 `configure()` 完成时 `rekey()`，
+    计数器与重放窗口一并归零；此后再用旧键（含握手键）封的报文一律 `auth_fail`。
+  - 接收端**先数据后握手**两次尝试：`env.open` 失败再试 `hs_env.open`，成功后只放行
+    `type=oob` 且载荷为 HELLO/HELLO_ACK 的报文，其余计入 `struct_fail`。数据信封在前是刻意的：
+    稳态流量不付第二次尝试的代价。
+  - 握手信封的**发送计数器起点每会话随机**（`BCryptGenRandom`/`/dev/urandom`）：重放的 HELLO 会让
+    对端重发 ACK，若起点固定则同一 (key, IV) 会封出第二条不同明文的 ACK → GCM 密钥流重用。
+
 - **重放窗口（#23③，#26 放宽到 256）**：重放有效密文不需要密钥，AEAD 拦不住重放。接收端**每方向**维护
   **256 槽滑动窗口**（与 IPsec 反重放同构）：以已见最高 `nonce_ctr` 为基准，前跳则接受并滑动/重置
   窗口，窗口内未见过的接受并置位，已见过的或落后超过窗口宽度的拒收——UDP 重排由窗口吸收，
@@ -384,8 +403,8 @@ symbol = magic(16) | 定长载荷
 - 不占用 `set_id/index`、不进 RS 集合、不计入任何丢包统计。
 - 长度精确校验（16 + 定长载荷）；未知 magic 丢弃并计数。
 - 已定义：`FCP_FECSTAT_V6`（§7）、`FCP_KEEPALIVE_V1`（保活，幂等可丢）、
-  `FCP_HELLO_V3` / `FCP_HELLO_ACK_V3`（握手，§6.1；HELLO 的 magic 为 12 字节 ASCII + 4×0x00
-  补齐 16 字节约定，#25）。
+  `FCP_HELLO_V4`（12 字节 ASCII + 4×0x00 补齐 16）与 `FCP_HELLO_ACK_V4`（16 字节 ASCII，正好 16）
+  ——握手，§6.1。v3 magic 不再识别，也不再回应（硬断，见 §6.1 与 `DEPLOY.md` §1.1）。
 
 ---
 
@@ -481,10 +500,34 @@ HELLO/ACK 全部在 AEAD 信封内（§6.1），因此**密钥先于握手存在
 
 ```text
 PSK         = 运维配置的 16 字节预共享密钥（两端一致，带外分发；SessionConfig.key）
-session_key = AES128-Encrypt(PSK, salt(8) ‖ 0x00×8)     # 每会话派生，salt 为线上明文（§4.1）
+X0          = AES128-Encrypt(PSK, salt(8) ‖ 0x00×8)    # v6 的 session_key；v7 里只做 bootstrap
+X1          = AES128-Encrypt(PSK, X0 ⊕ c_nonce(16))    # c_nonce = 客户端在 HELLO 里抽的 16B
+session_key = AES128-Encrypt(PSK, X1 ⊕ s_nonce(16))    # s_nonce = 服务端在 ACK 里抽的 16B
 key_c2s     = KDF(session_key, label="fcp-c2", L=128)   # §14.9，SP 800-108，现状不变
 key_s2c     = KDF(session_key, label="fcp-s2", L=128)
 ```
+
+- **v7 为什么再接两块（R3-1，关闭"握手无新鲜性"）**：v6 的 `session_key` 只依赖 `(PSK, salt)`，
+  而 salt 是线上一等公民。攻击者录下完整握手后重放，双方派生出**同一个** `session_key`，
+  而反重放窗口是每会话新建的 → 历史密文整段落回窗口内，可被原样重放/注入。
+  接上双向 nonce 后，密钥取决于**每一端当次抽的随机数**：重放的 HELLO/ACK 带的是上一次的 nonce，
+  重放对象用自己的新 nonce 派生 —— 密钥不匹配，旧密文全部 `auth_fail`。
+- **为什么是三块定长 CBC-MAC，而不是 `AES(PSK, salt‖c‖s)`**：定长 40 字节一次加密今天也能用，
+  但输入一旦变长（将来加 caps 摘要、加版本号）CBC-MAC 就会被长度扩展。三块串联现在就把路封死；
+  且 `(c,s) = (0,0)` 的结果**不等于** `X0`（第二块用 `X0` 作掩码，不是恒等），退化为 v6 的捷径不存在。
+- **nonce 宽度 16B、全零视为无效**（`HandshakeError::kBadNonce`，握手直接失败并响亮报错）：
+  全零会退化成"无挑战"，与 v6 等价，必须显式拒绝；16B 也让生日界远离可用区间。
+- **nonce 必须来自 CSPRNG**（`src/fcp/random.h`：Windows `BCryptGenRandom` / POSIX `/dev/urandom`）。
+  Qt 侧的 `QRandomGenerator::global()`（确定性 PRNG）已在 §8.3 R3-6 换成 `system()`（OS 后端），
+  本条不再依赖宿主自觉；核心库的 nonce 只走 `random.h`。其余宿主仍用 `std::random_device` /
+  `QRandomGenerator::system()`（都是 OS 后端，非本条引入的风险），清单见 `random.h` 头注释。
+- **握手信封的键就是 `X0`**（= v6 的 session_key），它不再用于数据面（§4.1 双信封）。
+  这不是冗余：salt 发现必须在握手成功之前可用，只能依赖 `(PSK, salt)`。
+- **仍无前向保密**：PSK 泄露 → 该 PSK 下所有会话（含历史）可解。要 PFS 须加 DH，属另一次改动。
+- **重放 HELLO 的残余成本**：服务端对重放的 HELLO 仍会**建立**一个会话（它在 epoch-1 密钥下合法），
+  但它抽自己的 `s_nonce`，派生键与录制方不同，录制数据一个字节都送不进去，会话随后因数据面全
+  `auth_fail`/静默被回收。攻击者每投一个重放 HELLO 换一个会话槽——与"伪造 HELLO"同价（后者需 PSK），
+  由 `max_sessions` + idle 回收承担，不是新增的放大器。
 
 - **为什么 session_key 必须按会话派生（P0 依据）**：IV = `counter(8) | dir(1) | 0×3`（§4.1），
   只依赖计数器与方向；若直接用 PSK 当会话密钥，则**同一 PSK 的任意两个会话**（不同 salt、
@@ -496,19 +539,24 @@ key_s2c     = KDF(session_key, label="fcp-s2", L=128)
   密钥互异；时序上的重用要求 64 位 salt 撞车（概率 `N²/2^65`，已被接受的余量）。
   **实现状态（任务 F1，已落地）**：`envelope.h` 新增 `derive_session_key`，构造函数按上式先派生
   `session_key` 再派生方向密钥；零线上改动：两端各自本地计算，不增字节、不碰握手。
+  **v7 起（R3-1）**：该函数只用于构造**握手信封**（注释标 "v6 only / bootstrap"），数据面改用
+  `derive_session_key_v7(psk, salt, c_nonce, s_nonce, out)`；黄金向量锁在
+  `tests/envelope_test.cc::TestV7KeyVector`（含 `(c,s)=(0,0)` 与交换 nonce 两个反例）。
 - **无前向保密（明确接受的取舍）**：PSK 泄露 → 该 PSK 下所有会话（含历史记录）可解——
   因为没有 DH/ECDHE。v6 不引入密钥交换（与"删掉过重机制"的定位一致）；若将来要 PFS，须在 caps
   保留位（bit4..7，§6.2）里加 key-exchange 能力位走 #26 式前向兼容闸门，不能悄悄改。
 - **PSK 轮换是运维职责**：换 PSK 即换部署；会话内的密钥生命周期由 2^32 终止线（§14.7）兜底，
   超限断连重连，重连即新 salt → 新 session_key。
-- **重放旧 HELLO 不构成威胁**：HELLO 在 AEAD 内，伪造需 PSK；重放的历史报文会因 salt 查找失败
-  或 nonce 重放窗口（§4.1）被拒。握手不泄露任何密钥材料，无降级路径（决策⑪）。
+- **重放旧 HELLO（v6 的定性判断已被推翻）**：v6 曾写"重放的历史报文会因 salt 查找失败或 nonce
+  重放窗口被拒"——**这是错的**，反重放窗口每会话新建，对重放完全敞开，即 R3-1 本身。
+  v7 的关闭手段是密钥编排而非窗口：见本节开头与 §6.1。
 
 ### 6.1 报文
 
 ```text
-HELLO_V3     = "FCP_HELLO_V3\0\0\0\0"(16) || caps(4)  # 共 20 字节（#25：magic 补齐 16 字节 oob 约定）
-HELLO_ACK_V3 = "FCP_HELLO_ACK_V3"(16)     || caps(4)  # 共 20 字节
+HELLO_V4     = "FCP_HELLO_V4\0\0\0\0"(16) || sender_nonce(16) || caps(4)  # 共 36 字节
+HELLO_ACK_V4 = "FCP_HELLO_ACK_V4"(16)     || client_nonce(16) || server_nonce(16) || caps(4)
+                                                                          # 共 52 字节
 
 caps = ver(u8)=1 | data(u8) | parity(u8) | flags(u8)
   flags bit0 支持成帧
@@ -517,6 +565,20 @@ caps = ver(u8)=1 | data(u8) | parity(u8) | flags(u8)
         bit3 支持 deadline 统计（M2 起）
         bit4..7 必须为 0
 ```
+
+- **magic 兼作握手版本号**：V3 → V4 是**硬断**（无降级协商）。旧 magic 一律不识别，v3 节点与 v7
+  节点互发只会各自超时（`V4 no ACK after 3 tries`），不会误建立会话。见 `DEPLOY.md` §1.1。
+- **角色决定哪 16 字节是自己的**：`send_direction == c2s` 的一端是客户端，产生 `client_nonce`；
+  另一端是服务端，产生 `server_nonce`。HELLO 只带`发送方`的 nonce，ACK 把两个都回显。
+  两端同时发 HELLO 时角色映射不冲突（每端角色由自己的发送方向唯一确定，不靠谁先发）。
+- **ACK 的 echo 是唯一的绑定机制（R3-1 的关键）**：收到 ACK 时，取"本端贡献的那 16 字节"
+  （客户端看 `client_nonce`、服务端看 `server_nonce`），必须与本端 `local_nonce_` 逐字节相等；
+  不等则丢弃并 `++nonce_mismatch_`，**不建立会话**。没有这一步，录制重放中的 ACK 会替客户端
+  "作证"一个它从未发起的挑战，会话就复活了。
+- **已建立会话收到 HELLO（R3-24）**：nonce 相同 → 视为重复 HELLO，**重发 ACK**（幂等，覆盖 ACK 丢失）；
+  nonce 不同 → `++hello_refused_`，**状态不动、不回 ACK**。v6 此前是无条件重置，一个重放 HELLO
+  就能打死活会话；现在活会话不受影响，攻击者只能换来"多发一次 ACK"。
+- **握手报文一律走握手信封**（§4.1），数据面信封此时还没 rekey；`configure()` 完成后切换。
 
 - HELLO/ACK 作为 **oob 报文**发送（type=2，#25），同样在 AEAD 信封内：不设 `caps_mac`，也没有 epoch。
   重传由握手层重传定时器承担（§6.2），不经 KCP。
@@ -547,8 +609,9 @@ else:                              FRAMED_REPAIR
   误杀连接；512/512KB 缓冲 ~0.5s 满速数据，覆盖 RTT ≤ ~500ms 握手档；重 BDP 链路经
   `SessionConfig` 调大。超限或握手失败 → 丢弃并 ERROR，保持响亮失败），协商完成后按序补发进集合。
   握手 oob 不受缓存限制（HELLO/ACK 本身要在协商前通过）。
-- 两端可**同时**发送 HELLO；收到 HELLO 即回 ACK。重复 HELLO 幂等但**必须重发 ACK**（此前的 ACK
-  可能已丢失，不重发会让对端在 3 次超时后断连）；重复 ACK 与其余多余报文吞掉（协商只进行一次）。
+- 两端可**同时**发送 HELLO；收到 HELLO 即回 ACK。重复 HELLO（**同一 nonce**）幂等但**必须重发 ACK**
+  （此前的 ACK 可能已丢失，不重发会让对端在 3 次超时后断连）；**不同 nonce** 的 HELLO 在已建立会话上
+  一律拒绝（`hello_refused`，状态不动、不回 ACK —— R3-24）；重复 ACK 与其余多余报文吞掉（协商只进行一次）。
 - 初始 `k`：`0`，或 `--fec-parity-pinned K`（`0..P`）。
 - V3 超时与重传（#27①）：重传间隔**指数退避 300ms → 600ms → 1200ms**（三次超时间隔），连同首发
   共 3 个 HELLO（与既定 3 次上限一致），总等待约 2.1s；仍无应答则**连接失败**，打 **ERROR**
@@ -801,12 +864,14 @@ fecstat_rx=<n> fecstat_stale=<n> fec_auth_fail=<n> fec_struct_fail=<n>
 
 | 客户端 | 服务端 | 模式 | 成帧 | FECSTAT | RS | 策略 |
 |---|---|---|---|---|---|---|
-| 两端均为本协议 V3 | `P' ≥ 1` | `FRAMED_REPAIR` | 始终 | 双向 | 有 | §8 |
-| 两端均为本协议 V3 | `P' = 0` | `FRAMED_STATS` | 始终 | 双向 | 无 | 只观测 |
-| 任一端为 V1/V2/v5 | — | **不支持** | — | — | — | 连接失败（ERROR），无降级 |
+| 两端均为本协议 V4（v7 密钥） | `P' ≥ 1` | `FRAMED_REPAIR` | 始终 | 双向 | 有 | §8 |
+| 两端均为本协议 V4（v7 密钥） | `P' = 0` | `FRAMED_STATS` | 始终 | 双向 | 无 | 只观测 |
+| 任一端为 V3 及更早 | — | **不支持** | — | — | — | 连接失败（ERROR），无降级 |
 
 **硬约束**：不存在"关掉 FEC"的配置，线上不存在裸 KCP 报文，所有模式一律成帧。
-Android CPP_REMOTE 等旧端必须升级到本协议 V3，否则连接失败。
+握手 V3 → V4 是**硬断**（R3-1：双向 nonce 改变密钥编排，线格式也变了 20→36/52 字节），
+两端必须同时升级；`DEPLOY.md` §1.1 给了升级顺序与误混版本的两种症状。
+Android CPP_REMOTE 等旧端必须升级到本协议 V4，否则连接失败。
 
 ---
 
@@ -1021,3 +1086,4 @@ index 11 / 12 永不出现（k=1 < P=3）
 | 28 | **2026-10-30 第二轮对抗复查，1 项 P0 修复设计 + 1 项算术勘误 + 4 项边界入档**：① **P0：会话密钥必须按会话派生 `session_key = AES128(PSK, salt‖0×8)`，新增 §6.0 密钥来源与信任模型**——HELLO/ACK 在 AEAD 内 ⇒ 静态 PSK 模型（此前规格从未写明）；规格原文"salt 是 KDF 熵源"（#24①/§14.7）在实现中不成立：`derive_direction_keys` 只用配置 PSK，salt 未参与任何派生（`envelope.cc` 核实），同一 PSK 的任意两会话（重连、或多客户端共用配置）派生出相同方向密钥，IV 每会话从 0 起 → GCM (key, IV) 跨会话重用：知道任一会话明文者可解另一会话同计数器流量并借已知明文恢复 GHASH 密钥 H 伪造报文；§14.7"撞上等于共用密钥"的论证同样依赖该前提。修复零线上改动（两端本地计算），明确无前向保密为接受取舍、PSK 轮换归运维、PFS 走 caps 保留位闸门（§6.0/§4.1/§12.1/§14.7/§14.9 同步；**实现待落地，任务 F1**）；② **重放窗口覆盖数字勘误**：256 槽 ≈ 336 KB ≈ **13–19 Mbps × 200ms**，#26④ 原写"覆盖 25 Mbps × 200ms"算错（25 Mbps × 200ms ≈ 476 包 > 256），该区间自激未消除，自适应窗口对高吞吐部署应前置（§4.1）；③ 协商前缓存溢出（64 段/64KB → ERROR）与 #27① 退避的交互：最坏握手期 ×2.3，8 Mbit/s 下 ~80ms 填满缓存，"慢握手+快发送"叠加直接断连，M2 应改反压（§14.13，任务 F2）；④ `late_guard` 上限 500ms / 墓碑上限 1s 低于 #27① 支持的 RTT≤700ms 区间——高估丢包方向安全，但口径不自洽，留 M2 标定（§14.14）；⑤ FECSTAT 无重传入档：连发两份 + 单调键幂等去重为 M2 小项（§14.15，任务 F3）；⑥ 短生命周期流自适应盲区入档：活不过 2~3 个报告周期的连接全程 k=0，短连接密集部署用 pinned k，跨连接继承留 M3（§14.16） |
 | 29 | **2026-10-31 M3 开工，FECSTAT 账本字段语义化 + R(k) 经验校正定案（§7.1/§8.1）**：① 原 `reserved0..2`（108/112/116）改为 `ledger_groups`/`ledger_fail_ppm`/`ledger_meta`（byte0 主导 k、bytes2-3 burst_kl 留突发检测任务），`flg bit3` = 账本有效；旧实现这些字节恒 0 且不发 bit3，**新旧互操作零协商**（旧收新按 reserved 忽略、新收旧按 `ledger_groups == 0` 忽略），128B 与全部既有偏移不变；② R(k) 校正为**单侧上调**：`p_use = max(p_observed, p_eff)`，理由是已证失效模式只有欠保护（#27②/§14.10），"好于 i.i.d."无对应机制按运气处理，避免 64 组小样本把 k 抖下去；③ 账本只含满编组（n=D、k 已知、k≥1）——部分集合码长不匹配二项模型、整组全丢 k 不可知，两者混入只按流量形状污染统计；极端突发下账本偏乐观为已知偏差（§8.1），`p_max` 余量与 RTO 兜底覆盖；④ 校正门 `ledger_groups ≥ 64 且主导 k == 当前 k`，不满足时行为与 M1 完全一致。实现随 #24 落地（`settle`/`fecstat`/`strategy`/`reporter`/`session` 日志），Windows Debug/Release ctest 25/25；设计全文见 `FCP_M3_CONTROL.md` |
 | 30 | **2026-10-31 #28 落地，字节预算口径勘误 + 默认值修正（§8.2）**：① **ratio = k/D 而非 k/(D+k)**——parity 与 data 每包字节数相同（`36+payload+28` vs `34+symbol_max+28`，symbol_max=payload+2），冗余比与码长无关，D=10 时 k=4 即 40%；#29 写下的"k/(10+k)、仅 k=7 触界"算错（把"parity 占总符号比"混进了"parity 占 data 字节比"）；② **默认 `--fec-budget` 从 0.40 改为 0.50**：原值恰好绑在 k=4——20% 丢包的常用工作点（§14.11 防拥塞的预算被默认值提前触发，属真缺陷）；0.50 下 D=10 的 k ≤ 5 完全自由、k = 6..7 极端档才受限；既有 #25 的预算单测用的是合成字节比、语义不受影响；③ 依据是 #28 离线重放工具的 5/10/20% 轨迹实测（`tests/replay_test.cc` 的 T39 场景），gate 内 27/27×2 全绿 |
+| 31 | **2026-10-31 v7 密钥编排 + 握手 V4，关闭 R3-1「握手无新鲜性」（§4.1/§6.0/§6.1/§11）**：① **双向 16B nonce 进线格式**：`HELLO_V4 = magic16‖sender_nonce16‖caps4`（36B）、`HELLO_ACK_V4 = magic16‖client_nonce16‖server_nonce16‖caps4`（52B），magic 兼作握手版本号，v3 硬断不识别；② **`session_key` 改为三块定长 CBC-MAC**：`X0 = AES(PSK, salt‖0^8)`（v6 值，降级为 bootstrap）→ `X1 = AES(PSK, X0⊕c_nonce)` → `session_key = AES(PSK, X1⊕s_nonce)`，无长度扩展、`(c,s)=(0,0)` 也不等于 v6 键；③ **双信封**：握手信封（键 = `X0`，只收发 HELLO/ACK，永不 rekey）与数据信封（握手完成时 `rekey(session_key)`，计数器与重放窗口归零），接收端「先数据后握手」两次尝试，握手信封命中的只放行 oob 握手载荷；④ **ACK echo 校验是绑定机制**：本端贡献的 16B 必须逐字节等于 `local_nonce_`，否则计 `nonce_mismatch` 并丢弃、不建立；⑤ **R3-24 一并关掉**：已建立会话收到不同 nonce 的 HELLO 只计 `hello_refused`，状态不动、不回 ACK；相同 nonce 则重发 ACK（幂等）；⑥ **CSPRNG 落地**（`src/fcp/random.cc`：`BCryptGenRandom` / `/dev/urandom`，核心库的 nonce/计数器起点只走这里；Qt 侧的 `global()` → `system()` 属 §8.3 R3-6，已在前一轮完成）；⑦ **握手信封发送计数器起点每会话随机**：否则重放 HELLO 会让同一 (key, IV) 封出第二条明文不同的 ACK → GCM 密钥流重用；⑧ 全零 nonce 判 `kBadNonce` 响亮失败 | R3-1 是第二轮对抗分析里唯一未关的 Critical：v6 的 `session_key` 只依赖 `(PSK, salt)`，而 salt 明文在线、反重放窗口每会话新建，录下完整握手重放即可让双方重建同一对 (key, IV)，把历史密文整段落回窗口内（解密 / 注入 / 伪造）。窗口类修补全部无效（窗口本来就是新的），唯一出路是让密钥依赖「本次运行的新鲜随机量」，故必须动线格式。代价明确接受：v6 不能互通（两端同时升级，`DEPLOY.md` §1.1 给了症状表），salt 宽度维持 8B（KDF 已混入双向 nonce，再加宽只增线上字节、不增实际安全），仍无前向保密。覆盖测试：`envelope_test`（v7 黄金向量，含 `(0,0)` 与交换 nonce 两个反例、`rekey` 归零、CSPRNG 可用性）、`handshake_test`（密钥协商一致、echo 不匹配、已建立拒新 HELLO、零 nonce、随机性、36/52 线格式、v3 magic 不再识别）、`session_test::TestReplayCannotReviveSession`（录制重放后客户端 `!established`、双向零交付、服务端 `auth_fail` 增长；变异验证：注掉 echo 校验该用例立刻红） |

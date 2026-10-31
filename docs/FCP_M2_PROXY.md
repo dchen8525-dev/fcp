@@ -266,7 +266,7 @@ WAN A/B 已随 #22 收口（见 §8.1）：先 1MiB 预热传输学出 k，再 4
 | `apps/fcp-proxy/engine.h/.cc` → `fcp_proxy_core` | `ProxyEngine`（连接表 + salt 路由 + tick + 预热缓存）。**无 socket、无真实时钟**：宿主以 `Host` 回调注入收发与 DNS，时间全部由 `now_ms` 参数传入，因此 ctest 能直接驱动它 | `fcp` |
 | `apps/fcp-proxy/reactor.h/.cc`、`cli.h/.cc`、`main_client.cc`、`main_server.cc` | 跨平台 select 反应堆（Windows 非阻塞 connect 的 `exceptfds` 语义；名称解析走 4 线程池 + 全部 A/AAAA 记录顺序回退；POSIX `fd ≥ FD_SETSIZE` 守卫；64 KiB UDP 收包缓冲；服务端 peer 槽随会话销毁回收；数值参数区间校验）、共用参数解析、CLI 双端入口 | `fcp_proxy_core`、`ws2_32`(Win) |
 | `tests/proxy_engine_test.cc` | 引擎级 socket-free 场景（16 个：SOCKS5/HTTP 往返、`OPEN_ERR → 本地应答`映射、畸形入口、背压、**部分拒绝后的零窗恢复**、salt 路由与重放绑定、短连接无残留、拨号超时与 grace 钟、会话上限、tombstone 尾段吸收、trace 落盘、未认证首包不成会话、认证前非 HELLO 超时、拨号背压上限、peer 回调配平） | `fcp_proxy_core` |
-| `apps/fcp-client/proxy_host.h/.cpp` → `ProxyHost` | Qt 侧适配器：`QTcpServer` 收本地 SOCKS5/HTTP 入口、`QUdpSocket` 走 FCP wire、`QHostInfo` 解析拨号目标、25ms `QTimer` 是引擎唯一时钟；全部在 GUI 线程（与 BenchEngine 同构，两功能可共存）。`app_send` 实现为高水位写（Qt 的 `write()` 恒全量接收，按 256KiB 上限截断才能保住 §7 第 8 条的不变式），`app_close` 走 `disconnectFromHost()` 优雅排空（`abort()` 会丢掉 Qt 写缓冲里的尾字节），UDP 收发缓冲对齐 CLI 的 2MiB。页面入口见 `MainWindow::buildProxy()`（导航第 3 页），QSettings 键 `proxy/*`，`--proxy-host/--proxy-port/--proxy-listen/--proxy-psk/--proxy-autostart` 供脚本化验收 | `fcp_proxy_core`、Qt Widgets/Network |
+| `apps/fcp-client/proxy_host.h/.cpp` → `ProxyHost` | Qt 侧适配器：`QTcpServer` 收本地 SOCKS5/HTTP 入口、`QUdpSocket` 走 FCP wire、`QHostInfo` 解析拨号目标、25ms `QTimer` 是引擎唯一时钟；全部在 GUI 线程（与 BenchEngine 同构，两功能可共存）。`app_send` 实现为高水位写（Qt 的 `write()` 恒全量接收，按 256KiB 上限截断才能保住 §7 第 8 条的不变式），`app_close` 走 `disconnectFromHost()` 优雅排空（`abort()` 会丢掉 Qt 写缓冲里的尾字节），UDP 收发缓冲对齐 CLI 的 2MiB。页面入口见 `MainWindow::buildProxy()`（导航第 3 页），QSettings 键 `proxy/*`（**PSK 除外**：每次启动随机生成且不落盘，A3），`--proxy-host/--proxy-port/--proxy-listen/--proxy-psk/--proxy-autostart` 供脚本化验收 | `fcp_proxy_core`、Qt Widgets/Network |
 
 `fcp_proxy_core` 是独立静态库且在 `FCP_BUILD_PROXY`（默认 OFF）之外：Qt 客户端只链接引擎、
 不需要 CLI 的两个可执行文件，而门禁必须能在不开 `FCP_BUILD_PROXY` 时跑到引擎。反应堆与
@@ -460,7 +460,9 @@ M2 代理半边的第二轮对抗（首轮见 `FCP_M3_CONTROL.md` 的 #30 条）
 4. **UDP 收包截断与参数区间**：2048B 栈缓冲在 `--mtu > ~2KiB` 时静默截断（下游只
    表现为认证失败）；改为 64 KiB 成员缓冲，覆盖全部合法 UDP 载荷。CLI 补数值区间
    与整串校验（`--mtu` 256..65535、`--d` 1..255、`--p/--p-max` 0..7、`--k` -1..7、
-   端口 1..65535，以及 `--window/--rcv-buf/--idle/--dial-timeout/--connect-timeout/
+   **`--d + --p ≤ 256`**（协议上限，超出时本端 `local_caps_valid` 会拒绝建会话、每隧道握手
+   必败，故 CLI 直接报错）、端口 1..65535，以及
+   `--window/--rcv-buf/--idle/--dial-timeout/--connect-timeout/
    --max-sessions/--stats` 与有限 `--fec-budget`），拒绝 `--d=abc`/`--mtu=99999`
    之类的静默截断。`--mtu` 的帮助文本同步更正为"IP packet budget incl. IP+UDP
    headers"——实现（`compute_mtu_limits`）一直按 IP 包字节计算，旧文案 "UDP payload"

@@ -308,7 +308,8 @@ void TestLateAccounting() {
 
 void TestGhostPlanValue() {
   const auto tx = BuildSet(10, 4, Payloads(800, 7));  // k_eff = 3, n = 7
-  Fixture f(10, 3);
+  // The planned k (4) must fit the negotiated P' (A9 clamps at ingress).
+  Fixture f(10, 4);
   for (const auto& s : tx) {
     f.feed_tx(s);
   }

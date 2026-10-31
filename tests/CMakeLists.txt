@@ -36,6 +36,11 @@ foreach(name IN LISTS FCP_TEST_NAMES)
   add_test(NAME ${name} COMMAND fcp_${name})
 endforeach()
 
+# P10' N16: without a timeout a hung loopback test blocks CI forever. The soak
+# test gets its own larger bound (the C3 acceptance run uses FCP_SOAK_MS).
+set_tests_properties(${FCP_TEST_NAMES} PROPERTIES TIMEOUT 300)
+set_tests_properties(soak_test PROPERTIES TIMEOUT 900)
+
 # The proxy engine lives under apps/ as a library of its own rather than in
 # libfcp, because it is the socket-free half the Qt client also links; its test
 # is the only one that needs that target (docs/FCP_M2_PROXY.md §6).
@@ -62,5 +67,9 @@ endif()
 add_test(NAME replay_tool_smoke
          COMMAND fcp_replay --trace=${CMAKE_CURRENT_SOURCE_DIR}/replay_golden.jsonl
                  --dump --require-exact)
+# P10' N10: PASS_REGULAR_EXPRESSION makes CTest ignore the exit code, so a
+# divergence (fcp_replay returns 1 after printing the summary) still passed.
+# Rely on the exit status and treat the divergence marker as a hard failure.
 set_tests_properties(replay_tool_smoke PROPERTIES
-         PASS_REGULAR_EXPRESSION "entries=[0-9]+ skipped=0")
+         TIMEOUT 120
+         FAIL_REGULAR_EXPRESSION "replay diverged")

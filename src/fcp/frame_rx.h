@@ -30,8 +30,13 @@ constexpr size_t kMaxS = 256;           // index is u8; D + P <= 256
 constexpr size_t kMaxActiveSets = 256;
 constexpr size_t kSnWindow = 4096;
 // Forward jumps larger than this are treated as a session discontinuity: no
-// placeholder sets are created for the skipped ids.
+// placeholder sets are created for the skipped ids, and the first far-future
+// symbol is dropped so one stray set_id cannot move the anchor (A8; the second
+// symbol — same or consecutive id — or a 2s timeout confirms the discontinuity).
+// The timeout matters for sparse streams: without it a source that sends one
+// symbol per set would wait forever for a confirmation that never comes.
 constexpr uint32_t kMaxGapPlaceholders = 64;
+constexpr int64_t kAheadConfirmTimeoutMs = 2000;
 
 // KCP sn sliding window: the slot is sn mod kSnWindow, so a value is only
 // "recently seen" while it stays inside the window. The 64 KiB slot table
@@ -91,7 +96,6 @@ struct RxSetView {
   std::bitset<kMaxS> orig_mask;
   std::bitset<kMaxS> recov_mask;
   std::bitset<kMaxS> parity_mask;
-  std::bitset<kMaxS> decoded_once;
 };
 
 class FrameRx {
@@ -125,6 +129,9 @@ class FrameRx {
   uint32_t anchor() const { return anchor_; }
   uint32_t struct_fail() const { return struct_fail_; }
   uint32_t stale() const { return stale_; }
+  // A8: far-future symbols dropped because a single set_id may not move the
+  // anchor; a second consecutive one re-anchors the window.
+  uint32_t ahead_dropped() const { return ahead_dropped_; }
   uint32_t late_dup() const { return late_dup_; }
   uint32_t late_data() const { return late_data_; }
   uint32_t late_recovered() const { return late_recovered_; }
@@ -160,7 +167,10 @@ class FrameRx {
     std::bitset<kMaxS> orig_mask;
     std::bitset<kMaxS> recov_mask;
     std::bitset<kMaxS> parity_mask;
-    std::bitset<kMaxS> decoded_once;
+    // Indices whose reconstruction failed the structural check. A23 allows
+    // retries, but each index must be counted once: otherwise a single bad
+    // set inflates struct_fail by the number of later parity symbols.
+    std::bitset<kMaxS> bad_recon;
     std::array<std::vector<uint8_t>, kMaxS> symbols;
   };
 
@@ -190,9 +200,15 @@ class FrameRx {
   std::set<uint32_t> retired_;
   uint32_t anchor_ = 0;
   bool anchor_valid_ = false;
+  // A8: first far-future set_id awaiting confirmation (same id, a consecutive
+  // id, or kAheadConfirmTimeoutMs without traffic near the anchor).
+  uint32_t pending_ahead_ = 0;
+  bool pending_ahead_valid_ = false;
+  int64_t pending_ahead_ms_ = 0;
 
   uint32_t struct_fail_ = 0;
   uint32_t stale_ = 0;
+  uint32_t ahead_dropped_ = 0;
   uint32_t late_dup_ = 0;
   uint32_t dup_after_recovered_ = 0;  // #31: retransmission lost the race to parity
   uint32_t late_data_ = 0;

@@ -29,7 +29,17 @@ void drop_front(std::vector<uint8_t>* v, size_t n) {
 
 // #29a: how long a reaped session's salt keeps absorbing the peer's tail
 // retransmissions before the routing entry is truly forgotten.
-constexpr int64_t kSaltTombstoneMs = 5000;
+// A1 follow-up: a reclaimed salt must stay forgotten long enough that a
+// recorded HELLO cannot resurrect the session. Five seconds only covered the
+// peer's RTO tail; a replayed handshake a moment later rebuilt the session
+// with the same (key, IV) space. Five minutes with a bounded table keeps the
+// memory cost fixed (only authenticated sessions may enter) while making the
+// replay window operationally useless. The residual (a recording older than
+// the TTL) needs a handshake challenge and is tracked as a protocol item.
+constexpr int64_t kSaltTombstoneMs = 5 * 60 * 1000;
+// Only authenticated sessions insert here, so this bound is a flood ceiling
+// for PSK holders, not for arbitrary UDP senders.
+constexpr size_t kSaltTombstoneMax = 8192;
 
 std::string salt_key_of(const uint8_t* salt) {
   return std::string(reinterpret_cast<const char*>(salt), Envelope::kSaltLen);
@@ -81,29 +91,46 @@ const char* stream_reason_text(CloseReason reason) {
 }  // namespace
 
 // Exported via engine.h (the Qt client builds its own sinks from settings).
+// N2 (P2'/P5'): the sink opens lazily on the first trace entry. A server
+// creates the Conn before the first datagram authenticates, so opening here
+// meant one empty file per forged 8-byte salt (a trivially amplified inode
+// DoS). Unauthenticated sessions never emit a controller report, so the file
+// now appears only for sessions that actually authenticate.
 SessionConfig::TraceFn make_trace_sink(const std::string& prefix, uint64_t cid) {
   if (prefix.empty()) {
     return nullptr;
   }
-  const std::string path = prefix + "." + std::to_string(cid) + ".jsonl";
-  make_directories_for(path);
-  std::shared_ptr<std::FILE> file(std::fopen(path.c_str(), "wb"),
-                                  [](std::FILE* f) {
-                                    if (f != nullptr) {
-                                      std::fclose(f);
-                                    }
-                                  });
-  if (file == nullptr || file.get() == nullptr) {
-    // #33: never silent again — stderr is the only surface here.
-    std::fprintf(stderr, "fcp: trace path %s unopenable; recording disabled\n",
-                 path.c_str());
-    return nullptr;
-  }
-  return [file](const TraceEntry& e) {
+  struct Lazy {
+    std::string path;
+    std::shared_ptr<std::FILE> file;
+    bool attempted = false;
+  };
+  auto state = std::make_shared<Lazy>();
+  state->path = prefix + "." + std::to_string(cid) + ".jsonl";
+  return [state](const TraceEntry& e) {
+    if (!state->attempted) {
+      state->attempted = true;
+      make_directories_for(state->path);
+      state->file = std::shared_ptr<std::FILE>(
+          std::fopen(state->path.c_str(), "wb"),
+          [](std::FILE* f) {
+            if (f != nullptr) {
+              std::fclose(f);
+            }
+          });
+      if (!state->file || state->file.get() == nullptr) {
+        // #33: never silent again — stderr is the only surface here.
+        std::fprintf(stderr, "fcp: trace path %s unopenable; recording disabled\n",
+                     state->path.c_str());
+      }
+    }
+    if (!state->file || state->file.get() == nullptr) {
+      return;
+    }
     std::string line;
     encode_trace_line(e, &line);
     line.push_back('\n');
-    std::fwrite(line.data(), 1, line.size(), file.get());
+    std::fwrite(line.data(), 1, line.size(), state->file.get());
   };
 }
 
@@ -249,26 +276,42 @@ void ProxyEngine::on_wire(uint64_t peer, const uint8_t* data, size_t len, int64_
       return;
     }
     born = true;
+  }
+  // A1: the salt rides in the clear, so the lookup above proves nothing. The
+  // envelope must authenticate before the datagram gets any authority over the
+  // session -- in particular before a mismatched source address may tear it
+  // down. Otherwise one 8-byte prefix from any spoofed address kills a live
+  // tunnel without the PSK.
+  const bool authenticated = c->session->on_wire(data, len, now_ms);
+  if (authenticated) {
+    // A1 follow-up: remember that this Conn earned the right to a tombstone.
+    c->authenticated_once = true;
+  }
+  if (born) {
+    // A salt is minted by a peer that holds the PSK, so the datagram that
+    // creates a server session must authenticate. Otherwise anyone with a UDP
+    // socket could insert a Conn per random salt and pin max_sessions; the
+    // session would sit in kNegotiating forever because there is no peer to
+    // negotiate with. (The start() in create_server_conn bounds the same table
+    // for an authenticated peer that never completes a handshake.)
+    if (!authenticated) {
+      finish_conn(*c, now_ms, "unauthenticated first datagram");
+      reap(now_ms);
+      return;
+    }
   } else if (c->peer != peer) {
-    // Same salt, different source address: a fourth-party replay of a live
-    // session's datagram. The envelope would still authenticate (same key), so
-    // this is the only place the binding is enforceable.
+    if (!authenticated) {
+      // Replayed or forged prefix from another address: it never reached the
+      // session (no tag, no nonce accepted), so dropping it is enough.
+      return;
+    }
+    // Same salt, different source address, and a fresh nonce that only the
+    // session key could have sealed: a fourth-party replay (or the peer after
+    // a NAT rebind). No envelope can attribute the source address, so this is
+    // the only place the binding is enforceable.
     ++counters_.salt_clash;
     log(label(*c) + " salt replay from another address");
     finish_conn(*c, now_ms, "salt re-bound to a new address");
-    reap(now_ms);
-    return;
-  }
-  const uint32_t auth_before = c->session->auth_fail();
-  c->session->on_wire(data, len, now_ms);
-  // A salt is minted by a peer that holds the PSK, so the datagram that
-  // creates a server session must authenticate. Otherwise anyone with a UDP
-  // socket could insert a Conn per random salt and pin max_sessions; the
-  // session would sit in kNegotiating forever because there is no peer to
-  // negotiate with. (The start() in create_server_conn bounds the same table
-  // for an authenticated peer that never completes a handshake.)
-  if (born && !c->session->established() && c->session->auth_fail() != auth_before) {
-    finish_conn(*c, now_ms, "unauthenticated first datagram");
     reap(now_ms);
     return;
   }
@@ -891,6 +934,14 @@ void ProxyEngine::drain_stream(Conn& conn) {
 }
 
 void ProxyEngine::flush_app(Conn& conn) {
+  // N3 (P4'): Qt emits bytesWritten synchronously from inside write(), so
+  // app_send can re-enter this function while the outer loop still holds
+  // `n`/`taken`. Without the guard the inner pass drains app_in and the outer
+  // one then drops bytes it never sent (or sends the same bytes twice).
+  if (conn.in_flush_app) {
+    return;
+  }
+  conn.in_flush_app = true;
   while (!conn.app_in.empty()) {
     if (!host_.app_send) {
       break;
@@ -903,6 +954,7 @@ void ProxyEngine::flush_app(Conn& conn) {
     conn.app_accepted += taken;
     drop_front(&conn.app_in, taken);
   }
+  conn.in_flush_app = false;
   if (conn.stream) {
     // What the socket would not take, plus what a parser has not consumed yet,
     // is still this stream's receive buffer. The pre-tunnel phases matter as
@@ -1017,16 +1069,20 @@ void ProxyEngine::reap(int64_t now_ms) {
       if (conn.session) {
         conn.session->flush_report(now_ms);
       }
-      if (!conn.salt_key.empty()) {
+      if (!conn.salt_key.empty() && conn.authenticated_once) {
         const auto salt_it = by_salt_.find(conn.salt_key);
         if (salt_it != by_salt_.end() && salt_it->second == id) {
           by_salt_.erase(salt_it);
           // #29a (M2 §8.1 tail race): the peer's retransmit tail keeps
-          // arriving after our side is gone. Keep the salt known-but-dead
-          // for a grace period so those datagrams drop as tombstones instead
-          // of counting as unknown_salt (client) or — worse on the server —
-          // being mistaken for a fresh HELLO and rebirthing a phantom
-          // session. The grace covers the peer's RTO tail (rto_max is 5s).
+          // arriving after our side is gone. Keep the salt known-but-dead so
+          // those datagrams drop as tombstones instead of counting as
+          // unknown_salt (client) or — worse on the server — being mistaken
+          // for a fresh HELLO and rebirthing a phantom session. Only an
+          // authenticated session may insert (A1 follow-up): otherwise every
+          // 8-byte forgery would buy a five-minute table entry.
+          if (salt_tombstones_.size() >= kSaltTombstoneMax) {
+            salt_tombstones_.erase(salt_tombstones_.begin());
+          }
           salt_tombstones_[conn.salt_key] = now_ms + kSaltTombstoneMs;
         }
       }

@@ -37,8 +37,31 @@ enum class Direction : uint8_t {
 // salt: out = AES128-Encrypt(psk, salt(8) || 0x00 x 8). Deterministic, so both
 // ends compute the same value; distinct salts yield distinct session keys.
 // salt length is Envelope::kSaltLen (8).
+//
+// v6 only: this is the *bootstrap* value for the handshake envelope (v7 keeps
+// using it for HELLO/HELLO_ACK). It is NOT a session key any more — a value
+// derived from public wire bytes alone is replayable, which is exactly the R3-1
+// defect. Data symbols use derive_session_key_v7().
 void derive_session_key(const uint8_t psk[16], const uint8_t salt[8],
                         uint8_t out[16]);
+
+// R3-1: the v7 session key binds fresh material from both ends, so replaying a
+// recorded handshake cannot rebuild the same key (the responder's nonce is new).
+//
+//   X0 = AES128-Encrypt(psk, salt(8) || 0x00 x 8)   // == derive_session_key
+//   X1 = AES128-Encrypt(psk, X0 xor client_nonce)
+//   X2 = AES128-Encrypt(psk, X1 xor server_nonce)   // == out
+//
+// Three fixed-size blocks, no padding: CBC-MAC has no length-extension
+// ambiguity when every message has the same known length, and block 0 can never
+// be confused with a nonce block because its position is fixed. All-zero
+// nonces do not degenerate to the v6 key (X2 != X0), so the two derivations
+// stay separated. client_nonce is the C2S side's draw, server_nonce the S2C
+// side's; the roles are fixed by Direction, not by who spoke first, so a
+// simultaneous handshake still converges on one key.
+void derive_session_key_v7(const uint8_t psk[16], const uint8_t salt[8],
+                           const uint8_t client_nonce[16],
+                           const uint8_t server_nonce[16], uint8_t out[16]);
 
 // Derives the two direction keys from the 16-byte session key (the ikm is the
 // per-session key from derive_session_key, not the configured PSK). Labels are
@@ -78,11 +101,21 @@ class Envelope {
   // Restores the send counter (must be < 2^32).
   bool set_send_nonce(uint64_t value);
 
+  // R3-1: switches this envelope to an explicit session key and restarts both
+  // directions from counter 0 with an empty replay window. Called exactly once
+  // per session, when the handshake has produced the nonce pair; the caller
+  // must not use the envelope for data before that (nothing does: symbols are
+  // prepared after negotiation and handshake traffic has its own envelope).
+  // Restarting the counter is safe here only because the key changes with it.
+  void rekey(const uint8_t session_key[16]);
+
   uint64_t send_nonce() const { return send_nonce_; }
   bool exhausted() const { return send_nonce_ >= kNonceLimit; }
 
  private:
   bool accept_nonce(uint64_t nonce_ctr);
+  // Derives both direction keys from a session key and resets all per-key state.
+  void install_keys(const uint8_t session_key[16]);
 
   uint8_t send_key_[16];
   uint8_t recv_key_[16];

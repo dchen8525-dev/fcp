@@ -3,6 +3,7 @@
 #include <QAbstractSocket>
 #include <QHostAddress>
 #include <QHostInfo>
+#include <QRandomGenerator>
 #include <QVariant>
 
 #include <algorithm>
@@ -19,6 +20,7 @@ constexpr qint64 kHandshakeLimitMs = 6000;
 constexpr qint64 kMeetTimeoutMs = 15000;
 constexpr double kPhaseSeconds = (kUpEndMs - kUpStartMs) / 1000.0;
 constexpr int kSocketBufferBytes = 4 * 1024 * 1024;
+constexpr size_t kDataSymbolOverhead = 36;  // session data-symbol wire header
 
 constexpr quint8 kMagic[8] = {'F', 'C', 'P', 'B', 'E', 'N', 'C', 'H'};
 
@@ -63,6 +65,17 @@ void BenchEngine::start(const Options& options) {
     cleanupRun();
   }
   opt_ = options;
+  if (opt_.key.size() != 16) {
+    // P1-2: the UI validates hex length, but constData() past the array is UB
+    // for any other caller.
+    failRun(QStringLiteral("PSK 长度无效（需 16 字节）"));
+    return;
+  }
+  ++run_gen_;
+  // A2: never reuse (key, salt) across runs -- that is a GCM two-time pad.
+  for (size_t i = 0; i < sizeof(session_salt_); ++i) {
+    session_salt_[i] = static_cast<quint8>(QRandomGenerator::system()->generate() & 0xFF);
+  }
   state_ = State::kIdle;
   last_result_ = Result{};
 
@@ -105,8 +118,11 @@ void BenchEngine::start(const Options& options) {
   setState(State::kResolving);
   Q_EMIT logLine(QStringLiteral("解析主机 %1…").arg(opt_.host));
 
-  QHostInfo::lookupHost(opt_.host, this, [this](const QHostInfo& info) {
-    if (state_ != State::kResolving) {
+  const quint64 gen = run_gen_;
+  QHostInfo::lookupHost(opt_.host, this, [this, gen](const QHostInfo& info) {
+    // P4-4: stop()/start(B) while A's lookup is in flight must not connect B's
+    // PSK and port to A's address.
+    if (gen != run_gen_ || state_ != State::kResolving) {
       return;
     }
     if (info.error() != QHostInfo::NoError || info.addresses().isEmpty()) {
@@ -157,7 +173,7 @@ void BenchEngine::connectTo(const QHostAddress& addr) {
 void BenchEngine::beginSession() {
   fcp::SessionConfig cfg;
   std::memcpy(cfg.key, opt_.key.constData(), 16);
-  std::memcpy(cfg.salt, opt_.salt.constData(), 8);
+  std::memcpy(cfg.salt, session_salt_, sizeof(cfg.salt));
   cfg.send_direction = fcp::Direction::kC2S;
   cfg.recv_direction = fcp::Direction::kS2C;
   cfg.d = 10;
@@ -168,13 +184,6 @@ void BenchEngine::beginSession() {
   session_ = std::make_unique<fcp::Session>(
       cfg,
       [this](const uint8_t* wire, size_t len, fcp::SymbolType type) {
-        if (type == fcp::SymbolType::kData) {
-          tx_wire_bytes_ += len;
-        } else if (type == fcp::SymbolType::kParity) {
-          ++tx_parity_;
-        } else {
-          ++tx_oob_;
-        }
         if (socket_.state() != QAbstractSocket::ConnectedState) {
           ++tx_fail_;
           return;
@@ -183,6 +192,20 @@ void BenchEngine::beginSession() {
                                        static_cast<qint64>(len));
         if (n != static_cast<qint64>(len)) {
           ++tx_fail_;
+          return;
+        }
+        // A20: only successful datagrams count. The old code booked the bytes
+        // before the socket accepted them, so a saturated send buffer produced
+        // ghost throughput exactly when the run was under pressure.
+        if (type == fcp::SymbolType::kData) {
+          tx_wire_bytes_ += len;
+          if (len > kDataSymbolOverhead) {
+            tx_data_bytes_ += len - kDataSymbolOverhead;
+          }
+        } else if (type == fcp::SymbolType::kParity) {
+          ++tx_parity_;
+        } else {
+          ++tx_oob_;
         }
       },
       [this](const uint8_t* payload, size_t len) {
@@ -274,7 +297,12 @@ void BenchEngine::pumpRendezvous(qint64 now) {
   }
   if (now >= next_magic_ms_) {
     if (socket_.state() == QAbstractSocket::ConnectedState) {
-      socket_.write(reinterpret_cast<const char*>(kMagic), sizeof(kMagic));
+      // A2: the client announces the run's random session salt alongside the
+      // magic; the server derives its session keys from it.
+      quint8 meet[sizeof(kMagic) + sizeof(session_salt_)];
+      std::memcpy(meet, kMagic, sizeof(kMagic));
+      std::memcpy(meet + sizeof(kMagic), session_salt_, sizeof(session_salt_));
+      socket_.write(reinterpret_cast<const char*>(meet), sizeof(meet));
       ++meet_sent_;
     }
     next_magic_ms_ = now + 50;
@@ -299,7 +327,8 @@ void BenchEngine::pumpSession(qint64 rel) {
     ++rx_datagrams_;
     // Late rendezvous magics are not session traffic; feeding them to the
     // session would book a bogus auth failure.
-    if (n == static_cast<qint64>(sizeof(kMagic)) &&
+    if ((n == static_cast<qint64>(sizeof(kMagic)) ||
+         n == static_cast<qint64>(sizeof(kMagic) + sizeof(session_salt_))) &&
         std::memcmp(buf, kMagic, sizeof(kMagic)) == 0) {
       continue;
     }
@@ -334,7 +363,6 @@ void BenchEngine::drivePhases(qint64 rel) {
       session_->on_kcp_output(segment_.data(), segment_.size(), rel);
       ++sn_;
       ++tx_segs_;
-      tx_data_bytes_ += segment_.size();
       tokens_ -= wire_per_seg;
       ++burst;
     }

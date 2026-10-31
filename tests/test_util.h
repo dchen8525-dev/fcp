@@ -41,6 +41,36 @@ inline std::string hex(const uint8_t* data, size_t len) {
   return out;
 }
 
+// Parses 2*len hex digits into out. Returns false on a short string or a
+// non-hex digit, so a mistyped vector fails the test instead of silently
+// comparing against half a buffer.
+inline bool unhex(const char* text, uint8_t* out, size_t len) {
+  if (text == nullptr || out == nullptr) {
+    return false;
+  }
+  auto nibble = [](char c, uint8_t* v) {
+    if (c >= '0' && c <= '9') {
+      *v = static_cast<uint8_t>(c - '0');
+    } else if (c >= 'a' && c <= 'f') {
+      *v = static_cast<uint8_t>(c - 'a' + 10);
+    } else if (c >= 'A' && c <= 'F') {
+      *v = static_cast<uint8_t>(c - 'A' + 10);
+    } else {
+      return false;
+    }
+    return true;
+  };
+  for (size_t i = 0; i < len; ++i) {
+    uint8_t hi = 0;
+    uint8_t lo = 0;
+    if (!nibble(text[2 * i], &hi) || !nibble(text[2 * i + 1], &lo)) {
+      return false;
+    }
+    out[i] = static_cast<uint8_t>((hi << 4) | lo);
+  }
+  return true;
+}
+
 inline std::mt19937& rng() {
   static std::mt19937 engine(0x5EED1234u);
   return engine;

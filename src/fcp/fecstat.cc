@@ -149,6 +149,17 @@ FecstatStatus FecstatValidator::validate(const uint8_t* in, size_t len, const ui
     if (!set_id_after(last_set_id_, out->accounted_through_set_id)) {
       return FecstatStatus::kStale;
     }
+    // P6' N8: "forward" must also be bounded. A signed neighbour can claim
+    // last + 2^31 - 1, which passes the half-window test and then makes every
+    // genuine report stale for the rest of the session (k frozen until the
+    // u32 wrap). The sender's own set counter is at most a handful of sets
+    // ahead of anything it could legitimately report.
+    const uint32_t forward =
+        out->accounted_through_set_id - last_set_id_;
+    if (forward > kFecstatMaxForwardSets) {
+      ++future_rejects_;
+      return FecstatStatus::kStale;
+    }
   }
   have_last_ = true;
   last_set_id_ = out->accounted_through_set_id;

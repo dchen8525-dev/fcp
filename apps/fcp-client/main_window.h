@@ -96,7 +96,6 @@ class MainWindow : public QMainWindow {
   QSpinBox* portSpin_ = nullptr;
   QDoubleSpinBox* mbpsSpin_ = nullptr;
   QLineEdit* pskEdit_ = nullptr;
-  QLineEdit* saltEdit_ = nullptr;
   QSpinBox* segSpin_ = nullptr;
   QSpinBox* mtuSpin_ = nullptr;
   QComboBox* fecMode_ = nullptr;

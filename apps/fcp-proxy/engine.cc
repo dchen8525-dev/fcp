@@ -4,6 +4,12 @@
 #include <cstring>
 #include <random>
 
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#endif
+
 namespace fcp {
 namespace {
 
@@ -31,11 +37,30 @@ std::string salt_key_of(const uint8_t* salt) {
 
 // #29a: one JSONL controller-trace sink per session, closed with the session
 // (the shared_ptr dies with the captured lambda). Empty prefix = disabled.
+// #33: the prefix may name a directory that does not exist yet (--trace=/run/
+// fcp/cli before anyone created /run/fcp) — create the parent chain instead of
+// silently recording nothing, which is how the first WAN run lost every
+// client-side trace.
+void make_directories_for(const std::string& path) {
+  for (size_t i = 1; i < path.size(); ++i) {
+    if (path[i] != '/' && path[i] != '\\') {
+      continue;
+    }
+    const std::string dir = path.substr(0, i);
+#ifdef _WIN32
+    _mkdir(dir.c_str());
+#else
+    mkdir(dir.c_str(), 0755);
+#endif
+  }
+}
+
 SessionConfig::TraceFn make_trace_sink(const std::string& prefix, uint64_t cid) {
   if (prefix.empty()) {
     return nullptr;
   }
   const std::string path = prefix + "." + std::to_string(cid) + ".jsonl";
+  make_directories_for(path);
   std::shared_ptr<std::FILE> file(std::fopen(path.c_str(), "wb"),
                                   [](std::FILE* f) {
                                     if (f != nullptr) {
@@ -43,6 +68,9 @@ SessionConfig::TraceFn make_trace_sink(const std::string& prefix, uint64_t cid) 
                                     }
                                   });
   if (file == nullptr || file.get() == nullptr) {
+    // #33: never silent again — stderr is the only surface here.
+    std::fprintf(stderr, "fcp: trace path %s unopenable; recording disabled\n",
+                 path.c_str());
     return nullptr;
   }
   return [file](const TraceEntry& e) {

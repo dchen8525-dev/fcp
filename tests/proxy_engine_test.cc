@@ -748,7 +748,7 @@ void salt_tombstone_absorbs_tail() {
 // session, and its lines decode back into TraceEntry.
 void trace_sink_writes_controller_trace() {
   Options opt;
-  opt.trace_prefix = "replay_trace_test";
+  opt.trace_prefix = "replay_trace_test/deep/dir/trace";  // #33: dirs auto-created
   Harness h{opt};
   h.local_open(kLocalConn);
   h.local_send(kLocalConn, greeting());
@@ -767,7 +767,7 @@ void trace_sink_writes_controller_trace() {
     return h.client->counters().live == 0 && h.server->counters().live == 0;
   }, 200));
 
-  std::FILE* f = std::fopen("replay_trace_test.101.jsonl", "rb");
+  std::FILE* f = std::fopen("replay_trace_test/deep/dir/trace.101.jsonl", "rb");
   CHECK(f != nullptr);
   char line[4096];
   CHECK(std::fgets(line, sizeof(line), f) != nullptr);
@@ -779,7 +779,7 @@ void trace_sink_writes_controller_trace() {
   // The in-memory path is lossless, so the controller is rightly still OFF;
   // what this guards is the recording plumbing, not the decision.
   CHECK(e.k_after == 0);
-  CHECK(std::remove("replay_trace_test.101.jsonl") == 0);
+  CHECK(std::remove("replay_trace_test/deep/dir/trace.101.jsonl") == 0);
 }
 
 // A server session is born from the first datagram that carries an unknown

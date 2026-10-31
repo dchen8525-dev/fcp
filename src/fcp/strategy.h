@@ -45,7 +45,15 @@ constexpr uint32_t kMinLedgerGroups = 64;
 enum class FecState : uint8_t {
   kOff = 0,
   kOn = 1,
+  // M3 third state (FCP_M3_CONTROL.md §2): the measured redundancy ratio
+  // parity_bytes/data_bytes exceeded the byte budget. k only declines here
+  // (one parity per report, floor 1); one report back under the ceiling
+  // returns to ON. Entered from and exited to ON only.
+  kCapped = 2,
 };
+
+// §10-style log name; keeps session.cc free of a per-state switch.
+const char* fec_state_name(FecState state);
 
 struct FecStrategyConfig {
   uint8_t d = 10;
@@ -57,6 +65,12 @@ struct FecStrategyConfig {
   // value only buys the first few seconds and converges away if the link lost
   // its habit.
   int initial_k = -1;
+  // M3 byte budget (FCP_M3_CONTROL.md §2): ceiling on the interval's
+  // parity_bytes/data_bytes ratio; 0 disables. The default 0.40 sits just
+  // under the wire ceiling k/(10+k) = 41% (k = 7), so it never binds at
+  // D = 10 unless the operator tightens it — wired and testable, off in
+  // practice.
+  double budget_ratio = 0.40;
 };
 
 class FecStrategy {
@@ -100,6 +114,7 @@ class FecStrategy {
   double target_recovery_;
   int pinned_k_;
   int initial_k_;
+  double budget_ratio_;  // clamped at construction; <= 0 means off
 
   FecState state_ = FecState::kOff;
   uint8_t k_ = 0;

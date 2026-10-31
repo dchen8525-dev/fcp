@@ -328,6 +328,7 @@ void Session::configure(int64_t now_ms) {
   // p_max_ is already min(p_max, P') -- 0 in stats mode, where the clamp drops
   // the seed and the machine stays OFF.
   strategy_config.initial_k = cfg_.initial_k;
+  strategy_config.budget_ratio = cfg_.fec_budget;
   strategy_ = std::make_unique<FecStrategy>(strategy_config);
   tx_->set_k(strategy_->k());
 
@@ -398,6 +399,11 @@ void Session::on_oob(const uint8_t* payload, size_t len, int64_t now_ms) {
   if (tx_) {
     tx_->set_k(strategy_->k());
   }
+  // Same measure the strategy acted on (§2); for the budget log lines only.
+  const double ratio = stat.data_bytes_rx > 0
+                           ? static_cast<double>(stat.parity_bytes_rx) /
+                                 static_cast<double>(stat.data_bytes_rx)
+                           : 0.0;
 
   const uint32_t sets = stat.sets_expected;
   if (static_cast<uint64_t>(stat.sets_k_unknown) * 10 > std::max<uint32_t>(1, sets)) {
@@ -437,7 +443,7 @@ void Session::on_oob(const uint8_t* payload, size_t len, int64_t now_ms) {
                 "usable=%uppm -> k=%u state=%s",
                 stat.sets_expected, stat.data_expected, stat.data_rx_orig,
                 stat.data_recovered_dl, stat.data_late_rx, lost, pre, usable,
-                strategy_->k(), strategy_->state() == FecState::kOn ? "ON" : "OFF");
+                strategy_->k(), fec_state_name(strategy_->state()));
   log(line);
 
   // M3 R(k) correction (FCP_M3_CONTROL.md §1.2): peer's ledger lifted the
@@ -449,6 +455,19 @@ void Session::on_oob(const uint8_t* payload, size_t len, int64_t now_ms) {
                   stat.ledger_groups, stat.ledger_fail_ppm, ledger_k(stat),
                   strategy_->last_p_eff(), strategy_->last_loss(),
                   strategy_->ledger_reports(), strategy_->ledger_skipped());
+    log(line);
+  }
+
+  // M3 byte budget transitions (§2), greppable for WAN calibration.
+  if (before != FecState::kCapped && strategy_->state() == FecState::kCapped) {
+    std::snprintf(line, sizeof(line),
+                  "FEC capped: parity/data=%.1f%% > budget=%.1f%% (k=%u)",
+                  ratio * 100.0, cfg_.fec_budget * 100.0, strategy_->k());
+    log(line);
+  } else if (before == FecState::kCapped && strategy_->state() == FecState::kOn) {
+    std::snprintf(line, sizeof(line),
+                  "FEC budget restored: parity/data=%.1f%% <= budget=%.1f%% (k=%u)",
+                  ratio * 100.0, cfg_.fec_budget * 100.0, strategy_->k());
     log(line);
   }
 

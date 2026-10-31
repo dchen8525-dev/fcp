@@ -39,6 +39,18 @@ uint8_t k_for(double loss, uint8_t d, uint8_t p_max, double target) {
   return p_max;
 }
 
+const char* fec_state_name(FecState state) {
+  switch (state) {
+    case FecState::kOff:
+      return "OFF";
+    case FecState::kOn:
+      return "ON";
+    case FecState::kCapped:
+      return "CAPPED";
+  }
+  return "?";
+}
+
 double binom_p_for_cdf(unsigned max_losses, unsigned trials, double q) {
   if (q >= 1.0) {
     return 0.0;
@@ -73,7 +85,9 @@ FecStrategy::FecStrategy(const FecStrategyConfig& config)
       // warm-up value is only the starting point and keeps the same P' clamp.
       initial_k_(config.pinned_k >= 0 || config.initial_k < 0
                      ? -1
-                     : std::min(config.initial_k, static_cast<int>(p_max_))) {
+                     : std::min(config.initial_k, static_cast<int>(p_max_))),
+      // Negative budgets are config noise, not "more off than off".
+      budget_ratio_(std::max(0.0, config.budget_ratio)) {
   if (pinned_k_ > 0) {
     state_ = FecState::kOn;
     k_ = static_cast<uint8_t>(pinned_k_);
@@ -132,6 +146,32 @@ void FecStrategy::on_report(const FecstatPacket& stat, bool window_queued) {
       consec_ge_08_ = 0;
     }
     return;
+  }
+
+  // M3 byte budget (FCP_M3_CONTROL.md §2): the peer's bytes are the real
+  // measure of our redundancy. Over the ceiling we drop one parity per report
+  // unconditionally (k_target is irrelevant — the budget wins over the
+  // recovery target), floored at 1 per §14.11 (congestion never returns k to
+  // 0). One report under the ceiling returns to ON without stepping.
+  if (budget_ratio_ > 0.0 && stat.data_bytes_rx > 0) {
+    const double ratio =
+        static_cast<double>(stat.parity_bytes_rx) / static_cast<double>(stat.data_bytes_rx);
+    if (ratio > budget_ratio_) {
+      state_ = FecState::kCapped;
+      k_ = std::max<uint8_t>(1, static_cast<uint8_t>(k_ - 1));
+      clean_streak_ = 0;
+      return;
+    }
+    if (state_ == FecState::kCapped) {
+      state_ = FecState::kOn;
+      return;
+    }
+  } else {
+    // No bytes to measure (or budget off): a capped state cannot persist on
+    // evidence it cannot see — fall back to ON.
+    if (state_ == FecState::kCapped) {
+      state_ = FecState::kOn;
+    }
   }
 
   // M3 R(k) correction (FCP_M3_CONTROL.md §1.2): a usable ledger from the

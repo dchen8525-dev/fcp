@@ -66,6 +66,7 @@ void Usage(EngineRole role, const char* argv0) {
       "  --mtu=N              UDP payload budget (default 1400)\n"
       "  --d=N --p=N          frame geometry (default 10/3)\n"
       "  --k=N                pinned parity per set, -1 = adaptive (default -1)\n"
+      "  --fec-budget=R       redundancy ceiling parity/data per report, 0 = off (default 0.4)\n"
       "  --window=KiB         stream send window (default 256)\n"
       "  --rcv-buf=KiB        stream receive buffer (default 256)\n"
       "  --idle=ms            tunnel idle teardown (default 300000)\n"
@@ -144,6 +145,9 @@ int run_proxy(EngineRole role, int argc, char** argv) {
   }
   if (const std::string* v = Find(opts, "k")) {
     ec.pinned_k = std::atoi(v->c_str());
+  }
+  if (const std::string* v = Find(opts, "fec-budget")) {
+    ec.fec_budget = std::strtod(v->c_str(), nullptr);
   }
   if (const std::string* v = Find(opts, "window")) {
     ec.send_window_bytes = static_cast<size_t>(KiB(*v));

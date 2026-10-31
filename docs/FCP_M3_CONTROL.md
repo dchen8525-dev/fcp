@@ -141,7 +141,7 @@ M2 的定价（单洞 SACK 立补、其余等 RTO）在 WAN 上的实测签名�
 | `src/fcp/stream.h/.cc`（#27） | dup-ACK 快重 + 多洞 SACK 记分板 | 仅 std |
 | `tests/e2e_link.h`（#26） | Gilbert–Elliott 注入 | — |
 | `tools/fcp_replay.cc`（#28） | 轨迹录制/回放 | `fcp` |
-| `apps/fcp-proxy/`（#25） | `--fec-budget` 透传（CLI 与 GUI 设置页） | `fcp_proxy_core` |
+| `apps/fcp-proxy/`（#25） | `--fec-budget` 透传：`EngineConfig::fec_budget` → `SessionConfig`；CLI 已落地，**GUI 设置页顺延 #29**（本机 Qt 工具链缺失，见变更记录 #24 条） | `fcp_proxy_core` |
 
 `k_for`/`binom_cdf` 纯函数保持不动（M1 的表格与 T 验收继续有效）；改动只发生在"喂给它
 什么 loss"与"输出后如何限速"两层。
@@ -193,3 +193,4 @@ M2 的定价（单洞 SACK 立补、其余等 RTO）在 WAN 上的实测签名�
 |---|---|
 | 2026-10-31 | M3 开工：范围盘点（M2 观测增强三项已在位）、设计定案（R(k) 单侧校正、FECSTAT reserved 复用、三态 CAPPED、预算默认 0.40）、任务分解 #24–#29 |
 | 2026-10-31 | **#24 落地**：`settle` 账本（满编组/失败/游程直方图/主导 k）→ `reporter` 打包（flg bit3、fail_ppm 整除舍入）→ `fecstat` codec 语义化 reserved0..2 → `strategy` 的 `binom_p_for_cdf` 反解与单侧校正门（`kMinLedgerGroups=64`、主导 k 必须等于当前 k）→ `session` 日志行 `FEC ledger: ...`。决策 #29 入协议文档（§7.1 字段表 + §8.1）。实现期修正两个测试假设：①洞数 > k 时 RS 欠定、**零恢复**（`TestLedgerFailedRun` 断言 recovered=0 而非 2）；②`binom_cdf` 在 q→1 处双精度平坦（实测 δp=1.6e-9@k=6、1.8e-7@k=7），反解 roundtrip 跳过 q>1−1e-9 带——校正路径无害（max() 单侧兜底）。fecstat_test 补旧端零账本互操作 golden；reporter_test 两场景 flg 断言升级 + 账本字段断言（26 组 1 失败 → 38462ppm）。T34 覆盖；T35 的注入级验证随 #26 的 GE 载体一起做。Windows Debug/Release ctest 25/25（Linux 回归随 #29 WAN 收口）。**Qt 客户端构建门禁本轮未复验**：本机 vcpkg（D:\work\vcpkg 与 VS 内置）均无 qt6、`build/windows-x64-app` 陈旧缓存 `Qt6_DIR-NOTFOUND`——环境缺依赖，非本次改动所致；`apps/` 不含对 `fecstat/settle/strategy` 头的任何引用（Qt 侧只经 `fcp_proxy_core` 引擎 API），新增字段零影响，Qt 门禁在下一次 GUI 相关任务或 #29 收口时补跑 |
+| 2026-10-31 | **#25 落地（T36）**：三态控制器 + 字节预算。`FecState::kCapped`（OFF/ON/CAPPED，`fec_state_name()` 统一日志名）；`FecStrategyConfig::budget_ratio`（默认 0.40，≤0 钳为不限）；逻辑在 on_report 的采样门之后：`ratio = parity_bytes_rx/data_bytes_rx` 超限 → CAPPED 且每报告 k−=1（下限 1，预算优先于 k_target）；回落 1 报告 → 回 ON 不步进（滞回）。输入是 FECSTAT 既有字段，**零线上改动**。透传：`SessionConfig::fec_budget` → `EngineConfig::fec_budget` → CLI `--fec-budget=R`（strtod，帮助文本）。session 日志 `FEC capped:`/`FEC budget restored:` 进出行 + 状态名三态化。测试五场景：进态与逐报告降 k、回落滞回与步进恢复、**红线收敛**（R=0.10 → k=1，ratio≈k/10 仿真）、R=0 不绑、R<k=1 自身比值的退化边界（停在 CAPPED 不下溢）。**GUI 设置页顺延**：Qt 工具链在本机缺失（见 #24 条），`--fec-budget` 的 GUI 透传并入 #29 收口或下一个 GUI 任务；CLI 与 GUI 共用的 `fcp_proxy_core` 已含全量逻辑。协议文档 §8.2 入档。Windows Debug/Release ctest 25/25 |

@@ -55,6 +55,8 @@ struct EngineConfig {
   uint16_t mtu = 1400;
   size_t ip_hdr_len = 20;
   int pinned_k = -1;  // >= 0 bypasses the adaptive strategy (measurements)
+  // M3 byte budget (FCP_M3_CONTROL.md §2), passed to SessionConfig verbatim.
+  double fec_budget = 0.40;
   size_t send_window_bytes = 256 * 1024;
   size_t rcv_buf_bytes = 256 * 1024;
   // Teardown of a tunnel that stopped speaking (§7: dead peer detection).

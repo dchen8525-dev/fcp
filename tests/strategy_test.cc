@@ -415,6 +415,108 @@ void TestLedgerGates() {
   CHECK_EQ(st.k(), 2);
 }
 
+// --- M3 byte budget / kCapped (FCP_M3_CONTROL.md §2) ---
+
+constexpr uint32_t kDataBytes = 140000;  // ~1000 full-size data packets
+constexpr uint32_t kParityAtK4 = 40000;  // ratio 2/7 ≈ 28.6% > 20% budget
+
+fcp::FecStrategyConfig BudgetConfig(double ratio) {
+  fcp::FecStrategyConfig c;
+  c.budget_ratio = ratio;
+  return c;
+}
+
+// A fresh report per feed — the monotonic key rejects a repeated set_id.
+fcp::FecstatPacket BudgetReport(uint32_t set_id, double loss, uint32_t parity_bytes) {
+  fcp::FecstatPacket p = LossReport(set_id, loss);
+  p.data_bytes_rx = kDataBytes;
+  p.parity_bytes_rx = parity_bytes;
+  return p;
+}
+
+// Over the ceiling the state enters CAPPED and sheds one parity per report
+// regardless of k_target, until a report measures back under.
+void TestBudgetEntersCapped() {
+  fcp::FecStrategy st(BudgetConfig(0.20));
+  uint32_t id = 0;
+  Feed(&st, &id, 0.20);  // k = 4, no byte signal on the entry report
+  CHECK_EQ(st.k(), 4);
+
+  st.on_report(BudgetReport(++id, 0.20, kParityAtK4), false);
+  CHECK(st.state() == fcp::FecState::kCapped);
+  CHECK_EQ(st.k(), 3);  // budget wins over k_target (= 4 at 20% loss)
+
+  st.on_report(BudgetReport(++id, 0.20, kParityAtK4), false);
+  CHECK_EQ(st.k(), 2);
+  st.on_report(BudgetReport(++id, 0.20, kParityAtK4), false);
+  CHECK_EQ(st.k(), 1);
+  // Floor: §14.11 — congestion pressure never returns k to 0.
+  st.on_report(BudgetReport(++id, 0.20, kParityAtK4), false);
+  CHECK(st.state() == fcp::FecState::kCapped);
+  CHECK_EQ(st.k(), 1);
+}
+
+// One report under the ceiling returns to ON without stepping; the next
+// report resumes normal ±1 movement (k may rise again).
+void TestBudgetRecoveryHysteresis() {
+  fcp::FecStrategy st(BudgetConfig(0.20));
+  uint32_t id = 0;
+  Feed(&st, &id, 0.20);
+  st.on_report(BudgetReport(++id, 0.20, kParityAtK4), false);
+  CHECK(st.state() == fcp::FecState::kCapped);
+  CHECK_EQ(st.k(), 3);
+
+  st.on_report(BudgetReport(++id, 0.20, 28000), false);  // ratio 20% — not over
+  CHECK(st.state() == fcp::FecState::kOn);
+  CHECK_EQ(st.k(), 3);  // hysteresis report moves nothing
+
+  st.on_report(BudgetReport(++id, 0.20, 28000), false);
+  CHECK(st.state() == fcp::FecState::kOn);
+  CHECK_EQ(st.k(), 4);  // k_for(0.20) = 4, normal stepping restored
+}
+
+// The red line: after convergence the measured ratio respects the budget.
+// R = 0.10 admits at most k = 1 (1/11 ≈ 9.1%); the walk-down is monotone.
+void TestBudgetConvergesUnderCeiling() {
+  fcp::FecStrategy st(BudgetConfig(0.10));
+  uint32_t id = 0;
+  Feed(&st, &id, 0.20);  // k = 4
+  for (int round = 0; round < 10; ++round) {
+    // The peer reports the traffic actually sent at the current k: ratio ≈ k/10.
+    st.on_report(BudgetReport(++id, 0.20, static_cast<uint32_t>(st.k()) * 14000), false);
+    if (st.state() == fcp::FecState::kOn) {
+      CHECK(static_cast<double>(st.k()) / 10.0 <= 0.10 + 1e-9);
+      return;
+    }
+    CHECK(st.state() == fcp::FecState::kCapped);
+    CHECK(st.k() >= 1);
+  }
+  CHECK(false);  // never converged
+}
+
+// Budget 0 disables the ceiling entirely, even with absurd ratio evidence.
+void TestBudgetZeroDisables() {
+  fcp::FecStrategy st(BudgetConfig(0.0));
+  uint32_t id = 0;
+  Feed(&st, &id, 0.20);
+  st.on_report(BudgetReport(++id, 0.20, 100000000), false);  // ratio 700x
+  CHECK(st.state() == fcp::FecState::kOn);
+  CHECK_EQ(st.k(), 4);
+}
+
+// Degenerate budget below the k=1 floor's own ratio: k stays 1, no underflow,
+// state stays CAPPED — documented boundary (§7 of the M3 doc), not a hang.
+void TestBudgetFloorStaysOne() {
+  fcp::FecStrategy st(BudgetConfig(0.05));
+  uint32_t id = 0;
+  Feed(&st, &id, 0.20);
+  for (int i = 0; i < 5; ++i) {
+    st.on_report(BudgetReport(++id, 0.20, 1400000), false);  // ratio 10x > 5%
+    CHECK_EQ(st.k(), 1);
+    CHECK(st.state() == fcp::FecState::kCapped);
+  }
+}
+
 int main() {
   TestOffToOn();
   TestTwoReportEntry();

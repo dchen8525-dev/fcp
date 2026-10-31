@@ -65,6 +65,11 @@ struct SessionConfig {
   // the negotiated P' and p_max). -1 starts OFF, which cannot pick a k until
   // the first FECSTAT report lands.
   int initial_k = -1;
+  // M3 byte budget (FCP_M3_CONTROL.md §2): ceiling on the interval's
+  // parity_bytes/data_bytes ratio seen by the peer's FECSTAT; 0 disables.
+  // Exceeding it enters the kCapped state (one parity per report down, floor
+  // 1) until a report measures back under the ceiling.
+  double fec_budget = 0.40;
   // #28③ (F2): pre-negotiation data cache limits (see handshake.h defaults).
   size_t handshake_cache_segments = kHandshakeMaxCachedSegments;
   size_t handshake_cache_bytes = kHandshakeMaxCachedBytes;

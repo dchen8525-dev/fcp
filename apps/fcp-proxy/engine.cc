@@ -318,6 +318,7 @@ bool ProxyEngine::create_client_conn(uint64_t id, uint64_t peer, int64_t now_ms)
   sc.mtu = cfg_.mtu;
   sc.ip_hdr_len = cfg_.ip_hdr_len;
   sc.pinned_k = cfg_.pinned_k;
+  sc.fec_budget = cfg_.fec_budget;
   // A stream numbers bytes, so a retransmission deliberately repeats an id the
   // peer has to see again; the frame-layer dedup keyed on the KCP sn would eat
   // it and stall the send window (session.h, SessionConfig::sn_of).
@@ -387,6 +388,7 @@ ProxyEngine::Conn* ProxyEngine::create_server_conn(uint64_t peer, const uint8_t*
   sc.mtu = cfg_.mtu;
   sc.ip_hdr_len = cfg_.ip_hdr_len;
   sc.pinned_k = cfg_.pinned_k;
+  sc.fec_budget = cfg_.fec_budget;
   sc.sn_of = nullptr;
   apply_prewarm(profile_for(peer, now_ms), &sc, &raw->stream_cfg);
 

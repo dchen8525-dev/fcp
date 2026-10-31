@@ -725,6 +725,32 @@ k_for(loss) = min{ k ∈ 1..P : Pr(本组丢包数 ≤ k | 码长 D+k, 丢包率
 - `k_for`/`binom_cdf` 纯函数不变；改动只发生在"喂什么 loss"这一层。设计细节与验收
   （T34/T35）见 `FCP_M3_CONTROL.md` §1/§8。
 
+### 8.2 字节预算与 CAPPED 态（M3，随 #25 落地）
+
+§14.11（拥塞冗余正反馈）的结构性解法：状态机扩为 **OFF / ON / CAPPED** 三态，输入是
+FECSTAT 既有字段 `parity_bytes_rx / data_bytes_rx`（对端对"你→我"方向的真实字节计量，
+无新增线上字段）：
+
+```text
+配置：--fec-budget R（冗余比上限，R ∈ [0,1]，默认 0.40；0 = 不限）
+ON，每报告：
+  ratio = parity_bytes_rx / data_bytes_rx
+  ratio > R → CAPPED，k −= 1（下限 1），本报告不再走 k_target 步进
+CAPPED，每报告：
+  ratio > R → 继续 k −= 1（下限 1，§14.11：拥塞不把 k 归零）
+  ratio ≤ R → 回 ON（1 报告滞回，该报告不步进；下一报告起恢复 ±1）
+```
+
+- **预算优先于恢复目标**：超预算时 `k_target` 不参与（否则"链路真需要 k=4 且 k=4 超预算"
+  会把红线永久顶穿）。收敛代价是每 excess parity 一个报告区间的超支，上界 `p_max` 个区间。
+- **默认 0.40 在 D=10 下实际不绑**：线上 ratio ≈ k/(D+k)（data 与 parity 的每包开销相同：
+  `36+payload+28` vs `34+symbol_max+28`，symbol_max=payload+2），k ≤ 6 时 ≤ 37.5% < 40%，
+  仅 k=7（41.2%）触界——wired and testable，深队列部署按需收紧。
+- **已知边界**：R < k=1 的自身比值（D=10 时 ~9.1%）时 k 停在 1、状态停在 CAPPED，预算
+  红线不可达——k 下限 1 的定价高于预算的配置矛盾，按 §14.11 的 k 下限为准；CAPPED 不
+  识别拥塞成因（只看字节比，不看 RTT/队列），是护栏不是控制器；CAPPED 不直接进 OFF
+  （干净链路上预算先松绑回 ON，再走既有 5 报告 clean streak）。
+
 ---
 
 ## 9. 与 KCP / 窗口 / RTO 的关系

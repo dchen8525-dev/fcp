@@ -139,6 +139,13 @@ jobs:
           grep -qF "fcp-proxy-server ${version}" /tmp/ver.txt
           fcp-proxy-client --version | grep -qF "fcp-proxy-client ${version}"
 
+          echo "== dpkg 记录的文件清单"
+          # 先打清单再逐条检查：落点类失败（第五次跑挂在文档路径上）只有
+          # 清单在手才能判断是"没装"还是"装到别的路径/别的文件名"。
+          dpkg -L fcp-proxy
+          echo "== /usr/share/doc/fcp-proxy 实际内容"
+          ls -la /usr/share/doc/fcp-proxy || true
+
           echo "== 包内文件落点"
           # 每一步都带一行回显：第四次跑时这里直接 exit 1，日志里只看到
           # "== 包内文件落点" 三个字，不知道是哪一条挂的（set -e 静默退出）。
@@ -153,9 +160,6 @@ jobs:
             dpkg -L fcp-proxy | grep -i systemd || echo "(包里没有 systemd 目录)"
             exit 1
           }
-          echo "== dpkg 记录的文件清单"
-          dpkg -L fcp-proxy
-
           echo "== conffile 登记（升级不覆盖运维配置的前提）"
           dpkg-query -W -f='${Conffiles}\n' fcp-proxy | tee /tmp/conf.txt
           grep -q '/etc/fcp/fcp-proxy.env' /tmp/conf.txt

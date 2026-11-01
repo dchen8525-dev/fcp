@@ -95,6 +95,21 @@ set_tests_properties(replay_tool_smoke PROPERTIES
          TIMEOUT 120
          FAIL_REGULAR_EXPRESSION "replay diverged")
 
+# 重构护栏：ctest 全绿只证明"没坏"，不证明"断言还在"。这一步把测试套件的
+# 形状钉住（每个测试二进制的测试函数数与 CHECK 数只许涨不许跌），防止重构
+# 过程中靠删断言把红灯变绿。基线 tests/test_baseline.json 随代码评审。
+# 缺 python3 时跳过而不是失败：VPS 门禁机器不一定装了 Python，而"没跑护栏"
+# 比"门禁因为缺解释器挂掉"好查得多。
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME test_baseline
+           COMMAND ${Python3_EXECUTABLE}
+                   ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/test_baseline.py)
+  set_tests_properties(test_baseline PROPERTIES TIMEOUT 60)
+else()
+  message(STATUS "python3 未找到；跳过 test_baseline 护栏")
+endif()
+
 # 打包器自检（scripts/mkdeb.py）：用 --self-test 跑纯逻辑单元（control 段落
 # 规则、ar 头、架构/版本校验），不需要已构建的二进制，也不写任何产物，
 # 两个平台都跑。真正的出包由 scripts/release_build_linux.sh 做。

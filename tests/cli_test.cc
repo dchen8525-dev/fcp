@@ -189,6 +189,16 @@ void TestRoleRequirements() {
                  &a, &error));
   CHECK_EQ(a.ro.bind_addr, std::string("192.168.1.1"));
   CHECK_EQ(a.ro.bind_port, 5001);
+
+  // The role has to reach BOTH halves. EngineConfig::role defaults to kClient,
+  // so a server that only fills ReactorOptions still prints "server: fcp on"
+  // and yet runs a client-side engine: it never births a session from a peer's
+  // datagram and silently drops every HELLO as unknown_salt. This is exactly
+  // what a 0.0.1 deb on a live host did.
+  CHECK_EQ(static_cast<int>(a.ec.role), static_cast<int>(EngineRole::kServer));
+  CHECK_EQ(static_cast<int>(a.ro.role), static_cast<int>(EngineRole::kServer));
+  CHECK(Ok(EngineRole::kClient, {}, &a, &error));
+  CHECK_EQ(static_cast<int>(a.ec.role), static_cast<int>(EngineRole::kClient));
 }
 
 void TestDefaultsSurvive() {

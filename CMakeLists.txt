@@ -15,10 +15,17 @@ project(fcp VERSION ${FCP_VERSION} LANGUAGES CXX)
 
 include(GNUInstallDirs)
 
-# 打包元数据（唯一真源：发布工作流从这些变量读，不要再在 yml 里抄一遍）。
-set(FCP_HOMEPAGE "https://github.com/dchen8525-dev/fcp" CACHE STRING "Package homepage")
-set(FCP_MAINTAINER "dchen8525 <dchen8525-dev@users.noreply.github.com>"
-    CACHE STRING "Deb maintainer / installer publisher")
+# 打包元数据：唯一真源是 packaging/debian/metadata.env（scripts/mkdeb.py 也读它）。
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/packaging/debian/metadata.env"
+     FCP_METADATA_LINES REGEX "^FCP_")
+foreach(line IN LISTS FCP_METADATA_LINES)
+  if(line MATCHES "^(FCP_[A-Z_]+)=(.*)$")
+    set(${CMAKE_MATCH_1} "${CMAKE_MATCH_2}")
+  endif()
+endforeach()
+if(NOT FCP_HOMEPAGE OR NOT FCP_MAINTAINER)
+  message(FATAL_ERROR "packaging/debian/metadata.env 必须给出 FCP_HOMEPAGE 与 FCP_MAINTAINER")
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

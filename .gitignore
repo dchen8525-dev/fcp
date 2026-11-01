@@ -6,3 +6,5 @@ dist/
 .zcode/
 /Testing/
 /replay_trace_test/
+__pycache__/
+*.pyc

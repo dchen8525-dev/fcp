@@ -172,6 +172,11 @@ bool parse_proxy_args(EngineRole role, int argc, char** argv, ProxyArgs* out,
     return true;
   }
   const bool client = role == EngineRole::kClient;
+  // Both halves, always: the engine decides who births a session (EngineConfig
+  // defaults to kClient, so a server that forgets this listens, prints
+  // "server: fcp on", and then drops every HELLO as unknown_salt), the reactor
+  // decides which sockets exist.
+  out->ec.role = role;
   out->ro.role = role;
 
   const std::string* key = Find(opts, "key");

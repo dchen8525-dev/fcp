@@ -14,7 +14,12 @@ packaging/debian/postrm   text eol=lf
 # Git for Windows 的 core.filemode 默认是 false，新建脚本必须
 # `git update-index --chmod=+x <file>` 补这一步，否则 Linux runner 上
 # 直接 "Permission denied"（首跑实测）。
+#
+# .py 同理：scripts/mkdeb.py 在 Linux runner 上被 python3 直接执行，CRLF 会让
+# `#!/usr/bin/env python3` 变成 "bad interpreter"（本地用 tar/scp 传代码时
+# 实测过，Git 索引里的 LF 才是准的）。
 *.sh    text eol=lf
+*.py    text eol=lf
 *.yml   text eol=lf
 *.yaml  text eol=lf
 *.iss   text eol=lf

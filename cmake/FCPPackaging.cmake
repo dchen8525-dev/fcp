@@ -53,8 +53,24 @@ set(CPACK_PACKAGE_CONTACT "${FCP_MAINTAINER}")
 set(CPACK_PACKAGE_HOMEPAGE_URL "${FCP_HOMEPAGE}")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
     "FCP proxy server and client (UDP tunnel with adaptive FEC)")
-set(CPACK_PACKAGE_DESCRIPTION_FILE
-    "${CMAKE_CURRENT_SOURCE_DIR}/packaging/debian/description")
+
+# 长描述：**必须先 STRIP 再交给 CPack，不能直接用 CPACK_PACKAGE_DESCRIPTION_FILE。**
+#
+# CPackDeb 会把文件内容原样塞进 Description 字段，然后 CPack 的 control 生成器
+# 在其后写 Installed-Size 并补一个空行结束。文件只要以换行结尾（POSIX 文本的
+# 正常写法），control 里就多出一个空行，dpkg 按空行分段，于是
+# "Installed-Size" 变成第二个段落、缺 Package 字段，安装直接失败：
+#   dpkg: error ... missing 'Package' field
+# 首跑 v0.0.1 就是这么红的。strip 掉尾部空白后段落正好一个。
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/packaging/debian/description" FCP_LONG_DESC)
+string(STRIP "${FCP_LONG_DESC}" FCP_LONG_DESC)
+# 摘要行必须自己接上：显式设置 CPACK_DEBIAN_PACKAGE_DESCRIPTION 后，
+# CPackDeb 那条"自动合并 SUMMARY + 文件内容"的分支就不再走（它的条件是
+# NOT CPACK_DEBIAN_PACKAGE_DESCRIPTION）。少了这一行，Description 的首行会变成
+# 正文第一句，不符合 Debian 的"首行即摘要"约定。
+set(CPACK_DEBIAN_PACKAGE_DESCRIPTION
+    "${CPACK_PACKAGE_DESCRIPTION_SUMMARY}\n${FCP_LONG_DESC}")
+
 set(CPACK_RESOURCE_FILE_LICENSE
     "${CMAKE_CURRENT_SOURCE_DIR}/packaging/debian/copyright")
 

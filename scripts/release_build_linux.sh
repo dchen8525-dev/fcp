@@ -39,6 +39,27 @@ ctest --test-dir "$BUILD_DIR" --output-on-failure
 echo "== cpack"
 (cd "$BUILD_DIR" && cpack -G DEB --config CPackConfig.cmake)
 
+# control 结构校验：出包就跑，别等到安装冒烟才发现。
+# 起因是首跑 v0.0.1：description 文件以换行结尾，CPack 把 Installed-Size
+# 顶成了第二段落，`dpkg -i` 报 "missing 'Package' field"。
+# dpkg-deb --info 会把这种包照样打印出来（不报错），所以这里必须自己看结构。
+deb="$(ls "$BUILD_DIR"/packages/*.deb)"
+control="$(dpkg-deb --ctrl-tarfile "$deb" | tar -xO ./control)"
+printf '%s\n' "$control"
+# 段落只允许一个。用 awk 数而不是 grep -c：grep -c 一个都没匹配上时返回 1，
+# 与 set -e 相加会变成"看起来失败"的假警报。
+blank_lines="$(printf '%s\n' "$control" | awk '$0 == "" { n++ } END { print n + 0 }')"
+if [ "$blank_lines" -ne 1 ]; then
+  echo "::error::control 里有 $blank_lines 个空行（应为 1，即结尾那一个）：Description 尾部空白会顶出多余段落" >&2
+  exit 1
+fi
+for field in Package Version Architecture Maintainer Description; do
+  printf '%s\n' "$control" | grep -q "^${field}:" || {
+    echo "::error::control 缺 ${field} 字段" >&2
+    exit 1
+  }
+done
+
 # 出厂自检：把包内文件按 install() 规则单独装到一棵临时树里，再跑一次。
 # 这一步与 deb 的内容是同一批文件（同一条 install 规则），目标是提前抓住
 #   * 版本号没注入（--version 输出对不上 tag）；

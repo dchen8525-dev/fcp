@@ -1,4 +1,4 @@
-// Redundancy strategy (FCP_PROTOCOL_V6.md §8).
+// Redundancy strategy (协议规格.md §8).
 //
 // B1: binom_cdf / k_for, the pure part.
 // B2: FecStrategy, the OFF/ON state machine driven by inbound FECSTAT reports.
@@ -45,7 +45,7 @@ constexpr uint32_t kMinLedgerGroups = 64;
 enum class FecState : uint8_t {
   kOff = 0,
   kOn = 1,
-  // M3 third state (FCP_M3_CONTROL.md §2): the measured redundancy ratio
+  // M3 third state (M3控制设计.md §2): the measured redundancy ratio
   // parity_bytes/data_bytes exceeded the byte budget. k only declines here
   // (one parity per report, floor 1); one report back under the ceiling
   // returns to ON. Entered from and exited to ON only.
@@ -60,12 +60,12 @@ struct FecStrategyConfig {
   uint8_t p_max = kDefaultPmax;
   double target_recovery = kTargetRecovery;
   int pinned_k = -1;  // --fec-parity-pinned; >= 0 bypasses the state machine
-  // Link warm-up (FCP_M2_PROXY.md §5): -1 starts OFF like every M1 session,
+  // Link warm-up (M2代理设计.md §5): -1 starts OFF like every M1 session,
   // >= 1 starts ON at that k. Reports still drive the machine, so a warmed
   // value only buys the first few seconds and converges away if the link lost
   // its habit.
   int initial_k = -1;
-  // M3 byte budget (FCP_M3_CONTROL.md §2): ceiling on the interval's
+  // M3 byte budget (M3控制设计.md §2): ceiling on the interval's
   // parity_bytes/data_bytes ratio; 0 disables. On the wire that ratio is k/D
   // (parity and data packets cost the same bytes), so the 0.50 default
   // leaves k <= 5 untouched at D = 10 and only constrains the k = 6..7

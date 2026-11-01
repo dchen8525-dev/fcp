@@ -3,31 +3,10 @@
 #include <cstring>
 
 #include "fcp/hdr.h"
+#include "fcp/wire.h"
 
 namespace fcp {
 namespace {
-
-void write16(uint8_t* out, uint16_t value) {
-  out[0] = static_cast<uint8_t>(value);
-  out[1] = static_cast<uint8_t>(value >> 8);
-}
-
-void write32(uint8_t* out, uint32_t value) {
-  out[0] = static_cast<uint8_t>(value);
-  out[1] = static_cast<uint8_t>(value >> 8);
-  out[2] = static_cast<uint8_t>(value >> 16);
-  out[3] = static_cast<uint8_t>(value >> 24);
-}
-
-uint16_t read16(const uint8_t* in) {
-  return static_cast<uint16_t>(static_cast<uint16_t>(in[0]) |
-                               (static_cast<uint16_t>(in[1]) << 8));
-}
-
-uint32_t read32(const uint8_t* in) {
-  return static_cast<uint32_t>(in[0]) | (static_cast<uint32_t>(in[1]) << 8) |
-         (static_cast<uint32_t>(in[2]) << 16) | (static_cast<uint32_t>(in[3]) << 24);
-}
 
 }  // namespace
 
@@ -46,34 +25,34 @@ void encode_fecstat(const FecstatPacket& packet, uint8_t out[kFecstatLen]) {
               sizeof(packet.session_salt));
   out[offsetof(FecstatPacket, ver)] = packet.ver;
   out[offsetof(FecstatPacket, flg)] = packet.flg;
-  write16(out + offsetof(FecstatPacket, interval_ms), packet.interval_ms);
-  write32(out + offsetof(FecstatPacket, accounted_through_set_id),
-          packet.accounted_through_set_id);
-  write32(out + offsetof(FecstatPacket, sets_expected), packet.sets_expected);
-  write32(out + offsetof(FecstatPacket, data_expected), packet.data_expected);
-  write32(out + offsetof(FecstatPacket, data_rx_orig), packet.data_rx_orig);
-  write32(out + offsetof(FecstatPacket, data_recovered_dl), packet.data_recovered_dl);
-  write32(out + offsetof(FecstatPacket, data_recovered_late), packet.data_recovered_late);
-  write32(out + offsetof(FecstatPacket, data_delivered), packet.data_delivered);
-  write32(out + offsetof(FecstatPacket, parity_rx), packet.parity_rx);
-  write32(out + offsetof(FecstatPacket, parity_expected), packet.parity_expected);
-  write32(out + offsetof(FecstatPacket, sets_k_unknown), packet.sets_k_unknown);
-  write32(out + offsetof(FecstatPacket, sets_full), packet.sets_full);
-  write32(out + offsetof(FecstatPacket, auth_fail), packet.auth_fail);
-  write32(out + offsetof(FecstatPacket, late_dup), packet.late_dup);
-  write32(out + offsetof(FecstatPacket, struct_fail), packet.struct_fail);
-  write16(out + offsetof(FecstatPacket, repair_lat_p50_ms), packet.repair_lat_p50_ms);
-  write16(out + offsetof(FecstatPacket, repair_lat_p95_ms), packet.repair_lat_p95_ms);
-  write32(out + offsetof(FecstatPacket, data_bytes_rx), packet.data_bytes_rx);
-  write32(out + offsetof(FecstatPacket, parity_bytes_rx), packet.parity_bytes_rx);
-  write32(out + offsetof(FecstatPacket, sets_tail_dropped), packet.sets_tail_dropped);
-  write32(out + offsetof(FecstatPacket, data_late_rx), packet.data_late_rx);
-  write32(out + offsetof(FecstatPacket, sets_partial), packet.sets_partial);
-  write32(out + offsetof(FecstatPacket, ledger_groups), packet.ledger_groups);
-  write32(out + offsetof(FecstatPacket, ledger_fail_ppm), packet.ledger_fail_ppm);
-  write32(out + offsetof(FecstatPacket, ledger_meta), packet.ledger_meta);
+  put_le16(packet.interval_ms, out + offsetof(FecstatPacket, interval_ms));
+  put_le32(packet.accounted_through_set_id,
+           out + offsetof(FecstatPacket, accounted_through_set_id));
+  put_le32(packet.sets_expected, out + offsetof(FecstatPacket, sets_expected));
+  put_le32(packet.data_expected, out + offsetof(FecstatPacket, data_expected));
+  put_le32(packet.data_rx_orig, out + offsetof(FecstatPacket, data_rx_orig));
+  put_le32(packet.data_recovered_dl, out + offsetof(FecstatPacket, data_recovered_dl));
+  put_le32(packet.data_recovered_late, out + offsetof(FecstatPacket, data_recovered_late));
+  put_le32(packet.data_delivered, out + offsetof(FecstatPacket, data_delivered));
+  put_le32(packet.parity_rx, out + offsetof(FecstatPacket, parity_rx));
+  put_le32(packet.parity_expected, out + offsetof(FecstatPacket, parity_expected));
+  put_le32(packet.sets_k_unknown, out + offsetof(FecstatPacket, sets_k_unknown));
+  put_le32(packet.sets_full, out + offsetof(FecstatPacket, sets_full));
+  put_le32(packet.auth_fail, out + offsetof(FecstatPacket, auth_fail));
+  put_le32(packet.late_dup, out + offsetof(FecstatPacket, late_dup));
+  put_le32(packet.struct_fail, out + offsetof(FecstatPacket, struct_fail));
+  put_le16(packet.repair_lat_p50_ms, out + offsetof(FecstatPacket, repair_lat_p50_ms));
+  put_le16(packet.repair_lat_p95_ms, out + offsetof(FecstatPacket, repair_lat_p95_ms));
+  put_le32(packet.data_bytes_rx, out + offsetof(FecstatPacket, data_bytes_rx));
+  put_le32(packet.parity_bytes_rx, out + offsetof(FecstatPacket, parity_bytes_rx));
+  put_le32(packet.sets_tail_dropped, out + offsetof(FecstatPacket, sets_tail_dropped));
+  put_le32(packet.data_late_rx, out + offsetof(FecstatPacket, data_late_rx));
+  put_le32(packet.sets_partial, out + offsetof(FecstatPacket, sets_partial));
+  put_le32(packet.ledger_groups, out + offsetof(FecstatPacket, ledger_groups));
+  put_le32(packet.ledger_fail_ppm, out + offsetof(FecstatPacket, ledger_fail_ppm));
+  put_le32(packet.ledger_meta, out + offsetof(FecstatPacket, ledger_meta));
   for (size_t i = 0; i < sizeof(packet.reserved) / sizeof(packet.reserved[0]); ++i) {
-    write32(out + offsetof(FecstatPacket, reserved) + 4 * i, packet.reserved[i]);
+    put_le32(packet.reserved[i], out + offsetof(FecstatPacket, reserved) + 4 * i);
   }
 }
 
@@ -99,33 +78,33 @@ FecstatStatus decode_fecstat(const uint8_t* in, size_t len, const uint8_t salt[8
               sizeof(packet.session_salt));
   packet.ver = in[offsetof(FecstatPacket, ver)];
   packet.flg = in[offsetof(FecstatPacket, flg)];
-  packet.interval_ms = read16(in + offsetof(FecstatPacket, interval_ms));
-  packet.accounted_through_set_id = read32(in + offsetof(FecstatPacket, accounted_through_set_id));
-  packet.sets_expected = read32(in + offsetof(FecstatPacket, sets_expected));
-  packet.data_expected = read32(in + offsetof(FecstatPacket, data_expected));
-  packet.data_rx_orig = read32(in + offsetof(FecstatPacket, data_rx_orig));
-  packet.data_recovered_dl = read32(in + offsetof(FecstatPacket, data_recovered_dl));
-  packet.data_recovered_late = read32(in + offsetof(FecstatPacket, data_recovered_late));
-  packet.data_delivered = read32(in + offsetof(FecstatPacket, data_delivered));
-  packet.parity_rx = read32(in + offsetof(FecstatPacket, parity_rx));
-  packet.parity_expected = read32(in + offsetof(FecstatPacket, parity_expected));
-  packet.sets_k_unknown = read32(in + offsetof(FecstatPacket, sets_k_unknown));
-  packet.sets_full = read32(in + offsetof(FecstatPacket, sets_full));
-  packet.auth_fail = read32(in + offsetof(FecstatPacket, auth_fail));
-  packet.late_dup = read32(in + offsetof(FecstatPacket, late_dup));
-  packet.struct_fail = read32(in + offsetof(FecstatPacket, struct_fail));
-  packet.repair_lat_p50_ms = read16(in + offsetof(FecstatPacket, repair_lat_p50_ms));
-  packet.repair_lat_p95_ms = read16(in + offsetof(FecstatPacket, repair_lat_p95_ms));
-  packet.data_bytes_rx = read32(in + offsetof(FecstatPacket, data_bytes_rx));
-  packet.parity_bytes_rx = read32(in + offsetof(FecstatPacket, parity_bytes_rx));
-  packet.sets_tail_dropped = read32(in + offsetof(FecstatPacket, sets_tail_dropped));
-  packet.data_late_rx = read32(in + offsetof(FecstatPacket, data_late_rx));
-  packet.sets_partial = read32(in + offsetof(FecstatPacket, sets_partial));
-  packet.ledger_groups = read32(in + offsetof(FecstatPacket, ledger_groups));
-  packet.ledger_fail_ppm = read32(in + offsetof(FecstatPacket, ledger_fail_ppm));
-  packet.ledger_meta = read32(in + offsetof(FecstatPacket, ledger_meta));
+  packet.interval_ms = get_le16(in + offsetof(FecstatPacket, interval_ms));
+  packet.accounted_through_set_id = get_le32(in + offsetof(FecstatPacket, accounted_through_set_id));
+  packet.sets_expected = get_le32(in + offsetof(FecstatPacket, sets_expected));
+  packet.data_expected = get_le32(in + offsetof(FecstatPacket, data_expected));
+  packet.data_rx_orig = get_le32(in + offsetof(FecstatPacket, data_rx_orig));
+  packet.data_recovered_dl = get_le32(in + offsetof(FecstatPacket, data_recovered_dl));
+  packet.data_recovered_late = get_le32(in + offsetof(FecstatPacket, data_recovered_late));
+  packet.data_delivered = get_le32(in + offsetof(FecstatPacket, data_delivered));
+  packet.parity_rx = get_le32(in + offsetof(FecstatPacket, parity_rx));
+  packet.parity_expected = get_le32(in + offsetof(FecstatPacket, parity_expected));
+  packet.sets_k_unknown = get_le32(in + offsetof(FecstatPacket, sets_k_unknown));
+  packet.sets_full = get_le32(in + offsetof(FecstatPacket, sets_full));
+  packet.auth_fail = get_le32(in + offsetof(FecstatPacket, auth_fail));
+  packet.late_dup = get_le32(in + offsetof(FecstatPacket, late_dup));
+  packet.struct_fail = get_le32(in + offsetof(FecstatPacket, struct_fail));
+  packet.repair_lat_p50_ms = get_le16(in + offsetof(FecstatPacket, repair_lat_p50_ms));
+  packet.repair_lat_p95_ms = get_le16(in + offsetof(FecstatPacket, repair_lat_p95_ms));
+  packet.data_bytes_rx = get_le32(in + offsetof(FecstatPacket, data_bytes_rx));
+  packet.parity_bytes_rx = get_le32(in + offsetof(FecstatPacket, parity_bytes_rx));
+  packet.sets_tail_dropped = get_le32(in + offsetof(FecstatPacket, sets_tail_dropped));
+  packet.data_late_rx = get_le32(in + offsetof(FecstatPacket, data_late_rx));
+  packet.sets_partial = get_le32(in + offsetof(FecstatPacket, sets_partial));
+  packet.ledger_groups = get_le32(in + offsetof(FecstatPacket, ledger_groups));
+  packet.ledger_fail_ppm = get_le32(in + offsetof(FecstatPacket, ledger_fail_ppm));
+  packet.ledger_meta = get_le32(in + offsetof(FecstatPacket, ledger_meta));
   for (size_t i = 0; i < sizeof(packet.reserved) / sizeof(packet.reserved[0]); ++i) {
-    packet.reserved[i] = read32(in + offsetof(FecstatPacket, reserved) + 4 * i);
+    packet.reserved[i] = get_le32(in + offsetof(FecstatPacket, reserved) + 4 * i);
   }
   *out = packet;
   return FecstatStatus::kOk;

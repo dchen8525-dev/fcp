@@ -13,7 +13,7 @@
 #include <cstring>
 #include <vector>
 
-#include "fcp/proxy_proto.h"
+#include "proxy/proxy_proto.h"
 #include "fcp/session.h"
 
 namespace {

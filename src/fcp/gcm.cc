@@ -24,14 +24,10 @@ void make_j0(const uint8_t iv[kGcmIvLen], uint8_t j0[16]) {
   j0[15] = 1;
 }
 
-void compute_tag(const Aes128Key& key, const uint8_t j0[16], const uint8_t* aad,
+void compute_tag(const GcmKey& key, const uint8_t j0[16], const uint8_t* aad,
                  size_t aad_len, const uint8_t* cipher, size_t cipher_len,
                  uint8_t tag[16]) {
-  uint8_t h[16];
-  uint8_t zero[16] = {};
-  aes128_encrypt_block(key, zero, h);
-
-  Ghash ghash(h);
+  Ghash ghash(key.ghash);
   ghash.update_padded(aad, aad_len);
   ghash.update_padded(cipher, cipher_len);
   ghash.update_lengths(aad_len, cipher_len);
@@ -39,7 +35,7 @@ void compute_tag(const Aes128Key& key, const uint8_t j0[16], const uint8_t* aad,
   uint8_t s[16];
   uint8_t ek[16];
   ghash.finalize(s);
-  aes128_encrypt_block(key, j0, ek);
+  aes128_encrypt_block(key.round_keys, j0, ek);
   for (int i = 0; i < 16; ++i) {
     tag[i] = static_cast<uint8_t>(s[i] ^ ek[i]);
   }
@@ -64,31 +60,35 @@ void ctr_xor(const Aes128Key& key, const uint8_t j0[16], const uint8_t* in, size
 
 }  // namespace
 
-bool gcm_seal(const uint8_t key[16], const uint8_t iv[kGcmIvLen], const uint8_t* aad,
-              size_t aad_len, const uint8_t* plain, size_t len, uint8_t* cipher,
-              uint8_t tag[kGcmTagLen]) {
-  Aes128Key round_keys;
-  aes128_expand_key(key, &round_keys);
+void gcm_key_init(const uint8_t key[16], GcmKey* out) {
+  aes128_expand_key(key, &out->round_keys);
+  uint8_t zero[16] = {};
+  aes128_encrypt_block(out->round_keys, zero, out->h);
+  // Built here, not per packet: the window table is 8 KiB and only depends on H.
+  ghash_init_table(out->h, &out->ghash);
+}
+
+bool gcm_seal_keyed(const GcmKey& key, const uint8_t iv[kGcmIvLen], const uint8_t* aad,
+                    size_t aad_len, const uint8_t* plain, size_t len, uint8_t* cipher,
+                    uint8_t tag[kGcmTagLen]) {
   uint8_t j0[16];
   make_j0(iv, j0);
-  ctr_xor(round_keys, j0, plain, len, cipher);
+  ctr_xor(key.round_keys, j0, plain, len, cipher);
 
   uint8_t full_tag[16];
-  compute_tag(round_keys, j0, aad, aad_len, cipher, len, full_tag);
+  compute_tag(key, j0, aad, aad_len, cipher, len, full_tag);
   std::memcpy(tag, full_tag, kGcmTagLen);
   return true;
 }
 
-bool gcm_open(const uint8_t key[16], const uint8_t iv[kGcmIvLen], const uint8_t* aad,
-              size_t aad_len, const uint8_t* cipher, size_t len,
-              const uint8_t tag[kGcmTagLen], uint8_t* plain) {
-  Aes128Key round_keys;
-  aes128_expand_key(key, &round_keys);
+bool gcm_open_keyed(const GcmKey& key, const uint8_t iv[kGcmIvLen], const uint8_t* aad,
+                    size_t aad_len, const uint8_t* cipher, size_t len,
+                    const uint8_t tag[kGcmTagLen], uint8_t* plain) {
   uint8_t j0[16];
   make_j0(iv, j0);
 
   uint8_t expected[16];
-  compute_tag(round_keys, j0, aad, aad_len, cipher, len, expected);
+  compute_tag(key, j0, aad, aad_len, cipher, len, expected);
 
   uint8_t diff = 0;
   for (size_t i = 0; i < kGcmTagLen; ++i) {
@@ -98,8 +98,24 @@ bool gcm_open(const uint8_t key[16], const uint8_t iv[kGcmIvLen], const uint8_t*
     return false;
   }
 
-  ctr_xor(round_keys, j0, cipher, len, plain);
+  ctr_xor(key.round_keys, j0, cipher, len, plain);
   return true;
+}
+
+bool gcm_seal(const uint8_t key[16], const uint8_t iv[kGcmIvLen], const uint8_t* aad,
+              size_t aad_len, const uint8_t* plain, size_t len, uint8_t* cipher,
+              uint8_t tag[kGcmTagLen]) {
+  GcmKey expanded;
+  gcm_key_init(key, &expanded);
+  return gcm_seal_keyed(expanded, iv, aad, aad_len, plain, len, cipher, tag);
+}
+
+bool gcm_open(const uint8_t key[16], const uint8_t iv[kGcmIvLen], const uint8_t* aad,
+              size_t aad_len, const uint8_t* cipher, size_t len,
+              const uint8_t tag[kGcmTagLen], uint8_t* plain) {
+  GcmKey expanded;
+  gcm_key_init(key, &expanded);
+  return gcm_open_keyed(expanded, iv, aad, aad_len, cipher, len, tag, plain);
 }
 
 }  // namespace fcp

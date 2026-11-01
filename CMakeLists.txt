@@ -1,6 +1,24 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(fcp LANGUAGES CXX)
+# 发布版本号的唯一真源是仓库根的 VERSION 文件；打 tag 时发布工作流把 tag 名
+# （去掉前导 v）传进 FCP_RELEASE_VERSION 覆盖它，并拒绝与 VERSION 不一致的 tag。
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" FCP_VERSION_RAW LIMIT_COUNT 1)
+string(STRIP "${FCP_VERSION_RAW}" FCP_VERSION)
+if(FCP_RELEASE_VERSION)
+  set(FCP_VERSION "${FCP_RELEASE_VERSION}")
+endif()
+if(NOT FCP_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$")
+  message(FATAL_ERROR "VERSION must be MAJOR.MINOR.PATCH, got '${FCP_VERSION}'")
+endif()
+
+project(fcp VERSION ${FCP_VERSION} LANGUAGES CXX)
+
+include(GNUInstallDirs)
+
+# 打包元数据（唯一真源：发布工作流从这些变量读，不要再在 yml 里抄一遍）。
+set(FCP_HOMEPAGE "https://github.com/dchen8525-dev/fcp" CACHE STRING "Package homepage")
+set(FCP_MAINTAINER "dchen8525 <dchen8525-dev@users.noreply.github.com>"
+    CACHE STRING "Deb maintainer / installer publisher")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,6 +34,8 @@ option(FCP_BUILD_TESTS "Build FCP tests" ON)
 option(FCP_BUILD_TOOLS "Build FCP tools (benchmark harness)" ON)
 option(FCP_BUILD_APP "Build the Qt desktop client" OFF)
 option(FCP_BUILD_PROXY "Build the FCP proxy CLI (client and server)" OFF)
+
+file(GLOB fcp_headers CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/fcp/*.h)
 
 add_library(fcp
   src/fcp/gf256.cc
@@ -38,10 +58,12 @@ add_library(fcp
   src/fcp/stream.cc
   src/fcp/prewarm.cc
   src/fcp/trace.cc
-  src/fcp/proxy_proto.cc
 )
 
 target_include_directories(fcp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+# version.h 的 kProductVersion（CLI --version）；PUBLIC 让宿主与测试都拿到。
+target_compile_definitions(fcp PUBLIC FCP_PRODUCT_VERSION="${FCP_VERSION}")
 
 # AES-NI intrinsics. MSVC enables them for x64 by default; GCC/Clang need -maes.
 if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i.86")
@@ -53,6 +75,20 @@ endif()
 # call random_bytes() for their own salts.
 if(WIN32)
   target_link_libraries(fcp PUBLIC bcrypt)
+endif()
+
+# The proxy application layer: the socket-free ProxyEngine (M2代理设计.md §6) and
+# the SOCKS5/HTTP-CONNECT/OPEN entry codecs (§4). Neither belongs in libfcp --
+# libfcp is the protocol (crypto, FEC, transport, control) and never parses a
+# proxy message -- and both are shared by the CLI executables, the Qt client and
+# ctest, which is why the pair lives in src/ rather than inside one app.
+if(FCP_BUILD_PROXY OR FCP_BUILD_APP OR FCP_BUILD_TESTS)
+  add_library(fcp_proxy_core STATIC
+    src/proxy/proxy_engine.cc
+    src/proxy/proxy_proto.cc
+  )
+  target_include_directories(fcp_proxy_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(fcp_proxy_core PUBLIC fcp)
 endif()
 
 # 覆盖率门禁：line ≥ 90 / branch ≥ 80（gcc/clang；MSVC 用 OpenCPP 或单独跑）。
@@ -75,13 +111,21 @@ if(FCP_BUILD_TOOLS)
   add_subdirectory(tools)
 endif()
 
-# The socket-free engine is a library of its own: the Qt client links it even
-# when the CLI executables are not configured (apps/fcp-proxy/CMakeLists.txt),
-# and ctest drives it directly -- so it is built whenever tests or an app are.
-if(FCP_BUILD_PROXY OR FCP_BUILD_APP OR FCP_BUILD_TESTS)
+# The CLI host (select reactor, argv parsing, the two mains). The protocol half
+# it drives is fcp_proxy_core above; only these executables are gated by
+# FCP_BUILD_PROXY. tests/cli_test.cc compiles cli.cc and reactor.cc directly so
+# the argv guards stay under the default test gate.
+if(FCP_BUILD_PROXY)
   add_subdirectory(apps/fcp-proxy)
 endif()
 
 if(FCP_BUILD_APP)
   add_subdirectory(apps/fcp-client)
+endif()
+
+# 发布打包（Linux deb）：只有同时构建代理 CLI 时才有意义 —— Windows 侧走
+# Inno Setup，由 .github/workflows/release.yml 直接组装，不经过 CPack。
+# 该文件自身也会再判一次平台与开关，这里保留条件只为让"为什么没生成 deb"显式。
+if(FCP_BUILD_PROXY)
+  include(cmake/FCPPackaging.cmake)
 endif()

@@ -1,4 +1,4 @@
-// ProxyEngine: the socket-free heart of the FCP proxy (docs/FCP_M2_PROXY.md §6).
+// ProxyEngine: the socket-free heart of the FCP proxy (M2代理设计.md §6).
 //
 // One engine holds every proxied connection. It owns the FCP sessions (one per
 // connection, §3), the FCP-STREAM attached to each, the proxy entry codec
@@ -34,7 +34,7 @@
 
 #include "fcp/envelope.h"
 #include "fcp/prewarm.h"
-#include "fcp/proxy_proto.h"
+#include "proxy/proxy_proto.h"
 #include "fcp/session.h"
 #include "fcp/stream.h"
 
@@ -61,7 +61,7 @@ struct EngineConfig {
   uint16_t mtu = 1400;
   size_t ip_hdr_len = 20;
   int pinned_k = -1;  // >= 0 bypasses the adaptive strategy (measurements)
-  // M3 byte budget (FCP_M3_CONTROL.md §2), passed to SessionConfig verbatim.
+  // M3 byte budget (M3控制设计.md §2), passed to SessionConfig verbatim.
   double fec_budget = 0.50;
   // #29a controller trace: when non-empty, every session writes a JSONL
   // controller trace (SessionConfig::trace) to `<prefix>.<cid>.jsonl` —
@@ -69,6 +69,14 @@ struct EngineConfig {
   std::string trace_prefix;
   size_t send_window_bytes = 256 * 1024;
   size_t rcv_buf_bytes = 256 * 1024;
+  // Window autotune (StreamConfig::auto_window): the stream's send window
+  // starts at send_window_bytes, grows while the stream is its own bottleneck
+  // between window_min_bytes and window_max_bytes, and holds or shrinks when
+  // its own queue shows up in the RTT. Not a BDP tracker: the measured BDP is
+  // only the recovery reference after a loss.
+  bool auto_window = true;
+  size_t window_min_bytes = 64 * 1024;
+  size_t window_max_bytes = 1024 * 1024;
   // Teardown of a tunnel that stopped speaking (§7: dead peer detection).
   int64_t idle_timeout_ms = 300000;
   // Remote resolution plus dial (§4.3).
@@ -186,6 +194,14 @@ class ProxyEngine {
   const PrewarmCache& prewarm_cache() const { return prewarm_; }
   // Bytes the engine is holding for `conn`'s application socket.
   size_t pending_app_bytes(uint64_t conn) const;
+  // The stream's send window in force for `conn` right now (0 before it has one).
+  // With autotune on this moves every RTT, so the host can show what the path
+  // was measured to carry instead of what it was configured with.
+  size_t send_window(uint64_t conn) const;
+  // The receive room the peer last advertised to `conn`'s stream (0 before it
+  // has an ACK). Together with send_window() this says which of the two
+  // windows is holding the tunnel back.
+  size_t peer_window(uint64_t conn) const;
 
  private:
   enum class Phase : uint8_t {
@@ -245,6 +261,13 @@ class ProxyEngine {
   void start_tunnel_client(Conn& conn, int64_t now_ms);
   // Server: the OPEN exchange on a stream.
   void send_open_error(Conn& conn, OpenError err);
+
+  // The fields both ends share. A15/B11: client and server used to copy them
+  // one by one in two places, so a new SessionConfig field could reach only
+  // one direction. A SessionConfig field added later goes here, never into a
+  // create_*_conn().
+  void fill_session_config(SessionConfig* sc, uint64_t conn_id) const;
+  std::unique_ptr<Session> make_session(uint64_t conn_id, const SessionConfig& sc);
 
   bool create_client_conn(uint64_t conn, uint64_t peer, int64_t now_ms);
   Conn* create_server_conn(uint64_t peer, const uint8_t* salt, int64_t now_ms);

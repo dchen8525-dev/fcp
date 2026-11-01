@@ -1,5 +1,7 @@
 #include "fcp/strategy.h"
 
+#include <cstring>
+
 #include "test_util.h"
 
 namespace {
@@ -320,7 +322,7 @@ void TestKInvariant() {
 
 }  // namespace
 
-// A report carrying the M3 ledger (FCP_M3_CONTROL.md §1.2). fail_rate is the
+// A report carrying the M3 ledger (M3控制设计.md §1.2). fail_rate is the
 // empirical share of full-size groups with >= 1 unrecovered data.
 fcp::FecstatPacket LedgerReport(uint32_t set_id, double loss, uint32_t groups,
                                 double fail_rate, uint8_t ledger_k,
@@ -437,7 +439,7 @@ void TestLedgerFlagDropClearsPEff() {
   CHECK_EQ(st.k(), 1);
 }
 
-// --- M3 byte budget / kCapped (FCP_M3_CONTROL.md §2) ---
+// --- M3 byte budget / kCapped (M3控制设计.md §2) ---
 
 constexpr uint32_t kDataBytes = 140000;  // ~1000 full-size data packets
 constexpr uint32_t kParityAtK4 = 40000;  // ratio 2/7 ≈ 28.6% > 20% budget
@@ -526,14 +528,20 @@ void TestBudgetZeroDisables() {
   CHECK_EQ(st.k(), 4);
 }
 
-// Degenerate budget below the k=1 floor's own ratio: k stays 1, no underflow,
-// state stays CAPPED — documented boundary (§7 of the M3 doc), not a hang.
+// Degenerate budget below the k=1 floor's own ratio: the walk-down stops at 1
+// and holds there (no underflow to 0, no exit from CAPPED on unmet evidence).
 void TestBudgetFloorStaysOne() {
   fcp::FecStrategy st(BudgetConfig(0.05));
   uint32_t id = 0;
-  Feed(&st, &id, 0.20);
-  for (int i = 0; i < 5; ++i) {
+  Feed(&st, &id, 0.20);  // k = 4
+  // The budget sheds one parity per report, so reach the floor first.
+  for (int i = 0; i < 3; ++i) {
     st.on_report(BudgetReport(++id, 0.20, 1400000), false);  // ratio 10x > 5%
+    CHECK_EQ(st.k(), static_cast<uint8_t>(3 - i));
+    CHECK(st.state() == fcp::FecState::kCapped);
+  }
+  for (int i = 0; i < 5; ++i) {
+    st.on_report(BudgetReport(++id, 0.20, 1400000), false);
     CHECK_EQ(st.k(), 1);
     CHECK(st.state() == fcp::FecState::kCapped);
   }
@@ -655,6 +663,16 @@ void TestCappedFloorReachesOff() {
   CHECK_EQ(st.k(), 0);
 }
 
+// §10 log names: the state string the session logs, plus the unknown-value
+// fallback (the enum is a wire-independent internal, but a corrupted cast must
+// still log something bounded rather than crash).
+void TestFecStateName() {
+  CHECK(std::strcmp(fcp::fec_state_name(fcp::FecState::kOff), "OFF") == 0);
+  CHECK(std::strcmp(fcp::fec_state_name(fcp::FecState::kOn), "ON") == 0);
+  CHECK(std::strcmp(fcp::fec_state_name(fcp::FecState::kCapped), "CAPPED") == 0);
+  CHECK(std::strcmp(fcp::fec_state_name(static_cast<fcp::FecState>(7)), "?") == 0);
+}
+
 int main() {
   TestOffToOn();
   TestTwoReportEntry();
@@ -674,6 +692,12 @@ int main() {
   TestLedgerFieldExtremes();
   TestLedgerGates();
   TestLedgerFlagDropClearsPEff();
+  TestBudgetEntersCapped();
+  TestBudgetRecoveryHysteresis();
+  TestBudgetConvergesUnderCeiling();
+  TestBudgetZeroDisables();
+  TestBudgetFloorStaysOne();
   TestCappedFloorReachesOff();
+  TestFecStateName();
   return fcp_test::finish();
 }

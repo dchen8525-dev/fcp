@@ -1,4 +1,4 @@
-// Proxy entry codecs (docs/FCP_M2_PROXY.md §4).
+// Proxy entry codecs (M2代理设计.md §4).
 //
 // Pure functions over byte ranges: no sockets, no clocks, no buffers owned by
 // this layer. The host (the CLI select reactor or the Qt adapter) accumulates

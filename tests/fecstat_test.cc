@@ -45,7 +45,7 @@ fcp::FecstatPacket SamplePacket() {
   packet.sets_tail_dropped = 0x11121315u;
   packet.data_late_rx = 0x21222325u;
   packet.sets_partial = 0x31323335u;
-  // M3 ledger fields occupy the former reserved[0..2] (FCP_M3_CONTROL.md
+  // M3 ledger fields occupy the former reserved[0..2] (M3控制设计.md
   // §1.2); reserved[3..4] stay reserved and keep a roundtrip check.
   packet.ledger_groups = 0x41424345u;
   packet.ledger_fail_ppm = 0x42424346u;
@@ -61,7 +61,7 @@ void TestGoldenLayout() {
   CHECK_EQ(sizeof(fcp::FecstatPacket), static_cast<size_t>(128));
   CHECK_EQ(alignof(fcp::FecstatPacket), static_cast<size_t>(4));
 
-  // Build the wire image with literal offsets from FCP_PROTOCOL_V6.md §7.1.
+  // Build the wire image with literal offsets from 协议规格.md §7.1.
   uint8_t expected[128] = {};
   std::memcpy(expected + 0, "FCP_FECSTAT_V6", 15);  // 14 chars + NUL; rest zero
   std::memcpy(expected + 16, kSalt, 8);

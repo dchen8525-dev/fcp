@@ -1,4 +1,4 @@
-// Systematic Cauchy Reed-Solomon codec over GF(2^8) (FCP_PROTOCOL_V6.md §4.4).
+// Systematic Cauchy Reed-Solomon codec over GF(2^8) (协议规格.md §4.4).
 //
 // Code length is always n + k (planned values): indices [0, n) are data,
 // [n, n + k) are parity. Early-closed sets simply send fewer parity symbols

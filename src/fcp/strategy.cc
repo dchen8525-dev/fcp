@@ -156,7 +156,7 @@ void FecStrategy::on_report(const FecstatPacket& stat, bool window_queued) {
     return;
   }
 
-  // M3 byte budget (FCP_M3_CONTROL.md §2): the peer's bytes are the real
+  // M3 byte budget (M3控制设计.md §2): the peer's bytes are the real
   // measure of our redundancy. Over the ceiling we drop one parity per report
   // unconditionally (k_target is irrelevant — the budget wins over the
   // recovery target), floored at 1 per §14.11 (congestion never returns k to
@@ -198,7 +198,7 @@ void FecStrategy::on_report(const FecstatPacket& stat, bool window_queued) {
     }
   }
 
-  // M3 R(k) correction (FCP_M3_CONTROL.md §1.2): a usable ledger from the
+  // M3 R(k) correction (M3控制设计.md §1.2): a usable ledger from the
   // peer upgrades the loss input from the observed mean to the i.i.d.-equivalent
   // rate that reproduces the empirical group-failure rate. One-sided: only
   // inflation is allowed, a ledger better than i.i.d. is treated as luck.

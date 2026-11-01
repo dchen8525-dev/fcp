@@ -1,0 +1,23 @@
+# 可读版 control（审包用，不是构建输入）。
+#
+# 真正的 package control 由 cmake/FCPPackaging.cmake 里的 CPACK_* 变量生成；
+# 改一边记得改另一边。长描述文本的唯一真源是 packaging/debian/description。
+#
+# 已安装文件（6 项，packaging/debian 与 cmake/FCPPackaging.cmake 的 install()）:
+#   /usr/bin/fcp-proxy-server
+#   /usr/bin/fcp-proxy-client
+#   /usr/lib/systemd/system/fcp-proxy.service
+#   /etc/fcp/fcp-proxy.env                (conffile)
+#   /usr/share/doc/fcp-proxy/*.md         (docs/*.md + VERSION)
+#   /usr/share/doc/fcp-proxy/copyright
+Package: fcp-proxy
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: @MAINTAINER@
+Section: net
+Priority: optional
+Depends: libstdc++6 (>= 11), libc6 (>= 2.35)
+Recommends: ca-certificates
+Homepage: @HOMEPAGE@
+Description: FCP proxy server and client (UDP tunnel with adaptive FEC)
+ See packaging/debian/description for the long description.

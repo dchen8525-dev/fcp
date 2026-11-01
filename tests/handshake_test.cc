@@ -203,9 +203,39 @@ void TestAckEchoMismatch() {
   CHECK_EQ(p.hs.nonce_mismatch(), 1u);
   CHECK(p.hs.state() == fcp::HandshakeState::kHelloSent);
 
+  // The mismatch must not consume the retry budget: the retransmit timer is
+  // what recovers from a recording flooding us with stale ACKs.
+  p.hs.on_tick(300);
+  CHECK_EQ(p.sent.size(), 2u);
+  CHECK(p.hs.state() == fcp::HandshakeState::kHelloSent);
+
   // The real ACK (echoing our draw) still completes the handshake.
   CHECK(p.deliver(MakeAck(p.nonce, stale_s)) == HandshakeStatus::kConsumed);
   CHECK(p.hs.established());
+  CHECK_EQ(p.hs.nonce_mismatch(), 1u);
+}
+
+// R3-1 cuts both ways: with a simultaneous open the *server* also sends a
+// HELLO and receives an ACK, and the field that must echo its own draw is the
+// server nonce. The client-side test above cannot catch a swapped-field bug
+// on this branch.
+void TestServerAckEchoMismatch() {
+  Peer p(10, 3, HandshakeRole::kServer, 0x22);
+  p.hs.start(0);
+  p.hs.on_tick(0);
+  CHECK_EQ(p.sent.size(), 1u);  // the server's own HELLO (simultaneous open)
+
+  // The client nonce is a legitimate draw, but the server field echoes a
+  // server draw this end never issued.
+  CHECK(p.deliver(MakeAck(Nonce(0x99), Nonce(0x33))) == HandshakeStatus::kConsumed);
+  CHECK(!p.hs.established());
+  CHECK_EQ(p.hs.nonce_mismatch(), 1u);
+  CHECK(p.hs.state() == fcp::HandshakeState::kHelloSent);
+
+  // A real ACK (correct echo) still completes the handshake.
+  CHECK(p.deliver(MakeAck(Nonce(0x99), p.nonce)) == HandshakeStatus::kConsumed);
+  CHECK(p.hs.established());
+  CHECK(std::memcmp(p.hs.peer_nonce(), Nonce(0x99).data(), 16) == 0);
   CHECK_EQ(p.hs.nonce_mismatch(), 1u);
 }
 
@@ -584,6 +614,7 @@ int main() {
   TestMutualHandshake();
   TestKeyAgreement();
   TestAckEchoMismatch();
+  TestServerAckEchoMismatch();
   TestEstablishedRefusesNewHello();
   TestZeroNonceRejected();
   TestCapsNegotiation();

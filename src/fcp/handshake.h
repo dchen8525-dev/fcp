@@ -1,5 +1,5 @@
 // HELLO / HELLO_ACK handshake and capability negotiation
-// (FCP_PROTOCOL_V6.md §6, design doc §10).
+// (协议规格.md §6, design doc §10).
 //
 // Both messages travel as oob frames (type=2, erratum #25): the session wraps
 // them in the AEAD envelope and the receiver dispatches by their 16-byte magic.

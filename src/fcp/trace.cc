@@ -203,37 +203,44 @@ bool decode_trace_line(const std::string& line, TraceEntry* e) {
       v != std::trunc(v) || static_cast<int>(v) != kTraceVersion) {
     return false;
   }
-  auto u8 = [&fields](const char* key, uint8_t fallback, uint8_t* out) {
+  // Every integer field in a trace line is one JSON number that has to land in
+  // a range and be integral; the four widths only differ in those two numbers,
+  // so the range and the truncation check live here (the same truncation test
+  // the ver field above applies).
+  auto int_field = [&fields](const char* key, double lo, double hi, double fallback,
+                             double* out) {
+    if (!field_in_range(fields, key, lo, hi, fallback, out)) {
+      return false;
+    }
+    return *out == std::trunc(*out);
+  };
+  auto u8 = [&int_field](const char* key, uint8_t fallback, uint8_t* out) {
     double raw = 0;
-    if (!field_in_range(fields, key, 0.0, 255.0, fallback, &raw) ||
-        raw != std::trunc(raw)) {
+    if (!int_field(key, 0.0, 255.0, fallback, &raw)) {
       return false;
     }
     *out = static_cast<uint8_t>(raw);
     return true;
   };
-  auto u16 = [&fields](const char* key, uint16_t fallback, uint16_t* out) {
+  auto u16 = [&int_field](const char* key, uint16_t fallback, uint16_t* out) {
     double raw = 0;
-    if (!field_in_range(fields, key, 0.0, 65535.0, fallback, &raw) ||
-        raw != std::trunc(raw)) {
+    if (!int_field(key, 0.0, 65535.0, fallback, &raw)) {
       return false;
     }
     *out = static_cast<uint16_t>(raw);
     return true;
   };
-  auto u32 = [&fields](const char* key, uint32_t fallback, uint32_t* out) {
+  auto u32 = [&int_field](const char* key, uint32_t fallback, uint32_t* out) {
     double raw = 0;
-    if (!field_in_range(fields, key, 0.0, 4294967295.0, fallback, &raw) ||
-        raw != std::trunc(raw)) {
+    if (!int_field(key, 0.0, 4294967295.0, fallback, &raw)) {
       return false;
     }
     *out = static_cast<uint32_t>(raw);
     return true;
   };
-  auto i32 = [&fields](const char* key, int fallback, int* out) {
+  auto i32 = [&int_field](const char* key, int fallback, int* out) {
     double raw = 0;
-    if (!field_in_range(fields, key, -2147483648.0, 2147483647.0, fallback, &raw) ||
-        raw != std::trunc(raw)) {
+    if (!int_field(key, -2147483648.0, 2147483647.0, fallback, &raw)) {
       return false;
     }
     *out = static_cast<int>(raw);

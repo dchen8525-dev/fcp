@@ -1,0 +1,289 @@
+name: release
+
+# 打 tag 即发布：`git tag v0.0.1 && git push origin v0.0.1`
+#
+# 产出两件发布物，挂在同一条 GitHub Release 上：
+#   * fcp-proxy_<版本>_<arch>.deb         Ubuntu 服务端（同包带 client、systemd unit、conffile）
+#   * FCP-Client-<版本>-win64-setup.exe   Windows 客户端（Qt GUI 安装包，Inno Setup）
+#
+# 门禁顺序是"测试在前、打包在后"：两个平台都先跑 ctest 全绿才允许产出发布物
+# （与 部署运维指南.md §1 的"四套 ctest 全绿"口径一致，CI 里跑 Release 两套）。
+# 打包之后还有安装冒烟：deb 走 dpkg -i + --version + conffile 登记 + 服务起停；
+# exe 走静默安装 → 启动 → 卸载，装不上或起不来都算失败。
+#
+# 手工触发（workflow_dispatch）：只产出 artifacts、不发 Release，
+# 用来在打 tag 之前把整条流水线跑通一遍。
+#
+# 详细说明（版本号真源、本地复现命令、失败排查表）见 docs/发布流程.md。
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布 vX.Y.Z（留空 = 只构建当前提交并产出 artifacts，不发 Release）"
+        required: false
+        type: string
+      publish:
+        description: "创建 GitHub Release（需要 tag 非空）"
+        required: false
+        type: boolean
+        default: false
+
+# 同一 tag 的发布不允许并发：两个 job 同时上传到同一条 Release 会互相覆盖。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  # Qt 版本钉死：aqtinstall 的官方预编译包，也进了 actions 缓存。
+  # 升级时只改这两行，并与本地 vcpkg 的 qtbase 版本对齐一次（docs/发布流程.md §4）。
+  QT_VERSION: "6.8.3"
+  QT_ARCH: "win64_msvc2022_64"
+
+jobs:
+  # 版本号只有一个真源：仓库根 VERSION。tag 必须与它逐字符一致，
+  # 否则"v0.0.2 打了个 0.0.1 的包"这种事故没人会注意到。
+  prep:
+    name: 版本与 tag 校验
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      publish: ${{ steps.resolve.outputs.publish }}
+      arch: ${{ steps.resolve.outputs.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: 解析版本
+        id: resolve
+        env:
+          DISPATCH_TAG: ${{ inputs.tag }}
+          DISPATCH_PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          file_version="$(tr -d '[:space:]' < VERSION)"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME}"
+            publish=true
+          else
+            tag="${DISPATCH_TAG:-}"
+            publish="${DISPATCH_PUBLISH:-false}"
+          fi
+
+          if [ -n "$tag" ]; then
+            if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::tag '$tag' 必须形如 v0.0.1（VERSION 文件格式 MAJOR.MINOR.PATCH）"
+              exit 1
+            fi
+            version="${tag#v}"
+            if [ "$version" != "$file_version" ]; then
+              echo "::error::VERSION 文件是 $file_version，tag 是 $tag —— 先把 VERSION 改成 $version 并提交"
+              exit 1
+            fi
+          else
+            version="$file_version"
+          fi
+
+          if [ "$publish" = "true" ] && [ -z "$tag" ]; then
+            echo "::error::publish=true 但没给 tag：手工触发想发 Release 必须填 tag"
+            exit 1
+          fi
+
+          # 发布物文件名里的架构，与 dpkg 的包文件名口径一致（linux-deb job 固定在
+          # ubuntu-22.04 上构建，所以这里就是 amd64；改成矩阵构建时这里要跟着改）。
+          arch="$(dpkg --print-architecture)"
+
+          echo "版本：$version   tag：${tag:-<none>}   发布：$publish   架构：$arch"
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "publish=$publish"
+            echo "arch=$arch"
+          } >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------- Linux deb
+  linux-deb:
+    name: Ubuntu deb（服务端）
+    needs: prep
+    # 22.04 而不是 latest：deb 的 glibc/libstdc++ 下限由构建机决定，
+    # 在 22.04 上构建可以在 22.04/24.04 上装（在 24.04 上构建就只能 24.04+）。
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build dpkg-dev file openssl
+
+      # 构建 / ctest / cpack 三步都在 scripts/release_build_linux.sh 里：
+      # 本地复现同一条命令，CI 与手工构建不会漂（docs/发布流程.md §2）。
+      - name: 构建 + ctest + cpack（发布门禁）
+        run: scripts/release_build_linux.sh build "${{ needs.prep.outputs.version }}"
+
+      - name: 安装冒烟（dpkg -i → 自检 → 服务起停 → 卸载）
+        run: |
+          set -euo pipefail
+          deb="$(ls build/packages/*.deb)"
+          version="${{ needs.prep.outputs.version }}"
+
+          sudo dpkg -i "$deb"
+
+          echo "== 版本自检"
+          fcp-proxy-server --version | tee /tmp/ver.txt
+          grep -qF "fcp-proxy-server ${version}" /tmp/ver.txt
+          fcp-proxy-client --version | grep -qF "fcp-proxy-client ${version}"
+
+          echo "== 包内文件落点"
+          test -x /usr/bin/fcp-proxy-server
+          test -x /usr/bin/fcp-proxy-client
+          test -f /etc/fcp/fcp-proxy.env
+          systemctl cat fcp-proxy >/dev/null   # unit 已注册（落点是 /usr/lib/systemd/system）
+          test -f "/usr/share/doc/fcp-proxy/部署运维指南.md"
+
+          echo "== conffile 登记（升级不覆盖运维配置的前提）"
+          dpkg-query -W -f='${Conffiles}\n' fcp-proxy | tee /tmp/conf.txt
+          grep -q '/etc/fcp/fcp-proxy.env' /tmp/conf.txt
+
+          echo "== 服务起停（systemd 可用时）"
+          if [ "$(systemctl is-system-running 2>/dev/null || true)" = "running" ] ||
+             [ "$(systemctl is-system-running 2>/dev/null || true)" = "degraded" ]; then
+            key="$(openssl rand -hex 16)"
+            echo "FCP_ARGS=--key=${key} --bind=127.0.0.1 --port=45000 --stats=5000" |
+              sudo tee /etc/fcp/fcp-proxy.env >/dev/null
+            sudo systemctl start fcp-proxy
+            sleep 2
+            if ! systemctl is-active --quiet fcp-proxy; then
+              sudo journalctl -u fcp-proxy --no-pager | tail -40
+              exit 1
+            fi
+            sudo ss -uln | grep -q ':45000'
+            sudo systemctl stop fcp-proxy
+          else
+            echo "::notice::本 runner 没有可用的 systemd，跳过服务起停检查"
+          fi
+
+          echo "== 卸载"
+          sudo dpkg -r fcp-proxy
+          test ! -e /usr/bin/fcp-proxy-server
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-deb
+          path: build/packages/*.deb
+          if-no-files-found: error
+          retention-days: 14
+
+  # ------------------------------------------------------------ Windows client
+  windows-client:
+    name: Windows 客户端安装包
+    needs: prep
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # aqtinstall 拉官方预编译 Qt（约 3–5 分钟）；vcpkg 源码编 qtbase 要
+      # 1–2 小时，在 runner 上既慢又容易超时。理由见 docs/发布流程.md §4。
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: ${{ env.QT_ARCH }}
+          cache: true
+
+      # 构建 / ctest / windeployqt / 启动冒烟 / ISCC 全在
+      # scripts/release_build_windows.ps1 里，本地同一命令可复现。
+      - name: 构建 + ctest + 安装包（发布门禁）
+        shell: pwsh
+        run: |
+          pwsh -File scripts/release_build_windows.ps1 `
+            -QtRoot "$env:QT_ROOT_DIR" `
+            -Version "${{ needs.prep.outputs.version }}" `
+            -BuildDir build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: 安装冒烟（静默装 → 启动 → 卸载）
+        shell: pwsh
+        run: |
+          $setup = (Get-ChildItem dist\*.exe |
+                    Where-Object { $_.Name -notlike "fcp_client*" } |
+                    Select-Object -First 1).FullName
+          if (!$setup) { throw "没找到安装包" }
+          $dir = Join-Path $env:RUNNER_TEMP "fcp-install"
+
+          Write-Host "== 静默安装到 $dir"
+          Start-Process -FilePath $setup -Wait -ArgumentList `
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=`"$dir`""
+          $exe = Join-Path $dir "fcp_client.exe"
+          if (!(Test-Path $exe)) { throw "装完没找到 $exe" }
+
+          Write-Host "== 启动"
+          $p = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 5
+          if ($p.HasExited) { throw "装好的客户端启动即退出（exit $($p.ExitCode)）" }
+          Stop-Process -Id $p.Id -Force
+
+          Write-Host "== 卸载"
+          $uninst = Join-Path $dir "unins000.exe"
+          if (!(Test-Path $uninst)) { throw "没有卸载器：安装包没走 Inno 的标准流程？" }
+          Start-Process -FilePath $uninst -Wait -ArgumentList `
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"
+          Start-Sleep -Seconds 3
+          if (Test-Path $exe) { throw "卸载后 $exe 还在" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-setup
+          path: dist/FCP-Client-*-win64-setup.exe
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------- Release
+  publish:
+    name: 发布 GitHub Release
+    needs: [prep, linux-deb, windows-client]
+    if: needs.prep.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: 汇总与校验和
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find dist -type f \( -name '*.deb' -o -name '*.exe' \) -exec cp {} release/ \;
+          ls -l release/
+          (cd release && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+
+      # 说明文本放在 .github/release-notes-template.md（YAML 里塞 heredoc 太难读），
+      # 这里只做占位替换。
+      - name: 创建 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.prep.outputs.version }}
+          TAG: ${{ needs.prep.outputs.tag }}
+          ARCH: ${{ needs.prep.outputs.arch }}
+        run: |
+          set -euo pipefail
+          sed -e "s|VERSION|${VERSION}|g" \
+              -e "s|ARCH|${ARCH}|g" \
+              -e "s|OWNER_REPO|${GH_REPO}|g" \
+              -e "s|TAG|${TAG}|g" \
+              .github/release-notes-template.md > /tmp/fcp-release-notes.md
+          cat /tmp/fcp-release-notes.md
+          # 不传 --generate-notes：它会把 PR 列表追加在 --notes 之后，
+          # 而 tag 按约定打在 main 上，那串 PR 在这里没有信息量。
+          gh release create "$TAG" \
+            --repo "$GH_REPO" \
+            --title "FCP $TAG" \
+            --notes-file /tmp/fcp-release-notes.md \
+            release/*

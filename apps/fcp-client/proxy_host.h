@@ -1,4 +1,4 @@
-// In-process proxy for the GUI client (docs/FCP_M2_PROXY.md §6, task #23).
+// In-process proxy for the GUI client (M2代理设计.md §6, task #23).
 //
 // Drives the same socket-free fcp::ProxyEngine as the CLI reactor, with Qt
 // primitives instead of select(): QTcpServer accepts the local SOCKS5/HTTP
@@ -26,7 +26,7 @@
 
 #include <memory>
 
-#include "engine.h"
+#include "proxy/proxy_engine.h"
 
 class QTcpServer;
 class QTcpSocket;

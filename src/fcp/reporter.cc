@@ -126,7 +126,7 @@ void FcpReporter::report(int64_t now_ms, int64_t elapsed_ms) {
     packet.sets_tail_dropped = c.sets_tail_dropped;
     packet.data_late_rx = c.data_late_rx;
     packet.sets_partial = c.sets_partial;
-    // M3 R(k) ledger (FCP_M3_CONTROL.md §1.2) with the #26 burst metric in
+    // M3 R(k) ledger (M3控制设计.md §1.2) with the #26 burst metric in
     // the ledger_meta high half (0.01 nat, saturating).
     if (c.ledger_groups > 0) {
       packet.flg |= kFlgLedger;

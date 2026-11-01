@@ -24,11 +24,18 @@ namespace fcp {
 // Fills out[0..len) from the OS CSPRNG. Returns false when the source is
 // unavailable; callers must treat that as fatal rather than fall back to a
 // weaker generator (a session with a guessable nonce is worse than no session).
+//
+// There is deliberately no "give me a uint32/uint64" convenience wrapper: the
+// only sensible failure convention for a security-relevant draw is "stop", and
+// a helper returning 0 would silently hand the caller exactly the predictable
+// value the CSPRNG exists to avoid (F-1, 对抗分析报告-第四轮).
 bool random_bytes(void* out, size_t len);
 
-// Convenience wrapper for a 32-bit draw. Returns 0 if the CSPRNG failed, so
-// callers that need a non-zero value must check `random_bytes` themselves.
-uint32_t random_u32();
+// Test-only: forces random_bytes to report the source as unavailable, so tests
+// can prove callers fail loudly instead of degrading (第四轮 F-6：熵源失败时的
+// 握手起点)。Not thread-safe, not part of the library contract, and never set
+// by production code.
+void set_random_failure_injection(bool enabled);
 
 }  // namespace fcp
 

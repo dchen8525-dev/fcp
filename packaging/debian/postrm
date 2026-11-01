@@ -1,0 +1,15 @@
+#!/bin/sh
+# fcp-proxy 卸载后脚本：purge 时清理配置与日志目录（remove 保留 conffile）。
+set -e
+
+if [ "$1" = "purge" ]; then
+  rm -rf /etc/fcp
+  rm -rf /var/log/fcp
+  rm -rf /var/lib/fcp
+fi
+
+if [ -d /run/systemd/system ] && [ -x /bin/systemctl ]; then
+  systemctl --system daemon-reload >/dev/null 2>&1 || true
+fi
+
+exit 0

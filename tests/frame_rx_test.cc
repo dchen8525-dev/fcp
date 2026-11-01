@@ -697,6 +697,71 @@ void TestStructuralFailureCountedOnce() {
   CHECK_EQ(f.rx.recovered(), 0u);
 }
 
+// The settlement primitives FcpSettle drives (§5.3): a set walks
+// ACTIVE -> ELIGIBLE -> ACCOUNTED -> released, the phase is visible through
+// view(), and ids outside the table report false instead of creating state.
+void TestActiveSetIdsAndSettlementPhases() {
+  Fixture f(10, 3);
+  CHECK_EQ(f.rx.active_sets(), 0u);
+  CHECK(f.rx.active_set_ids().empty());
+
+  // A data symbol is len(2) | payload; the declared length must equal the
+  // symbol length (on_datagram rejects mismatches).
+  auto data_symbol = [](uint16_t sn) {
+    std::vector<uint8_t> sym(6, 0);
+    sym[0] = static_cast<uint8_t>(sym.size());
+    sym[1] = static_cast<uint8_t>(sym.size() >> 8);
+    sym[2] = static_cast<uint8_t>(sn);
+    sym[3] = static_cast<uint8_t>(sn >> 8);
+    return sym;
+  };
+  f.feed(100, 0, fcp::pack_type_k(1, 0, 0), data_symbol(700));
+  f.feed(101, 0, fcp::pack_type_k(1, 0, 0), data_symbol(701));
+  CHECK_EQ(f.rx.active_sets(), 2u);
+  const auto ids = f.rx.active_set_ids();
+  CHECK_EQ(ids.size(), 2u);
+  bool saw_100 = false;
+  bool saw_101 = false;
+  for (uint32_t id : ids) {
+    saw_100 = saw_100 || id == 100;
+    saw_101 = saw_101 || id == 101;
+  }
+  CHECK(saw_100 && saw_101);
+
+  fcp::RxSetView v;
+  CHECK(f.rx.view(100, &v));
+  CHECK(v.phase == fcp::SetPhase::kActive);
+
+  // Eligible moves only an ACTIVE set; the transition is idempotent, and an
+  // unknown id does not allocate a set.
+  CHECK(f.rx.mark_eligible(100));
+  CHECK(f.rx.view(100, &v));
+  CHECK(v.phase == fcp::SetPhase::kEligible);
+  CHECK(f.rx.mark_eligible(100));
+  CHECK(v.phase == fcp::SetPhase::kEligible);
+  CHECK(!f.rx.mark_eligible(999));
+
+  // Accounting stamps the tombstone the late-delivery window runs on.
+  CHECK(f.rx.mark_accounted(100, 5000));
+  CHECK(f.rx.view(100, &v));
+  CHECK(v.phase == fcp::SetPhase::kAccounted);
+  CHECK_EQ(v.tombstone_until_ms, 5000);
+  CHECK(!f.rx.mark_accounted(999, 5000));
+
+  // Releasing an accounted set retires it; a second release finds nothing.
+  CHECK(f.rx.release_set(100));
+  CHECK(!f.rx.view(100, &v));
+  CHECK_EQ(f.rx.active_sets(), 1u);
+  CHECK(!f.rx.release_set(100));
+  CHECK(!f.rx.release_set(999));
+
+  // An unaccounted set may be released too (capacity eviction path); it
+  // simply disappears without leaving a tombstone.
+  CHECK(f.rx.release_set(101));
+  CHECK_EQ(f.rx.active_sets(), 0u);
+  CHECK(f.rx.active_set_ids().empty());
+}
+
 int main() {
   TestDataDeliveryAndDedup();
   TestNoParityNoDecode();
@@ -716,5 +781,6 @@ int main() {
   TestSameSetConfirmsReanchor();
   TestNMustCoverSeenData();
   TestStructuralFailureCountedOnce();
+  TestActiveSetIdsAndSettlementPhases();
   return fcp_test::finish();
 }

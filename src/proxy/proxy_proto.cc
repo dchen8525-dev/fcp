@@ -1,10 +1,18 @@
-#include "fcp/proxy_proto.h"
+#include "proxy/proxy_proto.h"
 
 #include <cstdio>
 #include <cstring>
 
+#include "fcp/wire.h"
+
 namespace fcp {
 namespace {
+
+// The OPEN magic. It is compared against a partial window on purpose: a short
+// read must be able to say "not FCPO yet", so the parsers pass a length of
+// their own and the writers copy the whole thing.
+constexpr char kOpenMagic[4] = {'F', 'C', 'P', 'O'};
+constexpr size_t kOpenMagicLen = sizeof(kOpenMagic);
 
 bool host_char_ok(uint8_t c) {
   if (c >= 'a' && c <= 'z') {
@@ -258,8 +266,7 @@ Socks5Parse socks5_parse_request(const uint8_t* buf, size_t len, size_t* consume
       }
     }
   }
-  const uint16_t port = static_cast<uint16_t>((buf[off + addr_len] << 8) |
-                                              buf[off + addr_len + 1]);
+  const uint16_t port = get_be16(buf + off + addr_len);
   if (port == 0) {
     return Socks5Parse::kMalformed;  // CONNECT to port 0 cannot be dialled
   }
@@ -441,7 +448,7 @@ OpenParse open_parse_request(const uint8_t* buf, size_t len, size_t* consumed,
   const size_t win = len > kOpenMaxBytes ? kOpenMaxBytes : len;
   // Fail fast: one byte that is not 'F' can never become the magic.
   const size_t magic_len = win < 4 ? win : 4;
-  if (std::memcmp(buf, "FCPO", magic_len) != 0) {
+  if (std::memcmp(buf, kOpenMagic, magic_len) != 0) {
     return OpenParse::kBadMagic;
   }
   if (win < 7) {  // magic | ver | atyp | len
@@ -466,7 +473,7 @@ OpenParse open_parse_request(const uint8_t* buf, size_t len, size_t* consumed,
   if (win < total) {
     return OpenParse::kNeedMore;
   }
-  const uint16_t port = static_cast<uint16_t>((buf[7 + addr_len] << 8) | buf[8 + addr_len]);
+  const uint16_t port = get_be16(buf + 7 + addr_len);
   if (port == 0) {
     return OpenParse::kBadAddress;  // nothing to dial
   }
@@ -497,13 +504,12 @@ size_t open_write_request(uint8_t* out, size_t cap, const ProxyTarget& target) {
   if (cap < total) {
     return 0;
   }
-  std::memcpy(out, "FCPO", 4);
+  std::memcpy(out, kOpenMagic, kOpenMagicLen);
   out[4] = kOpenVersion;
   out[5] = target.atyp;
   out[6] = static_cast<uint8_t>(addr_len);
   std::memcpy(out + 7, target.addr.data(), addr_len);
-  out[7 + addr_len] = static_cast<uint8_t>(target.port >> 8);
-  out[8 + addr_len] = static_cast<uint8_t>(target.port & 0xFFu);
+  put_be16(target.port, out + 7 + addr_len);
   return total;
 }
 
@@ -516,7 +522,7 @@ OpenParse open_parse_reply(const uint8_t* buf, size_t len, size_t* consumed, boo
     return OpenParse::kNeedMore;
   }
   const size_t magic_len = len < 4 ? len : 4;
-  if (std::memcmp(buf, "FCPO", magic_len) != 0) {
+  if (std::memcmp(buf, kOpenMagic, magic_len) != 0) {
     return OpenParse::kBadMagic;
   }
   if (len < 6) {  // magic | ver | kind
@@ -583,7 +589,7 @@ size_t open_write_ok(uint8_t* out, size_t cap) {
   if (out == nullptr || cap < kOpenOkLen) {
     return 0;
   }
-  std::memcpy(out, "FCPO", 4);
+  std::memcpy(out, kOpenMagic, kOpenMagicLen);
   out[4] = kOpenVersion;
   out[5] = kOpenKindOk;
   out[6] = 0;
@@ -595,7 +601,7 @@ size_t open_write_err(uint8_t* out, size_t cap, OpenError err) {
   if (out == nullptr || cap < kOpenErrLen) {
     return 0;
   }
-  std::memcpy(out, "FCPO", 4);
+  std::memcpy(out, kOpenMagic, kOpenMagicLen);
   out[4] = kOpenVersion;
   out[5] = kOpenKindErr;
   out[6] = static_cast<uint8_t>(err);

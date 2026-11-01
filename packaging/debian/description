@@ -1,0 +1,15 @@
+ FCP is a UDP tunnel with adaptive forward error correction and a stream
+ layer on top. This package installs the two CLI ends:
+ .
+  * fcp-proxy-server -- listens on one UDP port and dials the targets a
+    client asks for (SOCKS5 / HTTP CONNECT semantics);
+  * fcp-proxy-client -- opens a local SOCKS5 / HTTP CONNECT entry
+    (default 127.0.0.1:1080) and carries its traffic over FCP.
+ .
+ The package ships a systemd unit for the server side; start-up arguments
+ live in /etc/fcp/fcp-proxy.env (a dpkg conffile, so upgrades keep your
+ edits). The service is not started on install: you must supply a
+ pre-shared key first (see /usr/share/doc/fcp-proxy/部署运维指南.md).
+ .
+ FCP v7 does not interoperate with v6: both ends must run the same major
+ wire version.

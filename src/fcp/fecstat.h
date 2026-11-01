@@ -1,4 +1,4 @@
-// FECSTAT v6: 128-byte oob report (FCP_PROTOCOL_V6.md §7.1).
+// FECSTAT v6: 128-byte oob report (协议规格.md §7.1).
 //
 // All counters are per-interval; only accounted_through_set_id is session-level
 // and serves as the monotonic key.
@@ -53,7 +53,7 @@ struct FecstatPacket {
   uint32_t sets_tail_dropped;
   uint32_t data_late_rx;
   uint32_t sets_partial;
-  // M3 R(k) ledger (FCP_M3_CONTROL.md §1.2), carved out of the frozen
+  // M3 R(k) ledger (M3控制设计.md §1.2), carved out of the frozen
   // reserved[5]. Old peers leave these zero and every consumer treats
   // ledger_groups == 0 as "no ledger", so no handshake negotiation is needed
   // in either direction.

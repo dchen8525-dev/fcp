@@ -59,14 +59,11 @@ inline Bytes Segment(uint32_t sn) {
   return out;
 }
 
+// Delegates to the library so a wire-layout change cannot leave the test
+// reading a different offset than the code under test.
 inline uint32_t SnOf(const uint8_t* payload, size_t len) {
-  if (len < 16) {
-    return 0;
-  }
-  return static_cast<uint32_t>(payload[12]) |
-         (static_cast<uint32_t>(payload[13]) << 8) |
-         (static_cast<uint32_t>(payload[14]) << 16) |
-         (static_cast<uint32_t>(payload[15]) << 24);
+  uint32_t sn = 0;
+  return fcp::kcp_sn_of(payload, len, &sn) ? sn : 0;
 }
 
 inline uint32_t SnOf(const Bytes& payload) { return SnOf(payload.data(), payload.size()); }

@@ -1,4 +1,4 @@
-// T30 (docs/FCP_M2_PROXY.md §8): FCP-STREAM on top of two real FCP sessions.
+// T30 (M2代理设计.md §8): FCP-STREAM on top of two real FCP sessions.
 //
 // stream_test.cc feeds hand-built segments straight into Stream::on_segment(),
 // which proves the ARQ logic but says nothing about the carrier. Here every

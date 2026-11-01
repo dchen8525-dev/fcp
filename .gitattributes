@@ -1,0 +1,29 @@
+# 仓库里同时跑 Windows 本地构建与 Linux CI，换行符必须钉死：
+#   * .sh / .yml / .iss / .ps1 在 Linux runner 上执行或被 bash 解析，
+#     带 CRLF 的 shebang 会直接 "bad interpreter"，YAML 里的 `\r` 也会让
+#     tag 匹配之类的字符串比较莫名其妙地失败；
+#   * .bat 是 cmd.exe 的脚本，CRLF 更保险。
+* text=auto
+
+# 维护者脚本（postinst/prerm/postrm）没有后缀，单独列。
+packaging/debian/postinst text eol=lf
+packaging/debian/prerm    text eol=lf
+packaging/debian/postrm   text eol=lf
+
+*.sh    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.iss   text eol=lf
+*.ps1   text eol=lf
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+*.cc    text eol=lf
+*.h     text eol=lf
+*.md    text eol=lf
+CMakeLists.txt text eol=lf
+*.cmake text eol=lf
+*.txt   text eol=lf
+
+*.deb   binary
+*.exe   binary

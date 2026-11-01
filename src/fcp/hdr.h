@@ -1,4 +1,4 @@
-// FCP 6-byte FEC header (FCP_PROTOCOL_V6.md §4.2).
+// FCP 6-byte FEC header (协议规格.md §4.2).
 //
 //   offset 0  set_id  u32 little-endian
 //   offset 4  index   u8

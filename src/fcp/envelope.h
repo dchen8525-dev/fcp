@@ -1,7 +1,7 @@
 // FCP v6 wire envelope: salt(8) | nonce_ctr(8, LE) | AES-GCM ciphertext | tag(12).
 //
 // The 12-byte GCM IV is expanded locally as counter(8, LE) | direction(1) | 0x00 x 3;
-// the direction byte never goes on the wire (FCP_PROTOCOL_V6.md §4.1).
+// the direction byte never goes on the wire (协议规格.md §4.1).
 //
 // #26: send and receive use two direction keys derived from the session key
 // (SP 800-108 counter KDF, labels "fcp-c2" / "fcp-s2"), so each direction has
@@ -25,6 +25,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+
+#include "fcp/gcm.h"
 
 namespace fcp {
 
@@ -98,8 +100,25 @@ class Envelope {
   // rejected. Returns false on any failure.
   bool open(const uint8_t* wire, size_t len, std::vector<uint8_t>* plain);
 
-  // Restores the send counter (must be < 2^32).
+  // Restores the send counter inside the current packet budget (must be below
+  // both the counter ceiling and this envelope's send limit).
   bool set_send_nonce(uint64_t value);
+
+  // R3-1, bootstrap envelope only: draws a 64-bit start for the send counter
+  // from the OS CSPRNG and caps this envelope at `budget` more packets. Two
+  // session instances built from the same salt (a replayed HELLO creates one)
+  // would otherwise seal their first ACK under the same (key, IV) - which is
+  // the keystream reuse #31 exists to remove. NIST SP 800-38D bounds the
+  // number of invocations under a key, not the counter value, so a high start
+  // costs nothing as long as `budget` stays far below 2^32.
+  //
+  // The receive ceiling opens to the full counter range at the same time: the
+  // peer draws its own start, so a 2^32 receive ceiling would reject the very
+  // first bootstrap packet. The data envelope (start 0) keeps the 2^32 ceiling.
+  //
+  // Returns false when the CSPRNG is unavailable. Callers must fail the
+  // session there - falling back to a fixed start reintroduces the defect.
+  bool init_bootstrap_nonce(uint32_t budget);
 
   // R3-1: switches this envelope to an explicit session key and restarts both
   // directions from counter 0 with an empty replay window. Called exactly once
@@ -110,18 +129,33 @@ class Envelope {
   void rekey(const uint8_t session_key[16]);
 
   uint64_t send_nonce() const { return send_nonce_; }
-  bool exhausted() const { return send_nonce_ >= kNonceLimit; }
+  bool exhausted() const { return send_nonce_ >= send_limit_; }
 
  private:
+  // The value-level work of seal_at, without either ceiling check.
+  bool seal_unchecked(uint64_t nonce_ctr, const uint8_t* plain, size_t len,
+                      std::vector<uint8_t>* wire) const;
   bool accept_nonce(uint64_t nonce_ctr);
   // Derives both direction keys from a session key and resets all per-key state.
   void install_keys(const uint8_t session_key[16]);
 
-  uint8_t send_key_[16];
-  uint8_t recv_key_[16];
+  // Expanded once per key (install_keys): the AES schedule and GHASH's H are
+  // key-only state, so a per-datagram re-expansion is pure waste (~2% of the
+  // AES work at MTU 1400, and it multiplies the observable samples on the
+  // GHASH side channel, R3-27).
+  GcmKey send_key_;
+  GcmKey recv_key_;
   uint8_t salt_[kSaltLen];
   Direction send_direction_;
   Direction recv_direction_;
+  // Two bounds on the 64-bit wire counter, both defaulting to kNonceLimit:
+  //   counter_ceiling_ - values at or past it are refused on both directions
+  //     (protocol violation / block budget). The bootstrap envelope raises it
+  //     to the full 64-bit space (init_bootstrap_nonce).
+  //   send_limit_ - where this envelope's own budget ends: the start plus the
+  //     packets it was allowed to seal. exhausted() and seal() use this one.
+  uint64_t counter_ceiling_;
+  uint64_t send_limit_;
   uint64_t send_nonce_;
   bool recv_has_nonce_;
   uint64_t recv_highest_;

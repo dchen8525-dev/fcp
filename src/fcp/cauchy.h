@@ -4,7 +4,7 @@
 //   C[r][c] = 1 / (x_r ^ y_c),  x_r = r,  y_c = k + c
 //
 // The two index sets must be disjoint; with x_r = r the data set is offset by k.
-// (FCP_V6_DETAILED_DESIGN.md §5.4 writes "y_c = 256 + c"; over GF(2^8) that is
+// (详细设计.md §5.4 writes "y_c = 256 + c"; over GF(2^8) that is
 // c modulo 256 and collides with x_r = r, so the offset is k. Any Cauchy matrix
 // is MDS, i.e. every square submatrix is invertible, which is what the codec
 // relies on.)

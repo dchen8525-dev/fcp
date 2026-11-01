@@ -9,7 +9,9 @@ set(FCP_TEST_NAMES
   ghash_test
   gcm_test
   envelope_test
+  random_test
   hdr_test
+  wire_test
   fecstat_test
   kfor_test
   strategy_test
@@ -41,14 +43,33 @@ endforeach()
 set_tests_properties(${FCP_TEST_NAMES} PROPERTIES TIMEOUT 300)
 set_tests_properties(soak_test PROPERTIES TIMEOUT 900)
 
-# The proxy engine lives under apps/ as a library of its own rather than in
-# libfcp, because it is the socket-free half the Qt client also links; its test
-# is the only one that needs that target (docs/FCP_M2_PROXY.md §6).
+# The proxy layer is its own library (src/proxy, defined at the top level):
+# ProxyEngine plus the entry codecs, shared with the CLI and the Qt client
+# (M2代理设计.md §6). Both proxy tests link it rather than libfcp.
 target_link_libraries(fcp_proxy_engine_test PRIVATE fcp_proxy_core)
+target_link_libraries(fcp_proxy_proto_test PRIVATE fcp_proxy_core)
+
+# CLI argument parsing (apps/fcp-proxy/cli.cc, T-cli). cli.cc is not in
+# fcp_proxy_core (only the executables compile it, under FCP_BUILD_PROXY), so
+# the test compiles it directly together with reactor.cc — run_proxy references
+# Reactor symbols, and the pure parser would otherwise be ungated until someone
+# built the CLI. This keeps the parse guards (uint16 wrap, fec-budget domain,
+# d+p pair limit) under the default test gate.
+add_executable(fcp_cli_test cli_test.cc
+               ${CMAKE_CURRENT_SOURCE_DIR}/../apps/fcp-proxy/cli.cc
+               ${CMAKE_CURRENT_SOURCE_DIR}/../apps/fcp-proxy/reactor.cc)
+target_include_directories(fcp_cli_test PRIVATE
+               ${CMAKE_CURRENT_SOURCE_DIR}/../apps/fcp-proxy)
+target_link_libraries(fcp_cli_test PRIVATE fcp_proxy_core)
+if(WIN32)
+  target_link_libraries(fcp_cli_test PRIVATE ws2_32)
+endif()
+add_test(NAME cli_test COMMAND fcp_cli_test)
+set_tests_properties(cli_test PROPERTIES TIMEOUT 300)
 
 # Loopback UDP sockets need Winsock on Windows. The soak test runs for 8s of
 # simulated time in the default configuration; the C3 acceptance run uses
-# FCP_SOAK_MS=600000 FCP_SOAK_REALTIME=1 (see docs/FCP_M1_ACCEPTANCE.md).
+# FCP_SOAK_MS=600000 FCP_SOAK_REALTIME=1 (see M1验收记录.md).
 if(WIN32)
   foreach(name e2e_test soak_test adv_test stream_e2e_test prewarm_test)
     if(TARGET fcp_${name})

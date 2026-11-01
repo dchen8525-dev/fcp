@@ -1,0 +1,43 @@
+[Unit]
+Description=FCP proxy server (UDP tunnel endpoint with FEC)
+Documentation=file:///usr/share/doc/fcp-proxy/部署运维指南.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 参数全部来自 /etc/fcp/fcp-proxy.env 的 FCP_ARGS（包内的 conffile）。
+# 未填 FCP_ARGS 时服务会以 "--key ... is required" 退出，这是有意的：
+# 装了包不等于配好了密钥，见 部署运维指南.md §4。
+EnvironmentFile=-/etc/fcp/fcp-proxy.env
+ExecStart=/usr/bin/fcp-proxy-server $FCP_ARGS
+Restart=on-failure
+RestartSec=3
+
+# trace 与日志目录由 systemd 创建并归服务用户所有：
+#   LogsDirectory   -> /var/log/fcp   （--trace 前缀写这里）
+#   StateDirectory  -> /var/lib/fcp
+LogsDirectory=fcp
+LogsDirectoryMode=0750
+StateDirectory=fcp
+StateDirectoryMode=0750
+
+# 每连接最坏 2 × --window-cap 内存（部署运维指南.md §5.1），
+# 自适应默认 1024 KiB × 256 会话 ≈ 512 MiB 最坏承诺，宿主机要留够。
+MemoryMax=infinity
+LimitNOFILE=65536
+
+# 服务端只需要 UDP 出站与本地 TCP 出站拨号，不需要任何特权。
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=full
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

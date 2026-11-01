@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "fcp/session.h"
+#include "fcp/version.h"
 #include "reactor.h"
 
 namespace fcp {
@@ -68,19 +69,23 @@ void Usage(EngineRole role, const char* argv0) {
       "  --k=N                pinned parity per set, -1 = adaptive (default -1)\n"
       "  --fec-budget=R       redundancy ceiling parity/data per report, 0 = off (default 0.5)\n"
       "  --trace=PREFIX       per-session controller trace JSONL (calibration)\n"
-      "  --window=KiB         stream send window (default 256)\n"
-      "  --rcv-buf=KiB        stream receive buffer (default 256)\n"
+      "  --window=KiB         stream send window; autotune start when adaptive (default 256)\n"
+      "  --rcv-buf=KiB        stream receive buffer; a floor when adaptive (default 256)\n"
+      "  --auto-window        grow the send window while it is the bottleneck (default on)\n"
+      "  --no-auto-window     keep the fixed --window (disables --window-cap)\n"
+      "  --window-cap=KiB     autotune ceiling 64..4096 (default 1024)\n"
       "  --idle=ms            tunnel idle teardown (default 300000)\n"
       "  --dial-timeout=ms    remote resolve + connect budget (default 5000)\n"
       "  --connect-timeout=ms per-address TCP connect budget (default 5000)\n"
       "  --max-sessions=N     concurrent sessions (default 256)\n"
       "  --no-prewarm         start every session cold (default: reuse link priors)\n"
       "  --stats=ms           print a stats line this often (default: only on exit)\n"
-      "  -v                   per-connection protocol log\n");
+      "  -v                   per-connection protocol log\n"
+      "  --version            print the release version and exit\n");
 }
 
 bool CollectArgs(int argc, char** argv, std::map<std::string, std::string>* opts,
-                 bool* help) {
+                 bool* help, std::string* error) {
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "-v" || arg == "--verbose") {
@@ -91,9 +96,13 @@ bool CollectArgs(int argc, char** argv, std::map<std::string, std::string>* opts
       *help = true;
       continue;
     }
+    if (arg == "--version" || arg == "-V") {
+      (*opts)["version"] = "1";
+      continue;
+    }
     const size_t eq = arg.find('=');
     if (arg.rfind("--", 0) != 0) {
-      std::fprintf(stderr, "unknown argument: %s\n", arg.c_str());
+      *error = "unknown argument: " + arg;
       return false;
     }
     if (eq == std::string::npos) {
@@ -145,196 +154,278 @@ bool ParseDouble(const std::string& text, double* out) {
 
 }  // namespace
 
-int run_proxy(EngineRole role, int argc, char** argv) {
+bool parse_proxy_args(EngineRole role, int argc, char** argv, ProxyArgs* out,
+                      std::string* error) {
+  out->ec = EngineConfig{};
+  out->ro = ReactorOptions{};
+  out->help = false;
+  out->version = false;
+  out->notes.clear();
+
   std::map<std::string, std::string> opts;
-  bool help = false;
-  if (!CollectArgs(argc, argv, &opts, &help)) {
-    Usage(role, argv[0]);
-    return 1;
+  if (!CollectArgs(argc, argv, &opts, &out->help, error)) {
+    return false;
   }
-  if (help) {
-    Usage(role, argv[0]);
-    return 0;
+  // --version 先于 --key 校验：装完包自检 `fcp-proxy-server --version` 不该要求 PSK。
+  out->version = Find(opts, "version") != nullptr;
+  if (out->help || out->version) {
+    return true;
   }
   const bool client = role == EngineRole::kClient;
+  out->ro.role = role;
 
-  EngineConfig ec;
-  ec.role = role;
   const std::string* key = Find(opts, "key");
-  if (key == nullptr || !ParseKey(*key, ec.key)) {
-    std::fprintf(stderr, "--key=HEX32 (16 bytes as 32 hex digits) is required\n");
-    return 1;
+  if (key == nullptr || !ParseKey(*key, out->ec.key)) {
+    *error = "--key=HEX32 (16 bytes as 32 hex digits) is required";
+    return false;
   }
   if (const std::string* v = Find(opts, "mtu")) {
     // 256..65535: below that the codec has no room for even one symbol, above
     // it the value no longer fits the uint16 wire/field and would wrap.
     long n = 0;
     if (!ParseInt(*v, 256, 65535, &n)) {
-      std::fprintf(stderr, "--mtu must be an integer in 256..65535 (IP packet bytes)\n");
-      return 1;
+      *error = "--mtu must be an integer in 256..65535 (IP packet bytes)";
+      return false;
     }
-    ec.mtu = static_cast<uint16_t>(n);
+    out->ec.mtu = static_cast<uint16_t>(n);
   }
   if (const std::string* v = Find(opts, "d")) {
     long n = 0;
     if (!ParseInt(*v, 1, 255, &n)) {
-      std::fprintf(stderr, "--d must be an integer in 1..255\n");
-      return 1;
+      *error = "--d must be an integer in 1..255";
+      return false;
     }
-    ec.d = static_cast<uint8_t>(n);
+    out->ec.d = static_cast<uint8_t>(n);
   }
   if (const std::string* v = Find(opts, "p")) {
     long n = 0;
     if (!ParseInt(*v, 0, 7, &n)) {
-      std::fprintf(stderr, "--p must be an integer in 0..7\n");
-      return 1;
+      *error = "--p must be an integer in 0..7";
+      return false;
     }
-    ec.p = static_cast<uint8_t>(n);
+    out->ec.p = static_cast<uint8_t>(n);
   }
   // P8-4: D + P <= 256 is a protocol hard limit (the symbol table index is
   // u8); each flag is in range above, but the pair can still be illegal. Fail
   // at startup instead of on every tunnel's first handshake.
-  if (static_cast<uint16_t>(ec.d) + ec.p > 256) {
-    std::fprintf(stderr, "--d + --p must not exceed 256 (got %u + %u)\n",
-                 static_cast<unsigned>(ec.d), static_cast<unsigned>(ec.p));
-    return 1;
+  if (static_cast<uint16_t>(out->ec.d) + out->ec.p > 256) {
+    *error = "--d + --p must not exceed 256 (got " +
+             std::to_string(static_cast<unsigned>(out->ec.d)) + " + " +
+             std::to_string(static_cast<unsigned>(out->ec.p)) + ")";
+    return false;
   }
   if (const std::string* v = Find(opts, "p-max")) {
     long n = 0;
     if (!ParseInt(*v, 0, 7, &n)) {
-      std::fprintf(stderr, "--p-max must be an integer in 0..7\n");
-      return 1;
+      *error = "--p-max must be an integer in 0..7";
+      return false;
     }
-    ec.p_max = static_cast<uint8_t>(n);
+    out->ec.p_max = static_cast<uint8_t>(n);
   }
   if (const std::string* v = Find(opts, "k")) {
     long n = 0;
     if (!ParseInt(*v, -1, 7, &n)) {
-      std::fprintf(stderr, "--k must be -1 (adaptive) or 0..7\n");
-      return 1;
+      *error = "--k must be -1 (adaptive) or 0..7";
+      return false;
     }
-    ec.pinned_k = static_cast<int>(n);
+    out->ec.pinned_k = static_cast<int>(n);
   }
   if (const std::string* v = Find(opts, "fec-budget")) {
     double r = 0.0;
     // P6' N12: the controller's domain is R in [0,1] (0 = off). A value above
     // 1 used to pass and silently disable the cap (ratio can never exceed it).
     if (!ParseDouble(*v, &r) || r < 0.0 || r > 1.0) {
-      std::fprintf(stderr, "--fec-budget must be a number in 0..1 (0 = off)\n");
-      return 1;
+      *error = "--fec-budget must be a number in 0..1 (0 = off)";
+      return false;
     }
-    ec.fec_budget = r;
+    out->ec.fec_budget = r;
   }
   if (const std::string* v = Find(opts, "trace")) {
-    ec.trace_prefix = *v;
+    out->ec.trace_prefix = *v;
   }
   if (const std::string* v = Find(opts, "window")) {
     long n = 0;
     if (!ParseInt(*v, 1, 1048576, &n)) {
-      std::fprintf(stderr, "--window must be an integer in 1..1048576 KiB\n");
-      return 1;
+      *error = "--window must be an integer in 1..1048576 KiB";
+      return false;
     }
-    ec.send_window_bytes = static_cast<size_t>(n) * 1024;
+    out->ec.send_window_bytes = static_cast<size_t>(n) * 1024;
   }
   if (const std::string* v = Find(opts, "rcv-buf")) {
     long n = 0;
     if (!ParseInt(*v, 1, 1048576, &n)) {
-      std::fprintf(stderr, "--rcv-buf must be an integer in 1..1048576 KiB\n");
-      return 1;
+      *error = "--rcv-buf must be an integer in 1..1048576 KiB";
+      return false;
     }
-    ec.rcv_buf_bytes = static_cast<size_t>(n) * 1024;
+    out->ec.rcv_buf_bytes = static_cast<size_t>(n) * 1024;
+  }
+  const bool auto_flag = Find(opts, "auto-window") != nullptr;
+  if (const std::string* v = Find(opts, "auto-window"); v != nullptr && !v->empty()) {
+    *error = "--auto-window takes no value; use --no-auto-window to disable";
+    return false;
+  }
+  if (auto_flag && Find(opts, "no-auto-window") != nullptr) {
+    *error = "--auto-window and --no-auto-window are mutually exclusive";
+    return false;
+  }
+  if (auto_flag) {
+    out->ec.auto_window = true;  // already the default; the flag is for explicit scripts
+  }
+  if (Find(opts, "no-auto-window") != nullptr) {
+    out->ec.auto_window = false;
+  }
+  const bool cap_given = Find(opts, "window-cap") != nullptr;
+  if (const std::string* v = Find(opts, "window-cap")) {
+    long n = 0;
+    // The engine's window floor is 64 KiB; a cap below it would be silently
+    // raised, so reject it here instead. The ceiling is 4 MiB: the advertised
+    // receive capacity is raised to the same value, so a 1 GiB cap would let
+    // one connection promise 2 GiB of buffering (--max-sessions multiplies it).
+    if (!ParseInt(*v, 64, 4096, &n)) {
+      *error = "--window-cap must be an integer in 64..4096 KiB";
+      return false;
+    }
+    out->ec.window_max_bytes = static_cast<size_t>(n) * 1024;
+  }
+  if (cap_given && !out->ec.auto_window) {
+    *error = "--window-cap only applies to the adaptive window; "
+             "drop --no-auto-window or remove it";
+    return false;
+  }
+  if (out->ec.auto_window) {
+    // Say out loud what the autotune overrides: these two flags look effective
+    // in a command line but are clamped or raised by the window controller.
+    if (out->ec.rcv_buf_bytes < out->ec.window_max_bytes) {
+      out->notes.push_back(
+          "[fcp] note: adaptive window raises the advertised receive capacity "
+          "from --rcv-buf=" + std::to_string(out->ec.rcv_buf_bytes / 1024) +
+          " KiB to --window-cap=" + std::to_string(out->ec.window_max_bytes / 1024) +
+          " KiB per connection");
+    }
+    if (out->ec.send_window_bytes < out->ec.window_min_bytes) {
+      out->notes.push_back(
+          "[fcp] note: --window=" + std::to_string(out->ec.send_window_bytes / 1024) +
+          " KiB is below the autotune floor, starting at " +
+          std::to_string(out->ec.window_min_bytes / 1024) + " KiB");
+    } else if (out->ec.send_window_bytes > out->ec.window_max_bytes) {
+      out->notes.push_back(
+          "[fcp] note: --window=" + std::to_string(out->ec.send_window_bytes / 1024) +
+          " KiB is above the autotune ceiling, starting at " +
+          std::to_string(out->ec.window_max_bytes / 1024) + " KiB");
+    }
   }
   if (const std::string* v = Find(opts, "idle")) {
     long n = 0;
     if (!ParseInt(*v, 1, 86400000, &n)) {
-      std::fprintf(stderr, "--idle must be an integer in 1..86400000 ms\n");
-      return 1;
+      *error = "--idle must be an integer in 1..86400000 ms";
+      return false;
     }
-    ec.idle_timeout_ms = static_cast<int64_t>(n);
+    out->ec.idle_timeout_ms = static_cast<int64_t>(n);
   }
   if (const std::string* v = Find(opts, "dial-timeout")) {
     long n = 0;
     if (!ParseInt(*v, 1, 600000, &n)) {
-      std::fprintf(stderr, "--dial-timeout must be an integer in 1..600000 ms\n");
-      return 1;
+      *error = "--dial-timeout must be an integer in 1..600000 ms";
+      return false;
     }
-    ec.dial_timeout_ms = static_cast<int64_t>(n);
+    out->ec.dial_timeout_ms = static_cast<int64_t>(n);
   }
   if (const std::string* v = Find(opts, "max-sessions")) {
     long n = 0;
     if (!ParseInt(*v, 1, 65536, &n)) {
-      std::fprintf(stderr, "--max-sessions must be an integer in 1..65536\n");
-      return 1;
+      *error = "--max-sessions must be an integer in 1..65536";
+      return false;
     }
-    ec.max_sessions = static_cast<size_t>(n);
+    out->ec.max_sessions = static_cast<size_t>(n);
   }
   if (Find(opts, "no-prewarm") != nullptr) {
-    ec.prewarm = false;
+    out->ec.prewarm = false;
   }
 
-  ReactorOptions ro;
-  ro.role = role;
   if (client) {
     const std::string* host = Find(opts, "host");
     if (host == nullptr || host->empty()) {
-      std::fprintf(stderr, "--host=IP is required on the client\n");
-      return 1;
+      *error = "--host=IP is required on the client";
+      return false;
     }
-    ro.remote_host = *host;
+    out->ro.remote_host = *host;
     if (const std::string* v = Find(opts, "port")) {
       long n = 0;
       if (!ParseInt(*v, 1, 65535, &n)) {
-        std::fprintf(stderr, "--port must be an integer in 1..65535\n");
-        return 1;
+        *error = "--port must be an integer in 1..65535";
+        return false;
       }
-      ro.remote_port = static_cast<int>(n);
+      out->ro.remote_port = static_cast<int>(n);
     }
     if (const std::string* v = Find(opts, "listen")) {
-      ro.listen_addr = *v;
+      out->ro.listen_addr = *v;
     }
     if (const std::string* v = Find(opts, "local-port")) {
       long n = 0;
       if (!ParseInt(*v, 1, 65535, &n)) {
-        std::fprintf(stderr, "--local-port must be an integer in 1..65535\n");
-        return 1;
+        *error = "--local-port must be an integer in 1..65535";
+        return false;
       }
-      ro.listen_port = static_cast<int>(n);
+      out->ro.listen_port = static_cast<int>(n);
     }
   } else {
     if (const std::string* v = Find(opts, "bind")) {
-      ro.bind_addr = *v;
+      out->ro.bind_addr = *v;
     }
     if (const std::string* v = Find(opts, "port")) {
       long n = 0;
       if (!ParseInt(*v, 1, 65535, &n)) {
-        std::fprintf(stderr, "--port must be an integer in 1..65535\n");
-        return 1;
+        *error = "--port must be an integer in 1..65535";
+        return false;
       }
-      ro.bind_port = static_cast<int>(n);
+      out->ro.bind_port = static_cast<int>(n);
     }
   }
   if (const std::string* v = Find(opts, "stats")) {
     long n = 0;
     if (!ParseInt(*v, 0, 86400000, &n)) {
-      std::fprintf(stderr, "--stats must be an integer in 0..86400000 ms\n");
-      return 1;
+      *error = "--stats must be an integer in 0..86400000 ms";
+      return false;
     }
-    ro.stats_ms = static_cast<int64_t>(n);
+    out->ro.stats_ms = static_cast<int64_t>(n);
   }
   if (const std::string* v = Find(opts, "connect-timeout")) {
     long n = 0;
     if (!ParseInt(*v, 1, 600000, &n)) {
-      std::fprintf(stderr, "--connect-timeout must be an integer in 1..600000 ms\n");
-      return 1;
+      *error = "--connect-timeout must be an integer in 1..600000 ms";
+      return false;
     }
-    ro.connect_timeout_ms = static_cast<int64_t>(n);
+    out->ro.connect_timeout_ms = static_cast<int64_t>(n);
   }
-  ro.verbose = Find(opts, "verbose") != nullptr;
+  out->ro.verbose = Find(opts, "verbose") != nullptr;
+  return true;
+}
 
-  Reactor reactor(ec, ro);
+int run_proxy(EngineRole role, int argc, char** argv) {
+  ProxyArgs args;
   std::string error;
-  if (!reactor.start(&error)) {
-    std::fprintf(stderr, "startup failed: %s\n", error.c_str());
+  if (!parse_proxy_args(role, argc, argv, &args, &error)) {
+    std::fprintf(stderr, "%s\n", error.c_str());
+    Usage(role, argv[0]);
+    return 1;
+  }
+  if (args.version) {
+    std::printf("%s %s\n", role == EngineRole::kClient ? "fcp-proxy-client" : "fcp-proxy-server",
+                kProductVersion);
+    return 0;
+  }
+  if (args.help) {
+    Usage(role, argv[0]);
+    return 0;
+  }
+  for (const std::string& note : args.notes) {
+    std::fprintf(stderr, "%s\n", note.c_str());
+  }
+
+  Reactor reactor(args.ec, args.ro);
+  std::string startup_error;
+  if (!reactor.start(&startup_error)) {
+    std::fprintf(stderr, "startup failed: %s\n", startup_error.c_str());
     return 1;
   }
   reactor.run();

@@ -1,12 +1,11 @@
 #include "fcp/hdr.h"
 
+#include "fcp/wire.h"
+
 namespace fcp {
 
 void pack_hdr(const FecHdr& hdr, uint8_t out[kFecHdrLen]) {
-  out[0] = static_cast<uint8_t>(hdr.set_id);
-  out[1] = static_cast<uint8_t>(hdr.set_id >> 8);
-  out[2] = static_cast<uint8_t>(hdr.set_id >> 16);
-  out[3] = static_cast<uint8_t>(hdr.set_id >> 24);
+  put_le32(hdr.set_id, out);
   out[4] = hdr.index;
   out[5] = hdr.type_k;
 }
@@ -15,8 +14,7 @@ bool parse_hdr(const uint8_t* in, size_t len, FecHdr* out) {
   if (in == nullptr || out == nullptr || len < kFecHdrLen) {
     return false;
   }
-  out->set_id = static_cast<uint32_t>(in[0]) | (static_cast<uint32_t>(in[1]) << 8) |
-                (static_cast<uint32_t>(in[2]) << 16) | (static_cast<uint32_t>(in[3]) << 24);
+  out->set_id = get_le32(in);
   out->index = in[4];
   out->type_k = in[5];
   return true;

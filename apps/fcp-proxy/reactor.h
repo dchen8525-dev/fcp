@@ -1,4 +1,4 @@
-// Cross-platform select reactor for the FCP proxy CLI (docs/FCP_M2_PROXY.md §6).
+// Cross-platform select reactor for the FCP proxy CLI (M2代理设计.md §6).
 //
 // The socket half of the picture: ProxyEngine owns every byte of the protocol
 // and none of the descriptors, and this file is the mirror image -- it owns the
@@ -61,8 +61,8 @@
 #include <sys/types.h>
 #endif
 
-#include "engine.h"
-#include "fcp/proxy_proto.h"
+#include "proxy/proxy_engine.h"
+#include "proxy/proxy_proto.h"
 
 namespace fcp {
 

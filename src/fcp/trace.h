@@ -1,4 +1,4 @@
-// Controller trace recording and offline replay (FCP_M3_CONTROL.md §5, #28).
+// Controller trace recording and offline replay (M3控制设计.md §5, #28).
 //
 // A trace is one JSONL line per accepted FECSTAT report: the report's numeric
 // fields (flattened with an s_ prefix), the strategy config snapshot the

@@ -217,12 +217,15 @@ void BenchEngine::beginSession() {
         }
         ++rx_valid_segs_;
         // The server numbers its download stream from 1 without gaps, so the
-        // largest SN seen is exactly how many segments it sent.
-        const quint32 sn = static_cast<quint32>(payload[12]) |
-                           (static_cast<quint32>(payload[13]) << 8) |
-                           (static_cast<quint32>(payload[14]) << 16) |
-                           (static_cast<quint32>(payload[15]) << 24);
-        rx_max_sn_ = std::max(rx_max_sn_, sn);
+        // largest SN seen is exactly how many segments it sent. The sn offset
+        // is the protocol's (kcp_sn_of, also what payloadOk uses), not a local
+        // constant: it is the one place FCP touches the KCP header.
+        uint32_t sn = 0;
+        if (!fcp::kcp_sn_of(payload, len, &sn)) {
+          ++rx_corrupt_;
+          return;
+        }
+        rx_max_sn_ = std::max(rx_max_sn_, static_cast<quint32>(sn));
       },
       [this](const std::string& line) { Q_EMIT logLine(QString::fromStdString(line)); });
 
@@ -517,10 +520,10 @@ bool BenchEngine::payloadOk(const quint8* payload, size_t len) const {
   if (len != static_cast<size_t>(opt_.seg) || len < 16) {
     return false;
   }
-  const quint32 sn = static_cast<quint32>(payload[12]) |
-                     (static_cast<quint32>(payload[13]) << 8) |
-                     (static_cast<quint32>(payload[14]) << 16) |
-                     (static_cast<quint32>(payload[15]) << 24);
+  quint32 sn = 0;
+  if (!fcp::kcp_sn_of(payload, len, &sn)) {
+    return false;
+  }
   for (size_t i = 0; i < len; ++i) {
     if (i >= 12 && i < 16) {
       continue;

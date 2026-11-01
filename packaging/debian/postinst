@@ -1,0 +1,25 @@
+#!/bin/sh
+# fcp-proxy 安装后脚本：注册 systemd unit，处理从无到有的首次启用。
+# 不自动 start：装好包不等于配好密钥（/etc/fcp/fcp-proxy.env 默认是空的）。
+set -e
+
+if [ "$1" = "configure" ]; then
+  # 新装时目录由 dpkg 建好；升级时保留已有日志/状态。
+  install -d -m 0750 /etc/fcp
+
+  if [ -d /run/systemd/system ] && [ -x /bin/systemctl ]; then
+    systemctl --system daemon-reload >/dev/null 2>&1 || true
+  fi
+
+  cat <<'EOF'
+
+FCP proxy 已安装。下一步：
+  1. 编辑 /etc/fcp/fcp-proxy.env，填写 FCP_ARGS（至少要有 --key=HEX32）
+  2. systemctl enable --now fcp-proxy
+  3. journalctl -u fcp-proxy -f
+
+版本自检：fcp-proxy-server --version
+EOF
+fi
+
+exit 0

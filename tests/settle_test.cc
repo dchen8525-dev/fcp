@@ -484,7 +484,7 @@ void TestIdentityFuzz() {
 
 }  // namespace
 
-// M3 R(k) ledger (FCP_M3_CONTROL.md §1.2): only full-size groups with known
+// M3 R(k) ledger (M3控制设计.md §1.2): only full-size groups with known
 // k >= 1 enter; runs are RAW loss (recovered slots still count as lost).
 void TestLedgerRecovery() {
   const auto tx = BuildSet(10, 2, Payloads(400, 10));
@@ -570,7 +570,7 @@ void TestLedgerDominantK() {
   CHECK_EQ(f.settle.ledger_k(), 3);
 }
 
-// --- #26 burst detection (FCP_M3_CONTROL.md §3) ---
+// --- #26 burst detection (M3控制设计.md §3) ---
 
 // Exact i.i.d. reference via brute force over all 2^d loss masks (d = 10).
 void RunDistBruteForce(double out[9], double p, uint8_t d) {

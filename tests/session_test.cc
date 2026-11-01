@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -11,6 +12,7 @@
 #include "fcp/fecstat.h"
 #include "fcp/handshake.h"
 #include "fcp/hdr.h"
+#include "fcp/random.h"
 #include "test_util.h"
 
 namespace {
@@ -36,10 +38,8 @@ Bytes Segment(uint32_t sn) {
 }
 
 uint32_t SnOf(const Bytes& payload) {
-  return static_cast<uint32_t>(payload[12]) |
-         (static_cast<uint32_t>(payload[13]) << 8) |
-         (static_cast<uint32_t>(payload[14]) << 16) |
-         (static_cast<uint32_t>(payload[15]) << 24);
+  uint32_t sn = 0;
+  return fcp::kcp_sn_of(payload.data(), payload.size(), &sn) ? sn : 0;
 }
 
 fcp::SessionConfig MakeConfig(fcp::Direction send, fcp::Direction recv,
@@ -138,7 +138,7 @@ struct Link {
   fcp::Session* b = nullptr;
   bool loss_enabled = false;
   uint32_t loss_percent = 20;
-  // Gilbert–Elliott two-state channel (#26, FCP_M3_CONTROL.md §3): Bad drops
+  // Gilbert–Elliott two-state channel (#26, M3控制设计.md §3): Bad drops
   // ge_p_bad percent, Good ge_p_good; per-symbol transitions with the same
   // LCG. Mean loss ≈ (g2b/(g2b+b2g))·p_bad, mean bad stretch ≈ 100/b2g.
   bool ge_enabled = false;
@@ -440,7 +440,10 @@ void TestHandshakeRidesOob() {
   CHECK_EQ(sent.size(), 1u);
   CHECK(sent[0].second == fcp::SymbolType::kOob);
 
+  // R3-1: the bootstrap envelope starts at a random 64-bit counter, so the
+  // reader must widen its receive ceiling to match (see TestHandshakeAckEcho).
   fcp::Envelope reader(kKey, kSalt, fcp::Direction::kC2S, fcp::Direction::kC2S);
+  CHECK(reader.init_bootstrap_nonce(1u << 16));
   Bytes plain;
   CHECK(reader.open(sent[0].first.data(), sent[0].first.size(), &plain));
   fcp::FecHdr hdr{};
@@ -492,7 +495,11 @@ void TestHandshakeAckRidesOob() {
 
   // The ACK still rides the bootstrap key: it is sealed before the session key
   // exists, which is exactly why the handshake keeps its own envelope.
+  // R3-1: the session's bootstrap envelope seals from a random 64-bit counter
+  // start, so a reader peeking at handshake traffic must widen its receive
+  // ceiling the same way (a data envelope would cap at 2^32 and reject the ACK).
   fcp::Envelope reader(kKey, kSalt, fcp::Direction::kS2C, fcp::Direction::kS2C);
+  CHECK(reader.init_bootstrap_nonce(1u << 16));
   Bytes ack_plain;
   CHECK(reader.open(sent[0].first.data(), sent[0].first.size(), &ack_plain));
   fcp::FecHdr hdr{};
@@ -503,6 +510,58 @@ void TestHandshakeAckRidesOob() {
   CHECK_EQ(ack_plain.size() - fcp::kFecHdrLen, fcp::kHelloAckLen);
   CHECK(fcp::is_hello_ack(ack_plain.data() + fcp::kFecHdrLen,
                           ack_plain.size() - fcp::kFecHdrLen));
+}
+
+// F-2: a payload sealed with the bootstrap key that is not HELLO/HELLO_ACK is
+// dropped *and counted*. Both failure paths are exercised: a well-formed data
+// frame (structure is fine, epoch is wrong) and a truncated one. Before this
+// was counted, the packet fell between auth_fail and struct_fail and the
+// operator saw an idle tunnel with flat counters.
+void TestBootstrapNonHandshakeIsCounted() {
+  std::vector<Bytes> delivered;
+  fcp::Session b(
+      MakeConfig(fcp::Direction::kS2C, fcp::Direction::kC2S), nullptr,
+      [&delivered](const uint8_t* p, size_t n) { delivered.emplace_back(p, p + n); },
+      nullptr);
+  b.start(0);
+
+  // Establish with a hand-built HELLO so the data envelope rekeys away from
+  // the bootstrap key; only then does a bootstrap-sealed packet reach the
+  // bootstrap branch at all (before that, env_ opens it first).
+  uint8_t hello[fcp::kHelloLen];
+  fcp::build_hello(fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, fcp::kLocalFlagsM1},
+                   PeerDraw(), hello);
+  Bytes plain(fcp::kFecHdrLen + sizeof(hello));
+  fcp::pack_hdr(
+      fcp::FecHdr{0, 0, fcp::pack_type_k(0, 0, static_cast<uint8_t>(fcp::SymbolType::kOob))},
+      plain.data());
+  std::memcpy(plain.data() + fcp::kFecHdrLen, hello, sizeof(hello));
+
+  fcp::Envelope peer(kKey, kSalt, fcp::Direction::kC2S, fcp::Direction::kS2C);
+  Bytes wire;
+  CHECK(peer.seal(plain.data(), plain.size(), &wire));
+  b.on_wire(wire.data(), wire.size(), 1);
+  CHECK(b.established());
+  CHECK_EQ(b.struct_fail(), 0u);
+
+  // A structurally valid data frame under the bootstrap key.
+  Bytes data(fcp::kFecHdrLen + 4, 0);
+  fcp::pack_hdr(
+      fcp::FecHdr{0, 0, fcp::pack_type_k(0, 0, static_cast<uint8_t>(fcp::SymbolType::kData))},
+      data.data());
+  data[fcp::kFecHdrLen] = 4;
+  CHECK(peer.seal(data.data(), data.size(), &wire));
+  CHECK(b.on_wire(wire.data(), wire.size(), 2));  // authenticated: epoch check
+  CHECK_EQ(b.struct_fail(), 1u);
+  CHECK_EQ(b.auth_fail(), 0u);  // the tag was valid; nothing was delivered
+  CHECK(delivered.empty());
+
+  // A truncated payload (shorter than the FEC header) counts the same way.
+  const uint8_t tiny[2] = {0x00, 0x00};
+  CHECK(peer.seal(tiny, sizeof(tiny), &wire));
+  CHECK(b.on_wire(wire.data(), wire.size(), 3));
+  CHECK_EQ(b.struct_fail(), 2u);
+  CHECK(delivered.empty());
 }
 
 // A local codec geometry outside the caps bounds must be refused up front: with
@@ -979,7 +1038,7 @@ std::vector<unsigned> AllKs(const std::vector<std::string>& logs) {
   return ks;
 }
 
-// T35 at injection level (FCP_M3_CONTROL.md §8): two arms at ~10% mean loss,
+// T35 at injection level (M3控制设计.md §8): two arms at ~10% mean loss,
 // different texture. i.i.d. — the ledger confirms the binomial answer, k
 // holds at 2. Gilbert–Elliott bursts — the empirical group-failure rate
 // exceeds the binomial prediction, p_eff lifts the loss input, and k steps
@@ -1252,10 +1311,319 @@ void TestReplayCannotReviveSession() {
   CHECK(!a2.established());
 }
 
+// Session-level R3-24. The handshake-level test proves the state machine; this
+// one proves the wiring around it: the refusal must not re-run configure()
+// (which would rekey the live data plane onto the attacker's draw) and the
+// session must neither answer the rogue nor disturb the live peer.
+void TestEstablishedSurvivesForeignHello() {
+  Link link;
+  std::vector<Bytes> delivered;
+  std::vector<Bytes> a_oob_wires;
+  fcp::Session a(
+      MakeConfig(fcp::Direction::kC2S, fcp::Direction::kS2C),
+      [&](const uint8_t* w, size_t n, fcp::SymbolType t) {
+        if (t == fcp::SymbolType::kOob) {
+          a_oob_wires.emplace_back(w, w + n);
+        }
+        link.from_a(w, n, t);
+      },
+      [](const uint8_t*, size_t) {}, [](const std::string&) {});
+  fcp::Session b(
+      MakeConfig(fcp::Direction::kS2C, fcp::Direction::kC2S),
+      [&link](const uint8_t* w, size_t n, fcp::SymbolType t) { link.from_b(w, n, t); },
+      [&delivered](const uint8_t* p, size_t n) { delivered.emplace_back(p, p + n); },
+      [](const std::string&) {});
+  link.a = &a;
+  link.b = &b;
+  a.start(0);
+  b.start(0);
+  a.on_tick(0);
+  b.on_tick(0);
+  CHECK(a.established());
+  CHECK(b.established());
+
+  for (uint32_t sn = 0; sn < 4; ++sn) {
+    const Bytes seg = Segment(sn);
+    a.on_kcp_output(seg.data(), seg.size(), 0);
+  }
+  for (int64_t t = 25; t <= 400; t += fcp::kSessionTickMs) {
+    a.on_tick(t);
+    b.on_tick(t);
+  }
+  CHECK(!delivered.empty());
+
+  const uint32_t b_oob_before = link.b_oob;   // what b answers with
+  const uint32_t auth_before = b.auth_fail();
+  const fcp::NegotiatedParams params = b.params();
+
+  // A rogue implementation holds the PSK, so its HELLO authenticates under the
+  // bootstrap key; only the draw is foreign. The counters are plaintext on the
+  // wire, so the rogue can also see where the replay window sits and seal just
+  // past it — the strongest version of the attack.
+  CHECK(!a_oob_wires.empty());
+  uint64_t seen_ctr = 0;
+  for (int i = 7; i >= 0; --i) {
+    seen_ctr = (seen_ctr << 8) | a_oob_wires[0][8 + static_cast<size_t>(i)];
+  }
+  uint8_t rogue[16];
+  std::memset(rogue, 0xAA, sizeof(rogue));
+  rogue[15] = 0xAB;
+  uint8_t hello[fcp::kHelloLen];
+  fcp::build_hello(fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, fcp::kLocalFlagsM1},
+                   rogue, hello);
+  Bytes plain(fcp::kFecHdrLen + sizeof(hello));
+  fcp::pack_hdr(
+      fcp::FecHdr{0, 0, fcp::pack_type_k(0, 0, static_cast<uint8_t>(fcp::SymbolType::kOob))},
+      plain.data());
+  std::memcpy(plain.data() + fcp::kFecHdrLen, hello, sizeof(hello));
+  fcp::Envelope peer(kKey, kSalt, fcp::Direction::kC2S, fcp::Direction::kS2C);
+  // The rogue speaks the bootstrap epoch, whose counter space is the full
+  // 64-bit range — a data-envelope ceiling would refuse the draw.
+  CHECK(peer.init_bootstrap_nonce(1u << 20));
+  Bytes wire;
+  CHECK(peer.seal_at(seen_ctr + 1, plain.data(), plain.size(), &wire));
+  b.on_wire(wire.data(), wire.size(), 410);
+
+  // Still up, still on the negotiated geometry, silent toward the rogue, and
+  // the crypto counters did not move (refusal is a state-machine decision).
+  CHECK(b.established());
+  CHECK_EQ(b.auth_fail(), auth_before);
+  CHECK_EQ(link.b_oob, b_oob_before);
+  CHECK_EQ(b.params().d, params.d);
+  CHECK_EQ(b.params().p, params.p);
+  CHECK_EQ(b.params().mode, params.mode);
+
+  // The live data plane is untouched: later segments still authenticate and
+  // deliver under the original key.
+  const size_t delivered_before = delivered.size();
+  for (uint32_t sn = 10; sn < 14; ++sn) {
+    const Bytes seg = Segment(sn);
+    a.on_kcp_output(seg.data(), seg.size(), 420);
+  }
+  for (int64_t t = 425; t <= 800; t += fcp::kSessionTickMs) {
+    a.on_tick(t);
+    b.on_tick(t);
+  }
+  CHECK(b.established());
+  CHECK(delivered.size() > delivered_before);
+}
+
+// SessionConfig.handshake_nonce pins the draw (a test needs a stable key
+// material); all zeros means "draw from the CSPRNG". Both paths must hold:
+// a pinned draw reaches the wire verbatim, and unpinned sessions never share
+// one.
+void TestPinnedHandshakeNonce() {
+  const uint8_t pinned[16] = {0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78,
+                              0x79, 0x7A, 0x7B, 0x7C, 0x7D, 0x7E, 0x7F, 0x80};
+
+  // Opens the session's bootstrap-sealed HELLO and returns the plaintext.
+  auto hello_plain = [](const fcp::SessionConfig& cfg) {
+    std::vector<Bytes> oob;
+    fcp::Session s(cfg,
+                   [&oob](const uint8_t* w, size_t n, fcp::SymbolType t) {
+                     if (t == fcp::SymbolType::kOob) {
+                       oob.emplace_back(w, w + n);
+                     }
+                   },
+                   nullptr, nullptr);
+    s.start(0);
+    s.on_tick(0);
+    CHECK(!oob.empty());
+    // The reader plays the server side: it expects HELLOs sealed by a client.
+    // It must widen its receive ceiling the same way the real receiver's
+    // bootstrap envelope does — the sender's 64-bit counter start can exceed
+    // the data envelope's 2^32 limit.
+    fcp::Envelope reader(kKey, kSalt, fcp::Direction::kS2C, fcp::Direction::kC2S);
+    CHECK(reader.init_bootstrap_nonce(1u << 20));
+    Bytes plain;
+    CHECK(reader.open(oob[0].data(), oob[0].size(), &plain));
+    return plain;
+  };
+
+  fcp::SessionConfig cfg = MakeConfig(fcp::Direction::kC2S, fcp::Direction::kS2C);
+  std::memcpy(cfg.handshake_nonce, pinned, sizeof(pinned));
+  const Bytes h1 = hello_plain(cfg);
+  const Bytes h2 = hello_plain(cfg);
+  // The plaintext carries the FEC header in front of the HELLO.
+  CHECK_EQ(h1.size(), fcp::kFecHdrLen + fcp::kHelloLen);
+  // The pinned draw is on the wire, verbatim, at its fixed offset.
+  CHECK(std::memcmp(h1.data() + fcp::kFecHdrLen + fcp::kHelloMagicLen, pinned,
+                    sizeof(pinned)) == 0);
+  CHECK(h1 == h2);  // same pinned draw, same HELLO plaintext
+
+  fcp::SessionConfig unpinned = MakeConfig(fcp::Direction::kC2S, fcp::Direction::kS2C);
+  const Bytes d1 = hello_plain(unpinned);
+  const Bytes d2 = hello_plain(unpinned);
+  CHECK(d1 != d2);  // the CSPRNG path draws per session
+}
+
+// Key isolation between live sessions: the same PSK with a different salt and
+// different nonce draws must leave pair 2 unable to read pair 1's data —
+// counted as auth failures, never delivered, and pair 2's own plane unaffected.
+void TestCrossSessionDataIsolation() {
+  struct Pair {
+    Link link;
+    std::vector<Bytes> delivered;
+    std::vector<Bytes> a_data;  // a→b data datagrams, post-handshake
+    std::unique_ptr<fcp::Session> a;
+    std::unique_ptr<fcp::Session> b;
+
+    explicit Pair(const uint8_t* salt)
+        : a(new fcp::Session(
+              MakeConfig(fcp::Direction::kC2S, fcp::Direction::kS2C, salt),
+              [this](const uint8_t* w, size_t n, fcp::SymbolType t) {
+                if (t == fcp::SymbolType::kData) {
+                  a_data.emplace_back(w, w + n);
+                }
+                link.from_a(w, n, t);
+              },
+              [](const uint8_t*, size_t) {}, [](const std::string&) {})),
+          b(new fcp::Session(
+              MakeConfig(fcp::Direction::kS2C, fcp::Direction::kC2S, salt),
+              [this](const uint8_t* w, size_t n, fcp::SymbolType t) {
+                link.from_b(w, n, t);
+              },
+              [this](const uint8_t* p, size_t n) { delivered.emplace_back(p, p + n); },
+              [](const std::string&) {})) {
+      link.a = a.get();
+      link.b = b.get();
+    }
+
+    void establish() {
+      a->start(0);
+      b->start(0);
+      a->on_tick(0);
+      b->on_tick(0);
+      CHECK(a->established());
+      CHECK(b->established());
+    }
+
+    void pump(int64_t from, int64_t to) {
+      for (int64_t t = from; t <= to; t += fcp::kSessionTickMs) {
+        a->on_tick(t);
+        b->on_tick(t);
+      }
+    }
+
+    void send(uint32_t sn_begin, uint32_t sn_end, int64_t now) {
+      for (uint32_t sn = sn_begin; sn < sn_end; ++sn) {
+        const Bytes seg = Segment(sn);
+        a->on_kcp_output(seg.data(), seg.size(), now);
+      }
+    }
+  };
+
+  Pair p1(kSalt);
+  Pair p2(kSalt2);
+  p1.establish();
+  p2.establish();
+
+  p1.send(0, 4, 0);
+  p1.pump(25, 400);
+  CHECK_EQ(p1.a_data.size(), 4u);  // one symbol per segment
+  CHECK(!p1.delivered.empty());
+
+  // Cross-feed pair 1's data wire into pair 2's receiver.
+  const size_t delivered_before = p2.delivered.size();
+  const uint32_t auth_before = p2.b->auth_fail();
+  for (const Bytes& w : p1.a_data) {
+    p2.b->on_wire(w.data(), w.size(), 500);
+  }
+  CHECK(p2.b->auth_fail() > auth_before);  // authenticated as garbage, nothing more
+  CHECK_EQ(p2.delivered.size(), delivered_before);
+  CHECK(p2.b->established());
+
+  // Pair 2's own plane was never disturbed.
+  p2.send(0, 4, 520);
+  p2.pump(525, 900);
+  CHECK(!p2.delivered.empty());
+  CHECK(p2.b->established());
+}
+
+// 第四轮 F-6/F-1: when the OS CSPRNG is unavailable, a session must refuse to
+// come up instead of running on a guessable nonce. Construction fails the
+// handshake with kBadNonce, start() refuses loudly, and not one byte reaches
+// the wire. Lifting the injection must restore normal behaviour (no latch).
+void TestEntropyFailureRefusesStart() {
+  fcp::set_random_failure_injection(true);
+  std::vector<Bytes> oob;
+  std::vector<std::string> logs;
+  {
+    fcp::Session s(
+        MakeConfig(fcp::Direction::kC2S, fcp::Direction::kS2C),
+        [&oob](const uint8_t* w, size_t n, fcp::SymbolType t) {
+          if (t == fcp::SymbolType::kOob) {
+            oob.emplace_back(w, w + n);
+          }
+        },
+        nullptr, [&logs](const std::string& line) { logs.push_back(line); });
+    // Construction could not draw: the handshake is dead on arrival.
+    CHECK(s.state() == fcp::HandshakeState::kFailed);
+    CHECK(s.error() == fcp::HandshakeError::kBadNonce);
+    s.start(0);
+    s.on_tick(0);
+    CHECK(oob.empty());  // nothing ever seals, not even a HELLO retry
+    CHECK(!s.established());
+    CHECK(HasLine(logs,
+                  "FCP session refused: OS CSPRNG unavailable for the handshake "
+                  "nonce start"));
+  }
+  fcp::set_random_failure_injection(false);
+
+  // A fresh session after the injection is lifted starts normally: the flag
+  // must not latch anywhere in the library.
+  std::vector<Bytes> oob_ok;
+  fcp::Session ok(
+      MakeConfig(fcp::Direction::kC2S, fcp::Direction::kS2C),
+      [&oob_ok](const uint8_t* w, size_t n, fcp::SymbolType t) {
+        if (t == fcp::SymbolType::kOob) {
+          oob_ok.emplace_back(w, w + n);
+        }
+      },
+      nullptr, nullptr);
+  ok.start(0);
+  ok.on_tick(0);
+  CHECK(ok.state() == fcp::HandshakeState::kHelloSent);
+  CHECK(!oob_ok.empty());  // the HELLO went out
+}
+
+// §4: the frame layer's cross-set dedup key is the KCP sn at payload offset
+// 12. Anything shorter than a KCP header carries no sn, and the caller must
+// get false (dedup skipped) rather than a partial read.
+void TestKcpSnOf() {
+  uint8_t payload[32];
+  for (size_t i = 0; i < sizeof(payload); ++i) {
+    payload[i] = static_cast<uint8_t>(i);
+  }
+
+  uint32_t sn = 0xDEADBEEF;
+  CHECK(fcp::kcp_sn_of(payload, 16, &sn));
+  CHECK_EQ(sn, 0x0F0E0D0Cu);  // payload[12..15] little-endian, the KCP sn field
+
+  // Trailing bytes are ignored: only the fixed KCP header carries the sn.
+  CHECK(fcp::kcp_sn_of(payload, sizeof(payload), &sn));
+  CHECK_EQ(sn, 0x0F0E0D0Cu);
+
+  // One byte short of a KCP header: no sn, and the out parameter is untouched
+  // (a partial read would feed a bogus dedup key).
+  const uint32_t before = sn;
+  CHECK(!fcp::kcp_sn_of(payload, 15, &sn));
+  CHECK_EQ(sn, before);
+  CHECK(!fcp::kcp_sn_of(payload, 0, &sn));
+  CHECK_EQ(sn, before);
+
+  // A signals-only segment (sn 0) still reads the header field, not the
+  // payload prefix.
+  std::memset(payload + 12, 0, 4);
+  CHECK(fcp::kcp_sn_of(payload, 16, &sn));
+  CHECK_EQ(sn, 0u);
+}
+
 int main() {
   TestFullLoop();
   TestHandshakeRidesOob();
   TestHandshakeAckRidesOob();
+  TestBootstrapNonHandshakeIsCounted();
   TestInvalidLocalCaps();
   TestPinnedKClampedToNegotiatedP();
   TestHandshakeTimeout();
@@ -1269,5 +1637,10 @@ int main() {
   TestLedgerLiftsKUnderBursts();
   TestSendNonceExhaustionIsObservable();
   TestReplayCannotReviveSession();
+  TestEstablishedSurvivesForeignHello();
+  TestPinnedHandshakeNonce();
+  TestCrossSessionDataIsolation();
+  TestEntropyFailureRefusesStart();
+  TestKcpSnOf();
   return fcp_test::finish();
 }

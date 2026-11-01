@@ -18,7 +18,18 @@
 
 namespace fcp {
 
+namespace {
+// Test-only failure injection (see random.h). A plain bool: tests are
+// single-threaded and the flag must not cost the real path anything.
+bool g_inject_failure = false;
+}  // namespace
+
+void set_random_failure_injection(bool enabled) { g_inject_failure = enabled; }
+
 bool random_bytes(void* out, size_t len) {
+  if (g_inject_failure) {
+    return false;
+  }
   if (len == 0) {
     return true;
   }
@@ -43,14 +54,6 @@ bool random_bytes(void* out, size_t len) {
   const bool closed = std::fclose(f) == 0;
   return got == len && closed;
 #endif
-}
-
-uint32_t random_u32() {
-  uint32_t value = 0;
-  if (!random_bytes(&value, sizeof(value))) {
-    return 0;
-  }
-  return value;
 }
 
 }  // namespace fcp

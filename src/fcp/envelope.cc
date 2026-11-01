@@ -4,26 +4,14 @@
 
 #include "fcp/aes.h"
 #include "fcp/gcm.h"
+#include "fcp/random.h"
+#include "fcp/wire.h"
 
 namespace fcp {
 namespace {
 
-void store_le64(uint64_t value, uint8_t out[8]) {
-  for (int i = 0; i < 8; ++i) {
-    out[i] = static_cast<uint8_t>(value >> (8 * i));
-  }
-}
-
-uint64_t load_le64(const uint8_t in[8]) {
-  uint64_t value = 0;
-  for (int i = 0; i < 8; ++i) {
-    value |= static_cast<uint64_t>(in[i]) << (8 * i);
-  }
-  return value;
-}
-
 void make_iv(uint64_t nonce_ctr, Direction direction, uint8_t iv[kGcmIvLen]) {
-  store_le64(nonce_ctr, iv);
+  put_le64(nonce_ctr, iv);
   iv[8] = static_cast<uint8_t>(direction);
   iv[9] = 0;
   iv[10] = 0;
@@ -123,11 +111,13 @@ void derive_session_key_v7(const uint8_t psk[16], const uint8_t salt[8],
 
 Envelope::Envelope(const uint8_t key[16], const uint8_t salt[kSaltLen],
                    Direction send_direction, Direction recv_direction)
-    : send_key_{},
-      recv_key_{},
+    : send_key_{0},
+      recv_key_{0},
       salt_{},
       send_direction_(send_direction),
       recv_direction_(recv_direction),
+      counter_ceiling_(kNonceLimit),  // both overwritten by install_keys()
+      send_limit_(kNonceLimit),
       send_nonce_(0),
       recv_has_nonce_(false),
       recv_highest_(0),
@@ -144,9 +134,13 @@ void Envelope::install_keys(const uint8_t session_key[16]) {
   uint8_t key_c2s[16];
   uint8_t key_s2c[16];
   derive_direction_keys(session_key, key_c2s, key_s2c);
-  std::memcpy(send_key_, send_direction_ == Direction::kC2S ? key_c2s : key_s2c, 16);
-  std::memcpy(recv_key_, recv_direction_ == Direction::kC2S ? key_c2s : key_s2c, 16);
+  gcm_key_init(send_direction_ == Direction::kC2S ? key_c2s : key_s2c, &send_key_);
+  gcm_key_init(recv_direction_ == Direction::kC2S ? key_c2s : key_s2c, &recv_key_);
+  // #26①: a fresh data key starts at 0, so its packet budget is exactly the
+  // 2^32 ceiling on both directions.
   send_nonce_ = 0;
+  counter_ceiling_ = kNonceLimit;
+  send_limit_ = kNonceLimit;
   recv_has_nonce_ = false;
   recv_highest_ = 0;
   recv_seen_.reset();
@@ -157,10 +151,10 @@ void Envelope::rekey(const uint8_t session_key[16]) {
 }
 
 bool Envelope::seal(const uint8_t* plain, size_t len, std::vector<uint8_t>* wire) {
-  if (send_nonce_ >= kNonceLimit) {
+  if (send_nonce_ >= send_limit_) {
     return false;
   }
-  if (!seal_at(send_nonce_, plain, len, wire)) {
+  if (!seal_unchecked(send_nonce_, plain, len, wire)) {
     return false;
   }
   ++send_nonce_;
@@ -169,18 +163,29 @@ bool Envelope::seal(const uint8_t* plain, size_t len, std::vector<uint8_t>* wire
 
 bool Envelope::seal_at(uint64_t nonce_ctr, const uint8_t* plain, size_t len,
                        std::vector<uint8_t>* wire) const {
-  if (wire == nullptr || nonce_ctr >= kNonceLimit) {
+  // Test/replay primitive: an explicit counter never advances the send state,
+  // so it is bounded by the counter ceiling rather than this envelope's packet
+  // budget (a bootstrap envelope may name any value in the 64-bit space).
+  if (nonce_ctr >= counter_ceiling_) {
+    return false;
+  }
+  return seal_unchecked(nonce_ctr, plain, len, wire);
+}
+
+bool Envelope::seal_unchecked(uint64_t nonce_ctr, const uint8_t* plain, size_t len,
+                             std::vector<uint8_t>* wire) const {
+  if (wire == nullptr) {
     return false;
   }
   wire->resize(kOverhead + len);
   std::memcpy(wire->data(), salt_, kSaltLen);
-  store_le64(nonce_ctr, wire->data() + kSaltLen);
+  put_le64(nonce_ctr, wire->data() + kSaltLen);
 
   uint8_t iv[kGcmIvLen];
   make_iv(nonce_ctr, send_direction_, iv);
   uint8_t* cipher = wire->data() + kSaltLen + kNonceLen;
   uint8_t* tag = cipher + len;
-  return gcm_seal(send_key_, iv, nullptr, 0, plain, len, cipher, tag);
+  return gcm_seal_keyed(send_key_, iv, nullptr, 0, plain, len, cipher, tag);
 }
 
 bool Envelope::open(const uint8_t* wire, size_t len, std::vector<uint8_t>* plain) {
@@ -190,10 +195,11 @@ bool Envelope::open(const uint8_t* wire, size_t len, std::vector<uint8_t>* plain
   if (std::memcmp(wire, salt_, kSaltLen) != 0) {
     return false;
   }
-  const uint64_t nonce_ctr = load_le64(wire + kSaltLen);
-  // Reject counters at or past the limit before touching GCM: a sender that
-  // crossed the block budget is a protocol violation, not a replay candidate.
-  if (nonce_ctr >= kNonceLimit) {
+  const uint64_t nonce_ctr = get_le64(wire + kSaltLen);
+  // Reject counters at or past this direction's ceiling before touching GCM: a
+  // sender that crossed the block budget is a protocol violation, not a replay
+  // candidate.
+  if (nonce_ctr >= counter_ceiling_) {
     return false;
   }
   uint8_t iv[kGcmIvLen];
@@ -204,7 +210,7 @@ bool Envelope::open(const uint8_t* wire, size_t len, std::vector<uint8_t>* plain
   const uint8_t* tag = cipher + cipher_len;
 
   std::vector<uint8_t> decoded(cipher_len);
-  if (!gcm_open(recv_key_, iv, nullptr, 0, cipher, cipher_len, tag, decoded.data())) {
+  if (!gcm_open_keyed(recv_key_, iv, nullptr, 0, cipher, cipher_len, tag, decoded.data())) {
     plain->clear();
     return false;
   }
@@ -217,10 +223,26 @@ bool Envelope::open(const uint8_t* wire, size_t len, std::vector<uint8_t>* plain
 }
 
 bool Envelope::set_send_nonce(uint64_t value) {
-  if (value >= kNonceLimit) {
+  if (value >= counter_ceiling_ || value >= send_limit_) {
     return false;
   }
   send_nonce_ = value;
+  return true;
+}
+
+bool Envelope::init_bootstrap_nonce(uint32_t budget) {
+  uint64_t draw = 0;
+  if (!random_bytes(&draw, sizeof(draw))) {
+    return false;
+  }
+  // Leave `budget` increments plus one spare below UINT64_MAX, so neither
+  // seal() nor the peer's replay window can see the counter wrap.
+  const uint64_t span = static_cast<uint64_t>(budget) + 1;
+  send_nonce_ = draw % (UINT64_MAX - span);
+  send_limit_ = send_nonce_ + span;  // <= UINT64_MAX - 1
+  // The peer draws its own landing zone and only handshake frames travel this
+  // epoch, so the 2^32 invocation budget cannot apply to a counter value here.
+  counter_ceiling_ = UINT64_MAX;
   return true;
 }
 

@@ -1,5 +1,8 @@
 build/
+dist/
 .workbuddy/
 .cache/
 *.log
 .zcode/
+/Testing/
+/replay_trace_test/

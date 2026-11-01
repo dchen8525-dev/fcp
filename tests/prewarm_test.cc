@@ -1,4 +1,4 @@
-// Link warm-up tests (docs/FCP_M2_PROXY.md §5, task #19).
+// Link warm-up tests (M2代理设计.md §5, task #19).
 //
 // Two halves: the library knobs (FecStrategyConfig::initial_k,
 // SessionConfig::initial_srtt_ms / initial_k) and the host-side cache that

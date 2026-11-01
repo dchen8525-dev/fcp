@@ -1,4 +1,4 @@
-// #28 controller trace + offline replay (FCP_M3_CONTROL.md §5, T39).
+// #28 controller trace + offline replay (M3控制设计.md §5, T39).
 //
 // The recording side is a two-session in-memory link with injectable loss
 // (same shape as session_test's Link, trimmed to one data direction). The

@@ -1,4 +1,4 @@
-#include "engine.h"
+#include "proxy/proxy_engine.h"
 
 #include <cstdio>
 #include <cstring>
@@ -442,40 +442,47 @@ size_t ProxyEngine::pending_app_bytes(uint64_t conn) const {
   return c == nullptr ? 0 : c->app_in.size();
 }
 
+size_t ProxyEngine::send_window(uint64_t conn) const {
+  const Conn* c = find(conn);
+  return c == nullptr || c->stream == nullptr ? 0 : c->stream->send_window();
+}
+
+size_t ProxyEngine::peer_window(uint64_t conn) const {
+  const Conn* c = find(conn);
+  return c == nullptr || c->stream == nullptr ? 0 : c->stream->peer_window();
+}
+
 // ---- connection setup ----
 
-bool ProxyEngine::create_client_conn(uint64_t id, uint64_t peer, int64_t now_ms) {
-  auto conn = std::make_unique<Conn>();
-  Conn* raw = conn.get();
-  raw->id = id;
-  raw->peer = peer;
-  raw->phase = Phase::kEntry;
-
-  SessionConfig sc;
-  std::memcpy(sc.key, cfg_.key, sizeof(sc.key));
-  if (host_.new_salt) {
-    host_.new_salt(sc.salt);
-  } else {
-    random_salt(sc.salt);
-  }
-  sc.send_direction = Direction::kC2S;
-  sc.recv_direction = Direction::kS2C;
-  sc.d = cfg_.d;
-  sc.p = cfg_.p;
-  sc.p_max = cfg_.p_max;
-  sc.mtu = cfg_.mtu;
-  sc.ip_hdr_len = cfg_.ip_hdr_len;
-  sc.pinned_k = cfg_.pinned_k;
-  sc.fec_budget = cfg_.fec_budget;
-  sc.trace = make_trace_sink(cfg_.trace_prefix, id);
+// Every field whose value does not depend on which end we are. Both directions
+// used to spell this out twice, field by field (A15/B11), so a new
+// SessionConfig field could be added to one side and silently left unset on
+// the other. The caller fills only what genuinely differs between the ends --
+// salt and the two directions -- before or after this; everything else in
+// SessionConfig is shared by construction.
+void ProxyEngine::fill_session_config(SessionConfig* sc, uint64_t conn_id) const {
+  std::memcpy(sc->key, cfg_.key, sizeof(sc->key));
+  sc->d = cfg_.d;
+  sc->p = cfg_.p;
+  sc->p_max = cfg_.p_max;
+  sc->mtu = cfg_.mtu;
+  sc->ip_hdr_len = cfg_.ip_hdr_len;
+  sc->pinned_k = cfg_.pinned_k;
+  sc->fec_budget = cfg_.fec_budget;
+  sc->trace = make_trace_sink(cfg_.trace_prefix, conn_id);
   // A stream numbers bytes, so a retransmission deliberately repeats an id the
   // peer has to see again; the frame-layer dedup keyed on the KCP sn would eat
   // it and stall the send window (session.h, SessionConfig::sn_of).
-  sc.sn_of = nullptr;
-  apply_prewarm(profile_for(peer, now_ms), &sc, &raw->stream_cfg);
+  sc->sn_of = nullptr;
+}
 
-  const uint64_t cid = id;
-  raw->session = std::make_unique<Session>(
+// The Session's three host hooks: every one of them re-resolves the Conn by id
+// instead of capturing it, because a callback can fire while the table entry is
+// being replaced (find() returns nullptr, and the hook is a no-op). Both ends
+// wire themselves this way; only the engine knows which end it is, the Session
+// never does.
+std::unique_ptr<Session> ProxyEngine::make_session(uint64_t cid, const SessionConfig& sc) {
+  return std::make_unique<Session>(
       sc,
       [this, cid](const uint8_t* wire, size_t len, SymbolType) {
         Conn* p = find(cid);
@@ -493,6 +500,28 @@ bool ProxyEngine::create_client_conn(uint64_t id, uint64_t peer, int64_t now_ms)
         p->stream->on_segment(payload, len, now_ms_);
       },
       [this](const std::string& line) { log(line); });
+}
+
+bool ProxyEngine::create_client_conn(uint64_t id, uint64_t peer, int64_t now_ms) {
+  auto conn = std::make_unique<Conn>();
+  Conn* raw = conn.get();
+  raw->id = id;
+  raw->peer = peer;
+  raw->phase = Phase::kEntry;
+
+  SessionConfig sc;
+  fill_session_config(&sc, id);
+  if (host_.new_salt) {
+    host_.new_salt(sc.salt);
+  } else {
+    random_salt(sc.salt);
+  }
+  sc.send_direction = Direction::kC2S;
+  sc.recv_direction = Direction::kS2C;
+  fill_session_config(&sc, id);
+  apply_prewarm(profile_for(peer, now_ms), &sc, &raw->stream_cfg);
+
+  raw->session = make_session(id, sc);
   if (!raw->session->config_valid()) {
     log(label(id) + " bad MTU configuration");
     return false;
@@ -527,40 +556,13 @@ ProxyEngine::Conn* ProxyEngine::create_server_conn(uint64_t peer, const uint8_t*
   raw->socks5 = false;  // the server never answers a local request
 
   SessionConfig sc;
-  std::memcpy(sc.key, cfg_.key, sizeof(sc.key));
+  fill_session_config(&sc, id);
   std::memcpy(sc.salt, salt, Envelope::kSaltLen);
   sc.send_direction = Direction::kS2C;
   sc.recv_direction = Direction::kC2S;
-  sc.d = cfg_.d;
-  sc.p = cfg_.p;
-  sc.p_max = cfg_.p_max;
-  sc.mtu = cfg_.mtu;
-  sc.ip_hdr_len = cfg_.ip_hdr_len;
-  sc.pinned_k = cfg_.pinned_k;
-  sc.fec_budget = cfg_.fec_budget;
-  sc.trace = make_trace_sink(cfg_.trace_prefix, id);
-  sc.sn_of = nullptr;
   apply_prewarm(profile_for(peer, now_ms), &sc, &raw->stream_cfg);
 
-  const uint64_t cid = id;
-  raw->session = std::make_unique<Session>(
-      sc,
-      [this, cid](const uint8_t* wire, size_t len, SymbolType) {
-        Conn* p = find(cid);
-        if (p == nullptr || p->phase == Phase::kDone || !host_.wire_send) {
-          return;
-        }
-        counters_.bytes_tx += len;
-        host_.wire_send(p->peer, wire, len);
-      },
-      [this, cid](const uint8_t* payload, size_t len) {
-        Conn* p = find(cid);
-        if (p == nullptr || p->stream == nullptr) {
-          return;
-        }
-        p->stream->on_segment(payload, len, now_ms_);
-      },
-      [this](const std::string& line) { log(line); });
+  raw->session = make_session(id, sc);
   if (!raw->session->config_valid()) {
     return nullptr;
   }
@@ -586,6 +588,9 @@ void ProxyEngine::attach_stream(Conn& conn) {
   sc.max_segment = conn.session->mtu_limits().payload_max;
   sc.send_window_bytes = cfg_.send_window_bytes;
   sc.rcv_buf_bytes = cfg_.rcv_buf_bytes;
+  sc.auto_window = cfg_.auto_window;
+  sc.window_min_bytes = cfg_.window_min_bytes;
+  sc.window_max_bytes = cfg_.window_max_bytes;
   sc.idle_timeout_ms = cfg_.idle_timeout_ms;
   conn.stream_cfg = sc;
 
@@ -1027,17 +1032,26 @@ void ProxyEngine::finish_conn(Conn& conn, int64_t now_ms, const char* why) {
   // #33③ forensics: on a teardown, the stream's own counters say which side
   // stopped moving — a sender stuck mid-window (acked < queued) vs a receiver
   // that stopped delivering turns "upload froze" into a localizable defect.
-  if (conn.stream != nullptr && (conn.stream->bytes_acked() != conn.stream->bytes_queued() ||
-                                 conn.stream->bytes_delivered() != conn.stream->bytes_acked())) {
+  // The same line is the only place the autotune's verdict survives the run, so
+  // it also prints on a clean finish whenever the window actually moved.
+  const bool stuck = conn.stream != nullptr &&
+                     (conn.stream->bytes_acked() != conn.stream->bytes_queued() ||
+                      conn.stream->bytes_delivered() != conn.stream->bytes_acked());
+  const bool tuned = conn.stream != nullptr && cfg_.auto_window &&
+                     conn.stream->send_window() != cfg_.send_window_bytes;
+  if (stuck || tuned) {
     std::snprintf(diag_, sizeof(diag_),
                   "stream queued=%llu acked=%llu delivered=%llu unacked=%zu in_flight=%zu "
-                  "rwnd=%zu rto=%lld",
+                  "rwnd=%zu cwnd=%zu rto=%lld loss_rto=%llu loss_dup=%llu probes=%llu",
                   static_cast<unsigned long long>(conn.stream->bytes_queued()),
                   static_cast<unsigned long long>(conn.stream->bytes_acked()),
                   static_cast<unsigned long long>(conn.stream->bytes_delivered()),
                   conn.stream->unacked_segs(), conn.stream->in_flight(),
-                  conn.stream->peer_window(),
-                  static_cast<long long>(conn.stream->rto_ms()));
+                  conn.stream->peer_window(), conn.stream->send_window(),
+                  static_cast<long long>(conn.stream->rto_ms()),
+                  static_cast<unsigned long long>(conn.stream->rto_loss_events()),
+                  static_cast<unsigned long long>(conn.stream->dup_loss_events()),
+                  static_cast<unsigned long long>(conn.stream->probes_sent()));
     log(label(conn) + " closed: " + why + " [" + diag_ + "]");
   } else {
     log(label(conn) + " closed: " + why);

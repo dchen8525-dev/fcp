@@ -3,7 +3,34 @@
 #include <cstring>
 
 namespace fcp {
+namespace {
 
+// One application of the "multiply by alpha" step of the bit-serial routine:
+// shift the whole 128-bit register right by one bit and, when the bit that fell
+// off the end was set, fold the reduction polynomial back into the top byte.
+inline void mul_x(uint8_t v[16]) {
+  const uint8_t carry = static_cast<uint8_t>(v[15] & 1);
+  for (int j = 15; j > 0; --j) {
+    v[j] = static_cast<uint8_t>((v[j] >> 1) | (v[j - 1] << 7));
+  }
+  v[0] = static_cast<uint8_t>(v[0] >> 1);
+  if (carry != 0) {
+    v[0] ^= 0xE1;
+  }
+}
+
+inline void xor_into(uint8_t dst[16], const uint8_t src[16]) {
+  for (int i = 0; i < 16; ++i) {
+    dst[i] ^= src[i];
+  }
+}
+
+}  // namespace
+
+// The reference implementation, kept as the definition of the field arithmetic:
+// ghash_test.cc checks the table path against this one. a*b is a linear
+// combination of R^i(b) over the set bits of a, where R is mul_x; that identity
+// is exactly what the tables below precompute.
 void gf128_mul(const uint8_t a[16], const uint8_t b[16], uint8_t out[16]) {
   uint8_t z[16] = {};
   uint8_t v[16];
@@ -27,15 +54,69 @@ void gf128_mul(const uint8_t a[16], const uint8_t b[16], uint8_t out[16]) {
   std::memcpy(out, z, 16);
 }
 
-Ghash::Ghash(const uint8_t h[16]) : h_{}, y_{} { std::memcpy(h_, h, 16); }
+// NIST bit ordering: bit i of a block is bit (7 - i % 8) of byte i / 8, so the
+// high nibble of byte j holds bits 8j..8j+3 and the low nibble holds 8j+4..8j+7.
+// Nibble position p is therefore worth R^(4p) for its top bit, which is what the
+// per-position table is built from: one lookup then replaces three multiplies
+// by alpha and a scatter of XORs.
+void ghash_init_table(const uint8_t h[16], GhashTable* table) {
+  uint8_t base[16];  // R^(4p)(H)
+  std::memcpy(base, h, 16);
+  for (int pos = 0; pos < kGhashNibbles; ++pos) {
+    if (pos != 0) {
+      for (int k = 0; k < 4; ++k) {
+        mul_x(base);
+      }
+    }
+    // Contributions of the nibble's four bits, most significant first:
+    // comp[0] weighs 8, comp[1] weighs 4, comp[2] weighs 2, comp[3] weighs 1.
+    uint8_t comp[4][16];
+    std::memcpy(comp[0], base, 16);
+    for (int j = 1; j < 4; ++j) {
+      std::memcpy(comp[j], comp[j - 1], 16);
+      mul_x(comp[j]);
+    }
+    std::memset(table->t[pos][0], 0, 16);
+    for (int n = 1; n < 16; ++n) {
+      uint8_t acc[16] = {};
+      for (int j = 0; j < 4; ++j) {
+        if ((n & (8 >> j)) != 0) {
+          xor_into(acc, comp[j]);
+        }
+      }
+      std::memcpy(table->t[pos][n], acc, 16);
+    }
+  }
+}
+
+Ghash::Ghash(const GhashTable& table) : table_(&table), y_{} {}
 
 void Ghash::update_block(const uint8_t block[16]) {
+  // y = (y ^ block) * H. The operand of the multiply is the public accumulator
+  // (ciphertext-derived), so indexing a table with its nibbles reveals nothing
+  // about H: the access pattern is identical for every key, which is the
+  // constant-time property the bit-serial version had.
   for (int i = 0; i < 16; ++i) {
     y_[i] ^= block[i];
   }
-  uint8_t product[16];
-  gf128_mul(y_, h_, product);
-  std::memcpy(y_, product, 16);
+  uint64_t z0 = 0;
+  uint64_t z1 = 0;
+  for (int i = 0; i < 16; ++i) {
+    const uint8_t* hi = table_->t[2 * i][y_[i] >> 4];
+    const uint8_t* lo = table_->t[2 * i + 1][y_[i] & 0x0F];
+    uint64_t w0;
+    uint64_t w1;
+    std::memcpy(&w0, hi, 8);
+    std::memcpy(&w1, hi + 8, 8);
+    z0 ^= w0;
+    z1 ^= w1;
+    std::memcpy(&w0, lo, 8);
+    std::memcpy(&w1, lo + 8, 8);
+    z0 ^= w0;
+    z1 ^= w1;
+  }
+  std::memcpy(y_, &z0, 8);
+  std::memcpy(y_ + 8, &z1, 8);
 }
 
 void Ghash::update_padded(const uint8_t* data, size_t len) {

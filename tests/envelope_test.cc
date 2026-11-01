@@ -367,6 +367,110 @@ void TestRekey() {
   CHECK_EQ(plain[0], 1);
 }
 
+// Rekeying twice (a future key rotation does exactly this) must leave every
+// earlier epoch dead on the current receiver, not just the immediately
+// previous one: epoch0 died at the first rekey, epoch1 at the second.
+void TestRekeyTwice() {
+  fcp::Envelope client = MakeClient();
+  fcp::Envelope server = MakeServer();
+
+  uint8_t c1[16], s1[16], c2[16], s2[16], key1[16], key2[16];
+  CHECK(fcp_test::unhex("000102030405060708090a0b0c0d0e0f", c1, 16));
+  CHECK(fcp_test::unhex("f0e0d0c0b0a090807060504030201000", s1, 16));
+  CHECK(fcp_test::unhex("0102030405060708090a0b0c0d0e0f10", c2, 16));
+  CHECK(fcp_test::unhex("e0d0c0b0a090807060504030201000f0", s2, 16));
+  fcp::derive_session_key_v7(kKey, kSalt, c1, s1, key1);
+  fcp::derive_session_key_v7(kKey, kSalt, c2, s2, key2);
+  CHECK(std::memcmp(key1, key2, 16) != 0);
+
+  const uint8_t payload[4] = {9, 8, 7, 6};
+  std::vector<uint8_t> wire, plain;
+
+  CHECK(client.seal(payload, sizeof(payload), &wire));  // bootstrap epoch
+  const std::vector<uint8_t> epoch0 = wire;
+  client.rekey(key1);
+  server.rekey(key1);
+  CHECK(client.seal(payload, sizeof(payload), &wire));
+  const std::vector<uint8_t> epoch1 = wire;
+
+  client.rekey(key2);
+  server.rekey(key2);
+  CHECK_EQ(client.send_nonce(), 0u);  // counters restart with every key change
+  CHECK(client.seal(payload, sizeof(payload), &wire));
+  CHECK(server.open(wire.data(), wire.size(), &plain));
+  CHECK_EQ(plain[0], 9);
+
+  CHECK(!server.open(epoch1.data(), epoch1.size(), &plain));
+  CHECK(!server.open(epoch0.data(), epoch0.size(), &plain));
+}
+
+// A broken CSPRNG can hand both ends the same draw. The schedule must not
+// collapse onto the v6 bootstrap key (that would silently undo R3-1), and the
+// two ends must still agree on the key they derive.
+void TestV7IdenticalNonces() {
+  uint8_t same[16], other[16], x0[16], key[16], key_again[16], key_other[16];
+  CHECK(fcp_test::unhex("0a0b0c0d0e0f10111213141516171819", same, 16));
+  CHECK(fcp_test::unhex("0a0b0c0d0e0f1011121314151617181a", other, 16));
+  fcp::derive_session_key(kKey, kSalt, x0);
+  fcp::derive_session_key_v7(kKey, kSalt, same, same, key);
+  CHECK(std::memcmp(key, x0, 16) != 0);  // no shortcut back to the v6 key
+  fcp::derive_session_key_v7(kKey, kSalt, same, same, key_again);
+  CHECK(std::memcmp(key_again, key, 16) == 0);  // c == s: both ends still agree
+  fcp::derive_session_key_v7(kKey, kSalt, other, same, key_other);
+  CHECK(std::memcmp(key_other, key, 16) != 0);  // one differing draw re-splits
+}
+
+// R3-1/F-1: the bootstrap envelope draws a 64-bit start, so two session
+// instances built from the same (PSK, salt) — which a replayed HELLO creates —
+// never seal their first ACK under the same (key, IV).
+void TestBootstrapNonceStart() {
+  fcp::Envelope a = MakeClient();
+  fcp::Envelope b = MakeClient();
+  // Two session instances replaying one HELLO each have their own peer side.
+  fcp::Envelope peer_a = MakeServer();
+  fcp::Envelope peer_b = MakeServer();
+
+  // Both envelopes must have drawn; without init both sit at 0.
+  CHECK(a.send_nonce() == 0);
+  CHECK(a.init_bootstrap_nonce(1u << 16));
+  CHECK(peer_a.init_bootstrap_nonce(1u << 16));
+  CHECK(b.init_bootstrap_nonce(1u << 16));
+  CHECK(peer_b.init_bootstrap_nonce(1u << 16));
+  // A 64-bit draw colliding across two instances: 2^-64. The old 32-bit start
+  // collided after ~65k sessions under one salt.
+  CHECK(a.send_nonce() != b.send_nonce());
+
+  // Each peer accepts a start far above the 2^32 data-envelope ceiling: the
+  // receive ceiling widens with the draw, otherwise the first bootstrap packet
+  // would be rejected outright.
+  const uint8_t payload[2] = {0x5A, 0xA5};
+  std::vector<uint8_t> wire;
+  std::vector<uint8_t> plain;
+  CHECK(a.seal(payload, sizeof(payload), &wire));
+  CHECK(peer_a.open(wire.data(), wire.size(), &plain));
+  CHECK_EQ(plain[0], 0x5A);
+  CHECK(b.seal(payload, sizeof(payload), &wire));
+  CHECK(peer_b.open(wire.data(), wire.size(), &plain));
+
+  // The budget bounds the packet count, and the counter never wraps: the last
+  // legal counter is below UINT64_MAX.
+  fcp::Envelope bounded = MakeClient();
+  CHECK(bounded.init_bootstrap_nonce(8));
+  CHECK(bounded.send_nonce() < UINT64_MAX - 9);
+  for (int i = 0; i < 9; ++i) {
+    CHECK(bounded.seal(nullptr, 0, &wire));
+  }
+  CHECK(bounded.exhausted());
+  CHECK(!bounded.seal(nullptr, 0, &wire));
+
+  // A data envelope (no bootstrap draw) keeps the 2^32 ceiling on both sides.
+  fcp::Envelope data = MakeClient();
+  CHECK(data.send_nonce() == 0);
+  CHECK(data.set_send_nonce(fcp::Envelope::kNonceLimit - 1));
+  CHECK(data.seal(nullptr, 0, &wire));
+  CHECK(data.exhausted());
+}
+
 // The OS CSPRNG is the only source of salts/nonces/counter seeds; a silent
 // failure there would seed a session from zeros.
 void TestRandomSource() {
@@ -396,6 +500,9 @@ int main() {
   TestSessionKeyDerivation();
   TestV7KeyVector();
   TestRekey();
+  TestRekeyTwice();
+  TestV7IdenticalNonces();
+  TestBootstrapNonceStart();
   TestRandomSource();
   return fcp_test::finish();
 }

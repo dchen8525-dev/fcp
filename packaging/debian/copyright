@@ -1,0 +1,9 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: fcp
+Source: @HOMEPAGE@
+
+Files: *
+Copyright: 2026 dchen8525-dev
+License: TODO — 仓库尚未声明开源许可证，发布前请在仓库根补 LICENSE 文件，
+ 并把这段替换成实际条款（MIT / Apache-2.0 / 闭源二进制分发说明）。
+ 在补上之前，本包只适合自用与内部部署。

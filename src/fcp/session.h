@@ -44,6 +44,12 @@ constexpr int64_t kDefaultSrttMs = 200;
 // payload. §4 assumed the payload to be a KCP segment, whose sn sits at offset
 // 12; that is what this reads. Payloads shorter than a KCP header carry no sn
 // and skip the check.
+//
+// This is the only place in the code base that knows the KCP header layout:
+// the Qt bench's receive check and the test fixtures go through it too, so a
+// change to the offset changes every reader at once.
+constexpr size_t kKcpSnOffset = 12;
+constexpr size_t kKcpSnLen = kKcpSnOffset + 4;
 bool kcp_sn_of(const uint8_t* payload, size_t len, uint32_t* sn);
 
 struct SessionConfig {
@@ -57,7 +63,7 @@ struct SessionConfig {
   uint16_t mtu = 1400;
   size_t ip_hdr_len = 20;
   int pinned_k = -1;  // --fec-parity-pinned; >= 0 bypasses the strategy
-  // Link warm-up (FCP_M2_PROXY.md §5), both optional and both defaulting to
+  // Link warm-up (M2代理设计.md §5), both optional and both defaulting to
   // the cold M1 behaviour. initial_srtt_ms == 0 keeps the internal 200ms, so
   // T_flush, the settlement tombstones and the §8 queue guardrail all start
   // from the peer's history instead of from the first converged sample.
@@ -66,7 +72,7 @@ struct SessionConfig {
   // the negotiated P' and p_max). -1 starts OFF, which cannot pick a k until
   // the first FECSTAT report lands.
   int initial_k = -1;
-  // M3 byte budget (FCP_M3_CONTROL.md §2): ceiling on the interval's
+  // M3 byte budget (M3控制设计.md §2): ceiling on the interval's
   // parity_bytes/data_bytes ratio seen by the peer's FECSTAT; 0 disables.
   // Exceeding it enters the kCapped state (one parity per report down, floor
   // 1) until a report measures back under the ceiling.
@@ -82,7 +88,7 @@ struct SessionConfig {
   // retransmission deliberately repeats an id the peer has to see in order to
   // re-ack it, and suppressing that at this layer stalls the sender's window.
   FrameRx::SnFn sn_of = &kcp_sn_of;
-  // #28 controller trace sink (FCP_M3_CONTROL.md §5): invoked once per
+  // #28 controller trace sink (M3控制设计.md §5): invoked once per
   // accepted FECSTAT report with the report, the config snapshot and the
   // decision just made. Empty = no recording.
   using TraceFn = std::function<void(const TraceEntry&)>;
@@ -209,6 +215,9 @@ class Session {
   // nonce-bound session key.
   Envelope env_;
   Envelope hs_env_;
+  // R3-1: init_bootstrap_nonce() result. A session whose handshake counter
+  // start could not be drawn must not run — see Session::start().
+  bool bootstrap_seed_ok_ = false;
   SendFn send_;
   DeliverFn deliver_;
   LogFn log_;

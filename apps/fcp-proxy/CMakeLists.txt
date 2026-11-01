@@ -1,26 +1,23 @@
-# Proxy (docs/FCP_M2_PROXY.md §6).
+# The FCP proxy CLI (M2代理设计.md §6).
 #
-# The engine is split out as a static library because it is the part with no
-# sockets in it: the CLI executables below and the Qt adapter (task #23) link
-# the same object file, and ctest drives it directly (tests/proxy_engine_test.cc).
-# That is why the library is outside FCP_BUILD_PROXY, whose default is OFF: the
-# gate covers the reactor and the two mains, not the protocol.
+# This directory is only the host side: the select reactor, the shared argv
+# parser and the two one-line mains. The protocol half -- ProxyEngine and the
+# SOCKS5/HTTP-CONNECT/OPEN codecs -- is fcp_proxy_core in src/proxy, defined at
+# the top level next to libfcp because the Qt client links the same library.
 
-add_library(fcp_proxy_core STATIC engine.cc)
-target_include_directories(fcp_proxy_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(fcp_proxy_core PUBLIC fcp)
+find_package(Threads REQUIRED)
 
-if(FCP_BUILD_PROXY)
-  find_package(Threads REQUIRED)
+add_executable(fcp-proxy-client main_client.cc cli.cc reactor.cc)
+target_link_libraries(fcp-proxy-client PRIVATE fcp_proxy_core Threads::Threads)
 
-  add_executable(fcp-proxy-client main_client.cc cli.cc reactor.cc)
-  target_link_libraries(fcp-proxy-client PRIVATE fcp_proxy_core Threads::Threads)
+add_executable(fcp-proxy-server main_server.cc cli.cc reactor.cc)
+target_link_libraries(fcp-proxy-server PRIVATE fcp_proxy_core Threads::Threads)
 
-  add_executable(fcp-proxy-server main_server.cc cli.cc reactor.cc)
-  target_link_libraries(fcp-proxy-server PRIVATE fcp_proxy_core Threads::Threads)
-
-  if(WIN32)
-    target_link_libraries(fcp-proxy-client PRIVATE ws2_32)
-    target_link_libraries(fcp-proxy-server PRIVATE ws2_32)
-  endif()
+if(WIN32)
+  target_link_libraries(fcp-proxy-client PRIVATE ws2_32)
+  target_link_libraries(fcp-proxy-server PRIVATE ws2_32)
 endif()
+
+# deb 包里只有这两个可执行文件（packaging/debian 的 spec），别的一个都不装：
+# 工具、测试、静态库、systemd unit 的落点都在 cmake/FCPPackaging.cmake。
+install(TARGETS fcp-proxy-server fcp-proxy-client RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

@@ -60,6 +60,11 @@ constexpr Sock kBadSock = -1;
 constexpr int64_t kUpStartMs = 1000;
 constexpr int64_t kUpEndMs = 8000;
 constexpr double kPhaseSeconds = (kUpEndMs - kUpStartMs) / 1000.0;
+// #36 WAN smoke: under a sustained flood the kernel buffer never empties, so an
+// unbounded drain loop never returns to the outer loop -- `now`, on_tick() and
+// the phase clock freeze for the whole upload. The proxy reactor and the Qt
+// host already bound their drain for the same reason (128 datagrams).
+constexpr int kMaxRecvPerIteration = 256;
 
 // The benchmark's fixed FEC geometry. It is a compile-time constant, so --k can
 // be validated against it *before* the rendezvous loop: otherwise a bad --k
@@ -530,13 +535,17 @@ int main(int argc, char** argv) {
 
     uint8_t buf[2048];
     size_t len = 0;
-    while (ep.Recv(buf, sizeof(buf), &len)) {
+    for (int drained = 0; drained < kMaxRecvPerIteration; ++drained) {
+      if (!ep.Recv(buf, sizeof(buf), &len)) {
+        break;
+      }
       ++rx_datagrams;
       if (len == data_wire_len) {
         ++rx_data_wire;
       }
       rx_min_len = std::min(rx_min_len, len);
       rx_max_len = std::max(rx_max_len, len);
+      now = NowMs() - t0;
       session.on_wire(buf, len, now);
     }
 

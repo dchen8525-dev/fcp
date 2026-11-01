@@ -1,4 +1,4 @@
-// Proxy entry codec tests (docs/FCP_M2_PROXY.md §4, task #20 / line T31).
+// Proxy entry codec tests (M2代理设计.md §4, task #20 / line T31).
 //
 // Nothing here touches a socket: each case hands the codec a byte range and
 // checks the verdict, the exact consumed length, and the wire bytes written.
@@ -7,7 +7,7 @@
 // message is also fed back one byte at a time, so no branch can mistake a short
 // read for a protocol error or read past the buffer.
 
-#include "fcp/proxy_proto.h"
+#include "proxy/proxy_proto.h"
 
 #include <cstdint>
 #include <cstring>

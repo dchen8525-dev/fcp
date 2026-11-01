@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "fcp/random.h"
+#include "fcp/wire.h"
 
 namespace fcp {
 namespace {
@@ -58,6 +59,12 @@ bool mtu_fits_largest_oob(const SessionConfig& cfg) {
   return cfg.mtu >= oob_wire;
 }
 
+// R3-1: how many packets the handshake epoch may seal under the (PSK, salt)
+// key. A handshake spends a handful (HELLO/HELLO_ACK plus retries); 2^16 is
+// three orders of magnitude of headroom and still leaves the per-key GCM
+// invocation count far below the 2^32 bound.
+constexpr uint32_t kHandshakeSendBudget = 1u << 16;
+
 // R3-1: an all-zero configured nonce means "let the handshake draw one". The
 // distinction only exists so a test can pin the value.
 const uint8_t* nonce_or_null(const uint8_t nonce[16]) {
@@ -72,13 +79,10 @@ const uint8_t* nonce_or_null(const uint8_t nonce[16]) {
 
 // See session.h: the default dedup key, read out of a KCP segment header.
 bool kcp_sn_of(const uint8_t* payload, size_t len, uint32_t* sn) {
-  if (len < 16) {
+  if (payload == nullptr || sn == nullptr || len < kKcpSnLen) {
     return false;
   }
-  *sn = static_cast<uint32_t>(payload[12]) |
-        (static_cast<uint32_t>(payload[13]) << 8) |
-        (static_cast<uint32_t>(payload[14]) << 16) |
-        (static_cast<uint32_t>(payload[15]) << 24);
+  *sn = get_le32(payload + kKcpSnOffset);
   return true;
 }
 
@@ -99,14 +103,20 @@ Session::Session(const SessionConfig& config, SendFn send, DeliverFn deliver, Lo
       srtt_ms_(config.initial_srtt_ms > 0 ? config.initial_srtt_ms : kDefaultSrttMs) {
   // R3-1: the handshake envelope keeps the (PSK, salt) key for the whole life
   // of the session, so its counter must not restart at 0. A replayed HELLO
-  // makes us seal a fresh ACK under that same key; with a fixed start that
-  // would be a GCM (key, IV) reuse with a known plaintext prefix. A random
-  // 32-bit start makes every session's pair distinct, and the handshake only
-  // spends a handful of counters before it is done.
-  hs_env_.set_send_nonce(random_u32());
+  // makes a *new* session seal a fresh ACK under that same key; with a fixed
+  // start that would be a GCM (key, IV) reuse with a known plaintext prefix.
+  // A 64-bit random start makes every session's landing zone distinct, and the
+  // packet budget (kHandshakeSendBudget) keeps the per-key invocation count
+  // far below 2^32. A failed draw is fatal: start() refuses the session rather
+  // than falling back to a predictable start.
+  bootstrap_seed_ok_ = hs_env_.init_bootstrap_nonce(kHandshakeSendBudget);
 }
 
 void Session::start(int64_t now_ms) {
+  if (!bootstrap_seed_ok_) {
+    log("FCP session refused: OS CSPRNG unavailable for the handshake nonce start");
+    return;
+  }
   if (!limits_.valid) {
     log("FCP config invalid: MTU leaves no room for a data symbol");
     return;
@@ -165,6 +175,14 @@ bool Session::on_wire(const uint8_t* wire, size_t len, int64_t now_ms) {
         hdr_type(hdr.type_k) == SymbolType::kOob &&
         (is_hello(symbol, symbol_len) || is_hello_ack(symbol, symbol_len))) {
       on_oob(symbol, symbol_len, now_ms);
+    } else {
+      // §4.1: only HELLO/HELLO_ACK may ride the bootstrap key. Anything else
+      // that authenticates with it comes from a peer that never left the
+      // handshake epoch (or from a sealing bug). Counting it as a structural
+      // failure is what makes that visible: dropping it silently put the
+      // symptom in a gap between auth_fail and struct_fail, so an operator saw
+      // an idle tunnel with flat counters and no clue which side was stale.
+      ++pre_struct_fail_;
     }
     sync_report_counters();
     return true;
@@ -539,7 +557,7 @@ void Session::on_oob(const uint8_t* payload, size_t len, int64_t now_ms) {
                 strategy_->k(), fec_state_name(strategy_->state()));
   log(line);
 
-  // M3 R(k) correction (FCP_M3_CONTROL.md §1.2): peer's ledger lifted the
+  // M3 R(k) correction (M3控制设计.md §1.2): peer's ledger lifted the
   // loss input; own line keeps the §10 format untouched.
   if (strategy_->ledger_active()) {
     std::snprintf(line, sizeof(line),

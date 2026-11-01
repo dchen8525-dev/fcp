@@ -1,4 +1,4 @@
-// Link-parameter prewarm (docs/FCP_M2_PROXY.md §5).
+// Link-parameter prewarm (M2代理设计.md §5).
 //
 // A fresh session starts blind: srtt is assumed at kDefaultSrttMs and the FEC
 // state machine is OFF, so the first k decision waits for the first FECSTAT

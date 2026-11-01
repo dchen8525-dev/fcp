@@ -4,7 +4,7 @@ if(WIN32)
   target_link_libraries(fcp_bench PRIVATE ws2_32)
 endif()
 
-# Offline controller replay (FCP_M3_CONTROL.md §5, #28). No sockets: the tool
+# Offline controller replay (M3控制设计.md §5, #28). No sockets: the tool
 # only reads traces and drives the pure strategy.
 add_executable(fcp_replay fcp_replay.cc)
 target_link_libraries(fcp_replay PRIVATE fcp)

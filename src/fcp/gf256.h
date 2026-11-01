@@ -1,4 +1,4 @@
-// GF(2^8) arithmetic for the Reed-Solomon codec (FCP_PROTOCOL_V6.md §4.4).
+// GF(2^8) arithmetic for the Reed-Solomon codec (协议规格.md §4.4).
 //
 // Reduction polynomial x^8 + x^4 + x^3 + x^2 + 1 (0x11D), generator 2. Both are
 // wire-visible through the parity bytes, so they are fixed by the spec.

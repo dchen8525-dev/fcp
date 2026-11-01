@@ -5,6 +5,7 @@
 // R2 header validation  exhaustive type_k x index x geometry fuzz
 // R3 RS / Cauchy        exhaustive (n, k) erasure patterns incl. ghost parity
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <string>

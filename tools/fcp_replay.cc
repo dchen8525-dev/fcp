@@ -1,4 +1,4 @@
-// fcp_replay: offline controller replay (FCP_M3_CONTROL.md §5, #28).
+// fcp_replay: offline controller replay (M3控制设计.md §5, #28).
 //
 // Loads a JSONL controller trace recorded by a live session (SessionConfig::
 // trace) and re-runs the reports through a fresh FecStrategy built from the

@@ -149,7 +149,7 @@ void FcpSettle::account(const RxSetView& view) {
       counters_.parity_expected += view.k;  // planned k, an upper bound
     }
     // M3 R(k) ledger: only full-size groups with known k >= 1 match the
-    // binomial model k_for solves against (FCP_M3_CONTROL.md §1.2).
+    // binomial model k_for solves against (M3控制设计.md §1.2).
     if (view.k_known && view.k > 0 && view.k <= 7 && n_used == static_cast<uint32_t>(d_)) {
       ++counters_.ledger_groups;
       ++counters_.ledger_k_hist[view.k];

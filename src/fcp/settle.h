@@ -1,4 +1,4 @@
-// Set settlement (design doc §7, FCP_PROTOCOL_V6.md §5.2/§5.3).
+// Set settlement (design doc §7, 协议规格.md §5.2/§5.3).
 //
 // Drives the per-set phase machine on top of FrameRx:
 //   Active -> Eligible : saw_parity OR a fragment of a higher set_id was seen
@@ -36,7 +36,7 @@ constexpr int64_t kTombstoneMinMs = 200;
 constexpr int64_t kTombstoneMaxMs = 1400;
 constexpr double kUntrustedKUnknownRatio = 0.10;
 
-// Burst detection (FCP_M3_CONTROL.md §3, #26). The reference is the exact
+// Burst detection (M3控制设计.md §3, #26). The reference is the exact
 // i.i.d. law of the max raw-loss run M over one full-size group of `d` slots
 // at per-slot loss `p`: out[l] = P(M = l) for l = 0..7, out[8] = P(M >= 8).
 // Solved exactly by a run-length DP (no geometric approximation, no edge
@@ -69,7 +69,7 @@ struct SettleCounters {
   // they are added back in.
   uint32_t tail_delivered = 0;
   uint32_t late_dup = 0;
-  // M3 R(k) ledger (FCP_M3_CONTROL.md §1.2): full-size (n_used == d) settled
+  // M3 R(k) ledger (M3控制设计.md §1.2): full-size (n_used == d) settled
   // sets whose k is known and >= 1. Whole-set losses cannot know their k and
   // stay outside, so extreme bursts make the ledger optimistic (§1.3);
   // partial sets stay out because their code length breaks the binomial

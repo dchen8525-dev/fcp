@@ -1,6 +1,6 @@
 // FCP-STREAM v1: a minimal reliable ordered byte stream on top of one Session.
 //
-// Position in the stack (docs/FCP_M2_PROXY.md §1-§2): FCP carries opaque
+// Position in the stack (M2代理设计.md §1-§2): FCP carries opaque
 // payloads and recovers erasures; it does NOT retransmit what RS could not
 // repair. That ARQ job is this file — the slot KCP would otherwise fill. One
 // segment is exactly one data symbol, so segment boundaries survive the wire
@@ -38,7 +38,7 @@ constexpr size_t kStreamAckLen = 17;     // type | cum | rwnd | sack_start | sac
 constexpr size_t kStreamRstLen = 2;      // type | code
 constexpr uint8_t kStreamFlagFin = 1u << 0;
 
-// M3 fast retransmit (FCP_M3_CONTROL.md §4, #27): duplicate ACKs of the same
+// M3 fast retransmit (M3控制设计.md §4, #27): duplicate ACKs of the same
 // cumulative point are proof the peer is buffering past a hole; the third one
 // force-retransmits the first unacked segment without waiting for the RTO or
 // the SACK-fill bookkeeping. The receiver rotates the single SACK block per
@@ -65,8 +65,44 @@ enum class CloseReason : uint8_t {
 struct StreamConfig {
   // Largest segment payload the session can carry: Session::mtu_limits().payload_max.
   size_t max_segment = 1336;
+  // Send window. With auto_window off this is the fixed window (legacy
+  // behaviour); with it on it is only the starting value -- see below.
   size_t send_window_bytes = 256 * 1024;
   size_t rcv_buf_bytes = 256 * 1024;
+  // Window autotune. The send window starts at send_window_bytes and grows
+  // while the stream is its own bottleneck: doubling per RTT until ssthresh, then
+  // one segment per RTT after that. A credible epoch (enough samples to say
+  // something) refreshes ssthresh to twice the delivery-rate x min_rtt estimate,
+  // so slow start exits where the path appears to saturate -- but never below the
+  // window already in force, and additive growth continues past the estimate.
+  // Goodput on a lossy path underestimates capacity (retransmitted bytes are not
+  // "delivered"), and using the estimate as a ceiling froze the window
+  // permanently after the first loss. It is also the recovery reference: a loss
+  // sets ssthresh to it, so the window doubles back to what it had proven before
+  // going additive.
+  //
+  // The downward signals are loss and self-induced delay. When the minimum RTT
+  // of an epoch sits window_queue_ms above the historical minimum, our own queue
+  // is standing, so the window holds; two consecutive epochs over twice that cut
+  // it by an eighth. Both readings need enough samples in the epoch, because the
+  // minimum of one or two rounds on a jittery path says nothing about a queue.
+  // Loss costs one 30% decrease per epoch.
+  //
+  // window_max_bytes is the hard ceiling. In auto mode the receive capacity is
+  // raised to the same value so the peer's growth is not clamped by a buffer
+  // smaller than the window it is allowed to reach. This is NOT negotiated on
+  // the wire: auto/fixed mixes are safe (a fixed peer simply advertises its
+  // own buffer and the sender stays peer-limited) but the extra memory is
+  // committed per connection by arrivals, not reserved.
+  bool auto_window = false;
+  size_t window_min_bytes = 64 * 1024;
+  size_t window_max_bytes = 1024 * 1024;
+  // Standing-queue allowance: an epoch whose minimum RTT is this far above the
+  // historical minimum holds the window; two consecutive epochs at twice this
+  // shrink it. Kept comfortably below the Session §8 guardrail (srtt -
+  // min_srtt >= 40ms trims FEC k) so the two controllers do not fight.
+  // 0 disables the delay brake.
+  int64_t window_queue_ms = 20;
   int64_t initial_srtt_ms = 200;
   int64_t rto_min_ms = 100;
   int64_t rto_max_ms = 5000;
@@ -132,8 +168,22 @@ class Stream {
   uint64_t retransmits() const { return retransmits_; }
   uint64_t dup_bytes() const { return dup_bytes_; }
   uint64_t segs_sent() const { return segs_sent_; }
+  // F-3: zero-window probes are real segments on the wire, but they are a
+  // liveness device, not application data. Counted apart so a throughput or
+  // redundancy-ratio reading can subtract them.
+  uint64_t probes_sent() const { return probes_sent_; }
   uint64_t segs_rx() const { return segs_rx_; }
   uint64_t bad_segs() const { return bad_segs_; }
+  // Current send window (== send_window_bytes when auto_window is off) and the
+  // autotune's state, for the teardown diagnostics and the unit tests.
+  size_t send_window() const { return send_window_; }
+  size_t ssthresh() const { return ssthresh_; }
+  size_t loss_floor() const { return loss_floor_; }
+  // Loss attribution for the shrink terms above.
+  uint64_t dup_loss_events() const { return dup_loss_events_; }
+  uint64_t rto_loss_events() const { return rto_loss_events_; }
+  size_t last_target() const { return last_target_; }
+  int64_t min_rtt_ms() const { return min_rtt_ms_; }
   size_t in_flight() const { return in_flight_; }
   size_t queued_bytes() const { return tx_pending_.size(); }
   size_t unacked_segs() const { return tx_.size(); }
@@ -174,6 +224,7 @@ class Stream {
   void retransmit_timeouts(int64_t now_ms);
   void probe_zero_window(int64_t now_ms);
   void update_srtt(int64_t sample_ms);
+  void update_window(int64_t now_ms);
   void finish(int64_t now_ms, CloseReason reason);
   uint32_t cum_out() const;
   size_t rwnd_out() const;
@@ -200,6 +251,13 @@ class Stream {
   size_t in_flight_ = 0;             // bytes of sent-and-unacked segments
   size_t peer_rwnd_ = 0;
   bool probe_credit_ = false;        // let one segment past a closed window
+  // F-3: persist-timer style backoff for zero-window probes. A peer that keeps
+  // answering with the same closed window would otherwise pull one full segment
+  // every probe_ms for as long as the ACKs keep coming.
+  int64_t probe_backoff_ = 1;
+  // peer_rwnd_ starts as a guess copied from our own config; the autotune only
+  // reads a full window as path evidence once an ACK has confirmed the peer's.
+  bool peer_rwnd_seen_ = false;
 
   std::deque<RcvChunk> oob_;         // sorted, disjoint, offset >= rcv_nxt_
   size_t oob_bytes_ = 0;
@@ -217,6 +275,53 @@ class Stream {
 
   int64_t srtt_ms_ = 0;
   int64_t rto_ms_ = 0;
+  // Window autotune (see StreamConfig::auto_window). send_window_ is what
+  // send_space()/pump() read; the epoch counters turn "bytes acknowledged
+  // since the last sample" into a delivery rate.
+  size_t send_window_ = 0;
+  size_t ssthresh_ = 0;
+  size_t window_min_ = 0;
+  size_t window_max_ = 0;
+  // The deepest the loss term alone may take the window: the window the stream
+  // started with. A stream-level hole on this stack is not clean congestion
+  // evidence -- the FEC layer already absorbed what it could, so the residue is
+  // a mix of contention and random loss the parity missed -- and a window below
+  // the operator's `--window` is strictly worse there (measured 2026-10-31: a
+  // 64 KiB window on a 160ms/17%-loss path ran at a third of the fixed 256 KiB
+  // rate and never climbed back). Cutting on queue evidence is still allowed to
+  // go all the way down to window_min_, because a standing queue of our own
+  // making is a real signal.
+  size_t loss_floor_ = 0;
+  // Receive capacity backing the advertised window: rcv_buf_bytes, raised to
+  // window_max_bytes in auto mode so the peer's growth is never clamped by a
+  // buffer that is smaller than the window it is allowed to reach.
+  size_t rcv_cap_ = 0;
+  int64_t min_rtt_ms_ = 0;
+  int64_t epoch_min_rtt_ms_ = 0;  // lowest sample inside the current epoch
+  int epoch_samples_ = 0;         // clean samples inside the current epoch
+  size_t last_target_ = 0;        // recovery reference, and the slow-start bound
+  int64_t win_epoch_ms_ = 0;
+  uint64_t epoch_acked_ = 0;
+  bool loss_epoch_ = false;
+  // Which loss evidence showed up, counted separately because the two have
+  // different remedies and a WAN log line cannot tell them apart afterwards:
+  // `dup_loss_events` is a second duplicate-ACK burst with the first repair
+  // still unacked (a hole the peer is waiting behind), `rto_loss_events` is a
+  // timeout pass (nothing came back at all).
+  uint64_t dup_loss_events_ = 0;
+  uint64_t rto_loss_events_ = 0;
+  bool limited_epoch_ = false;
+  // Consecutive epochs whose minimum RTT sat over the queue allowance; the
+  // delay brake fires on the second one, so path jitter cannot fake a queue.
+  int queue_over_ = 0;
+  // Exponential RTO backoff (Karn): doubled per timeout episode and reset by a
+  // clean sample, so a silent peer is retransmitted at a decaying rate instead
+  // of one full window every base RTO.
+  int64_t rto_backoff_ = 1;
+  // A dup-ACK burst that is still unexplained: the first forced retransmission
+  // may just be reordering (FEC delivers symbols out of order), so the 30%
+  // window cut waits for a second burst with the first repair still unacked.
+  bool fast_retx_armed_ = false;
   int64_t last_activity_ms_ = 0;
   int64_t last_probe_ms_ = 0;
   bool eof_delivered_ = false;
@@ -235,6 +340,7 @@ class Stream {
   uint64_t retransmits_ = 0;
   uint64_t dup_bytes_ = 0;
   uint64_t segs_sent_ = 0;
+  uint64_t probes_sent_ = 0;
   uint64_t segs_rx_ = 0;
   uint64_t bad_segs_ = 0;
 };

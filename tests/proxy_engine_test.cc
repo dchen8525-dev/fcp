@@ -1,4 +1,4 @@
-// T31 (docs/FCP_M2_PROXY.md §6): ProxyEngine driven without a single socket.
+// T31 (M2代理设计.md §6): ProxyEngine driven without a single socket.
 //
 // The engine is the part of the proxy that decides things -- connection table,
 // salt routing, entry parsing, OPEN exchange, backpressure, teardown, prewarm --
@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
@@ -27,9 +28,9 @@
 #include <string>
 #include <vector>
 
-#include "engine.h"
+#include "proxy/proxy_engine.h"
 #include "fcp/envelope.h"
-#include "fcp/proxy_proto.h"
+#include "proxy/proxy_proto.h"
 #include "test_util.h"
 
 namespace {
@@ -50,6 +51,15 @@ struct Options {
   int64_t dial_timeout_ms = 5000;
   size_t send_window_bytes = 64 * 1024;
   size_t rcv_buf_bytes = 32 * 1024;
+  // Off by default here: these tests pin the legacy fixed-window backpressure
+  // invariants. The autotune has its own test below.
+  bool auto_window = false;
+  size_t window_min_bytes = 64 * 1024;
+  size_t window_max_bytes = 1024 * 1024;
+  // One-way wire latency in 25ms ticks. 0 is the instant loopback every other
+  // scenario uses; a rate-limited autotune scenario needs a real round trip,
+  // because with no latency the window is never what holds the sender back.
+  size_t wire_latency_ticks = 0;
   bool prewarm = true;
   std::string trace_prefix;  // #29a: per-session controller trace when set
 };
@@ -70,6 +80,10 @@ class Harness {
     base.prewarm = opt.prewarm;
     base.send_window_bytes = opt.send_window_bytes;
     base.rcv_buf_bytes = opt.rcv_buf_bytes;
+    base.auto_window = opt.auto_window;
+    base.window_min_bytes = opt.window_min_bytes;
+    base.window_max_bytes = opt.window_max_bytes;
+    latency_ticks_ = opt.wire_latency_ticks;
 
     EngineConfig cc = base;
     cc.role = EngineRole::kClient;
@@ -86,6 +100,8 @@ class Harness {
 
   void step() {
     now_ms += kTickMs;
+    ++step_no_;
+    promote_due();
     if (auto_answer) {
       answer_pending(true, OpenError::kRefused);
     }
@@ -183,6 +199,12 @@ class Harness {
     std::set<uint64_t> closed;
   };
 
+  struct Delayed {
+    size_t due_step = 0;
+    bool from_client = false;
+    std::vector<uint8_t> bytes;
+  };
+
   EngineHost make_host(bool is_client) {
     EngineHost h;
     h.app_send = [this, is_client](uint64_t conn, const uint8_t* data, size_t len) {
@@ -195,10 +217,8 @@ class Harness {
       std::vector<uint8_t> d(wire, wire + len);
       if (is_client) {
         last_from_client = d;
-        to_server.push_back(std::move(d));
-      } else {
-        to_client.push_back(std::move(d));
       }
+      emit(std::move(d), is_client);
       ++datagrams;
       (void)peer;
     };
@@ -222,6 +242,26 @@ class Harness {
       (is_client ? client_log : server_log).push_back(line);
     };
     return h;
+  }
+
+  // A datagram leaves now and arrives `latency_ticks_` later; one-way and
+  // symmetric, so a round trip costs twice that in ticks.
+  void emit(std::vector<uint8_t> d, bool from_client) {
+    if (latency_ticks_ == 0) {
+      (from_client ? to_server : to_client).push_back(std::move(d));
+      return;
+    }
+    // Constant latency makes the queue FIFO by arrival time, so the head is
+    // always the next one to come due.
+    delayed_.push_back(Delayed{step_no_ + latency_ticks_, from_client, std::move(d)});
+  }
+
+  void promote_due() {
+    while (!delayed_.empty() && delayed_.front().due_step <= step_no_) {
+      Delayed d = std::move(delayed_.front());
+      delayed_.pop_front();
+      (d.from_client ? to_server : to_client).push_back(std::move(d.bytes));
+    }
   }
 
   size_t app_send(bool is_client, uint64_t conn, const uint8_t* data, size_t len) {
@@ -261,6 +301,9 @@ class Harness {
 
   Side client_side, server_side;
   std::vector<std::vector<uint8_t>> to_client, to_server;
+  std::deque<Delayed> delayed_;
+  size_t step_no_ = 0;
+  size_t latency_ticks_ = 0;
   uint8_t salt_counter = 1;
   size_t answered_ = 0;
 };
@@ -546,10 +589,16 @@ void salt_routing_and_replay_binding() {
   uint8_t key[16];
   std::memset(key, 0x2A, sizeof(key));  // Harness PSK
   Envelope hijacker(key, salt, Direction::kC2S, Direction::kS2C);
-  CHECK(hijacker.set_send_nonce(5000));
+  // R3-1: the bootstrap epoch's counter starts at a random 64-bit value, so
+  // "fresh" for this epoch means "above whatever the peer started at". The
+  // hijack therefore has to land above every legal bootstrap counter — the
+  // largest a session can ever seal is UINT64_MAX - 2 (its start plus budget
+  // stays one below the wrap). This is also the hardening the random start
+  // buys: a PSK holder can no longer pick 5000 and land inside the window.
+  CHECK(hijacker.init_bootstrap_nonce(1u << 16));
   std::vector<uint8_t> hijack;
   const std::vector<uint8_t> payload{0xAA, 0xBB};
-  CHECK(hijacker.seal(payload.data(), payload.size(), &hijack));
+  CHECK(hijacker.seal_at(UINT64_MAX - 1, payload.data(), payload.size(), &hijack));
   h.server->on_wire(kOtherPeer, hijack.data(), hijack.size(), h.now_ms);
   CHECK_EQ(h.server->counters().salt_clash, 1u);
   CHECK_EQ(h.server->counters().live, 0u);
@@ -927,6 +976,103 @@ void peer_callbacks_balance_server_sessions() {
   CHECK_EQ(bad.server_peer_retired.size(), 1u);
 }
 
+// Window autotune through the engine: with auto_window on, the tunnel's
+// buffers follow window_max instead of the fixed --window/--rcv-buf pair. The
+// memory gate still closes on a stalled reader, and nothing offered before the
+// stall is lost when it reopens.
+void auto_window_bounds_memory_by_window_max() {
+  const size_t kMax = 128 * 1024;
+  Options opt;
+  opt.auto_window = true;
+  opt.window_min_bytes = 16 * 1024;
+  opt.window_max_bytes = kMax;
+  opt.send_window_bytes = 16 * 1024;
+  opt.rcv_buf_bytes = 16 * 1024;
+  Harness h{opt};
+  h.local_open(kLocalConn);
+  h.local_send(kLocalConn, greeting());
+  h.local_send(kLocalConn, socks5_request(0x01, 0x01, ipv4_bytes("198.51.100.9"), 80));
+  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, 60));
+  const uint64_t target_conn = h.first_dial_conn();
+
+  h.client_accept_limit = 0;  // the local socket is not draining
+  size_t pushed = 0;
+  const std::vector<uint8_t> chunk(2048, 0x5A);
+  for (int i = 0; i < 200; ++i) {
+    h.step();
+    pushed += h.target_send(target_conn, chunk);
+  }
+  // Receive cap (one window_max) plus the sender's window (at most one more).
+  // Nothing leaves the engine while the reader stalls, so this is what it holds.
+  CHECK(pushed > 0u);
+  CHECK(pushed <= 2 * kMax);
+  CHECK(h.client->pending_app_bytes(kLocalConn) <= kMax);
+  // The reader, not the path, is the bottleneck here: the peer's advertised room
+  // closes and the window stays where it started. Growing it would only move the
+  // buffering to the receiver that cannot drain it.
+  CHECK(h.server->send_window(target_conn) <= kMax);
+  CHECK_EQ(h.server->send_window(target_conn), opt.send_window_bytes);
+  CHECK_EQ(h.server->peer_window(target_conn), 0u);  // the reader said "no room"
+
+  h.client_accept_limit = kNoLimit;
+  const size_t want = pushed;
+  CHECK(h.run_until([&] { return h.app_bytes(kLocalConn).size() >= 12 + want; }, 800));
+  CHECK_EQ(h.app_bytes(kLocalConn).size(), 12 + want);
+  CHECK_EQ(text_of(h.app_bytes(kLocalConn)).substr(12), std::string(want, 0x5A));
+
+  h.local_close(kLocalConn);
+  CHECK(h.run_until([&] {
+    return h.client->counters().live == 0 && h.server->counters().live == 0;
+  }, 120));
+}
+
+// The other half of the same gate: with a real round trip and a reader that
+// keeps up, the sender's own window is what binds, and it has to grow inside
+// the engine -- not only in the stream unit tests. An eager target socket feeds
+// it, so nothing but the window stands between 16 KiB and window_max.
+void auto_window_grows_in_the_engine() {
+  const size_t kMax = 128 * 1024;
+  Options opt;
+  opt.auto_window = true;
+  opt.window_min_bytes = 16 * 1024;
+  opt.window_max_bytes = kMax;
+  opt.send_window_bytes = 16 * 1024;
+  opt.rcv_buf_bytes = 16 * 1024;
+  opt.wire_latency_ticks = 4;  // 200ms round trip
+  Harness h{opt};
+  h.local_open(kLocalConn);
+  h.local_send(kLocalConn, greeting());
+  h.local_send(kLocalConn, socks5_request(0x01, 0x01, ipv4_bytes("198.51.100.9"), 80));
+  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, 60));
+  const uint64_t target_conn = h.first_dial_conn();
+
+  const std::vector<uint8_t> chunk(2048, 0x5A);
+  size_t pushed = 0;
+  for (int i = 0; i < 300; ++i) {
+    h.step();
+    // Feed as much as the engine will take this tick: an eager target socket.
+    for (int q = 0; q < 8; ++q) {
+      const size_t taken = h.target_send(target_conn, chunk);
+      pushed += taken;
+      if (taken == 0) {
+        break;
+      }
+    }
+  }
+  CHECK(pushed > 2 * kMax);  // the tunnel moved well past one window
+  CHECK(h.server->send_window(target_conn) > opt.send_window_bytes);
+  CHECK(h.server->send_window(target_conn) <= kMax);
+
+  // The reader kept up with everything the window let through.
+  CHECK(h.run_until([&] { return h.app_bytes(kLocalConn).size() >= 12 + pushed; }, 600));
+  CHECK_EQ(text_of(h.app_bytes(kLocalConn)).substr(12), std::string(pushed, 0x5A));
+
+  h.local_close(kLocalConn);
+  CHECK(h.run_until([&] {
+    return h.client->counters().live == 0 && h.server->counters().live == 0;
+  }, 200));
+}
+
 int main() {
   socks5_round_trip();
   http_connect_round_trip();
@@ -943,6 +1089,8 @@ int main() {
   unauthenticated_datagrams_do_not_create_sessions();
   authenticated_non_hello_session_times_out();
   dial_backpressure_bounds_pre_tunnel_bytes();
+  auto_window_bounds_memory_by_window_max();
+  auto_window_grows_in_the_engine();
   peer_callbacks_balance_server_sessions();
   return fcp_test::finish();
 }

@@ -146,13 +146,23 @@ jobs:
           echo "== /usr/share/doc/fcp-proxy 实际内容"
           ls -la /usr/share/doc/fcp-proxy || true
 
+          echo "== /etc/fcp 目录与 conffile 状态"
+          # /etc/fcp 是 0750 root:root（env 里有 PSK，不能放宽），所以下面凡是
+          # 碰 /etc 的检查都得 sudo：非 root 的 test -f 因父目录不可搜索而 EACCES，
+          # 返回假——第六次跑就挂在这条上，日志里 dpkg -L 明明列着该文件。
+          sudo ls -ld /etc/fcp
+          sudo stat -c '%n  mode=%a  owner=%U:%G  size=%s' /etc/fcp/fcp-proxy.env
+
           echo "== 包内文件落点"
           # 每一步都带一行回显：第四次跑时这里直接 exit 1，日志里只看到
           # "== 包内文件落点" 三个字，不知道是哪一条挂的（set -e 静默退出）。
-          check() { echo "  - $1"; shift; "$@"; }
+          check() {
+            echo "  - $1"; shift
+            if ! "$@"; then echo "::error::落点检查失败：$*"; return 1; fi
+          }
           check "/usr/bin/fcp-proxy-server 可执行" test -x /usr/bin/fcp-proxy-server
           check "/usr/bin/fcp-proxy-client 可执行" test -x /usr/bin/fcp-proxy-client
-          check "/etc/fcp/fcp-proxy.env 存在" test -f /etc/fcp/fcp-proxy.env
+          check "/etc/fcp/fcp-proxy.env 存在" sudo test -f /etc/fcp/fcp-proxy.env
           check "文档已装" test -f "/usr/share/doc/fcp-proxy/部署运维指南.md"
           echo "  - systemd unit 已注册"
           systemctl cat fcp-proxy >/dev/null || {

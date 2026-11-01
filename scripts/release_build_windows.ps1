@@ -90,12 +90,23 @@ if ($p.HasExited) {
 Stop-Process -Id $p.Id -Force
 
 # --- Inno Setup ---------------------------------------------------------------
+# runner 预装 Inno 6，但 6.5 起中文语言文件拆成独立包；缺了它 .iss 会报
+# "Couldn't open include file ... ChineseSimplified.isl"（首跑实测）。
+# 补装失败不致命：fcp-client.iss 里有 #ifexist 兜底，会退成英文界面。
 $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
 if (!(Test-Path $iscc)) {
   choco install innosetup --no-progress -y
-  $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
 }
 if (!(Test-Path $iscc)) { throw "找不到 ISCC.exe" }
+
+$isl = "${env:ProgramFiles(x86)}\Inno Setup 6\Languages\ChineseSimplified.isl"
+if (!(Test-Path $isl)) {
+  Write-Host "== 安装 Inno Setup 简体中文语言包"
+  choco install innosetup-chinesesimplified --no-progress -y
+  if (!(Test-Path $isl)) {
+    Write-Host "::warning::中文语言包仍缺失，安装包将只有英文界面"
+  }
+}
 
 & $iscc "/DMyAppVersion=$Version" `
         "/DSourceDir=$deploy" `

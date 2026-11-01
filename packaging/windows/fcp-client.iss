@@ -66,7 +66,15 @@ ArchitecturesAllowed=x64compatible
 ; WOW6432Node，卸载清理反而更绕。
 
 [Languages]
+; Inno Setup 6.5 起中文语言文件不再随主程序分发，需要单独安装
+; （choco 包 innosetup-chinesesimplified，见 scripts/release_build_windows.ps1）。
+; 这里用 #ifexist 兜底：语言包缺失时退回英文界面并打一条 warning，
+; 而不是让整条发布流水线因为一个 .isl 文件挂掉。首条 [Languages] 是默认语言。
+#ifexist "compiler:Languages\ChineseSimplified.isl"
 Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+#else
+#pragma message "ChineseSimplified.isl 缺失：安装包只有英文界面（装 innosetup-chinesesimplified 可恢复）"
+#endif
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]

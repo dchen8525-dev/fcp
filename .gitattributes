@@ -10,6 +10,10 @@ packaging/debian/postinst text eol=lf
 packaging/debian/prerm    text eol=lf
 packaging/debian/postrm   text eol=lf
 
+# 可执行位记在 Git 索引里（100755），不依赖工作区的文件模式：
+# Git for Windows 的 core.filemode 默认是 false，新建脚本必须
+# `git update-index --chmod=+x <file>` 补这一步，否则 Linux runner 上
+# 直接 "Permission denied"（首跑实测）。
 *.sh    text eol=lf
 *.yml   text eol=lf
 *.yaml  text eol=lf

@@ -44,20 +44,22 @@ echo "== cpack"
 # 顶成了第二段落，`dpkg -i` 报 "missing 'Package' field"。
 # dpkg-deb --info 会把这种包照样打印出来（不报错），所以这里必须自己看结构。
 deb="$(ls "$BUILD_DIR"/packages/*.deb)"
-control="$(dpkg-deb --ctrl-tarfile "$deb" | tar -xO ./control)"
-printf '%s\n' "$control"
-# 段落只允许一个。用 awk 数而不是 grep -c：grep -c 一个都没匹配上时返回 1，
-# 与 set -e 相加会变成"看起来失败"的假警报。
-blank_lines="$(printf '%s\n' "$control" | awk '$0 == "" { n++ } END { print n + 0 }')"
+control_file="$BUILD_DIR/packages/control.txt"
+dpkg-deb --ctrl-tarfile "$deb" | tar -xO ./control > "$control_file"
+cat "$control_file"
+# 段落只允许一个。数文件而不是管道接命令替换：$(...) 会吃掉结尾换行，
+# 把"正好一个空行"数成 0（第二次踩）。空行计数器用 awk 不用 grep -c：
+# grep -c 零匹配返回 1，与 set -e 相加会变成假警报。
+blank_lines="$(awk '$0 == "" { n++ } END { print n + 0 }' "$control_file")"
 if [ "$blank_lines" -ne 1 ]; then
   echo "::error::control 里有 $blank_lines 个空行（应为 1，即结尾那一个）：Description 尾部空白会顶出多余段落" >&2
   exit 1
 fi
 for field in Package Version Architecture Maintainer Description; do
-  printf '%s\n' "$control" | grep -q "^${field}:" || {
+  if ! grep -q "^${field}:" "$control_file"; then
     echo "::error::control 缺 ${field} 字段" >&2
     exit 1
-  }
+  fi
 done
 
 # 出厂自检：把包内文件按 install() 规则单独装到一棵临时树里，再跑一次。

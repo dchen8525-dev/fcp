@@ -64,12 +64,11 @@ set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
 # 首跑 v0.0.1 就是这么红的。strip 掉尾部空白后段落正好一个。
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/packaging/debian/description" FCP_LONG_DESC)
 string(STRIP "${FCP_LONG_DESC}" FCP_LONG_DESC)
-# 摘要行必须自己接上：显式设置 CPACK_DEBIAN_PACKAGE_DESCRIPTION 后，
-# CPackDeb 那条"自动合并 SUMMARY + 文件内容"的分支就不再走（它的条件是
-# NOT CPACK_DEBIAN_PACKAGE_DESCRIPTION）。少了这一行，Description 的首行会变成
-# 正文第一句，不符合 Debian 的"首行即摘要"约定。
-set(CPACK_DEBIAN_PACKAGE_DESCRIPTION
-    "${CPACK_PACKAGE_DESCRIPTION_SUMMARY}\n${FCP_LONG_DESC}")
+# 只 strip，不自己拼摘要：CPackDeb 在 CPACK_DEBIAN_PACKAGE_DESCRIPTION 已设置
+# 且 CPACK_PACKAGE_DESCRIPTION_SUMMARY 非默认值时，会自己 PREPEND 一行摘要。
+# 第二次跑时我在这里又拼了一遍，control 里摘要出现两次（Description 首行 +
+# 正文第一行），已回退。
+set(CPACK_DEBIAN_PACKAGE_DESCRIPTION "${FCP_LONG_DESC}")
 
 set(CPACK_RESOURCE_FILE_LICENSE
     "${CMAKE_CURRENT_SOURCE_DIR}/packaging/debian/copyright")

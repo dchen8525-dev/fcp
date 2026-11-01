@@ -140,11 +140,21 @@ jobs:
           fcp-proxy-client --version | grep -qF "fcp-proxy-client ${version}"
 
           echo "== 包内文件落点"
-          test -x /usr/bin/fcp-proxy-server
-          test -x /usr/bin/fcp-proxy-client
-          test -f /etc/fcp/fcp-proxy.env
-          systemctl cat fcp-proxy >/dev/null   # unit 已注册（落点是 /usr/lib/systemd/system）
-          test -f "/usr/share/doc/fcp-proxy/部署运维指南.md"
+          # 每一步都带一行回显：第四次跑时这里直接 exit 1，日志里只看到
+          # "== 包内文件落点" 三个字，不知道是哪一条挂的（set -e 静默退出）。
+          check() { echo "  - $1"; shift; "$@"; }
+          check "/usr/bin/fcp-proxy-server 可执行" test -x /usr/bin/fcp-proxy-server
+          check "/usr/bin/fcp-proxy-client 可执行" test -x /usr/bin/fcp-proxy-client
+          check "/etc/fcp/fcp-proxy.env 存在" test -f /etc/fcp/fcp-proxy.env
+          check "文档已装" test -f "/usr/share/doc/fcp-proxy/部署运维指南.md"
+          echo "  - systemd unit 已注册"
+          systemctl cat fcp-proxy >/dev/null || {
+            echo "::error::systemctl cat fcp-proxy 失败；包内 unit 落点："
+            dpkg -L fcp-proxy | grep -i systemd || echo "(包里没有 systemd 目录)"
+            exit 1
+          }
+          echo "== dpkg 记录的文件清单"
+          dpkg -L fcp-proxy
 
           echo "== conffile 登记（升级不覆盖运维配置的前提）"
           dpkg-query -W -f='${Conffiles}\n' fcp-proxy | tee /tmp/conf.txt

@@ -17,9 +17,13 @@
 #include <string>
 
 #include "fcp/fecstat.h"
-#include "fcp/strategy.h"
 
 namespace fcp {
+
+// SessionLogFn itself needs no strategy: the functions take FecState by value,
+// and so does the enum's underlying type. Declaring it here keeps this header
+// (and its includers) off strategy.h.
+enum class FecState : uint8_t;
 
 using SessionLogFn = std::function<void(const std::string& line)>;
 

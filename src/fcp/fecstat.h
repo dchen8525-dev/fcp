@@ -18,6 +18,11 @@ constexpr uint8_t kFecstatVersion = 6;
 // One interval cannot settle more groups than the active-set window even at
 // line rate; anything larger is a stale/forged neighbour, not progress.
 constexpr uint32_t kFecstatMaxForwardSets = 1u << 20;
+// §8 "样本": a report with fewer accounted data packets than this may refresh
+// the log but must not move k. The reporter's 2s cadence and the strategy's
+// decision gate are the same threshold — one constant so they cannot drift
+// into "reports on a sample the controller refuses to act on".
+constexpr uint32_t kMinSamplePackets = 256;
 constexpr char kFecstatMagic[16] = "FCP_FECSTAT_V6";
 
 // flg bit3: the M3 ledger fields (ledger_groups/fail_ppm/meta) are valid.
@@ -25,6 +30,12 @@ constexpr char kFecstatMagic[16] = "FCP_FECSTAT_V6";
 // group; receivers additionally gate on ledger_groups, so a bit without
 // backing counts is still ignored.
 constexpr uint8_t kFlgLedger = 0x08;
+// All four bits of FecstatPacket::flg live next to the field description
+// above; the writers are reporter.cc (direction/tail/late) and strategy (via
+// ledger_groups), the readers are the receiving strategy.
+constexpr uint8_t kFlgDirection = 0x01;
+constexpr uint8_t kFlgTailDropped = 0x02;
+constexpr uint8_t kFlgLateRecovery = 0x04;
 
 struct FecstatPacket {
   char magic[16];              // "FCP_FECSTAT_V6" + 2 x NUL, fixed width
@@ -137,6 +148,8 @@ class FecstatValidator {
 
   // Reports rejected for jumping implausibly far ahead (kept apart from the
   // stale counter so "behind" and "from the future" stay distinguishable).
+  // Not read by any host yet: it exists so a session that starved its peer's
+  // controller with a forged forward jump can be diagnosed without a rebuild.
   uint32_t future_rejects() const { return future_rejects_; }
 
  private:

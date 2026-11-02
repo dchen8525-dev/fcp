@@ -20,6 +20,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "fcp/defaults.h"
 #include "fcp/envelope.h"
 #include "fcp/fecstat.h"
 #include "fcp/frame_rx.h"
@@ -28,8 +29,8 @@
 #include "fcp/hdr.h"
 #include "fcp/reporter.h"
 #include "fcp/settle.h"
-#include "fcp/trace.h"
 #include "fcp/strategy.h"
+#include "fcp/trace.h"
 
 namespace fcp {
 
@@ -57,11 +58,11 @@ struct SessionConfig {
   uint8_t salt[Envelope::kSaltLen] = {};
   Direction send_direction = Direction::kC2S;
   Direction recv_direction = Direction::kS2C;
-  uint8_t d = 10;
-  uint8_t p = 3;
+  uint8_t d = kDefaultD;
+  uint8_t p = kDefaultP;
   uint8_t p_max = kDefaultPmax;
-  uint16_t mtu = 1400;
-  size_t ip_hdr_len = 20;
+  uint16_t mtu = kDefaultMtu;
+  size_t ip_hdr_len = kDefaultIpHeaderLen;
   int pinned_k = -1;  // --fec-parity-pinned; >= 0 bypasses the strategy
   // Link warm-up (M2代理设计.md §5), both optional and both defaulting to
   // the cold M1 behaviour. initial_srtt_ms == 0 keeps the internal 200ms, so
@@ -76,7 +77,7 @@ struct SessionConfig {
   // parity_bytes/data_bytes ratio seen by the peer's FECSTAT; 0 disables.
   // Exceeding it enters the kCapped state (one parity per report down, floor
   // 1) until a report measures back under the ceiling.
-  double fec_budget = 0.50;
+  double fec_budget = kDefaultFecBudget;
   // #28③ (F2): pre-negotiation data cache limits (see handshake.h defaults).
   size_t handshake_cache_segments = kHandshakeMaxCachedSegments;
   size_t handshake_cache_bytes = kHandshakeMaxCachedBytes;

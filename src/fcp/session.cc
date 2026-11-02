@@ -230,8 +230,8 @@ bool Session::on_wire_data(const std::vector<uint8_t>& plain, size_t wire_len,
   if (parse_hdr(plain.data(), plain.size(), &hdr)) {
     const SymbolType type = hdr_type(hdr.type_k);
     // Reuse the shared constant from frame_tx.h instead of shadowing it:
-    // get_limits() derives payload_max from the same value, so the two must
-    // never drift apart.
+    // compute_mtu_limits() derives payload_max from the same value, so the two
+    // must never drift apart.
     if (type == SymbolType::kData) {
       data_payload_rx_ += wire_len > kDataWireOverhead ? wire_len - kDataWireOverhead : 0;
       if (reporter_ != nullptr) {

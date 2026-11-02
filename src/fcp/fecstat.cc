@@ -6,9 +6,6 @@
 #include "fcp/wire.h"
 
 namespace fcp {
-namespace {
-
-}  // namespace
 
 FecstatPacket MakeFecstatPacket(const uint8_t salt[8]) {
   FecstatPacket packet{};

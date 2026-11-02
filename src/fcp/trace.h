@@ -24,6 +24,7 @@
 #include <string>
 #include <vector>
 
+#include "fcp/defaults.h"
 #include "fcp/fecstat.h"
 #include "fcp/strategy.h"
 
@@ -33,10 +34,10 @@ constexpr int kTraceVersion = 1;
 
 // The strategy-relevant slice of the recording session's controller config.
 struct TraceConfigSnapshot {
-  uint8_t d = 10;
+  uint8_t d = kDefaultD;
   uint8_t p_max = kDefaultPmax;
   double target_recovery = kTargetRecovery;
-  double budget = 0.50;
+  double budget = kDefaultFecBudget;
   int initial_k = -1;
   int pinned = -1;
 };

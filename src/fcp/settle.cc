@@ -92,7 +92,8 @@ void FcpSettle::tick(int64_t now_ms, int64_t rtt_ms) {
   const int64_t guard = late_guard_ms(rtt_ms);
   const int64_t tomb = tombstone_ms(rtt_ms);
 
-  for (const uint32_t id : rx_->active_set_ids()) {
+  rx_->active_set_ids(&tick_ids_);
+  for (const uint32_t id : tick_ids_) {
     RxSetView view;
     if (!rx_->view(id, &view)) {
       continue;

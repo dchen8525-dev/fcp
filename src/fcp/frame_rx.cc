@@ -1,7 +1,6 @@
 #include "fcp/frame_rx.h"
 
 #include <algorithm>
-#include <cstring>
 #include <utility>
 
 #include "fcp/hdr.h"
@@ -213,11 +212,21 @@ void FrameRx::on_datagram(const uint8_t* plaintext, size_t len, int64_t now_ms) 
 
 std::vector<uint32_t> FrameRx::active_set_ids() const {
   std::vector<uint32_t> ids;
-  ids.reserve(sets_.size());
-  for (const auto& kv : sets_) {
-    ids.push_back(kv.first);
-  }
+  active_set_ids(&ids);
   return ids;
+}
+
+void FrameRx::active_set_ids(std::vector<uint32_t>* out) const {
+  if (out == nullptr) {
+    return;
+  }
+  // Clear, not assign: the storage is kept so a per-tick caller (FcpSettle)
+  // does not allocate once every 25ms.
+  out->clear();
+  out->reserve(sets_.size());
+  for (const auto& kv : sets_) {
+    out->push_back(kv.first);
+  }
 }
 
 void FrameRx::set_event_sink(EventFn fn) { event_ = std::move(fn); }
@@ -384,13 +393,11 @@ void FrameRx::deliver_payload(const uint8_t* payload, size_t len, bool recovered
   }
   if (recovered) {
     if (late) {
-      ++late_recovered_;
       emit_event(RxEvent::kRecoveredLate, repair_ms);
     } else {
       emit_event(RxEvent::kRecovered, repair_ms);
     }
   } else if (late) {
-    ++late_data_;
     emit_event(RxEvent::kDataLate, 0);
   } else {
     emit_event(RxEvent::kDataDelivered, 0);

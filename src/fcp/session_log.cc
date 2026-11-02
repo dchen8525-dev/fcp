@@ -2,6 +2,8 @@
 
 #include <cstdio>
 
+#include "fcp/strategy.h"  // FecState and fec_state_name()
+
 namespace fcp {
 namespace {
 

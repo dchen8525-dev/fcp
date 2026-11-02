@@ -7,7 +7,6 @@
 #ifndef FCP_STRATEGY_H_
 #define FCP_STRATEGY_H_
 
-#include <cstddef>
 #include <cstdint>
 
 #include "fcp/fecstat.h"
@@ -20,9 +19,6 @@ constexpr uint8_t kMaxParity = 7;
 constexpr uint8_t kDefaultPmax = 4;
 // Target probability that a group needs no KCP retransmission (§8).
 constexpr double kTargetRecovery = 0.80;
-// Reports with fewer accounted data packets only refresh logs (spec §8 "样本").
-constexpr uint32_t kMinSamplePackets = 256;
-
 // P(X <= max_losses) for X ~ Binomial(trials, p).
 // p is clamped to [0, 1]; trials == 0 returns 1.
 double binom_cdf(unsigned max_losses, unsigned trials, double p);

@@ -117,6 +117,9 @@ class FrameRx {
   void on_datagram(const uint8_t* plaintext, size_t len, int64_t now_ms);
 
   std::vector<uint32_t> active_set_ids() const;
+  // Same list into caller-owned storage; FcpSettle::tick() uses this so the
+  // 25ms pump does not allocate whenever a set is open.
+  void active_set_ids(std::vector<uint32_t>* out) const;
   size_t active_sets() const { return sets_.size(); }
   bool view(uint32_t set_id, RxSetView* out) const;
 
@@ -133,8 +136,6 @@ class FrameRx {
   // anchor; a second consecutive one re-anchors the window.
   uint32_t ahead_dropped() const { return ahead_dropped_; }
   uint32_t late_dup() const { return late_dup_; }
-  uint32_t late_data() const { return late_data_; }
-  uint32_t late_recovered() const { return late_recovered_; }
   uint32_t data_delivered() const { return data_delivered_; }
   uint32_t recovered() const { return recovered_; }
   uint32_t decode_attempts() const { return decode_attempts_; }
@@ -212,8 +213,6 @@ class FrameRx {
   uint32_t ahead_dropped_ = 0;
   uint32_t late_dup_ = 0;
   uint32_t dup_after_recovered_ = 0;  // #31: retransmission lost the race to parity
-  uint32_t late_data_ = 0;
-  uint32_t late_recovered_ = 0;
   uint32_t data_delivered_ = 0;
   uint32_t recovered_ = 0;
   uint32_t decode_attempts_ = 0;

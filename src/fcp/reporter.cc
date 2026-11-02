@@ -4,6 +4,8 @@
 #include <cstring>
 #include <utility>
 
+#include "fcp/settle.h"
+
 namespace fcp {
 namespace {
 

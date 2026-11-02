@@ -20,16 +20,18 @@
 #include <vector>
 
 #include "fcp/fecstat.h"
-#include "fcp/settle.h"
 
 namespace fcp {
 
+// Only used through a pointer: callers that merely hold an FcpReporter
+// (session.h by value) need not pull in settle.h.
+class FcpSettle;
+
 constexpr int64_t kFecstatMinIntervalMs = 2000;
 constexpr int64_t kFecstatMaxIntervalMs = 60000;
-constexpr uint32_t kFecstatMinSamples = 256;
-constexpr uint8_t kFlgDirection = 0x01;
-constexpr uint8_t kFlgTailDropped = 0x02;
-constexpr uint8_t kFlgLateRecovery = 0x04;
+// The report cadence and the strategy's decision gate are the same §8
+// threshold; see kMinSamplePackets in fecstat.h.
+constexpr uint32_t kFecstatMinSamples = kMinSamplePackets;
 
 class FcpReporter {
  public:

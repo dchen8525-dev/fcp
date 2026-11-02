@@ -20,12 +20,12 @@
 
 #include <cstdint>
 #include <functional>
+#include <vector>
 
 #include "fcp/frame_rx.h"
 
 namespace fcp {
 
-constexpr int64_t kSettleTickMs = 25;
 constexpr int64_t kTailDropMs = 1000;
 constexpr int64_t kLateGuardMinMs = 100;
 // #29a (§14.14): raised to match the handshake backoff's RTT <= ~700ms door
@@ -134,6 +134,8 @@ class FcpSettle {
   EventObserver observer_;
   SettleCounters counters_{};
   uint32_t accounted_through_ = 0;
+  // Reused by tick() for the active set ids; see FrameRx::active_set_ids().
+  std::vector<uint32_t> tick_ids_;
 };
 
 }  // namespace fcp

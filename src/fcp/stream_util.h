@@ -1,17 +1,14 @@
-// Small helpers shared by the stream's translation units (stream.cc,
-// stream_recv.cc, stream_send.cc, stream_window.cc).
+// Small helpers shared by the stream's translation units.
 //
-// The stream is one class split across six .cc files by responsibility, so
-// anything two of them need has to live in a header rather than in a
-// per-file anonymous namespace. Nothing here is protocol-specific; the
-// wrap-safe comparisons live in seq.h.
+// The stream is one class split across stream.cc plus stream_recv.cc,
+// stream_send.cc and stream_window.cc, so anything two of them need has to
+// live in a header rather than in a per-file anonymous namespace. Nothing here
+// is protocol-specific; the wrap-safe comparisons live in seq.h.
 
 #ifndef FCP_STREAM_UTIL_H_
 #define FCP_STREAM_UTIL_H_
 
-#include <algorithm>
 #include <cstdint>
-#include <string>
 
 namespace fcp {
 namespace stream_detail {

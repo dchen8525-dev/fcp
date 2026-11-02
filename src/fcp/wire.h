@@ -28,7 +28,6 @@ constexpr uint16_t get_le16(const uint8_t* p) {
                                (static_cast<uint16_t>(p[1]) << 8));
 }
 
-constexpr size_t kLe32Len = 4;
 constexpr size_t kLe64Len = 8;
 
 constexpr uint32_t get_le32(const uint8_t* p) {

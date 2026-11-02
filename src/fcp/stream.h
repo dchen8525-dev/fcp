@@ -27,6 +27,8 @@
 #include <string>
 #include <vector>
 
+#include "fcp/defaults.h"
+
 namespace fcp {
 
 constexpr uint8_t kStreamTypeData = 1;
@@ -67,8 +69,8 @@ struct StreamConfig {
   size_t max_segment = 1336;
   // Send window. With auto_window off this is the fixed window (legacy
   // behaviour); with it on it is only the starting value -- see below.
-  size_t send_window_bytes = 256 * 1024;
-  size_t rcv_buf_bytes = 256 * 1024;
+  size_t send_window_bytes = kDefaultSendWindowBytes;
+  size_t rcv_buf_bytes = kDefaultRcvBufBytes;
   // Window autotune. The send window starts at send_window_bytes and grows
   // while the stream is its own bottleneck: doubling per RTT until ssthresh, then
   // one segment per RTT after that. A credible epoch (enough samples to say
@@ -95,8 +97,8 @@ struct StreamConfig {
   // own buffer and the sender stays peer-limited) but the extra memory is
   // committed per connection by arrivals, not reserved.
   bool auto_window = false;
-  size_t window_min_bytes = 64 * 1024;
-  size_t window_max_bytes = 1024 * 1024;
+  size_t window_min_bytes = kDefaultWindowMinBytes;
+  size_t window_max_bytes = kDefaultWindowMaxBytes;
   // Standing-queue allowance: an epoch whose minimum RTT is this far above the
   // historical minimum holds the window; two consecutive epochs at twice this
   // shrink it. Kept comfortably below the Session §8 guardrail (srtt -
@@ -108,7 +110,7 @@ struct StreamConfig {
   int64_t rto_max_ms = 5000;
   // Teardown after this long with no inbound segment. Own traffic does not
   // count, so a dead peer is detected by the idle clock, not by an empty log.
-  int64_t idle_timeout_ms = 300000;
+  int64_t idle_timeout_ms = kDefaultIdleTimeoutMs;
   // Zero-window probing: resend one segment this often while the peer advertises
   // no room and we have nothing in flight to be acked.
   int64_t probe_ms = 1000;

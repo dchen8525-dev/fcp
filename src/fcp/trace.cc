@@ -253,7 +253,7 @@ bool decode_trace_line(const std::string& line, TraceEntry* e) {
     return false;
   }
   c.target_recovery = field_or(fields, "c_target", kTargetRecovery);
-  c.budget = field_or(fields, "c_budget", 0.50);
+  c.budget = field_or(fields, "c_budget", kDefaultFecBudget);
 
   if (!field_in_range(fields, "now", -9007199254740992.0, 9007199254740992.0, 0.0, &v)) {
     return false;

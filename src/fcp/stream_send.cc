@@ -13,8 +13,8 @@
 
 namespace fcp {
 
-void Stream::handle_ack(const uint8_t* seg, size_t len, int64_t now_ms) {
-  (void)len;
+// `len` is validated by on_segment() (>= kStreamAckLen) and never read here.
+void Stream::handle_ack(const uint8_t* seg, size_t /*len*/, int64_t now_ms) {
   const uint32_t cum = get_le32(seg + 1);
   // #30 adversarial hardening, corrected by A4: the bound must be the highest
   // byte that actually reached the wire, not snd_nxt_ (segmentation runs ahead

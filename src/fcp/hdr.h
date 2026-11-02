@@ -14,6 +14,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "fcp/seq.h"
+
 namespace fcp {
 
 constexpr size_t kFecHdrLen = 6;
@@ -36,12 +38,6 @@ constexpr uint8_t pack_type_k(uint8_t k, uint8_t j, uint8_t type) {
   return static_cast<uint8_t>(((k & 0x07) << 5) | ((j & 0x07) << 2) | (type & 0x03));
 }
 
-constexpr void unpack_type_k(uint8_t type_k, uint8_t* k, uint8_t* j, uint8_t* type) {
-  *k = static_cast<uint8_t>(type_k >> 5);
-  *j = static_cast<uint8_t>((type_k >> 2) & 0x07);
-  *type = static_cast<uint8_t>(type_k & 0x03);
-}
-
 constexpr SymbolType hdr_type(uint8_t type_k) {
   return static_cast<SymbolType>(type_k & 0x03);
 }
@@ -60,13 +56,20 @@ constexpr uint8_t hdr_j(uint8_t type_k) {
   return static_cast<uint8_t>((type_k >> 2) & 0x07);
 }
 
-// Spec §14.5: set_id ordering is a modular half-window test so every u32
-// comparison keeps working across the wrap. True when b is strictly after a
-// (b - a mod 2^32 is in [1, 2^31)).
-constexpr bool set_id_after(uint32_t a, uint32_t b) {
-  const uint32_t delta = static_cast<uint32_t>(b - a);
-  return delta != 0 && delta < 0x80000000u;
+// All three header accessors at once. It has no production callers; hdr_test's
+// round-trip uses it as the second spelling that keeps hdr_k/hdr_j/hdr_type
+// honest, so it is defined in terms of them rather than re-decoding the byte.
+constexpr void unpack_type_k(uint8_t type_k, uint8_t* k, uint8_t* j, uint8_t* type) {
+  *k = hdr_k(type_k);
+  *j = hdr_j(type_k);
+  *type = static_cast<uint8_t>(hdr_type(type_k));
 }
+
+// Spec §14.5: set_id ordering is a modular half-window test so every u32
+// comparison keeps working across the wrap. True when b is strictly after a.
+// The rule itself lives in seq.h (shared with the stream's byte offsets); the
+// name stays here because ten call sites read better with it.
+constexpr bool set_id_after(uint32_t a, uint32_t b) { return seq_after(b, a); }
 
 void pack_hdr(const FecHdr& hdr, uint8_t out[kFecHdrLen]);
 

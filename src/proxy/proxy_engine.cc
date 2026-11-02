@@ -476,6 +476,20 @@ void ProxyEngine::fill_session_config(SessionConfig* sc, uint64_t conn_id) const
   sc->sn_of = nullptr;
 }
 
+// Same contract as fill_session_config, for the stream half: every
+// StreamConfig field the engine owns a copy of in EngineConfig. The caller
+// keeps what is per-connection (the prewarm profile, which apply_prewarm
+// writes into Conn::stream_cfg at creation) and fills max_segment afterwards,
+// since it needs the negotiated MTU.
+void ProxyEngine::fill_stream_config(StreamConfig* sc) const {
+  sc->send_window_bytes = cfg_.send_window_bytes;
+  sc->rcv_buf_bytes = cfg_.rcv_buf_bytes;
+  sc->auto_window = cfg_.auto_window;
+  sc->window_min_bytes = cfg_.window_min_bytes;
+  sc->window_max_bytes = cfg_.window_max_bytes;
+  sc->idle_timeout_ms = cfg_.idle_timeout_ms;
+}
+
 // The Session's three host hooks: every one of them re-resolves the Conn by id
 // instead of capturing it, because a callback can fire while the table entry is
 // being replaced (find() returns nullptr, and the hook is a no-op). Both ends
@@ -585,13 +599,8 @@ ProxyEngine::Conn* ProxyEngine::create_server_conn(uint64_t peer, const uint8_t*
 
 void ProxyEngine::attach_stream(Conn& conn) {
   StreamConfig sc = conn.stream_cfg;
+  fill_stream_config(&sc);
   sc.max_segment = conn.session->mtu_limits().payload_max;
-  sc.send_window_bytes = cfg_.send_window_bytes;
-  sc.rcv_buf_bytes = cfg_.rcv_buf_bytes;
-  sc.auto_window = cfg_.auto_window;
-  sc.window_min_bytes = cfg_.window_min_bytes;
-  sc.window_max_bytes = cfg_.window_max_bytes;
-  sc.idle_timeout_ms = cfg_.idle_timeout_ms;
   conn.stream_cfg = sc;
 
   const uint64_t id = conn.id;

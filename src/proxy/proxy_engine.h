@@ -267,6 +267,10 @@ class ProxyEngine {
   // one direction. A SessionConfig field added later goes here, never into a
   // create_*_conn().
   void fill_session_config(SessionConfig* sc, uint64_t conn_id) const;
+  // The matching single entry point for StreamConfig, applied in
+  // attach_stream(): a StreamConfig field sourced from EngineConfig goes
+  // here, never into a create_*_conn() or a hand-written copy in attach.
+  void fill_stream_config(StreamConfig* sc) const;
   std::unique_ptr<Session> make_session(uint64_t conn_id, const SessionConfig& sc);
 
   bool create_client_conn(uint64_t conn, uint64_t peer, int64_t now_ms);

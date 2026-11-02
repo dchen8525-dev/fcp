@@ -3,17 +3,11 @@
 #include <algorithm>
 #include <string>
 
+#include "fcp/seq.h"
 #include "fcp/wire.h"
 
 namespace fcp {
 namespace {
-
-// Sequence numbers are u32 byte offsets that wrap on long-lived connections
-// (4 GiB is ~27 minutes at 20 Mbps), so every comparison is modular, same
-// rule as set_id ordering in spec §14.5.
-bool seq_after(uint32_t a, uint32_t b) { return static_cast<int32_t>(a - b) > 0; }
-bool seq_at_or_after(uint32_t a, uint32_t b) { return static_cast<int32_t>(a - b) >= 0; }
-int64_t seq_dist(uint32_t a, uint32_t b) { return static_cast<int32_t>(a - b); }
 
 int64_t clamp_ms(int64_t v, int64_t lo, int64_t hi) {
   return v < lo ? lo : (v > hi ? hi : v);

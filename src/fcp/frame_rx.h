@@ -149,30 +149,26 @@ class FrameRx {
   uint32_t retired_dropped() const { return retired_dropped_; }
 
  private:
-  struct RxSet {
-    uint32_t set_id = 0;
-    SetPhase phase = SetPhase::kActive;
-    uint8_t k = 0;
-    bool k_known = false;
-    uint8_t n = 0;
-    bool n_known = false;
-    uint8_t max_data_index = 0;
-    bool saw_parity = false;
-    bool has_any_symbol = false;
-    size_t symbol_count = 0;
-    size_t symbol_max = 0;
-    int64_t t_first_ms = 0;
-    int64_t tombstone_until_ms = 0;
-    uint32_t decode_attempts = 0;
-    std::bitset<kMaxS> orig_mask;
-    std::bitset<kMaxS> recov_mask;
-    std::bitset<kMaxS> parity_mask;
+  // The published fields are RxSetView, so the two spellings cannot drift
+  // apart; the private extras append after them and view() slices the base
+  // off. sizeof/alignof pinned at the pre-split values (MSVC x64, measured on
+  // both spellings): the base is byte-identical to the old flattened field
+  // list, so inheriting adds no padding.
+  struct RxSet : RxSetView {
     // Indices whose reconstruction failed the structural check. A23 allows
     // retries, but each index must be counted once: otherwise a single bad
     // set inflates struct_fail by the number of later parity symbols.
     std::bitset<kMaxS> bad_recon;
     std::array<std::vector<uint8_t>, kMaxS> symbols;
   };
+  // Pre-split these two fields were flattened into the same struct as the
+  // view fields (152 + 32 + 8192 = 8376 with a debug STL, 6328 with a release
+  // one); the identity below says the inheritance reproduces that exactly, so
+  // RxSet stays padding-free and sizeof(RxSet) is unchanged by the split.
+  static_assert(sizeof(RxSet) == sizeof(RxSetView) + sizeof(std::bitset<kMaxS>) +
+                                   sizeof(std::array<std::vector<uint8_t>, kMaxS>) &&
+                    alignof(RxSet) == alignof(RxSetView),
+                "RxSet must be RxSetView plus its private fields, with no padding");
 
   RxSet& get_or_create(uint32_t set_id, int64_t now_ms);
   bool note_k(RxSet* set, uint8_t k);

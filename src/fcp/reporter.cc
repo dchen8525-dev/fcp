@@ -17,6 +17,28 @@ uint16_t percentile(const std::vector<uint16_t>& sorted, unsigned pct) {
   return sorted[rank - 1];
 }
 
+// The mechanical part of SettleCounters -> FecstatPacket: every field whose
+// name the two structs share, so a new interval counter is wired in one place
+// instead of two that can silently drift apart. Not template metaprogramming:
+// the packet also carries non-counter fields (magic, flags, derived ppm/KL
+// values) and only a handful of counters, so a plain function is clearer.
+void copy_settle_counters(const SettleCounters& c, FecstatPacket* p) {
+  p->sets_expected = c.sets_expected;
+  p->data_expected = c.data_expected;
+  p->data_rx_orig = c.data_rx_orig;
+  p->data_recovered_dl = c.data_recovered_dl;
+  p->data_recovered_late = c.data_recovered_late;
+  p->data_delivered = c.data_delivered;
+  p->parity_rx = c.parity_rx;
+  p->parity_expected = c.parity_expected;
+  p->sets_k_unknown = c.sets_k_unknown;
+  p->sets_full = c.sets_full;
+  p->late_dup = c.late_dup;
+  p->sets_tail_dropped = c.sets_tail_dropped;
+  p->data_late_rx = c.data_late_rx;
+  p->sets_partial = c.sets_partial;
+}
+
 }  // namespace
 
 FcpReporter::FcpReporter(FcpSettle* settle, SendFn send)
@@ -112,20 +134,7 @@ void FcpReporter::report(int64_t now_ms, int64_t elapsed_ms) {
       packet.flg |= kFlgLateRecovery;
     }
     packet.accounted_through_set_id = settle_->accounted_through_set_id();
-    packet.sets_expected = c.sets_expected;
-    packet.data_expected = c.data_expected;
-    packet.data_rx_orig = c.data_rx_orig;
-    packet.data_recovered_dl = c.data_recovered_dl;
-    packet.data_recovered_late = c.data_recovered_late;
-    packet.data_delivered = c.data_delivered;
-    packet.parity_rx = c.parity_rx;
-    packet.parity_expected = c.parity_expected;
-    packet.sets_k_unknown = c.sets_k_unknown;
-    packet.sets_full = c.sets_full;
-    packet.late_dup = c.late_dup;
-    packet.sets_tail_dropped = c.sets_tail_dropped;
-    packet.data_late_rx = c.data_late_rx;
-    packet.sets_partial = c.sets_partial;
+    copy_settle_counters(c, &packet);
     // M3 R(k) ledger (M3控制设计.md §1.2) with the #26 burst metric in
     // the ledger_meta high half (0.01 nat, saturating).
     if (c.ledger_groups > 0) {

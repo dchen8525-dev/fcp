@@ -303,24 +303,9 @@ bool FrameRx::view(uint32_t set_id, RxSetView* out) const {
   if (it == sets_.end()) {
     return false;
   }
-  const RxSet& s = it->second;
-  out->set_id = s.set_id;
-  out->phase = s.phase;
-  out->k = s.k;
-  out->k_known = s.k_known;
-  out->n = s.n;
-  out->n_known = s.n_known;
-  out->max_data_index = s.max_data_index;
-  out->saw_parity = s.saw_parity;
-  out->has_any_symbol = s.has_any_symbol;
-  out->symbol_count = s.symbol_count;
-  out->symbol_max = s.symbol_max;
-  out->t_first_ms = s.t_first_ms;
-  out->tombstone_until_ms = s.tombstone_until_ms;
-  out->decode_attempts = s.decode_attempts;
-  out->orig_mask = s.orig_mask;
-  out->recov_mask = s.recov_mask;
-  out->parity_mask = s.parity_mask;
+  // Slicing copy: RxSet derives from RxSetView, so this carries exactly the
+  // published fields and nothing else.
+  *out = it->second;
   return true;
 }
 

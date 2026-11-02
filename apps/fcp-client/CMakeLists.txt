@@ -31,7 +31,7 @@ target_link_libraries(fcp_client PRIVATE fcp fcp_proxy_core Qt6::Widgets Qt6::Ne
 # the whole target is compiled with QT_NO_KEYWORDS (Q_SIGNALS/Q_EMIT instead).
 target_compile_definitions(fcp_client PRIVATE QT_NO_KEYWORDS)
 
-# main.cc 把它塞进 QApplication::setApplicationVersion（安装包/关于对话框用）。
+# main.cc 把它塞进 QApplication::setApplicationVersion（发布物/关于对话框用）。
 target_compile_definitions(fcp_client PRIVATE FCP_APP_VERSION="${FCP_APP_VERSION}")
 
 if(WIN32)

@@ -48,7 +48,6 @@ class ProxyHost : public QObject {
     QString listen = QStringLiteral("127.0.0.1");
     quint16 listen_port = 1080;
     int mtu = 1400;
-    int window_kib = 0;     // 0 = engine default (256 KiB)
     int pinned_k = -1;      // -1 = adaptive
     bool prewarm = true;
     // #35: M3 controller passthrough — the byte-budget ceiling and the
@@ -99,6 +98,10 @@ class ProxyHost : public QObject {
   size_t appSend(uint64_t conn, const uint8_t* data, size_t len);
   void appClose(uint64_t conn);
   void wireSend(uint64_t peer, const uint8_t* wire, size_t len);
+  // Sends one datagram to server_addr_ and reports the first failure of the
+  // run. A UDP send can fail (no route, message too big); retransmission hides
+  // it, but an entirely failing tunnel looked identical to a silent peer.
+  void sendWireDatagram(const uint8_t* wire, size_t len);
   void dial(uint64_t conn, const fcp::ProxyTarget& target);
   std::string peerKey(uint64_t peer);
 
@@ -141,6 +144,7 @@ class ProxyHost : public QObject {
   quint64 resolve_gen_ = 0;  // P4-3: only the newest start() owns DNS results
 
   std::vector<std::vector<uint8_t>> wire_backlog_;  // before the address is known
+  bool wire_send_warned_ = false;  // one UDP send failure logged per run
 
   State state_ = State::kIdle;
   fcp::ProxyEngine::Counters last_counters_;

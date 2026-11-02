@@ -56,6 +56,11 @@ struct SettleCounters {
   uint32_t data_recovered_dl = 0;
   uint32_t data_recovered_late = 0;
   uint32_t data_late_rx = 0;
+  // Late originals that were never part of data_expected: the set accounted
+  // with no symbols (k unknown) or the index was beyond its accounted code
+  // length. Real deliveries, but counted like tail deliveries: they enter
+  // delivered_le_sum, never the expected/delivered identity.
+  uint32_t data_late_unexpected = 0;
   uint32_t data_delivered = 0;
   uint32_t parity_rx = 0;
   uint32_t parity_expected = 0;

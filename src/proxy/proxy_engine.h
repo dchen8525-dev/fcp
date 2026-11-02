@@ -68,6 +68,9 @@ struct EngineConfig {
   // the calibration input for tools/fcp_replay.
   std::string trace_prefix;
   size_t send_window_bytes = kDefaultSendWindowBytes;
+  // True when the start was set explicitly (CLI --window / GUI spinbox), which
+  // keeps the prewarm cache from replacing it with the peer's converged value.
+  bool window_explicit = false;
   size_t rcv_buf_bytes = kDefaultRcvBufBytes;
   // Window autotune (StreamConfig::auto_window): the stream's send window
   // starts at send_window_bytes, grows while the stream is its own bottleneck

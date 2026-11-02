@@ -229,10 +229,24 @@ void TestKUnknownAndUntrusted() {
   CHECK_EQ(f.c().data_rx_orig, 3u);
   CHECK(f.settle.untrusted());  // 4 unknown vs 1 expected
 
+  // A delayed original for one of the k-unknown placeholders. It is delivered
+  // during the tombstone, but that set contributed 0 to data_expected, so it
+  // must not enter data_late_rx: identity_ok() would then be 4 == 3.
+  f.feed(2, 0, fcp::pack_type_k(1, 0, 0), DataSymbol(700), 150);
+  CHECK_EQ(f.c().data_delivered, 5u);  // 3 from set 0, 1 from set 5, 1 late
+  CHECK_EQ(f.c().data_late_unexpected, 1u);
+  CHECK_EQ(f.c().data_late_rx, 0u);
+  CHECK(f.settle.identity_ok());
+  // delivered_le_sum only closes once set 5's tail drop is accounted below.
+
   // Set 5 never closed: no parity, not superseded -> tail drop at 1s.
   f.settle.tick(1000, 100);
   CHECK_EQ(f.c().sets_tail_dropped, 1u);
   CHECK_EQ(f.rx.active_sets(), 0u);
+  CHECK_EQ(f.c().tail_delivered, 1u);
+  // The unexpected-late delivery is in the same "delivered, not expected"
+  // bucket, so the sum now covers every delivered payload.
+  CHECK(f.settle.delivered_le_sum());
   // Tail-dropped sets are never accounted, so the key stops at the placeholders.
   CHECK_EQ(f.settle.accounted_through_set_id(), 4u);
 }

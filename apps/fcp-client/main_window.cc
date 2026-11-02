@@ -897,30 +897,6 @@ void MainWindow::saveSettings() {
   settings.setValue("proxy/trace_prefix", proxyTraceEdit_->text().trimmed());
 }
 
-void MainWindow::applyArgumentOverrides() {
-  for (const QString& arg : QCoreApplication::arguments()) {
-    if (arg.startsWith("--host=")) {
-      hostEdit_->setText(arg.mid(7));
-    } else if (arg.startsWith("--port=")) {
-      portSpin_->setValue(arg.mid(7).toInt());
-    } else if (arg.startsWith("--mbps=")) {
-      mbpsSpin_->setValue(arg.mid(7).toDouble());
-    } else if (arg.startsWith("--proxy-host=")) {
-      proxyHostEdit_->setText(arg.mid(13));
-    } else if (arg.startsWith("--proxy-port=")) {
-      proxyPortSpin_->setValue(arg.mid(13).toInt());
-    } else if (arg.startsWith("--proxy-listen=")) {
-      proxyListenSpin_->setValue(arg.mid(15).toInt());
-    } else if (arg.startsWith("--proxy-psk=")) {
-      proxyPskEdit_->setText(arg.mid(12));
-    } else if (arg.startsWith("--proxy-fec-budget=")) {
-      proxyBudgetSpin_->setValue(arg.mid(19).toDouble());
-    } else if (arg.startsWith("--proxy-trace=")) {
-      proxyTraceEdit_->setText(arg.mid(14));
-    }
-  }
-}
-
 BenchEngine::Options MainWindow::collectOptions(bool* ok, QString* error) const {
   BenchEngine::Options options;
   options.host = hostEdit_->text().trimmed();

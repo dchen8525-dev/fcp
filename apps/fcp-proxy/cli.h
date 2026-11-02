@@ -28,8 +28,31 @@ struct ProxyArgs {
   ReactorOptions ro;
   bool help = false;
   bool version = false;  // --version：打印发布版本后退出（安装包自检/排障用）
+  // An explicit --mtu wins over the interface-derived default applied just
+  // before startup; parsing must not distinguish the two otherwise.
+  bool mtu_explicit = false;
   std::vector<std::string> notes;
 };
+
+// Process ceilings used by ResourceNotes(). -1 means the platform has no
+// equivalent (Windows) or the value is unlimited.
+struct ResourceLimits {
+  long open_files = -1;
+  long address_space = -1;
+};
+
+// Worst-case resource arithmetic, pure so tests can pin it without depending
+// on the host's limits. Returns human-readable warning lines (empty when the
+// configuration fits). Called by run_proxy after parsing.
+std::vector<std::string> ResourceNotes(EngineRole role, const EngineConfig& ec,
+                                       const ResourceLimits& limits);
+
+// Lowers `configured` so the IP packet stays within `interface_mtu`. Both are
+// IP packet sizes (the configured budget already includes IP+UDP headers, and
+// the interface MTU is the largest IP packet it carries), so this is a plain
+// min. Never raises the configured value and returns it unchanged when the
+// interface is too small to produce a valid MTU.
+uint16_t MtuForInterface(uint16_t configured, size_t interface_mtu);
 
 // Pure argv parsing: no I/O, no engine construction, no process exit. Returns
 // false on a usage error with a one-line reason in *error (the same text

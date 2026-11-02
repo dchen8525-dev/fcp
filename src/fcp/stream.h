@@ -70,6 +70,18 @@ struct StreamConfig {
   // Send window. With auto_window off this is the fixed window (legacy
   // behaviour); with it on it is only the starting value -- see below.
   size_t send_window_bytes = kDefaultSendWindowBytes;
+  // Set when send_window_bytes came from an explicit choice (a CLI --window or
+  // the GUI spinbox) rather than the default. The prewarm cache may replace a
+  // default start with the peer's converged window; it never overrides an
+  // explicit one.
+  bool send_window_explicit = false;
+  // Floor for the loss-driven decrease in auto mode (decision #33). Normally
+  // the operator's --window, which is not necessarily the window the stream
+  // starts at: the prewarm prior may raise the start above it. Without this
+  // field the floor would be the seeded start, so a warm connection could
+  // never shrink back to the value the operator asked for. 0 means "use the
+  // start window", which is the behaviour when no prior was applied.
+  size_t loss_floor_bytes = 0;
   size_t rcv_buf_bytes = kDefaultRcvBufBytes;
   // Window autotune. The send window starts at send_window_bytes and grows
   // while the stream is its own bottleneck: doubling per RTT until ssthresh, then

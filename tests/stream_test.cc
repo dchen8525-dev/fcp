@@ -146,6 +146,10 @@ class Fixture {
   // between ticks is too late, because a synchronous loopback delivers a whole
   // window inside one flush before the receive buffer ever sees the debt.
   std::function<void(int index)> on_deliver;
+  // Called from inside an endpoint's send callback, after the segment is
+  // logged. A synchronous host (in-process loopback) is modelled by feeding an
+  // ACK from here: it re-enters the stream while pump() is still on the stack.
+  std::function<void(int index, const std::vector<uint8_t>& seg)> on_send;
 
   void cut_all() { killer = [](const Packet&) { return true; }; }
 
@@ -253,6 +257,9 @@ class Fixture {
           // bytes, so the second push must not duplicate them.
           ends_[index].sent.emplace_back(seg, seg + len);
           wire_.push_back(Packet{index, peer, ends_[index].sent.back()});
+          if (on_send) {
+            on_send(index, ends_[index].sent.back());
+          }
         },
         [this, index](const uint8_t* bytes, size_t len) {
           std::vector<uint8_t>& d = ends_[index].delivered;
@@ -1509,6 +1516,89 @@ void TestAutoWindowHoldsAtTheStartWindow() {
   CHECK(f.b().delivered == src);
 }
 
+// The prewarm prior raises the start window above the operator's --window; the
+// loss floor must stay at the operator's value (StreamConfig::loss_floor_bytes),
+// otherwise a warm connection that hits loss freezes at the prior instead of
+// shrinking to the configured start (decision #37, on top of #33).
+void TestAutoWindowLossFloorFollowsConfiguredStart() {
+  StreamConfig c = AutoCfg();
+  c.send_window_bytes = kAutoCeil;   // seeded by the previous session
+  c.loss_floor_bytes = kAutoFloor;   // what --window actually asked for
+  Fixture f(c);
+  f.cut_all();
+  CHECK_EQ(f.sa().send_window(), kAutoCeil);
+  CHECK_EQ(f.sa().loss_floor(), kAutoFloor);
+
+  DelayedPath path(f, 100);
+  const std::vector<uint8_t> src = MakeBytes(4 * 1024 * 1024, 43);
+  Applier w(f.sa(), src);
+  path.drop_acks();
+  for (int round = 0; round < 1600; ++round) {
+    w.push();
+    path.run(25);
+  }
+  // The old floor (the seeded start) would leave this at kAutoCeil.
+  CHECK_EQ(f.sa().send_window(), kAutoFloor);
+  CHECK(f.sa().rto_loss_events() > 0u);
+
+  // Not a dead end: ACKs resume, the window reopens and the data is intact.
+  path.resume_acks();
+  for (int round = 0; round < 4000 && w.off < src.size(); ++round) {
+    w.push();
+    path.run(25);
+  }
+  path.run(3000);
+  CHECK_EQ(w.off, src.size());
+  CHECK(f.sa().send_window() > kAutoFloor);
+  CHECK(f.b().delivered == src);
+}
+
+// A synchronous host can ACK from inside the send callback, which pops the
+// just-sent segment and re-enters pump() while the outer pump is still walking
+// tx_. That reindexes the queue under the scan, so the scan must relocate the
+// segment it just emitted instead of trusting an index: the held-back segment
+// has to stay queued and go out exactly once, in order, when the window opens.
+void TestSynchronousAckDuringPumpKeepsQueueConsistent() {
+  StreamConfig c = DefaultCfg();
+  c.max_segment = 106;       // 100-byte payloads
+  c.send_window_bytes = 250; // room to queue both segments after the reopen
+  c.rcv_buf_bytes = 80;      // A's guess of the peer window: nothing fits, so A probes
+  StreamConfig peer = c;
+  peer.rcv_buf_bytes = 250;  // the peer really does have room for one segment
+  Fixture f(c, peer);
+  bool injected = false;
+  f.on_send = [&](int index, const std::vector<uint8_t>& seg) {
+    if (injected || !IsData(seg)) {
+      return;
+    }
+    injected = true;
+    const uint32_t off = rd32(seg.data() + 1);
+    const uint32_t end = off + static_cast<uint32_t>(seg.size() - fcp::kStreamDataHdrLen);
+    f.feed(index, MakeAck(end, 80, 0, 0));
+  };
+
+  const std::vector<uint8_t> src = MakeBytes(200, 77);
+  CHECK_EQ(f.sa().write(src.data(), src.size()), 200u);
+  f.tick(25);
+  CHECK(injected);
+  const auto after_first = f.data_of(kA);
+  CHECK_EQ(after_first.size(), 1u);  // the zero-window probe
+  CHECK_EQ(rd32(after_first[0].data() + 1), 0u);
+  // The ACK was consumed from inside the callback; the second segment is held
+  // back, not lost and not sent out of order.
+  CHECK_EQ(f.sa().unacked_segs(), 1u);
+
+  // Reopening the peer window releases the held-back segment in order.
+  f.feed(kA, MakeAck(100, 250, 0, 0));
+  f.tick(50);
+  const auto after_reopen = f.data_of(kA);
+  CHECK_EQ(after_reopen.size(), 2u);
+  CHECK_EQ(rd32(after_reopen[0].data() + 1), 0u);
+  CHECK_EQ(rd32(after_reopen[1].data() + 1), 100u);
+  f.drain();
+  CHECK(f.b().delivered == src);
+}
+
 // auto_window off is the legacy fixed window: no growth, no probes of the path.
 void TestFixedWindowUnchanged() {
   Fixture f;
@@ -1780,6 +1870,8 @@ int main() {
   TestAutoWindowGrowsToCeiling();
   TestAutoWindowCutsOnLoss();
   TestAutoWindowHoldsAtTheStartWindow();
+  TestAutoWindowLossFloorFollowsConfiguredStart();
+  TestSynchronousAckDuringPumpKeepsQueueConsistent();
   TestFixedWindowUnchanged();
   TestAutoWindowRaisesRcvCap();
   TestAutoWindowGrowsPastInflatedTarget();

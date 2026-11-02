@@ -1,6 +1,7 @@
 #include "fcp/frame_rx.h"
 
 #include <cstring>
+#include <functional>
 #include <vector>
 
 #include "fcp/frame_tx.h"
@@ -42,12 +43,20 @@ struct Fixture {
   uint8_t d;
   std::vector<std::vector<uint8_t>> delivered;
   std::vector<std::vector<uint8_t>> oobs;
+  // Runs inside the deliver callback, i.e. while FrameRx is still processing
+  // the symbol. A synchronous host uses this hook to model re-entry.
+  std::function<void()> on_deliver;
   fcp::FrameRx rx;
 
   explicit Fixture(uint8_t d_in = 10, uint8_t p_in = 3)
       : d(d_in),
         rx(d_in, p_in,
-           [this](const uint8_t* p, size_t len) { delivered.emplace_back(p, p + len); },
+           [this](const uint8_t* p, size_t len) {
+             delivered.emplace_back(p, p + len);
+             if (on_deliver) {
+               on_deliver();
+             }
+           },
            [this](const uint8_t* m, size_t len, int64_t) { oobs.emplace_back(m, m + len); },
            &SnFnAdapter) {}
 
@@ -480,6 +489,43 @@ void TestCapacityEviction() {
   CHECK(f.rx.view(256, &v));
 }
 
+// A synchronous host delivers re-entrantly from inside the deliver callback.
+// With the table full, the eviction path used to pick the lowest id — which
+// could be the very set whose symbol was still on the stack — freeing the
+// RxSet that try_decode dereferenced on return. Pinning the set under
+// processing makes the next-oldest set the victim instead.
+void TestReentrantDeliveryCannotEvictTheCurrentSet() {
+  Fixture f(10, 3);
+  bool armed = false;
+  int reentries = 0;
+  f.on_deliver = [&]() {
+    if (!armed) {
+      return;
+    }
+    armed = false;
+    ++reentries;
+    // Fresh set id while sets_ is at kMaxActiveSets: capacity eviction runs
+    // from inside the outer on_datagram.
+    f.feed(256, 0, fcp::pack_type_k(1, 0, 0), {2, 0});
+  };
+  // Fill 1..255, then make set 0 the oldest entry and the one being decoded.
+  for (uint32_t sid = 1; sid <= 255; ++sid) {
+    f.feed(sid, 0, fcp::pack_type_k(1, 0, 0), {2, 0});
+  }
+  CHECK_EQ(f.rx.active_sets(), 255u);
+  armed = true;
+  f.feed(0, 0, fcp::pack_type_k(1, 0, 0), {2, 0});
+  CHECK_EQ(reentries, 1);
+  CHECK_EQ(f.rx.active_sets(), 256u);  // still bounded
+
+  fcp::RxSetView v;
+  CHECK(f.rx.view(0, &v));     // the set being processed survived
+  CHECK(!f.rx.view(1, &v));    // the oldest unpinned set was evicted instead
+  CHECK(f.rx.view(256, &v));
+  CHECK_EQ(f.rx.tail_dropped(), 1u);
+  CHECK_EQ(f.rx.data_delivered(), 257u);
+}
+
 void TestZeroK() {
   std::vector<std::vector<uint8_t>> segs;
   for (uint32_t i = 0; i < 10; ++i) {
@@ -774,6 +820,7 @@ int main() {
   TestStaleAnchor();
   TestMalformedDoesNotMoveAnchor();
   TestCapacityEviction();
+  TestReentrantDeliveryCannotEvictTheCurrentSet();
   TestZeroK();
   TestDupAfterRecovered();
   TestKClampedToNegotiatedP();

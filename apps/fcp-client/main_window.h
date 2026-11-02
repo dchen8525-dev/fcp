@@ -26,8 +26,6 @@ class MainWindow : public QMainWindow {
   explicit MainWindow(QWidget* parent = nullptr);
   ~MainWindow() override;
 
-  void applyArgumentOverrides();
-
  public Q_SLOTS:
   void startTest();
   void stopTest();

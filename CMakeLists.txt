@@ -135,9 +135,10 @@ if(FCP_BUILD_APP)
   add_subdirectory(apps/fcp-client)
 endif()
 
-# 发布打包（Linux deb）：只有同时构建代理 CLI 时才有意义 —— Windows 侧走
-# Inno Setup，由 .github/workflows/release.yml 直接组装，不经过 CPack。
-# 该文件自身也会再判一次平台与开关，这里保留条件只为让"为什么没生成 deb"显式。
+# 发布打包（Linux 服务端 deb）：只有同时构建代理 CLI 时才有意义 —— Windows
+# Windows 单文件 exe 与 Linux AppImage 由 scripts/release_build_*.{ps1,sh} 组装，不经过
+# CPack。该文件自身也会再判一次平台与开关，这里保留条件只为让"为什么没生成
+# deb"显式。
 if(FCP_BUILD_PROXY)
   include(cmake/FCPPackaging.cmake)
 endif()

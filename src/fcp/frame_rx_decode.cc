@@ -103,8 +103,11 @@ void FrameRx::try_decode(RxSet* set, int64_t now_ms) {
     const int64_t waited = now_ms - set->t_first_ms;
     const uint32_t repair_ms = static_cast<uint32_t>(
         std::clamp<int64_t>(waited, 0, static_cast<int64_t>(0xFFFFFFFF)));
+    // Recovered-late deliveries are already outside the expected identity
+    // (they are counted in delivered_le_sum only), so the unexpected flag only
+    // matters for originals.
     deliver_payload(s.data() + 2, declared - 2, true,
-                    set->phase == SetPhase::kAccounted, now_ms, repair_ms);
+                    set->phase == SetPhase::kAccounted, false, now_ms, repair_ms);
   }
 }
 

@@ -188,6 +188,13 @@ void FcpSettle::on_event(RxEvent event, uint32_t value) {
       ++counters_.data_delivered;
       ++counters_.data_late_rx;
       break;
+    case RxEvent::kDataLateUnexpected:
+      // Never part of data_expected (k-unknown set or an index past the
+      // accounted code length), so it must not enter data_late_rx: the
+      // identity would then exceed expected by one per such delivery.
+      ++counters_.data_delivered;
+      ++counters_.data_late_unexpected;
+      break;
     case RxEvent::kDataDuplicate:
       ++counters_.late_dup;
       break;
@@ -257,7 +264,8 @@ bool FcpSettle::identity_ok() const {
 bool FcpSettle::delivered_le_sum() const {
   const int64_t sum = static_cast<int64_t>(counters_.data_rx_orig) +
                       counters_.data_recovered_dl + counters_.data_recovered_late +
-                      counters_.data_late_rx + counters_.tail_delivered;
+                      counters_.data_late_rx + counters_.data_late_unexpected +
+                      counters_.tail_delivered;
   return static_cast<int64_t>(counters_.data_delivered) <= sum;
 }
 

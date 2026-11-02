@@ -13,9 +13,14 @@ target_link_libraries(fcp-proxy-client PRIVATE fcp_proxy_core Threads::Threads)
 add_executable(fcp-proxy-server main_server.cc cli.cc reactor.cc)
 target_link_libraries(fcp-proxy-server PRIVATE fcp_proxy_core Threads::Threads)
 
+# tools/cli_parse.h: the argv splitting and range checks shared with the tools.
+target_include_directories(fcp-proxy-client PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../tools)
+target_include_directories(fcp-proxy-server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../tools)
+
 if(WIN32)
-  target_link_libraries(fcp-proxy-client PRIVATE ws2_32)
-  target_link_libraries(fcp-proxy-server PRIVATE ws2_32)
+  # iphlpapi: the startup MTU default reads the local interface table.
+  target_link_libraries(fcp-proxy-client PRIVATE ws2_32 iphlpapi)
+  target_link_libraries(fcp-proxy-server PRIVATE ws2_32 iphlpapi)
 endif()
 
 # deb 包里只有这两个可执行文件（packaging/debian 的 spec），别的一个都不装：

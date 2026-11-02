@@ -2,14 +2,16 @@ name: release
 
 # 打 tag 即发布：`git tag v0.0.1 && git push origin v0.0.1`
 #
-# 产出两件发布物，挂在同一条 GitHub Release 上：
-#   * fcp-proxy_<版本>_<arch>.deb         Ubuntu 服务端（同包带 client、systemd unit、conffile）
-#   * FCP-Client-<版本>-win64-setup.exe   Windows 客户端（Qt GUI 安装包，Inno Setup）
+# 产出三件发布物，挂在同一条 GitHub Release 上：
+#   * fcp-proxy_<版本>_<arch>.deb         Ubuntu 服务端（同包带 CLI client、systemd unit、conffile）
+#   * FCP-Client-<版本>-win64.exe          Windows 客户端（单文件，双击运行，免安装）
+#   * FCP-Client-<版本>-x86_64.AppImage    Linux 客户端（双击运行，免安装）
 #
-# 门禁顺序是"测试在前、打包在后"：两个平台都先跑 ctest 全绿才允许产出发布物
+# 门禁顺序是"测试在前、打包在后"：三个构建 job 都先跑 ctest 全绿才允许产出发布物
 # （与 部署运维指南.md §1 的"四套 ctest 全绿"口径一致，CI 里跑 Release 两套）。
-# 打包之后还有安装冒烟：deb 走 dpkg -i + --version + conffile 登记 + 服务起停；
-# exe 走静默安装 → 启动 → 卸载，装不上或起不来都算失败。
+# 打包之后还有启动冒烟：deb 走 dpkg -i + --version + conffile 登记 + 服务起停；
+# Windows 单文件 exe 走 --smoke-test（GUI 自行退出，查退出码）；AppImage 走
+# 离屏启动并活过 6 秒。
 #
 # 手工触发（workflow_dispatch）：只产出 artifacts、不发 Release，
 # 用来在打 tag 之前把整条流水线跑通一遍。
@@ -178,8 +180,12 @@ jobs:
           if [ "$(systemctl is-system-running 2>/dev/null || true)" = "running" ] ||
              [ "$(systemctl is-system-running 2>/dev/null || true)" = "degraded" ]; then
             key="$(openssl rand -hex 16)"
-            echo "FCP_ARGS=--key=${key} --bind=127.0.0.1 --port=45000 --stats=5000" |
-              sudo tee /etc/fcp/fcp-proxy.env >/dev/null
+            # Exercise the conffile's recommended shape, not just --key: the
+            # unit runs with DynamicUser=yes, which cannot read a root-owned
+            # 0600 key file, so the packaged deployment has to obtain the PSK
+            # through --key-env. A --key-only smoke test would not catch that.
+            printf 'FCP_PSK=%s\nFCP_ARGS=--key-env=FCP_PSK --bind=127.0.0.1 --port=45000 --log=stats:5000\n' \
+              "$key" | sudo tee /etc/fcp/fcp-proxy.env >/dev/null
             sudo systemctl start fcp-proxy
             sleep 2
             if ! systemctl is-active --quiet fcp-proxy; then
@@ -203,9 +209,48 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # ------------------------------------------------------- Linux client AppImage
+  linux-appimage:
+    name: Linux 客户端 AppImage
+    needs: prep
+    # 与 deb 同一个构建机下限：AppImage 里的 Qt 由 aqtinstall 打进包里，但
+    # glibc/libstdc++ 仍来自构建机；22.04 构建可在 22.04/24.04 上运行。
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # 与 Windows 同一个 Qt 版本真源（env.QT_VERSION）；发行版 22.04 自带的
+      # Qt 6.2 没有 qt_standard_project_setup()，不能直接用来构建客户端。
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: linux_gcc_64
+          cache: true
+
+      - name: 构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build curl file librsvg2-bin xvfb xauth \
+            libgl1-mesa-dev libegl1-mesa-dev libxkbcommon-dev \
+            libxkbcommon-x11-0 libxcb-cursor0 \
+            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+            libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
+
+      # build + ctest + AppDir + AppImage + 启动冒烟都在脚本里；本地同一命令可复现。
+      - name: 构建 + ctest + AppImage（发布门禁）
+        run: bash scripts/release_build_linux_appimage.sh build "${{ needs.prep.outputs.version }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-appimage
+          path: dist/*.AppImage
+          if-no-files-found: error
+          retention-days: 14
+
   # ------------------------------------------------------------ Windows client
   windows-client:
-    name: Windows 客户端安装包
+    name: Windows 客户端（单文件便携 exe）
     needs: prep
     runs-on: windows-latest
     steps:
@@ -219,9 +264,9 @@ jobs:
           arch: ${{ env.QT_ARCH }}
           cache: true
 
-      # 构建 / ctest / windeployqt / 启动冒烟 / ISCC 全在
+      # 构建 / ctest / windeployqt / 启动冒烟 / 单文件 SFX 全在
       # scripts/release_build_windows.ps1 里，本地同一命令可复现。
-      - name: 构建 + ctest + 安装包（发布门禁）
+      - name: 构建 + ctest + 便携 exe（发布门禁）
         shell: pwsh
         run: |
           pwsh -File scripts/release_build_windows.ps1 `
@@ -230,46 +275,29 @@ jobs:
             -BuildDir build
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: 安装冒烟（静默装 → 启动 → 卸载）
+      # 脚本已经冒烟过产物；这里再从 dist 独立跑一次，验证上传的就是能运行的
+      # 那个文件。--smoke-test 让 GUI 2.5 秒后自行退出，退出码可判断。
+      - name: 单文件冒烟（--smoke-test）
         shell: pwsh
         run: |
-          $setup = (Get-ChildItem dist\*.exe |
-                    Where-Object { $_.Name -notlike "fcp_client*" } |
-                    Select-Object -First 1).FullName
-          if (!$setup) { throw "没找到安装包" }
-          $dir = Join-Path $env:RUNNER_TEMP "fcp-install"
-
-          Write-Host "== 静默安装到 $dir"
-          Start-Process -FilePath $setup -Wait -ArgumentList `
-            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=`"$dir`""
-          $exe = Join-Path $dir "fcp_client.exe"
-          if (!(Test-Path $exe)) { throw "装完没找到 $exe" }
-
-          Write-Host "== 启动"
-          $p = Start-Process -FilePath $exe -PassThru
-          Start-Sleep -Seconds 5
-          if ($p.HasExited) { throw "装好的客户端启动即退出（exit $($p.ExitCode)）" }
-          Stop-Process -Id $p.Id -Force
-
-          Write-Host "== 卸载"
-          $uninst = Join-Path $dir "unins000.exe"
-          if (!(Test-Path $uninst)) { throw "没有卸载器：安装包没走 Inno 的标准流程？" }
-          Start-Process -FilePath $uninst -Wait -ArgumentList `
-            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"
-          Start-Sleep -Seconds 3
-          if (Test-Path $exe) { throw "卸载后 $exe 还在" }
+          $exe = (Get-ChildItem dist\*.exe | Select-Object -First 1).FullName
+          if (!$exe) { throw "没找到单文件便携 exe" }
+          Write-Host "== 启动 $exe"
+          $p = Start-Process -FilePath $exe -ArgumentList '--smoke-test' -PassThru
+          if (!$p.WaitForExit(30000)) { throw "客户端 30 秒内未退出" }
+          if ($p.ExitCode -ne 0) { throw "客户端退出码 $($p.ExitCode)" }
 
       - uses: actions/upload-artifact@v4
         with:
-          name: windows-setup
-          path: dist/FCP-Client-*-win64-setup.exe
+          name: windows-portable
+          path: dist/FCP-Client-*-win64.exe
           if-no-files-found: error
           retention-days: 14
 
   # ---------------------------------------------------------------- Release
   publish:
     name: 发布 GitHub Release
-    needs: [prep, linux-deb, windows-client]
+    needs: [prep, linux-deb, linux-appimage, windows-client]
     if: needs.prep.outputs.publish == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -283,7 +311,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release
-          find dist -type f \( -name '*.deb' -o -name '*.exe' \) -exec cp {} release/ \;
+          find dist -type f \( -name '*.deb' -o -name '*.exe' -o -name '*.AppImage' \) \
+            -exec cp {} release/ \;
           ls -l release/
           (cd release && sha256sum * > SHA256SUMS && cat SHA256SUMS)
 

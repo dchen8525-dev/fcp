@@ -83,10 +83,19 @@ void apply_prewarm(const PeerProfile& profile, SessionConfig* session, StreamCon
       session->initial_k = profile.initial_k;
     }
   }
-  if (stream != nullptr && profile.srtt_ms > 0) {
-    // The stream keeps its own smoothed value: RTO is derived from it on the
-    // very first segment, long before the session has a sample to hand over.
-    stream->initial_srtt_ms = profile.srtt_ms;
+  if (stream != nullptr) {
+    if (profile.srtt_ms > 0) {
+      // The stream keeps its own smoothed value: RTO is derived from it on the
+      // very first segment, long before the session has a sample to hand over.
+      stream->initial_srtt_ms = profile.srtt_ms;
+    }
+    // Only seed the autotuner's start. A fixed window is the operator's choice
+    // and an explicit --window overrides even the prior: precedence is
+    // explicit CLI > prewarm > default.
+    if (profile.window_bytes > 0 && stream->auto_window &&
+        !stream->send_window_explicit) {
+      stream->send_window_bytes = profile.window_bytes;
+    }
   }
 }
 

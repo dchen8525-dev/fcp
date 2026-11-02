@@ -68,6 +68,11 @@ enum class SetPhase : uint8_t {
 enum class RxEvent : uint8_t {
   kDataDelivered,   // unique original delivery before settlement
   kDataLate,        // unique original delivery during the tombstone window
+  // A late original for a set accounted with no expected data (k unknown) or
+  // for an index beyond the accounted code length. It is a real delivery but
+  // was never part of data_expected, so settle must keep it out of the
+  // expected/delivered identity and count it like a tail delivery instead.
+  kDataLateUnexpected,
   kDataDuplicate,   // duplicate sn or duplicate symbol of an active set
   kRecovered,       // unique delivery of a reconstruction before settlement
   kRecoveredLate,   // unique delivery of a reconstruction after settlement
@@ -171,13 +176,16 @@ class FrameRx {
                     alignof(RxSet) == alignof(RxSetView),
                 "RxSet must be RxSetView plus its private fields, with no padding");
 
-  RxSet& get_or_create(uint32_t set_id, int64_t now_ms);
+  // Returns nullptr only when every set is pinned (a reentrant host, depth
+  // kMaxActiveSets); the caller drops the datagram rather than evicting a set
+  // whose symbol is still being processed.
+  RxSet* get_or_create(uint32_t set_id, int64_t now_ms);
   bool note_k(RxSet* set, uint8_t k);
   void prune_retired();
   void store_symbol(RxSet* set, uint8_t index, const uint8_t* symbol, size_t len);
   void create_placeholders(uint32_t first, uint32_t last, int64_t now_ms);
   void deliver_payload(const uint8_t* payload, size_t len, bool recovered, bool late,
-                       int64_t now_ms, uint32_t repair_ms);
+                       bool late_unexpected, int64_t now_ms, uint32_t repair_ms);
   // RS decode + the structural re-check of every reconstruction
   // (frame_rx_decode.cc).
   void try_decode(RxSet* set, int64_t now_ms);
@@ -195,6 +203,16 @@ class FrameRx {
   SnDedup sn_dedup_;
 
   std::map<uint32_t, RxSet> sets_;
+  // Set ids whose symbols are being processed right now. A synchronous host
+  // can re-enter on_datagram from deliver_; capacity eviction must never pick
+  // a set still on the stack (that freed RxSet was then dereferenced by
+  // try_decode and the next missing-index iteration).
+  std::vector<uint32_t> pinned_ids_;
+  // Data indices covered by the accounting of each accounted set, i.e. the
+  // n_used FcpSettle added to data_expected. A later original at or beyond it
+  // (including every index of a k-unknown set, boundary 0) was never part of
+  // expected and must not enter the identity's late term.
+  std::map<uint32_t, uint32_t> account_boundary_;
   // Set ids whose accounting is final (tombstone expired, or a tombstone was
   // capacity-evicted). Re-creating their state would let one late fragment
   // account the same set twice. Entries are pruned once they fall out of the

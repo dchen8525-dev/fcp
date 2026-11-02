@@ -59,10 +59,11 @@ add_executable(fcp_cli_test cli_test.cc
                ${CMAKE_CURRENT_SOURCE_DIR}/../apps/fcp-proxy/cli.cc
                ${CMAKE_CURRENT_SOURCE_DIR}/../apps/fcp-proxy/reactor.cc)
 target_include_directories(fcp_cli_test PRIVATE
-               ${CMAKE_CURRENT_SOURCE_DIR}/../apps/fcp-proxy)
+               ${CMAKE_CURRENT_SOURCE_DIR}/../apps/fcp-proxy
+               ${CMAKE_CURRENT_SOURCE_DIR}/../tools)
 target_link_libraries(fcp_cli_test PRIVATE fcp_proxy_core)
 if(WIN32)
-  target_link_libraries(fcp_cli_test PRIVATE ws2_32)
+  target_link_libraries(fcp_cli_test PRIVATE ws2_32 iphlpapi)
 endif()
 add_test(NAME cli_test COMMAND fcp_cli_test)
 set_tests_properties(cli_test PROPERTIES TIMEOUT 300)
@@ -94,6 +95,28 @@ add_test(NAME replay_tool_smoke
 set_tests_properties(replay_tool_smoke PROPERTIES
          TIMEOUT 120
          FAIL_REGULAR_EXPRESSION "replay diverged")
+
+# Tool argument guards. Both parsers used to accept unknown or repeated
+# options silently (the last one won), and fcp_replay used to print a pinned k
+# that FecStrategy had already clamped. Every line below must fail before any
+# network I/O, so WILL_FAIL is safe: these exit immediately with code 1.
+set(FCP_TOOL_GUARDS
+  replay_rejects_unknown_option replay_rejects_k_above_pmax
+  bench_rejects_host_on_server bench_rejects_ambiguous_seg)
+add_test(NAME replay_rejects_unknown_option
+         COMMAND fcp_replay --trace=${CMAKE_CURRENT_SOURCE_DIR}/replay_golden.jsonl
+                 --targe=0.9)
+add_test(NAME replay_rejects_k_above_pmax
+         COMMAND fcp_replay --trace=${CMAKE_CURRENT_SOURCE_DIR}/replay_golden.jsonl
+                 --p-max=2 --k=5)
+add_test(NAME bench_rejects_host_on_server
+         COMMAND fcp_bench server --host=10.0.0.1
+                 --key=000102030405060708090a0b0c0d0e0f)
+add_test(NAME bench_rejects_ambiguous_seg
+         COMMAND fcp_bench server --seg=34
+                 --key=000102030405060708090a0b0c0d0e0f)
+set_tests_properties(${FCP_TOOL_GUARDS} PROPERTIES
+         WILL_FAIL TRUE TIMEOUT 30)
 
 # 重构护栏：ctest 全绿只证明"没坏"，不证明"断言还在"。这一步把测试套件的
 # 形状钉住（每个测试二进制的测试函数数与 CHECK 数只许涨不许跌），防止重构

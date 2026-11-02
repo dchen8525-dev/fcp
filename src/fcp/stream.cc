@@ -33,7 +33,19 @@ Stream::Stream(const StreamConfig& config, SegmentFn send, ReadFn read, ClosedFn
   send_window_ = cfg_.auto_window
                      ? std::clamp(cfg_.send_window_bytes, window_min_, window_max_)
                      : cfg_.send_window_bytes;
-  loss_floor_ = send_window_;
+  // The loss floor is the operator's start, which stays put when the prewarm
+  // prior raises the actual start. Clamp it into [window_min_, send_window_]:
+  // above the start it would pin the window above where the stream began, and
+  // below the minimum the stream could not make progress. In fixed mode the
+  // window is not clamped to window_min_, so skip the clamp there (the loss
+  // branch never runs; std::clamp would assert on a start below the minimum).
+  if (!cfg_.auto_window) {
+    loss_floor_ = send_window_;
+  } else {
+    loss_floor_ = cfg_.loss_floor_bytes == 0
+                      ? send_window_
+                      : std::clamp(cfg_.loss_floor_bytes, window_min_, send_window_);
+  }
   ssthresh_ = window_max_;
   // The peer's advertised window is clamped by our receive buffer, so in auto
   // mode the floor of that buffer has to cover what the sender may grow into;
@@ -207,10 +219,13 @@ void Stream::pump(int64_t now_ms) {
   // Bookkeeping is applied before handing the bytes to the host: a host that
   // delivers synchronously (in-process loopback) can reach handle_ack() from
   // inside send_, and that pops segments out of tx_. Indexing freshly each round
-  // keeps us off freed elements.
-  for (size_t i = 0; i < tx_.size(); ++i) {
+  // keeps us off freed elements; after emit_seg() the index may have shifted,
+  // so relocate the emitted segment by its unique offset.
+  size_t i = 0;
+  while (i < tx_.size()) {
     PendingSeg& seg = tx_[i];
     if (seg.sent) {
+      ++i;
       continue;
     }
     if (!forced && in_flight_ + seg.wire_len() > allowed) {
@@ -226,8 +241,22 @@ void Stream::pump(int64_t now_ms) {
     seg.sent = true;
     seg.sent_ms = now_ms;
     in_flight_ += seg.wire_len();
-    snd_max_ = seg.offset + static_cast<uint32_t>(seg.wire_len());
+    // A reentrant pump may already have put a later segment on the wire, so
+    // this is a max, not an assignment: snd_max_ bounds ACKs and must never go
+    // backwards (a regressed bound rejects the peer's honest cumulative ACK).
+    snd_max_ = std::max(snd_max_,
+                        seg.offset + static_cast<uint32_t>(seg.wire_len()));
+    const uint32_t emitted_offset = seg.offset;
     emit_seg(seg);
+    // Relocate. A synchronous host can ACK from inside send_ and pop this
+    // segment, so the index no longer names the next candidate. Find the
+    // emitted segment by its unique offset (0 if it is already gone) and
+    // continue from there instead of stepping over a still-unsent segment.
+    size_t at = 0;
+    while (at < tx_.size() && tx_[at].offset != emitted_offset) {
+      ++at;
+    }
+    i = at < tx_.size() ? at + 1 : 0;
   }
   // The host respects backpressure (write() stops at send_space()), so a full
   // window often has nothing left to hold back above; bytes on the wire up to

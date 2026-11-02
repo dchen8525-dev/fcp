@@ -12,9 +12,11 @@ Type=simple
 # User= 时服务是以 root 跑的，目录自然归 root。
 # 代价：默认 --port=4460 无需特权端口，若运维把它改到 1024 以下会启动失败。
 DynamicUser=yes
-# 参数全部来自 /etc/fcp/fcp-proxy.env 的 FCP_ARGS（包内的 conffile）。
+# 参数全部来自 /etc/fcp/fcp-proxy.env 的 FCP_ARGS（包内的 conffile）；PSK 用
+# 该文件里的 FCP_PSK + --key-env=FCP_PSK——DynamicUser 读不了 root 的 0600
+# 密钥文件，而 EnvironmentFile 是 systemd 以 root 读取后注入的。
 # 未填 FCP_ARGS 时服务会以 "--key ... is required" 退出，这是有意的：
-# 装了包不等于配好了密钥，见 部署运维指南.md §4。
+# 装了包不等于配好了密钥，见 部署运维指南.md §3/§4。
 EnvironmentFile=-/etc/fcp/fcp-proxy.env
 ExecStart=/usr/bin/fcp-proxy-server $FCP_ARGS
 Restart=on-failure
@@ -35,6 +37,10 @@ StateDirectoryMode=0750
 LimitNOFILE=65536
 
 # 服务端只需要 UDP 出站与本地 TCP 出站拨号，不需要任何特权。
+# AF_NETLINK 是 getifaddrs() 的依赖：自动 --mtu 默认要枚举本机接口，裸的
+# AF_INET/AF_INET6 白名单会让 socket(NETLINK_ROUTE) 返回 EAFNOSUPPORT，默认
+# 静默退化成不按接口下调（文档承诺的行为只在手工运行时成立）。
+# AF_UNIX 留给 NSS（nss-resolve 等）解析 --host，否则某些主机上 DNS 会失败。
 NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes
@@ -42,7 +48,7 @@ ProtectSystem=full
 ProtectHome=yes
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
-RestrictAddressFamilies=AF_INET AF_INET6
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 StandardOutput=journal
 StandardError=journal
 

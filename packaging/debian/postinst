@@ -7,7 +7,8 @@ if [ "$1" = "configure" ]; then
   # 新装时目录由 dpkg 建好；升级时保留已有日志/状态。
   install -d -m 0750 /etc/fcp
 
-  # 该 conffile 里放的是 --key=<PSK>，必须是 0600。dpkg 升级时只解包新版本
+  # 该 conffile 里放 FCP_PSK=<PSK>（配合 FCP_ARGS 的 --key-env=FCP_PSK）
+  # 或旧写法的 --key/--key-file 参数，必须是 0600。dpkg 升级时只解包新版本
   # 提供的文件，不会收紧既有文件的权限，所以老版本装过的机器要在这里补一次。
   # 只在文件存在时改，避免在 dpkg 尚未落地时创建出空文件。
   if [ -e /etc/fcp/fcp-proxy.env ]; then
@@ -25,7 +26,7 @@ if [ "$1" = "configure" ]; then
     cat <<'EOF'
 
 FCP proxy 已安装。下一步：
-  1. 编辑 /etc/fcp/fcp-proxy.env，填写 FCP_ARGS（至少要有 --key=HEX32）
+  1. 编辑 /etc/fcp/fcp-proxy.env，填写 FCP_ARGS（至少要有 --key=HEX32 或 --key-file=FILE）
   2. systemctl enable --now fcp-proxy
   3. journalctl -u fcp-proxy -f
 

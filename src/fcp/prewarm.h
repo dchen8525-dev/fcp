@@ -38,6 +38,11 @@ struct PeerProfile {
   // -1 = unknown. A converged k of 0 (clean link) already is the cold default,
   // so it is stored as -1 rather than as a third state.
   int initial_k = -1;
+  // Send window the previous session to this peer converged to (0 = unknown).
+  // Only a session that ran the autotuner writes this: a fixed window is a
+  // configuration choice, not a measurement of the link. It seeds the next
+  // session's start value, which the closed loop is then free to move.
+  size_t window_bytes = 0;
 };
 
 // Cache key "host:port". A bare IPv6 literal is bracketed first so the key

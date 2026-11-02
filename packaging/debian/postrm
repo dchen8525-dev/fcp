@@ -7,7 +7,10 @@ if [ "$1" = "purge" ]; then
   # 语义自己删，这里再动它就是越权（可能删掉运维手放的其它文件）。
   # systemd 的 LogsDirectory/StateDirectory 会在下次启动时重建，所以这两棵
   # 树在 purge 后允许消失。
+  # DynamicUser=yes 时真实目录在 /var/log/private 与 /var/lib/private 下，
+  # /var/log/fcp、/var/lib/fcp 只是符号链接；只删链接会把数据留在盘上。
   rm -rf /var/log/fcp /var/lib/fcp
+  rm -rf /var/log/private/fcp /var/lib/private/fcp
 fi
 
 if [ -d /run/systemd/system ] && [ -x /bin/systemctl ]; then

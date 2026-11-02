@@ -6,6 +6,28 @@
 #include "fcp/hdr.h"
 
 namespace fcp {
+namespace {
+
+bool IsPinned(const std::vector<uint32_t>& ids, uint32_t id) {
+  return std::find(ids.begin(), ids.end(), id) != ids.end();
+}
+
+// Pins the set for the duration of on_datagram. A synchronous host may deliver
+// a whole window from inside deliver_ (in-process loopback), which re-enters
+// on_datagram and can hit the capacity eviction path; the set being decoded
+// must not be the victim.
+class SetPin {
+ public:
+  SetPin(std::vector<uint32_t>* ids, uint32_t id) : ids_(ids) { ids_->push_back(id); }
+  ~SetPin() { ids_->pop_back(); }
+  SetPin(const SetPin&) = delete;
+  SetPin& operator=(const SetPin&) = delete;
+
+ private:
+  std::vector<uint32_t>* ids_;
+};
+
+}  // namespace
 
 SnDedup::SnDedup() : slots_(std::make_unique<std::array<Slot, kSnWindow>>()) {
   slots_->fill(Slot{});
@@ -153,7 +175,13 @@ void FrameRx::on_datagram(const uint8_t* plaintext, size_t len, int64_t now_ms) 
     create_placeholders(prev_anchor + 1, hdr.set_id, now_ms);
   }
 
-  RxSet& set = get_or_create(hdr.set_id, now_ms);
+  RxSet* created = get_or_create(hdr.set_id, now_ms);
+  if (created == nullptr) {
+    ++struct_fail_;
+    return;
+  }
+  RxSet& set = *created;
+  const SetPin pin(&pinned_ids_, hdr.set_id);
   // A9: k is the sender's parity count for this set, but the peer may only
   // choose it within the negotiated P'. Clamping keeps a lying k from poisoning
   // the set against the honest k (note_k is first-wins) and from inflating the
@@ -182,8 +210,11 @@ void FrameRx::on_datagram(const uint8_t* plaintext, size_t len, int64_t now_ms) 
     set.orig_mask.set(index);
     set.max_data_index = std::max(set.max_data_index, index);
     store_symbol(&set, index, symbol, symbol_len);
-    deliver_payload(symbol + 2, symbol_len - 2, false,
-                    set.phase == SetPhase::kAccounted, now_ms, 0);
+    const bool late = set.phase == SetPhase::kAccounted;
+    const auto boundary = account_boundary_.find(hdr.set_id);
+    const bool late_unexpected =
+        late && (boundary == account_boundary_.end() || index >= boundary->second);
+    deliver_payload(symbol + 2, symbol_len - 2, false, late, late_unexpected, now_ms, 0);
     try_decode(&set, now_ms);
     return;
   }
@@ -249,14 +280,28 @@ bool FrameRx::mark_accounted(uint32_t set_id, int64_t tombstone_until_ms) {
   }
   it->second.phase = SetPhase::kAccounted;
   it->second.tombstone_until_ms = tombstone_until_ms;
+  // Mirror FcpSettle::account()'s boundary. A k-unknown set contributed 0;
+  // otherwise the code length is n when known, else highest index + 1. Late
+  // originals outside this range were never part of data_expected.
+  account_boundary_[set_id] =
+      it->second.has_any_symbol
+          ? (it->second.n_known ? it->second.n
+                                : static_cast<uint32_t>(it->second.max_data_index) + 1)
+          : 0;
   return true;
 }
 
 bool FrameRx::release_set(uint32_t set_id) {
+  // A reentrant settle (host callback) must not free the set whose symbol is
+  // still being decoded; the next tick releases it instead.
+  if (IsPinned(pinned_ids_, set_id)) {
+    return false;
+  }
   const auto it = sets_.find(set_id);
   if (it == sets_.end()) {
     return false;
   }
+  account_boundary_.erase(set_id);
   // Only an accounted set is final (§5.3). A tail-dropped set is a heuristic
   // verdict (1s without parity); a late parity may legitimately rebuild it and
   // settle it once, which is what TestNoReaccountAfterRelease's tail half and
@@ -317,16 +362,19 @@ bool FrameRx::view(uint32_t set_id, RxSetView* out) const {
   return true;
 }
 
-FrameRx::RxSet& FrameRx::get_or_create(uint32_t set_id, int64_t now_ms) {
+FrameRx::RxSet* FrameRx::get_or_create(uint32_t set_id, int64_t now_ms) {
   const auto it = sets_.find(set_id);
   if (it != sets_.end()) {
-    return it->second;
+    return &it->second;
   }
   if (sets_.size() >= kMaxActiveSets) {
     // Tombstones outrank capacity pressure: evict the oldest unaccounted set.
+    // Pinned sets (currently being processed further up the stack) are never
+    // victims: erasing one frees an RxSet that a reentrant caller still holds.
     auto victim = sets_.end();
     for (auto sit = sets_.begin(); sit != sets_.end(); ++sit) {
-      if (sit->second.phase != SetPhase::kAccounted) {
+      if (sit->second.phase != SetPhase::kAccounted &&
+          !IsPinned(pinned_ids_, sit->first)) {
         victim = sit;
         break;
       }
@@ -335,27 +383,45 @@ FrameRx::RxSet& FrameRx::get_or_create(uint32_t set_id, int64_t now_ms) {
       // Everything is a tombstone: still bound the map by evicting the oldest
       // grave instead of growing past the cap (an authenticated peer flooding
       // fresh set ids between settle ticks must not balloon memory).
-      victim = sets_.begin();
+      for (auto sit = sets_.begin(); sit != sets_.end(); ++sit) {
+        if (!IsPinned(pinned_ids_, sit->first)) {
+          victim = sit;
+          break;
+        }
+      }
     }
-    if (victim->second.phase == SetPhase::kAccounted) {
+    if (victim == sets_.end()) {
+      // Every set is pinned: only reachable if the host re-enters one
+      // on_datagram per set (depth kMaxActiveSets). Drop this datagram; the
+      // peer retransmits, and growing past the cap is the worse failure.
+      return nullptr;
+    }
+    const uint32_t victim_id = victim->first;
+    const bool victim_accounted = victim->second.phase == SetPhase::kAccounted;
+    // Capture the delivered count before the erase, but emit only after it: the
+    // event sink is a synchronous host callback that may re-enter this module,
+    // and it must not see (or free) the victim through a stale iterator.
+    const uint32_t victim_delivered = static_cast<uint32_t>(
+        (victim->second.orig_mask | victim->second.recov_mask).count());
+    account_boundary_.erase(victim_id);
+    if (victim_accounted) {
       // Evicted after accounting: never let the id be settled again.
-      retired_.insert(victim->first);
+      retired_.insert(victim_id);
       prune_retired();
-    } else {
-      // Unaccounted set dropped under capacity pressure: same bookkeeping as
-      // the settle module's 1s tail drop, so delivered stays bounded by
-      // expected + tail_delivered.
-      const uint32_t delivered = static_cast<uint32_t>(
-          (victim->second.orig_mask | victim->second.recov_mask).count());
-      emit_event(RxEvent::kSetTailDropped, delivered);
     }
     sets_.erase(victim);
     ++tail_dropped_;
+    if (!victim_accounted) {
+      // Unaccounted set dropped under capacity pressure: same bookkeeping as
+      // the settle module's 1s tail drop, so delivered stays bounded by
+      // expected + tail_delivered.
+      emit_event(RxEvent::kSetTailDropped, victim_delivered);
+    }
   }
   RxSet& set = sets_.emplace(set_id, RxSet{}).first->second;
   set.set_id = set_id;
   set.t_first_ms = now_ms;
-  return set;
+  return &set;
 }
 
 bool FrameRx::note_k(RxSet* set, uint8_t k) {
@@ -375,7 +441,7 @@ void FrameRx::store_symbol(RxSet* set, uint8_t index, const uint8_t* symbol, siz
 }
 
 void FrameRx::deliver_payload(const uint8_t* payload, size_t len, bool recovered, bool late,
-                              int64_t now_ms, uint32_t repair_ms) {
+                              bool late_unexpected, int64_t now_ms, uint32_t repair_ms) {
   if (sn_of_) {
     uint32_t sn = 0;
     // Payloads too short to carry a KCP sn (control/keepalive-sized segments)
@@ -397,6 +463,8 @@ void FrameRx::deliver_payload(const uint8_t* payload, size_t len, bool recovered
     } else {
       emit_event(RxEvent::kRecovered, repair_ms);
     }
+  } else if (late_unexpected) {
+    emit_event(RxEvent::kDataLateUnexpected, 0);
   } else if (late) {
     emit_event(RxEvent::kDataLate, 0);
   } else {

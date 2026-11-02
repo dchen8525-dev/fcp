@@ -60,6 +60,9 @@ struct Options {
   bool auto_window = false;
   size_t window_min_bytes = 64 * 1024;
   size_t window_max_bytes = 1024 * 1024;
+  // --window was given explicitly, so the prewarm prior must not replace the
+  // start (StreamConfig::send_window_explicit).
+  bool window_explicit = false;
   // One-way wire latency in 25ms ticks. 0 is the instant loopback every other
   // scenario uses; a rate-limited autotune scenario needs a real round trip,
   // because with no latency the window is never what holds the sender back.
@@ -90,6 +93,7 @@ class Harness {
     base.auto_window = opt.auto_window;
     base.window_min_bytes = opt.window_min_bytes;
     base.window_max_bytes = opt.window_max_bytes;
+    base.window_explicit = opt.window_explicit;
     latency_ticks_ = opt.wire_latency_ticks;
 
     EngineConfig cc = base;
@@ -634,6 +638,7 @@ void salt_routing_and_replay_binding() {
 void short_connections_leave_no_state_behind() {
   Options opt;
   opt.prewarm = true;
+  opt.auto_window = true;
   Harness h{opt};
   const std::vector<uint8_t> payload = {'h', 'i'};
   for (size_t i = 0; i < 20; ++i) {
@@ -656,6 +661,12 @@ void short_connections_leave_no_state_behind() {
   // One key for the client's single peer, reused by all 20 sessions.
   CHECK_EQ(h.client->prewarm_cache().size(), 1u);
   CHECK_EQ(h.server->prewarm_cache().size(), 1u);
+  // An autotuning session also leaves its converged window as the next
+  // session's start prior; a fixed window would not (it is configuration).
+  fcp::PeerProfile profile;
+  CHECK(h.client->prewarm_cache().get("server:peer" + std::to_string(kServerPeer),
+                                      h.now_ms, &profile));
+  CHECK(profile.window_bytes > 0);
 }
 
 // §4.3 + §7: the dial deadline is the engine's, not the host's, and the grace
@@ -1133,6 +1144,63 @@ void auto_window_grows_in_the_engine() {
   }, 200));
 }
 
+// §5 + #37: the window an adaptive session converged to is the next adaptive
+// session's start. The unit test in prewarm_test covers apply_prewarm() alone,
+// which still passes when create_*_conn() and attach_stream() overwrite the
+// seeded value -- this is the engine-level half of the contract.
+void prewarm_seeds_the_next_stream_window() {
+  const auto run = [](bool window_explicit) {
+    const size_t kMax = 128 * 1024;
+    Options opt;
+    opt.auto_window = true;
+    opt.window_min_bytes = 16 * 1024;
+    opt.window_max_bytes = kMax;
+    opt.send_window_bytes = 16 * 1024;
+    opt.rcv_buf_bytes = 16 * 1024;
+    opt.wire_latency_ticks = 4;  // 200ms round trip, as in the growth test
+    opt.window_explicit = window_explicit;
+    Harness h{opt};
+
+    post_socks5_entry(h, "192.0.2.1", 80, kLocalConn);
+    CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, kTunnelSteps));
+    const uint64_t first_target = h.first_dial_conn();
+    const std::vector<uint8_t> chunk(2048, 0x5A);
+    size_t pushed = 0;
+    for (int i = 0; i < 300; ++i) {
+      h.step();
+      for (int q = 0; q < 8; ++q) {
+        const size_t taken = h.target_send(first_target, chunk);
+        pushed += taken;
+        if (taken == 0) {
+          break;
+        }
+      }
+    }
+    CHECK(pushed > 2 * kMax);
+    CHECK(h.server->send_window(first_target) > opt.send_window_bytes);
+
+    // End session 1; the reap writes the profile.
+    h.local_close(kLocalConn);
+    CHECK(h.run_until([&] {
+      return h.client->counters().live == 0 && h.server->counters().live == 0;
+    }, 200));
+    fcp::PeerProfile profile;
+    CHECK(h.server->prewarm_cache().get("client:peer" + std::to_string(kClientPeer),
+                                        h.now_ms, &profile));
+    CHECK(profile.window_bytes > opt.send_window_bytes);
+    const size_t prior = profile.window_bytes;
+
+    // Session 2 sends no target bytes, so the server stream's window is still
+    // the value its constructor started from.
+    post_socks5_entry(h, "192.0.2.2", 80, kLocalConn + 1);
+    CHECK(h.run_until([&] { return h.dials.size() == 2; }, kTunnelSteps));
+    CHECK_EQ(h.server->send_window(h.last_dial_conn()),
+             window_explicit ? opt.send_window_bytes : prior);
+  };
+  run(false);  // default start is replaced by the peer's converged value
+  run(true);   // an explicit --window wins over the prior
+}
+
 int main() {
   socks5_round_trip();
   socks5_request_corked_with_greeting();
@@ -1154,6 +1222,7 @@ int main() {
   dial_backpressure_bounds_pre_tunnel_bytes();
   auto_window_bounds_memory_by_window_max();
   auto_window_grows_in_the_engine();
+  prewarm_seeds_the_next_stream_window();
   peer_callbacks_balance_server_sessions();
   return fcp_test::finish();
 }

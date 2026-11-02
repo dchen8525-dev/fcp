@@ -181,10 +181,11 @@ void TestCacheTtl() {
   fcp::PeerProfile got;
   CHECK(!cache.get("k", 0, &got));
 
-  cache.put("k", fcp::PeerProfile{45, 3}, 0);
+  cache.put("k", fcp::PeerProfile{45, 3, 512 * 1024}, 0);
   CHECK(cache.get("k", 999, &got));
   CHECK_EQ(got.srtt_ms, 45);
   CHECK_EQ(got.initial_k, 3);
+  CHECK_EQ(got.window_bytes, 512u * 1024);
   CHECK(!cache.get("k", 1000, &got));
 
   // The entry is readable again only by being refreshed, not by time travel.
@@ -263,6 +264,28 @@ void TestApplyPrewarm() {
   fcp::apply_prewarm(fcp::PeerProfile{80, -1}, &only_rtt, nullptr);
   CHECK_EQ(only_rtt.initial_srtt_ms, 80);
   CHECK_EQ(only_rtt.initial_k, -1);
+
+  // A converged window seeds the autotuner's start only...
+  fcp::StreamConfig warm;
+  warm.auto_window = true;
+  fcp::apply_prewarm(fcp::PeerProfile{0, -1, 512 * 1024}, nullptr, &warm);
+  CHECK_EQ(warm.send_window_bytes, 512u * 1024);
+  // ...never an explicit --window, and never a fixed window.
+  fcp::StreamConfig explicit_start;
+  explicit_start.auto_window = true;
+  explicit_start.send_window_explicit = true;
+  explicit_start.send_window_bytes = 128 * 1024;
+  fcp::apply_prewarm(fcp::PeerProfile{0, -1, 512 * 1024}, nullptr, &explicit_start);
+  CHECK_EQ(explicit_start.send_window_bytes, 128u * 1024);
+  fcp::StreamConfig fixed;
+  fixed.auto_window = false;
+  fcp::apply_prewarm(fcp::PeerProfile{0, -1, 512 * 1024}, nullptr, &fixed);
+  CHECK_EQ(fixed.send_window_bytes, fcp::kDefaultSendWindowBytes);
+  // An unknown window leaves the default alone.
+  fcp::StreamConfig unknown;
+  unknown.auto_window = true;
+  fcp::apply_prewarm(fcp::PeerProfile{0, -1, 0}, nullptr, &unknown);
+  CHECK_EQ(unknown.send_window_bytes, fcp::kDefaultSendWindowBytes);
 }
 
 // The point of the whole exercise: the first set of a brand-new session

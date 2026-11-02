@@ -490,6 +490,11 @@ void ProxyEngine::fill_session_config(SessionConfig* sc, uint64_t conn_id) const
 // since it needs the negotiated MTU.
 void ProxyEngine::fill_stream_config(StreamConfig* sc) const {
   sc->send_window_bytes = cfg_.send_window_bytes;
+  // The loss floor is the configured start, captured before apply_prewarm()
+  // may replace send_window_bytes with a prior (decision #33: only the
+  // delay evidence may take the window below the operator's --window).
+  sc->loss_floor_bytes = cfg_.send_window_bytes;
+  sc->send_window_explicit = cfg_.window_explicit;
   sc->rcv_buf_bytes = cfg_.rcv_buf_bytes;
   sc->auto_window = cfg_.auto_window;
   sc->window_min_bytes = cfg_.window_min_bytes;
@@ -543,6 +548,11 @@ bool ProxyEngine::create_client_conn(uint64_t id, uint64_t peer, int64_t now_ms)
   }
   sc.send_direction = Direction::kC2S;
   sc.recv_direction = Direction::kS2C;
+  // Fill the engine-owned half first: apply_prewarm() decides whether the
+  // window prior may replace the start from StreamConfig::auto_window and
+  // StreamConfig::send_window_explicit, so those flags have to be real values,
+  // not the default-constructed false/false.
+  fill_stream_config(&raw->stream_cfg);
   apply_prewarm(profile_for(peer, now_ms), &sc, &raw->stream_cfg);
 
   raw->session = make_session(id, sc);
@@ -584,6 +594,10 @@ ProxyEngine::Conn* ProxyEngine::create_server_conn(uint64_t peer, const uint8_t*
   std::memcpy(sc.salt, salt, Envelope::kSaltLen);
   sc.send_direction = Direction::kS2C;
   sc.recv_direction = Direction::kC2S;
+  // Same order as the client path: the flags apply_prewarm() reads must be the
+  // configured ones. The stream is attached later, when the handshake
+  // completes, so this is also the only point where conn.stream_cfg is filled.
+  fill_stream_config(&raw->stream_cfg);
   apply_prewarm(profile_for(peer, now_ms), &sc, &raw->stream_cfg);
 
   raw->session = make_session(id, sc);
@@ -608,8 +622,12 @@ ProxyEngine::Conn* ProxyEngine::create_server_conn(uint64_t peer, const uint8_t*
 }
 
 void ProxyEngine::attach_stream(Conn& conn) {
+  // conn.stream_cfg already holds the engine-owned fields plus whatever
+  // apply_prewarm() seeded (both creation paths fill it before seeding). Do not
+  // call fill_stream_config() here: it would overwrite the seeded
+  // send_window_bytes with the configured default and silently disable the
+  // window prior.
   StreamConfig sc = conn.stream_cfg;
-  fill_stream_config(&sc);
   sc.max_segment = conn.session->mtu_limits().payload_max;
   conn.stream_cfg = sc;
 
@@ -1056,8 +1074,11 @@ void ProxyEngine::finish_conn(Conn& conn, int64_t now_ms, const char* why) {
   const bool stuck = conn.stream != nullptr &&
                      (conn.stream->bytes_acked() != conn.stream->bytes_queued() ||
                       conn.stream->bytes_delivered() != conn.stream->bytes_acked());
+  // Compare against the start this stream actually used, not the configured
+  // default: apply_prewarm() may have seeded a prior, and a connection that
+  // ended exactly at its prior has not "moved" relative to it.
   const bool tuned = conn.stream != nullptr && cfg_.auto_window &&
-                     conn.stream->send_window() != cfg_.send_window_bytes;
+                     conn.stream->send_window() != conn.stream_cfg.send_window_bytes;
   if (stuck || tuned) {
     std::snprintf(diag_, sizeof(diag_),
                   "stream queued=%llu acked=%llu delivered=%llu unacked=%zu in_flight=%zu "
@@ -1150,6 +1171,12 @@ void ProxyEngine::save_profile(Conn& conn, int64_t now_ms) {
   // anyway, so it is stored as "unknown" rather than as a third state.
   const uint8_t k = conn.session ? conn.session->k() : 0;
   profile.initial_k = k > 0 ? static_cast<int>(k) : -1;
+  // Only the autotuner's result describes the link; a fixed window describes
+  // the operator's configuration and must not become a prior for a later
+  // adaptive session.
+  if (conn.stream_cfg.auto_window) {
+    profile.window_bytes = conn.stream->send_window();
+  }
   prewarm_.put(key, profile, now_ms);
 }
 

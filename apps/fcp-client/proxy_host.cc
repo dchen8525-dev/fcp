@@ -73,6 +73,20 @@ void ProxyHost::start(const Options& options) {
     Q_EMIT finished(Result{false, QStringLiteral("PSK 长度无效（需 16 字节）"), Stats{}});
     return;
   }
+  // The UDP socket below binds AnyIPv4, and the wire protocol is IPv4-only
+  // (SessionConfig's ip_hdr_len is 20). An IPv6 literal would otherwise be
+  // accepted here, fail every sendDatagram, and present as a silent tunnel.
+  {
+    const QHostAddress literal(opt_.server);
+    if (!literal.isNull() &&
+        literal.protocol() != QAbstractSocket::UnknownNetworkLayerProtocol &&
+        literal.protocol() != QAbstractSocket::IPv4Protocol) {
+      Q_EMIT finished(Result{false,
+                             QStringLiteral("FCP 服务端只支持 IPv4 地址：%1").arg(opt_.server),
+                             Stats{}});
+      return;
+    }
+  }
 
   cfg_ = fcp::EngineConfig{};
   cfg_.role = fcp::EngineRole::kClient;
@@ -86,11 +100,6 @@ void ProxyHost::start(const Options& options) {
   // old `cfg_.trace = make_trace_sink(...)` no longer compiles and would have
   // opened an extra file for connection id 1.
   cfg_.trace_prefix = opt_.trace_prefix.toLocal8Bit().toStdString();
-  if (opt_.window_kib > 0) {
-    const size_t bytes = static_cast<size_t>(opt_.window_kib) * 1024;
-    cfg_.send_window_bytes = bytes;
-    cfg_.rcv_buf_bytes = bytes;
-  }
 
   if (!udp_.bind(QHostAddress::AnyIPv4, 0)) {
     Q_EMIT finished(Result{false, QStringLiteral("UDP 绑定失败：%1").arg(udp_.errorString()), Stats{}});
@@ -152,12 +161,17 @@ void ProxyHost::start(const Options& options) {
   engine_ = std::make_unique<fcp::ProxyEngine>(cfg_, host);
   clock_.start();
   wire_backlog_.clear();
+  wire_send_warned_ = false;
   resolving_ = false;
   rate_ms_ = 0;
   rate_up_base_ = 0;
   rate_down_base_ = 0;
   up_rate_ = 0.0;
   down_rate_ = 0.0;
+  // clock_() restarts at 0 for this run, so a leftover throttle deadline from
+  // the previous run (which may have reached minutes) would suppress tracing
+  // for that long. Reset it with the rest of the per-run state.
+  trace_ms_ = 0;
   tick_.start();
 
   setState(State::kStarting);
@@ -214,16 +228,21 @@ void ProxyHost::resolveServer() {
                            .arg(name, info.errorString()));
           return;
         }
-        // Prefer IPv4 (matches the bench client and the CLI's WAN use).
+        // IPv4 only: the socket is AnyIPv4 and the protocol is IPv4-only.
+        // Falling back to the first address of any family (the old behaviour)
+        // picked an IPv6 address on v6-first hosts and every datagram failed
+        // silently; say so instead.
         QHostAddress picked;
         for (const QHostAddress& addr : info.addresses()) {
           if (addr.protocol() == QAbstractSocket::IPv4Protocol) {
             picked = addr;
             break;
           }
-          if (picked.isNull()) {
-            picked = addr;
-          }
+        }
+        if (picked.isNull()) {
+          finishEngine(false,
+                       QStringLiteral("解析 %1 只得到非 IPv4 地址").arg(name));
+          return;
         }
         server_addr_ = picked;
         onServerReady();
@@ -234,8 +253,7 @@ void ProxyHost::onServerReady() {
   peer_key_ = QString::fromStdString(host_port_text(
       server_addr_.toString(), opt_.port)).toStdString();
   for (std::vector<uint8_t>& dg : wire_backlog_) {
-    udp_.writeDatagram(reinterpret_cast<const char*>(dg.data()),
-                       static_cast<qint64>(dg.size()), server_addr_, opt_.port);
+    sendWireDatagram(dg.data(), dg.size());
   }
   wire_backlog_.clear();
   setState(State::kRunning);
@@ -320,8 +338,22 @@ void ProxyHost::wireSend(uint64_t, const uint8_t* wire, size_t len) {
     }
     return;
   }
-  udp_.writeDatagram(reinterpret_cast<const char*>(wire),
-                     static_cast<qint64>(len), server_addr_, opt_.port);
+  sendWireDatagram(wire, len);
+}
+
+void ProxyHost::sendWireDatagram(const uint8_t* wire, size_t len) {
+  if (udp_.writeDatagram(reinterpret_cast<const char*>(wire),
+                         static_cast<qint64>(len), server_addr_, opt_.port) >= 0) {
+    return;
+  }
+  if (wire_send_warned_) {
+    return;
+  }
+  wire_send_warned_ = true;
+  Q_EMIT logLine(QStringLiteral("UDP 发送到 %1:%2 失败：%3")
+                     .arg(server_addr_.toString())
+                     .arg(opt_.port)
+                     .arg(udp_.errorString()));
 }
 
 void ProxyHost::dial(uint64_t conn, const fcp::ProxyTarget& target) {

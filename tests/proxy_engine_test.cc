@@ -776,6 +776,49 @@ void zero_window_recovery_after_partial_refusal() {
   }, 120));
 }
 
+// The SOCKS5 request may arrive in the same write as the greeting (a client is
+// free to cork them; RFC 1928 says nothing against it). parse_entry() answers
+// the greeting and then continues into the request inside one call, so the
+// connection changes entry phase mid-parse. This pins that the second half is
+// still consumed rather than re-parsed as a greeting.
+void socks5_request_corked_with_greeting() {
+  Harness h{Options()};
+  h.local_open(kLocalConn);
+  std::vector<uint8_t> both = greeting();
+  const std::vector<uint8_t> req =
+      socks5_request(0x01, 0x01, ipv4_bytes("203.0.113.11"), 8443);
+  both.insert(both.end(), req.begin(), req.end());
+  h.local_send(kLocalConn, both);
+
+  CHECK(h.run_until([&] { return !h.dials.empty(); }, 40));
+  CHECK_EQ(h.dials.size(), 1u);
+  CHECK_EQ(static_cast<int>(h.dials[0].target.port), 8443);
+  // Exactly one method-selection reply, not two.
+  CHECK(starts_with(h.app_bytes(kLocalConn), std::string("\x05\x00", 2)));
+
+  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, 40));
+}
+
+// The greeting alone leaves the connection waiting for the request: it must not
+// be mistaken for a complete entry, and must not be counted as a bad entry.
+void socks5_greeting_without_request_waits() {
+  Harness h{Options()};
+  h.local_open(kLocalConn);
+  h.local_send(kLocalConn, greeting());
+  CHECK_EQ(text_of(h.app_bytes(kLocalConn)), std::string("\x05\x00", 2));
+
+  h.step();
+  h.step();
+  CHECK(h.dials.empty());
+  CHECK_EQ(h.client->counters().bad_entry, 0u);
+  CHECK_EQ(h.client->counters().live, 1u);
+
+  // The request arriving later still completes the handshake.
+  h.local_send(kLocalConn, socks5_request(0x01, 0x01, ipv4_bytes("203.0.113.12"), 9000));
+  CHECK(h.run_until([&] { return !h.dials.empty(); }, 40));
+  CHECK_EQ(static_cast<int>(h.dials[0].target.port), 9000);
+}
+
 }  // namespace
 
 
@@ -1075,6 +1118,8 @@ void auto_window_grows_in_the_engine() {
 
 int main() {
   socks5_round_trip();
+  socks5_request_corked_with_greeting();
+  socks5_greeting_without_request_waits();
   http_connect_round_trip();
   open_error_maps_to_the_local_reply();
   malformed_local_requests();

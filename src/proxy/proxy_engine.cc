@@ -90,12 +90,12 @@ const char* stream_reason_text(CloseReason reason) {
 
 }  // namespace
 
-// Exported via engine.h (the Qt client builds its own sinks from settings).
-// N2 (P2'/P5'): the sink opens lazily on the first trace entry. A server
-// creates the Conn before the first datagram authenticates, so opening here
-// meant one empty file per forged 8-byte salt (a trivially amplified inode
-// DoS). Unauthenticated sessions never emit a controller report, so the file
-// now appears only for sessions that actually authenticate.
+// Declared in proxy_engine.h; the Qt client builds its own sinks from settings.
+// The sink opens lazily on the first trace entry: a server creates the Conn
+// before the first datagram authenticates, so opening eagerly meant one empty
+// file per forged 8-byte salt (a trivially amplified inode DoS). Only
+// authenticated sessions emit a controller report, so the file appears only
+// for those.
 SessionConfig::TraceFn make_trace_sink(const std::string& prefix, uint64_t cid) {
   if (prefix.empty()) {
     return nullptr;
@@ -165,7 +165,7 @@ void ProxyEngine::on_local_bytes(uint64_t conn, const uint8_t* data, size_t len,
   if (c == nullptr || c->phase == Phase::kDone || len == 0) {
     return;
   }
-  if (c->phase == Phase::kEntry) {
+  if (in_entry_phase(c->phase)) {
     append_bytes(&c->entry, data, len);
     parse_entry(*c, now_ms);
   } else {
@@ -182,7 +182,7 @@ void ProxyEngine::on_local_closed(uint64_t conn, int64_t now_ms) {
     return;
   }
   c->local_eof = true;
-  if (c->phase == Phase::kEntry) {
+  if (in_entry_phase(c->phase)) {
     // The application hung up before finishing its request: nothing to tunnel,
     // and no reply is owed to a client that never asked for one.
     finish_conn(*c, now_ms, "local closed before the request");
@@ -409,7 +409,7 @@ bool ProxyEngine::wants_local_read(uint64_t conn) const {
       c->local_eof) {
     return false;
   }
-  if (c->phase == Phase::kEntry) {
+  if (in_entry_phase(c->phase)) {
     // One head is all the parsers look at, so a client that never completes one
     // cannot make this buffer grow past the budget it is judged against.
     return c->entry.size() <= kHttpHeadMaxBytes;
@@ -454,12 +454,9 @@ size_t ProxyEngine::peer_window(uint64_t conn) const {
 
 // ---- connection setup ----
 
-// Every field whose value does not depend on which end we are. Both directions
-// used to spell this out twice, field by field (A15/B11), so a new
-// SessionConfig field could be added to one side and silently left unset on
-// the other. The caller fills only what genuinely differs between the ends --
-// salt and the two directions -- before or after this; everything else in
-// SessionConfig is shared by construction.
+// Every field whose value does not depend on which end we are. The caller fills
+// only what genuinely differs between the ends -- salt and the two directions
+// -- so a new SessionConfig field lands for both directions by construction.
 void ProxyEngine::fill_session_config(SessionConfig* sc, uint64_t conn_id) const {
   std::memcpy(sc->key, cfg_.key, sizeof(sc->key));
   sc->d = cfg_.d;
@@ -524,6 +521,10 @@ bool ProxyEngine::create_client_conn(uint64_t id, uint64_t peer, int64_t now_ms)
   raw->phase = Phase::kEntry;
 
   SessionConfig sc;
+  // One call is enough: fill_session_config() writes key/D/P'/MTU/budget/trace
+  // but never sc.salt, so it composes with host_.new_salt() in either order.
+  // (This used to be called on both sides of the salt draw, which built and
+  // discarded a trace sink per connection.)
   fill_session_config(&sc, id);
   if (host_.new_salt) {
     host_.new_salt(sc.salt);
@@ -532,7 +533,6 @@ bool ProxyEngine::create_client_conn(uint64_t id, uint64_t peer, int64_t now_ms)
   }
   sc.send_direction = Direction::kC2S;
   sc.recv_direction = Direction::kS2C;
-  fill_session_config(&sc, id);
   apply_prewarm(profile_for(peer, now_ms), &sc, &raw->stream_cfg);
 
   raw->session = make_session(id, sc);
@@ -664,7 +664,7 @@ void ProxyEngine::session_events(Conn& conn, int64_t now_ms) {
   }
   if (conn.session->state() == HandshakeState::kFailed) {
     ++counters_.handshake_failed;
-    if (cfg_.role == EngineRole::kClient && conn.phase != Phase::kEntry) {
+    if (cfg_.role == EngineRole::kClient && !in_entry_phase(conn.phase)) {
       queue_local_reply(conn, Socks5Rep::kGeneralFailure, HttpReply::kBadGateway);
     }
     finish_conn(conn, now_ms, "handshake failed");
@@ -684,7 +684,7 @@ void ProxyEngine::session_events(Conn& conn, int64_t now_ms) {
 // ---- entry protocol (client) ----
 
 bool ProxyEngine::parse_entry(Conn& conn, int64_t now_ms) {
-  while (conn.phase == Phase::kEntry && !conn.entry.empty()) {
+  while (in_entry_phase(conn.phase) && !conn.entry.empty()) {
     if (!conn.sniffed) {
       conn.sniffed = true;
       conn.socks5 = conn.entry[0] == kSocks5Version;
@@ -699,7 +699,7 @@ bool ProxyEngine::parse_entry(Conn& conn, int64_t now_ms) {
         conn.target = target;
         drop_front(&conn.entry, consumed);
         start_tunnel_client(conn, now_ms);
-        return conn.phase != Phase::kEntry;
+        return !in_entry_phase(conn.phase);
       }
       if (r == HttpParse::kNeedMore) {
         if (conn.entry.size() > kHttpHeadMaxBytes) {
@@ -721,7 +721,7 @@ bool ProxyEngine::parse_entry(Conn& conn, int64_t now_ms) {
       return false;
     }
 
-    if (!conn.greeting_done) {
+    if (conn.phase == Phase::kEntry) {
       size_t consumed = 0;
       Socks5Greeting greeting;
       const Socks5Parse r =
@@ -748,7 +748,7 @@ bool ProxyEngine::parse_entry(Conn& conn, int64_t now_ms) {
         finish_conn(conn, now_ms, "no acceptable SOCKS5 method");
         return false;
       }
-      conn.greeting_done = true;
+      conn.phase = Phase::kSocks5Request;
       continue;  // the request may already be corked behind the greeting
     }
 
@@ -760,7 +760,7 @@ bool ProxyEngine::parse_entry(Conn& conn, int64_t now_ms) {
       conn.target = target;
       drop_front(&conn.entry, consumed);
       start_tunnel_client(conn, now_ms);
-      return conn.phase != Phase::kEntry;
+      return !in_entry_phase(conn.phase);
     }
     if (r == Socks5Parse::kNeedMore) {
       if (conn.entry.size() > kSocks5MaxRequestBytes) {
@@ -778,7 +778,7 @@ bool ProxyEngine::parse_entry(Conn& conn, int64_t now_ms) {
     finish_conn(conn, now_ms, "rejected SOCKS5 request");
     return false;
   }
-  return conn.phase != Phase::kEntry;
+  return !in_entry_phase(conn.phase);
 }
 
 void ProxyEngine::start_tunnel_client(Conn& conn, int64_t now_ms) {
@@ -948,10 +948,10 @@ void ProxyEngine::drain_stream(Conn& conn) {
 }
 
 void ProxyEngine::flush_app(Conn& conn) {
-  // N3 (P4'): Qt emits bytesWritten synchronously from inside write(), so
-  // app_send can re-enter this function while the outer loop still holds
-  // `n`/`taken`. Without the guard the inner pass drains app_in and the outer
-  // one then drops bytes it never sent (or sends the same bytes twice).
+  // Qt emits bytesWritten synchronously from inside write(), so app_send can
+  // re-enter this function while the outer loop still holds `n`/`taken`.
+  // Without the guard the inner pass drains app_in and the outer one then
+  // drops bytes it never sent (or sends the same bytes twice).
   if (conn.in_flush_app) {
     return;
   }

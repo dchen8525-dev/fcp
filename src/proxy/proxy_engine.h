@@ -34,9 +34,9 @@
 
 #include "fcp/envelope.h"
 #include "fcp/prewarm.h"
-#include "proxy/proxy_proto.h"
 #include "fcp/session.h"
 #include "fcp/stream.h"
+#include "proxy/proxy_proto.h"
 
 namespace fcp {
 
@@ -55,30 +55,30 @@ struct EngineConfig {
   EngineRole role = EngineRole::kClient;
   // Pre-shared key: both ends must be configured with the same one.
   uint8_t key[16] = {};
-  uint8_t d = 10;
-  uint8_t p = 3;
+  uint8_t d = kDefaultD;
+  uint8_t p = kDefaultP;
   uint8_t p_max = kDefaultPmax;
-  uint16_t mtu = 1400;
-  size_t ip_hdr_len = 20;
+  uint16_t mtu = kDefaultMtu;
+  size_t ip_hdr_len = kDefaultIpHeaderLen;
   int pinned_k = -1;  // >= 0 bypasses the adaptive strategy (measurements)
   // M3 byte budget (M3控制设计.md §2), passed to SessionConfig verbatim.
-  double fec_budget = 0.50;
+  double fec_budget = kDefaultFecBudget;
   // #29a controller trace: when non-empty, every session writes a JSONL
   // controller trace (SessionConfig::trace) to `<prefix>.<cid>.jsonl` —
   // the calibration input for tools/fcp_replay.
   std::string trace_prefix;
-  size_t send_window_bytes = 256 * 1024;
-  size_t rcv_buf_bytes = 256 * 1024;
+  size_t send_window_bytes = kDefaultSendWindowBytes;
+  size_t rcv_buf_bytes = kDefaultRcvBufBytes;
   // Window autotune (StreamConfig::auto_window): the stream's send window
   // starts at send_window_bytes, grows while the stream is its own bottleneck
   // between window_min_bytes and window_max_bytes, and holds or shrinks when
   // its own queue shows up in the RTT. Not a BDP tracker: the measured BDP is
   // only the recovery reference after a loss.
   bool auto_window = true;
-  size_t window_min_bytes = 64 * 1024;
-  size_t window_max_bytes = 1024 * 1024;
+  size_t window_min_bytes = kDefaultWindowMinBytes;
+  size_t window_max_bytes = kDefaultWindowMaxBytes;
   // Teardown of a tunnel that stopped speaking (§7: dead peer detection).
-  int64_t idle_timeout_ms = 300000;
+  int64_t idle_timeout_ms = kDefaultIdleTimeoutMs;
   // Remote resolution plus dial (§4.3).
   int64_t dial_timeout_ms = 5000;
   // How long a finished tunnel may still take to flush its own bytes: the fin
@@ -179,7 +179,6 @@ class ProxyEngine {
     uint32_t over_limit = 0;  // refused: max_sessions reached
     uint32_t bad_entry = 0;   // malformed local request
     uint32_t open_failed = 0;  // OPEN_ERR sent or received
-    uint32_t dup_rec = 0;      // #31: FEC recovered a slot the ARQ rtx also hit
     uint32_t handshake_failed = 0;
     uint32_t reset = 0;        // stream RST either way
     uint32_t idle_closed = 0;
@@ -205,7 +204,13 @@ class ProxyEngine {
 
  private:
   enum class Phase : uint8_t {
-    kEntry,       // client: local request not yet complete
+    // Client: still reading the local request. Covers the protocol sniff (from
+    // byte 0), the HTTP head, and the SOCKS5 greeting.
+    kEntry,
+    // Client: the SOCKS5 greeting was answered, the CONNECT request is not in
+    // yet. A request may be corked behind the greeting, so parse_entry() falls
+    // straight through from kEntry into this phase.
+    kSocks5Request,
     kAwaitReply,  // client: OPEN written, OPEN_OK/ERR not yet in
     kNegotiating,  // server: session created by an inbound HELLO, not yet up
     kAwaitOpen,   // server: stream up, OPEN message not yet complete
@@ -213,6 +218,13 @@ class ProxyEngine {
     kTunnel,      // both directions usable
     kDone,        // marked for reap
   };
+
+  // Is the client still exchanging its entry request? Asked instead of comparing
+  // against kEntry, so adding an entry phase cannot silently reclassify a
+  // connection as "past the entry exchange" at a call site that forgot it.
+  static bool in_entry_phase(Phase phase) {
+    return phase == Phase::kEntry || phase == Phase::kSocks5Request;
+  }
 
   struct Conn {
     uint64_t id = 0;
@@ -225,10 +237,17 @@ class ProxyEngine {
 
     bool socks5 = true;     // client: entry protocol, sniffed from byte 0
     bool sniffed = false;   // socks5 was decided from the first byte
-    bool greeting_done = false;  // client: SOCKS5 method negotiation is over
     bool local_eof = false;  // the application socket gave up
-    bool closing = false;  // OPEN_ERR went out: flush, then tear down
-    bool want_fin = false;   // close the stream once both buffers are empty
+    // Two independent teardown paths, and the difference is load-bearing:
+    //   closing  -- we refused the tunnel (OPEN_ERR). Inbound stream bytes are
+    //               dropped by on_stream_bytes(); nothing may be forwarded.
+    //   want_fin -- we are done sending (local EOF, peer close, or the flush
+    //               after an OPEN_ERR) but the peer's bytes are still taken
+    //               until the fin lands.
+    // send_open_error() sets both; on_local_closed()/on_target_closed() set only
+    // want_fin; the stream's own close callback sets only want_fin.
+    bool closing = false;
+    bool want_fin = false;
     bool established_seen = false;
     // A1 follow-up: only a session that once presented a valid GCM tag may
     // leave a salt tombstone. Untagged traffic must not grow that table.
@@ -262,14 +281,10 @@ class ProxyEngine {
   // Server: the OPEN exchange on a stream.
   void send_open_error(Conn& conn, OpenError err);
 
-  // The fields both ends share. A15/B11: client and server used to copy them
-  // one by one in two places, so a new SessionConfig field could reach only
-  // one direction. A SessionConfig field added later goes here, never into a
-  // create_*_conn().
+  // The fields both ends share. A new SessionConfig field belongs here, never
+  // in a create_*_conn(); fill_stream_config() in attach_stream() is the same
+  // rule for StreamConfig. (History: A15/B11.)
   void fill_session_config(SessionConfig* sc, uint64_t conn_id) const;
-  // The matching single entry point for StreamConfig, applied in
-  // attach_stream(): a StreamConfig field sourced from EngineConfig goes
-  // here, never into a create_*_conn() or a hand-written copy in attach.
   void fill_stream_config(StreamConfig* sc) const;
   std::unique_ptr<Session> make_session(uint64_t conn_id, const SessionConfig& sc);
 

@@ -466,6 +466,7 @@ QWidget* MainWindow::makeTrafficCell(const char* text, const char* cap, bool dow
   return cell;
 }
 
+QWidget* MainWindow::makeField(const QString& label, QWidget* input) {
   auto* field = new QWidget;
   auto* layout = new QVBoxLayout(field);
   layout->setContentsMargins(0, 0, 0, 0);

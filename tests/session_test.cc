@@ -13,6 +13,7 @@
 #include "fcp/handshake.h"
 #include "fcp/hdr.h"
 #include "fcp/random.h"
+#include "fecstat_log.h"
 #include "test_util.h"
 
 namespace {
@@ -66,6 +67,19 @@ const uint8_t* PeerDraw() {
   return kPeer;
 }
 
+// A HELLO in its on-wire shape but not yet sealed: an oob FEC header with
+// set_id = index = 0 followed by the HELLO body. Every bootstrap-epoch test
+// starts from this, then seals it with its own envelope.
+Bytes OobHello(const uint8_t draw[fcp::kHandshakeNonceLen]) {
+  Bytes plain(fcp::kFecHdrLen + fcp::kHelloLen);
+  fcp::pack_hdr(
+      fcp::FecHdr{0, 0, fcp::pack_type_k(0, 0, static_cast<uint8_t>(fcp::SymbolType::kOob))},
+      plain.data());
+  fcp::build_hello(fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, fcp::kLocalFlagsM1}, draw,
+                   plain.data() + fcp::kFecHdrLen);
+  return plain;
+}
+
 // R3-1: after the handshake the data envelope is keyed by both draws, so a
 // test that peeks at a session's output has to derive the same key. Handshake
 // messages still use the bootstrap key, hence the plain readers further down.
@@ -91,39 +105,6 @@ bool HasLine(const std::vector<std::string>& logs, const std::string& want) {
 bool HasPrefix(const std::vector<std::string>& logs, const std::string& prefix) {
   for (const std::string& line : logs) {
     if (line.rfind(prefix, 0) == 0) {
-      return true;
-    }
-  }
-  return false;
-}
-
-struct FecstatLogFields {
-  uint32_t sets = 0;
-  uint32_t expect = 0;
-  uint32_t rx = 0;
-  uint32_t rec = 0;
-  uint32_t late = 0;
-  uint32_t lost = 0;
-  uint32_t pre = 0;
-  uint32_t usable = 0;
-  unsigned k = 0;
-  std::string state;
-};
-
-bool ParseFecstatLog(const std::vector<std::string>& logs, FecstatLogFields* out) {
-  for (const std::string& line : logs) {
-    if (line.rfind("FECSTAT sets=", 0) != 0) {
-      continue;
-    }
-    char state[8] = {};
-    const int n = std::sscanf(
-        line.c_str(),
-        "FECSTAT sets=%u expect=%u rx=%u rec=%u late=%u lost=%u pre=%uppm "
-        "usable=%uppm -> k=%u state=%7s",
-        &out->sets, &out->expect, &out->rx, &out->rec, &out->late, &out->lost,
-        &out->pre, &out->usable, &out->k, state);
-    if (n == 10) {
-      out->state = state;
       return true;
     }
   }
@@ -297,8 +278,8 @@ void TestFullLoop() {
   CHECK(k1 >= 1);
   CHECK(static_cast<uint8_t>(k1) <= a.params().p);  // k <= P'
 
-  FecstatLogFields first;
-  CHECK(ParseFecstatLog(log_a, &first));
+  fcp_test::FecstatLogFields first;
+  CHECK(fcp_test::ParseFecstatLog(log_a, &first));
   CHECK_EQ(first.state, std::string("ON"));
   CHECK_EQ(static_cast<uint8_t>(first.k), k1);
   CHECK(first.expect >= fcp::kMinSamplePackets);
@@ -476,14 +457,7 @@ void TestHandshakeAckRidesOob() {
       nullptr, nullptr);
   b.start(0);
 
-  uint8_t hello[fcp::kHelloLen];
-  fcp::build_hello(fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, fcp::kLocalFlagsM1},
-                   PeerDraw(), hello);
-  Bytes plain(fcp::kFecHdrLen + sizeof(hello));
-  fcp::pack_hdr(
-      fcp::FecHdr{0, 0, fcp::pack_type_k(0, 0, static_cast<uint8_t>(fcp::SymbolType::kOob))},
-      plain.data());
-  std::memcpy(plain.data() + fcp::kFecHdrLen, hello, sizeof(hello));
+  const Bytes plain = OobHello(PeerDraw());
 
   fcp::Envelope peer(kKey, kSalt, fcp::Direction::kC2S, fcp::Direction::kS2C);
   Bytes wire;
@@ -528,14 +502,7 @@ void TestBootstrapNonHandshakeIsCounted() {
   // Establish with a hand-built HELLO so the data envelope rekeys away from
   // the bootstrap key; only then does a bootstrap-sealed packet reach the
   // bootstrap branch at all (before that, env_ opens it first).
-  uint8_t hello[fcp::kHelloLen];
-  fcp::build_hello(fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, fcp::kLocalFlagsM1},
-                   PeerDraw(), hello);
-  Bytes plain(fcp::kFecHdrLen + sizeof(hello));
-  fcp::pack_hdr(
-      fcp::FecHdr{0, 0, fcp::pack_type_k(0, 0, static_cast<uint8_t>(fcp::SymbolType::kOob))},
-      plain.data());
-  std::memcpy(plain.data() + fcp::kFecHdrLen, hello, sizeof(hello));
+  const Bytes plain = OobHello(PeerDraw());
 
   fcp::Envelope peer(kKey, kSalt, fcp::Direction::kC2S, fcp::Direction::kS2C);
   Bytes wire;
@@ -585,14 +552,7 @@ void TestInvalidLocalCaps() {
   CHECK(HasLine(logs, "FCP config invalid: local D/P out of range"));
 
   // A valid peer HELLO may negotiate on paper, but no codec is built either.
-  uint8_t hello[fcp::kHelloLen];
-  fcp::build_hello(fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, fcp::kLocalFlagsM1},
-                   PeerDraw(), hello);
-  Bytes plain(fcp::kFecHdrLen + sizeof(hello));
-  fcp::pack_hdr(
-      fcp::FecHdr{0, 0, fcp::pack_type_k(0, 0, static_cast<uint8_t>(fcp::SymbolType::kOob))},
-      plain.data());
-  std::memcpy(plain.data() + fcp::kFecHdrLen, hello, sizeof(hello));
+  const Bytes plain = OobHello(PeerDraw());
   fcp::Envelope peer(kKey, kSalt, fcp::Direction::kS2C, fcp::Direction::kS2C);
   Bytes wire;
   CHECK(peer.seal(plain.data(), plain.size(), &wire));
@@ -1020,7 +980,7 @@ void TestSessionTable() {
 // Every k the FECSTAT log line announced, in order (T35 trajectory view).
 std::vector<unsigned> AllKs(const std::vector<std::string>& logs) {
   std::vector<unsigned> ks;
-  FecstatLogFields f;
+  fcp_test::FecstatLogFields f;
   for (const std::string& line : logs) {
     if (line.rfind("FECSTAT sets=", 0) != 0) {
       continue;
@@ -1368,14 +1328,7 @@ void TestEstablishedSurvivesForeignHello() {
   uint8_t rogue[16];
   std::memset(rogue, 0xAA, sizeof(rogue));
   rogue[15] = 0xAB;
-  uint8_t hello[fcp::kHelloLen];
-  fcp::build_hello(fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, fcp::kLocalFlagsM1},
-                   rogue, hello);
-  Bytes plain(fcp::kFecHdrLen + sizeof(hello));
-  fcp::pack_hdr(
-      fcp::FecHdr{0, 0, fcp::pack_type_k(0, 0, static_cast<uint8_t>(fcp::SymbolType::kOob))},
-      plain.data());
-  std::memcpy(plain.data() + fcp::kFecHdrLen, hello, sizeof(hello));
+  const Bytes plain = OobHello(rogue);
   fcp::Envelope peer(kKey, kSalt, fcp::Direction::kC2S, fcp::Direction::kS2C);
   // The rogue speaks the bootstrap epoch, whose counter space is the full
   // 64-bit range — a data-envelope ceiling would refuse the draw.

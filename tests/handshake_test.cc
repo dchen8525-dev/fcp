@@ -153,8 +153,8 @@ void TestMutualHandshake() {
   CHECK_EQ(b.hs.hello_refused(), 0u);
 
   // Both ends agree on the nonce pair even though the exchange crossed.
-  CHECK(std::memcmp(a.hs.client_nonce(), b.hs.client_nonce(), 16) == 0);
-  CHECK(std::memcmp(a.hs.server_nonce(), b.hs.server_nonce(), 16) == 0);
+  CHECK(std::memcmp(a.hs.client_nonce(), b.hs.client_nonce(), fcp::kHandshakeNonceLen) == 0);
+  CHECK(std::memcmp(a.hs.server_nonce(), b.hs.server_nonce(), fcp::kHandshakeNonceLen) == 0);
 
   // No retries after establishment.
   a.hs.on_tick(10000);
@@ -186,7 +186,7 @@ void TestKeyAgreement() {
                              key_a);
   fcp::derive_session_key_v7(psk, salt, b.hs.client_nonce(), b.hs.server_nonce(),
                              key_b);
-  CHECK(std::memcmp(key_a, key_b, 16) == 0);
+  CHECK(std::memcmp(key_a, key_b, 16) == 0);  // 16 = AES-128 session key, not a nonce
 }
 
 // R3-1: an ACK that does not echo our own draw belongs to someone else's
@@ -235,7 +235,7 @@ void TestServerAckEchoMismatch() {
   // A real ACK (correct echo) still completes the handshake.
   CHECK(p.deliver(MakeAck(Nonce(0x99), p.nonce)) == HandshakeStatus::kConsumed);
   CHECK(p.hs.established());
-  CHECK(std::memcmp(p.hs.peer_nonce(), Nonce(0x99).data(), 16) == 0);
+  CHECK(std::memcmp(p.hs.peer_nonce(), Nonce(0x99).data(), fcp::kHandshakeNonceLen) == 0);
   CHECK_EQ(p.hs.nonce_mismatch(), 1u);
 }
 
@@ -262,7 +262,7 @@ void TestEstablishedRefusesNewHello() {
   CHECK_EQ(p.sent.size(), 2u);
   CHECK(p.hs.established());
   CHECK_EQ(p.hs.hello_refused(), 1u);
-  CHECK(std::memcmp(p.hs.peer_nonce(), Nonce(0x11).data(), 16) == 0);
+  CHECK(std::memcmp(p.hs.peer_nonce(), Nonce(0x11).data(), fcp::kHandshakeNonceLen) == 0);
 }
 
 // A draw of all zeros carries no freshness; accepting it would let a forgery
@@ -598,7 +598,7 @@ void TestNonceIsRandom() {
   fcp::Handshake b(10, 3, nullptr, HandshakeRole::kClient);
   CHECK(a.state() == fcp::HandshakeState::kIdle);
   CHECK(b.state() == fcp::HandshakeState::kIdle);
-  CHECK(std::memcmp(a.local_nonce(), b.local_nonce(), 16) != 0);
+  CHECK(std::memcmp(a.local_nonce(), b.local_nonce(), fcp::kHandshakeNonceLen) != 0);
 
   uint8_t acc = 0;
   for (size_t i = 0; i < 16; ++i) {

@@ -336,6 +336,16 @@ void ProbeR3Rs() {
     std::vector<std::vector<uint8_t>> recovered;
     const bool ok = fcp::decode(ptrs.data(), n, k, symbol_max, &recovered);
     if (erased_data.empty()) {
+      // Nothing to erase: decode must succeed and reconstruct nothing. rs.cc
+      // pre-sizes `recovered` to n slots and fills only the erased ones, so
+      // "nothing reconstructed" means every slot is empty -- not that the
+      // vector itself is empty. This branch used to return silently, so the
+      // whole no-loss shape went unasserted.
+      CHECK(ok);
+      CHECK_EQ(recovered.size(), n);
+      for (const std::vector<uint8_t>& r : recovered) {
+        CHECK(r.empty());
+      }
       return ok;
     }
     // With g ghost/lost parity rows only k-g parity rows remain, so losses
@@ -431,15 +441,25 @@ void ProbeR3Rs() {
     for (size_t k = 1; k <= 7; ++k) {
       const std::vector<uint8_t> mat = fcp::cauchy_matrix(n, k);
       const size_t t = std::min(n, k);
-      // take the top-left t x t block (distinct rows 0..t-1, cols 0..t-1)
+      // Top-left t x t block: rows 0..t-1 and columns 0..t-1 are distinct by
+      // construction. The source is row-major with n columns per row, so the
+      // source stride is n while the block stride is t.
       std::vector<uint8_t> block(t * t);
       for (size_t r = 0; r < t; ++r) {
         for (size_t c = 0; c < t; ++c) {
           block[r * t + c] = mat[r * n + c];
         }
       }
+      // Inverting destroys the block, so keep a copy for the MDS check below.
+      const std::vector<uint8_t> original = block;
       CHECK(fcp::cauchy_invert_matrix(block.data(), t));
-      // identity * inverse must reproduce the inverse
+      // MDS means the inverse restores the original block, not merely that a
+      // matrix was produced: M * M^-1 must be the identity in GF(256), so
+      // (M^-1)^-1 == M. Inverting the result and comparing is the cheapest way
+      // to assert that without a matrix multiply here.
+      std::vector<uint8_t> round_trip = block;
+      CHECK(fcp::cauchy_invert_matrix(round_trip.data(), t));
+      CHECK(round_trip == original);
     }
   }
 
@@ -448,7 +468,9 @@ void ProbeR3Rs() {
   for (size_t k = 1; k <= 7; ++k) {
     for (size_t c = 0; k + c <= 255; ++c) {
       for (size_t r = 0; r < k; ++r) {
-        CHECK(fcp::cauchy_coeff(r, c, k) != 0 || false);  // inverse of non-zero
+        // x_r and y_c are disjoint, so their XOR is non-zero and so is the
+        // coefficient's inverse: a zero here would be a singular block.
+        CHECK(fcp::cauchy_coeff(r, c, k) != 0);
         const uint8_t denom = static_cast<uint8_t>(r ^ (k + c));
         CHECK(denom != 0);
       }

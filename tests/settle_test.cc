@@ -60,11 +60,13 @@ struct Fixture {
 
   void feed(uint32_t set_id, uint8_t index, uint8_t type_k, const std::vector<uint8_t>& symbol,
             int64_t now_ms = 0) {
+    // on_datagram copies what it keeps, so one scratch buffer serves every
+    // datagram and the loop-heavy tests stop allocating per symbol.
     uint8_t hdr[fcp::kFecHdrLen];
     fcp::pack_hdr(fcp::FecHdr{set_id, index, type_k}, hdr);
-    std::vector<uint8_t> dg(hdr, hdr + fcp::kFecHdrLen);
-    dg.insert(dg.end(), symbol.begin(), symbol.end());
-    rx.on_datagram(dg.data(), dg.size(), now_ms);
+    dg_.assign(hdr, hdr + fcp::kFecHdrLen);
+    dg_.insert(dg_.end(), symbol.begin(), symbol.end());
+    rx.on_datagram(dg_.data(), dg_.size(), now_ms);
   }
 
   void feed_tx(const fcp::TxSymbol& s, int64_t now_ms = 0) {
@@ -78,6 +80,9 @@ struct Fixture {
   }
 
   const fcp::SettleCounters& c() const { return settle.counters(); }
+
+ private:
+  std::vector<uint8_t> dg_;  // scratch for feed()
 };
 
 std::vector<fcp::TxSymbol> BuildSet(uint8_t d, uint8_t k,
@@ -151,14 +156,17 @@ void TestBasicAccounting() {
   CHECK(!f.settle.untrusted());
   CHECK_EQ(f.settle.accounted_through_set_id(), 0u);
 
+  // Accounted at 100 (see the tick above); the tombstone runs one
+  // tombstone_ms(100) past that, so 300 is derived, not restated.
+  const int64_t tombstone_until = 100 + fcp::FcpSettle::tombstone_ms(100);
   fcp::RxSetView v;
   CHECK(f.rx.view(0, &v));
   CHECK(v.phase == fcp::SetPhase::kAccounted);
-  CHECK_EQ(v.tombstone_until_ms, 300);
+  CHECK_EQ(v.tombstone_until_ms, tombstone_until);
 
-  f.settle.tick(299, 100);
+  f.settle.tick(tombstone_until - 1, 100);
   CHECK(f.rx.view(0, &v));
-  f.settle.tick(300, 100);
+  f.settle.tick(tombstone_until, 100);
   CHECK(!f.rx.view(0, &v));
   CHECK_EQ(f.rx.active_sets(), 0u);
 }

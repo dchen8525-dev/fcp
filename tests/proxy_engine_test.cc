@@ -43,6 +43,10 @@ constexpr uint64_t kClientPeer = 3;  // the server's id for the client's address
 constexpr uint64_t kOtherPeer = 9;   // a fourth-party source address
 constexpr uint64_t kLocalConn = 101;  // the first id the client host allocates
 constexpr size_t kNoLimit = static_cast<size_t>(-1);
+// Bytes the client writes into the local socket for a successful SOCKS5 entry:
+// the 2-byte method selection plus the 10-byte CONNECT reply. Everything the
+// application reads before tunnel data starts is this prefix.
+constexpr size_t kEntryReplyBytes = fcp::kSocks5GreetingReplyLen + fcp::kSocks5ReplyLen;
 
 struct Options {
   size_t client_max_sessions = 256;
@@ -352,6 +356,21 @@ bool logged(const std::vector<std::string>& lines, const std::string& needle) {
   return false;
 }
 
+// Every step here is a virtual 25ms tick, so this is a generous ceiling rather
+// than an expectation: a tunnel comes up in a few ticks, and a scenario that
+// needs the whole ceiling is one whose handshake regressed.
+constexpr int kTunnelSteps = 60;
+
+// The three sends every tunnel scenario starts with: open the local socket,
+// answer the SOCKS5 greeting, and CONNECT to an IPv4 literal. The wait that
+// follows stays at the call site, because what counts as "up" differs.
+void post_socks5_entry(Harness& h, const char* ip = "198.51.100.9", uint16_t port = 80,
+                       uint64_t conn = kLocalConn) {
+  h.local_open(conn);
+  h.local_send(conn, greeting());
+  h.local_send(conn, socks5_request(0x01, 0x01, ipv4_bytes(ip), port));
+}
+
 // ---- scenarios ----
 
 // The whole of §4.1 plus §4.3: greeting, CONNECT, dial, OPEN_OK, payload in both
@@ -376,7 +395,7 @@ void socks5_round_trip() {
   CHECK_EQ(h.server->counters().tunnels, 1u);
   // The SOCKS5 success reply is 10 bytes with rep=0 and an unspecified bind.
   const std::vector<uint8_t> reply = h.app_bytes(kLocalConn);
-  CHECK_EQ(reply.size(), 12u);  // greeting reply (2) + connect reply (10)
+  CHECK_EQ(reply.size(), kEntryReplyBytes);
   CHECK_EQ(static_cast<int>(reply[3]), 0x00);
 
   // Payload, both ways.
@@ -385,7 +404,7 @@ void socks5_round_trip() {
   h.target_send(target_conn, std::vector<uint8_t>{'2', '0', '0'});
   CHECK(h.run_until([&] { return h.app_bytes(kLocalConn).size() == 15; }, 20));
   CHECK_EQ(text_of(h.target_bytes(target_conn)), std::string("GET"));
-  CHECK_EQ(text_of(h.app_bytes(kLocalConn)).substr(12), std::string("200"));
+  CHECK_EQ(text_of(h.app_bytes(kLocalConn)).substr(kEntryReplyBytes), std::string("200"));
 
   // Close: the application hangs up, the fin crosses, and both tables empty out.
   h.local_close(kLocalConn);
@@ -444,7 +463,7 @@ void open_error_maps_to_the_local_reply() {
     CHECK(h.run_until([&] { return h.client->counters().open_failed == 1; }, 40));
 
     const std::vector<uint8_t> reply = h.app_bytes(conn);
-    CHECK_EQ(reply.size(), 12u);
+    CHECK_EQ(reply.size(), kEntryReplyBytes);
     CHECK_EQ(static_cast<int>(reply[3]), static_cast<int>(cases[i].rep));
     CHECK_EQ(h.client->counters().tunnels, 0u);
 
@@ -487,7 +506,7 @@ void malformed_local_requests() {
     h.local_send(kLocalConn, greeting());
     h.local_send(kLocalConn, socks5_request(0x03, 0x01, ipv4_bytes("198.51.100.1"), 1234));
     const std::vector<uint8_t> reply = h.app_bytes(kLocalConn);
-    CHECK_EQ(reply.size(), 12u);
+    CHECK_EQ(reply.size(), kEntryReplyBytes);
     CHECK_EQ(static_cast<int>(reply[3]), 0x07);
     CHECK_EQ(h.client->counters().bad_entry, 1u);
   }
@@ -525,10 +544,8 @@ void backpressure_closes_the_window() {
   opt.rcv_buf_bytes = kRcvBuf;
   opt.send_window_bytes = 32 * 1024;
   Harness h{opt};
-  h.local_open(kLocalConn);
-  h.local_send(kLocalConn, greeting());
-  h.local_send(kLocalConn, socks5_request(0x01, 0x01, ipv4_bytes("198.51.100.9"), 80));
-  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, 60));
+  post_socks5_entry(h);
+  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, kTunnelSteps));
   const uint64_t target_conn = h.first_dial_conn();
 
   h.client_accept_limit = 0;  // the local socket is not draining
@@ -556,7 +573,7 @@ void backpressure_closes_the_window() {
   const size_t want = pushed;
   CHECK(h.run_until([&] { return h.app_bytes(kLocalConn).size() >= 12 + want; }, 800));
   CHECK_EQ(h.app_bytes(kLocalConn).size(), 12 + want);
-  CHECK_EQ(text_of(h.app_bytes(kLocalConn)).substr(12), std::string(want, 0x5A));
+  CHECK_EQ(text_of(h.app_bytes(kLocalConn)).substr(kEntryReplyBytes), std::string(want, 0x5A));
 
   h.local_close(kLocalConn);
   CHECK(h.run_until([&] {
@@ -569,10 +586,8 @@ void backpressure_closes_the_window() {
 // the datagram authenticates; a bare salt prefix must not be able to kill it.
 void salt_routing_and_replay_binding() {
   Harness h{Options()};
-  h.local_open(kLocalConn);
-  h.local_send(kLocalConn, greeting());
-  h.local_send(kLocalConn, socks5_request(0x01, 0x01, ipv4_bytes("198.51.100.9"), 80));
-  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, 60));
+  post_socks5_entry(h);
+  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, kTunnelSteps));
 
   CHECK_EQ(h.client->counters().unknown_salt, 0u);
   CHECK_EQ(h.server->counters().salt_clash, 0u);
@@ -623,10 +638,8 @@ void short_connections_leave_no_state_behind() {
   const std::vector<uint8_t> payload = {'h', 'i'};
   for (size_t i = 0; i < 20; ++i) {
     const uint64_t conn = kLocalConn + i;
-    h.local_open(conn);
-    h.local_send(conn, greeting());
-    h.local_send(conn, socks5_request(0x01, 0x01, ipv4_bytes("192.0.2.1"), 80));
-    CHECK(h.run_until([&] { return h.client->counters().tunnels == i + 1; }, 80));
+    post_socks5_entry(h, "192.0.2.1", 80, conn);
+    CHECK(h.run_until([&] { return h.client->counters().tunnels == i + 1; }, kTunnelSteps));
     h.local_send(conn, payload);
     CHECK(h.run_until([&] { return h.target_bytes(h.last_dial_conn()).size() >= 2; }, 40));
     h.local_close(conn);
@@ -673,10 +686,8 @@ void dial_timeout_and_grace_clock() {
     Options opt;
     opt.flush_grace_ms = 250;
     Harness h{opt};
-    h.local_open(kLocalConn);
-    h.local_send(kLocalConn, greeting());
-    h.local_send(kLocalConn, socks5_request(0x01, 0x01, ipv4_bytes("192.0.2.7"), 80));
-    CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, 60));
+    post_socks5_entry(h, "192.0.2.7");
+    CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, kTunnelSteps));
     h.client_accept_limit = 0;
     h.target_send(h.first_dial_conn(), std::vector<uint8_t>(64, 0x11));
     // The bytes still have to cross the wire before the local socket is asked
@@ -691,10 +702,8 @@ void dial_timeout_and_grace_clock() {
     Options opt;
     opt.flush_grace_ms = 250;
     Harness h{opt};
-    h.local_open(kLocalConn);
-    h.local_send(kLocalConn, greeting());
-    h.local_send(kLocalConn, socks5_request(0x01, 0x01, ipv4_bytes("192.0.2.7"), 80));
-    CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, 60));
+    post_socks5_entry(h, "192.0.2.7");
+    CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, kTunnelSteps));
     h.local_close(kLocalConn);
     h.mute_server = true;
     CHECK(h.run_until(
@@ -767,10 +776,8 @@ void zero_window_recovery_after_partial_refusal() {
   opt.rcv_buf_bytes = 32 * 1024;
   opt.send_window_bytes = 64 * 1024;
   Harness h{opt};
-  h.local_open(kLocalConn);
-  h.local_send(kLocalConn, greeting());
-  h.local_send(kLocalConn, socks5_request(0x01, 0x01, ipv4_bytes("198.51.100.9"), 80));
-  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, 60));
+  post_socks5_entry(h);
+  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, kTunnelSteps));
   const uint64_t target_conn = h.first_dial_conn();
 
   // The reader drains slowly: every app_send takes at most 4 KiB, which
@@ -789,7 +796,7 @@ void zero_window_recovery_after_partial_refusal() {
   const size_t want = pushed;
   CHECK(h.run_until([&] { return h.app_bytes(kLocalConn).size() >= 12 + want; }, 4000));
   CHECK_EQ(h.app_bytes(kLocalConn).size(), 12 + want);
-  CHECK_EQ(text_of(h.app_bytes(kLocalConn)).substr(12), std::string(want, 0x5A));
+  CHECK_EQ(text_of(h.app_bytes(kLocalConn)).substr(kEntryReplyBytes), std::string(want, 0x5A));
   CHECK(!logged(h.client_log, "closed"));
 
   h.local_close(kLocalConn);
@@ -850,10 +857,8 @@ void socks5_greeting_without_request_waits() {
 // a stale datagram.
 void salt_tombstone_absorbs_tail() {
   Harness h{Options()};
-  h.local_open(kLocalConn);
-  h.local_send(kLocalConn, greeting());
-  h.local_send(kLocalConn, socks5_request(0x01, 0x01, ipv4_bytes("198.51.100.9"), 80));
-  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, 60));
+  post_socks5_entry(h);
+  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, kTunnelSteps));
   const std::vector<uint8_t> tail = h.last_from_client;
 
   h.local_close(kLocalConn);
@@ -881,10 +886,8 @@ void trace_sink_writes_controller_trace() {
   Options opt;
   opt.trace_prefix = "replay_trace_test/deep/dir/trace";  // #33: dirs auto-created
   Harness h{opt};
-  h.local_open(kLocalConn);
-  h.local_send(kLocalConn, greeting());
-  h.local_send(kLocalConn, socks5_request(0x01, 0x01, ipv4_bytes("198.51.100.9"), 80));
-  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, 60));
+  post_socks5_entry(h);
+  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, kTunnelSteps));
   // Drive >= 256 data packets through the tunnel so a report fires at the 2s
   // cadence, then settle everything so the sink's file closes.
   const std::vector<uint8_t> bulk(400 * 1336, 0x5A);
@@ -933,10 +936,8 @@ void unauthenticated_datagrams_do_not_create_sessions() {
   CHECK(logged(h.server_log, "unauthenticated first datagram"));
 
   // The table the junk would have filled is still available to a real client.
-  h.local_open(kLocalConn);
-  h.local_send(kLocalConn, greeting());
-  h.local_send(kLocalConn, socks5_request(0x01, 0x01, ipv4_bytes("198.51.100.9"), 80));
-  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, 60));
+  post_socks5_entry(h);
+  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, kTunnelSteps));
   CHECK_EQ(h.server->counters().over_limit, 0u);
 }
 
@@ -1012,10 +1013,8 @@ void dial_backpressure_bounds_pre_tunnel_bytes() {
 // a live session.
 void peer_callbacks_balance_server_sessions() {
   Harness h{Options()};
-  h.local_open(kLocalConn);
-  h.local_send(kLocalConn, greeting());
-  h.local_send(kLocalConn, socks5_request(0x01, 0x01, ipv4_bytes("203.0.113.9"), 443));
-  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, 40));
+  post_socks5_entry(h, "203.0.113.9", 443);
+  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, kTunnelSteps));
 
   CHECK_EQ(h.server_peer_bounds.size(), 1u);
   CHECK_EQ(h.server_peer_bounds[0], kClientPeer);
@@ -1054,10 +1053,8 @@ void auto_window_bounds_memory_by_window_max() {
   opt.send_window_bytes = 16 * 1024;
   opt.rcv_buf_bytes = 16 * 1024;
   Harness h{opt};
-  h.local_open(kLocalConn);
-  h.local_send(kLocalConn, greeting());
-  h.local_send(kLocalConn, socks5_request(0x01, 0x01, ipv4_bytes("198.51.100.9"), 80));
-  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, 60));
+  post_socks5_entry(h);
+  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, kTunnelSteps));
   const uint64_t target_conn = h.first_dial_conn();
 
   h.client_accept_limit = 0;  // the local socket is not draining
@@ -1083,7 +1080,7 @@ void auto_window_bounds_memory_by_window_max() {
   const size_t want = pushed;
   CHECK(h.run_until([&] { return h.app_bytes(kLocalConn).size() >= 12 + want; }, 800));
   CHECK_EQ(h.app_bytes(kLocalConn).size(), 12 + want);
-  CHECK_EQ(text_of(h.app_bytes(kLocalConn)).substr(12), std::string(want, 0x5A));
+  CHECK_EQ(text_of(h.app_bytes(kLocalConn)).substr(kEntryReplyBytes), std::string(want, 0x5A));
 
   h.local_close(kLocalConn);
   CHECK(h.run_until([&] {
@@ -1105,10 +1102,8 @@ void auto_window_grows_in_the_engine() {
   opt.rcv_buf_bytes = 16 * 1024;
   opt.wire_latency_ticks = 4;  // 200ms round trip
   Harness h{opt};
-  h.local_open(kLocalConn);
-  h.local_send(kLocalConn, greeting());
-  h.local_send(kLocalConn, socks5_request(0x01, 0x01, ipv4_bytes("198.51.100.9"), 80));
-  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, 60));
+  post_socks5_entry(h);
+  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, kTunnelSteps));
   const uint64_t target_conn = h.first_dial_conn();
 
   const std::vector<uint8_t> chunk(2048, 0x5A);
@@ -1130,7 +1125,7 @@ void auto_window_grows_in_the_engine() {
 
   // The reader kept up with everything the window let through.
   CHECK(h.run_until([&] { return h.app_bytes(kLocalConn).size() >= 12 + pushed; }, 600));
-  CHECK_EQ(text_of(h.app_bytes(kLocalConn)).substr(12), std::string(pushed, 0x5A));
+  CHECK_EQ(text_of(h.app_bytes(kLocalConn)).substr(kEntryReplyBytes), std::string(pushed, 0x5A));
 
   h.local_close(kLocalConn);
   CHECK(h.run_until([&] {

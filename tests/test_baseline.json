@@ -3,7 +3,7 @@
   "binaries": {
     "adv_test": {
       "functions": 10,
-      "checks": 321
+      "checks": 326
     },
     "aes_test": {
       "functions": 2,

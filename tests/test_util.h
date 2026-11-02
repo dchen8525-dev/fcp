@@ -6,8 +6,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <ostream>
 #include <random>
+#include <sstream>
 #include <string>
+#include <type_traits>
 
 namespace fcp_test {
 
@@ -19,6 +22,54 @@ inline int& failures() {
 inline void report_failure(const char* file, int line, const char* expr) {
   std::fprintf(stderr, "%s:%d CHECK failed: %s\n", file, line, expr);
   ++failures();
+}
+
+// CHECK_EQ reports what it compared, not just the expression: on a threshold
+// assertion ("expected >= 256 packets") the bare text "#actual == #expected"
+// cannot tell a CI reader whether the run missed by one or by a factor of a
+// hundred. Everything that prints is streamed generically, so any type with an
+// operator<< works, and an enum without one falls back to its integer value.
+// Narrow integer types are widened first: printing uint8_t through the generic
+// path would emit a character, not a number.
+template <typename T>
+struct Fmt {
+  const T& v;
+};
+
+template <typename T>
+Fmt<T> fmt(const T& v) {
+  return Fmt<T>{v};
+}
+
+template <typename T>
+std::ostream& operator<<(std::ostream& os, const Fmt<T>& f) {
+  if constexpr (std::is_enum_v<T>) {
+    os << +static_cast<std::underlying_type_t<T>>(f.v);
+  } else if constexpr (std::is_integral_v<T> && sizeof(T) == 1) {
+    os << +f.v;
+  } else {
+    os << f.v;
+  }
+  return os;
+}
+
+inline void report_failure_values(const char* file, int line, const char* expr,
+                                  const std::string& actual, const std::string& expected) {
+  std::fprintf(stderr, "%s:%d CHECK failed: %s\n    actual:   %s\n    expected: %s\n", file,
+               line, expr, actual.c_str(), expected.c_str());
+  ++failures();
+}
+
+template <typename A, typename E>
+void check_eq(const char* file, int line, const char* expr, const A& actual, const E& expected) {
+  if (actual == expected) {
+    return;
+  }
+  std::ostringstream a;
+  std::ostringstream e;
+  a << fmt(actual);
+  e << fmt(expected);
+  report_failure_values(file, line, expr, a.str(), e.str());
 }
 
 inline int finish() {
@@ -89,12 +140,12 @@ inline uint8_t random_byte() {
     }                                                          \
   } while (0)
 
-#define CHECK_EQ(actual, expected)                                   \
-  do {                                                               \
-    if (!((actual) == (expected))) {                                 \
-      ::fcp_test::report_failure(__FILE__, __LINE__,                 \
-                                 #actual " == " #expected);          \
-    }                                                                \
+#define CHECK_EQ(actual, expected)                                                 \
+  do {                                                                             \
+    const auto& check_eq_a = (actual);                                             \
+    const auto& check_eq_e = (expected);                                           \
+    ::fcp_test::check_eq(__FILE__, __LINE__, #actual " == " #expected, check_eq_a, \
+                         check_eq_e);                                              \
   } while (0)
 
 #define TEST_MAIN()          \

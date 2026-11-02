@@ -30,8 +30,12 @@
 
 #include "fcp/fecstat.h"
 #include "fcp/session.h"
+#include "fecstat_log.h"
 
 namespace fcp_e2e {
+
+using fcp_test::FecstatLogFields;
+using fcp_test::ParseFecstatLog;
 
 using Bytes = std::vector<uint8_t>;
 
@@ -93,39 +97,6 @@ inline fcp::SessionConfig MakeConfig(fcp::Direction send, fcp::Direction recv, u
   cfg.p_max = fcp::kDefaultPmax;
   cfg.pinned_k = pinned_k;
   return cfg;
-}
-
-struct FecstatLogFields {
-  uint32_t sets = 0;
-  uint32_t expect = 0;
-  uint32_t rx = 0;
-  uint32_t rec = 0;
-  uint32_t late = 0;
-  uint32_t lost = 0;
-  uint32_t pre = 0;
-  uint32_t usable = 0;
-  unsigned k = 0;
-  std::string state;
-};
-
-inline bool ParseFecstatLog(const std::vector<std::string>& logs, FecstatLogFields* out) {
-  for (const std::string& line : logs) {
-    if (line.rfind("FECSTAT sets=", 0) != 0) {
-      continue;
-    }
-    char state[8] = {};
-    const int n = std::sscanf(
-        line.c_str(),
-        "FECSTAT sets=%u expect=%u rx=%u rec=%u late=%u lost=%u pre=%uppm "
-        "usable=%uppm -> k=%u state=%7s",
-        &out->sets, &out->expect, &out->rx, &out->rec, &out->late, &out->lost,
-        &out->pre, &out->usable, &out->k, state);
-    if (n == 10) {
-      out->state = state;
-      return true;
-    }
-  }
-  return false;
 }
 
 inline bool SameCounters(const fcp::SettleCounters& x, const fcp::SettleCounters& y) {

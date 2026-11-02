@@ -2,7 +2,7 @@
 """把已构建的产物打成 Ubuntu/Debian 的 .deb —— 只用 Python 标准库，Windows 和
 Linux 上跑同一条命令，不需要 cpack、dpkg-deb、fakeroot、tar 或 ar。
 
-    python3 scripts/mkdeb.py --build-dir build --arch amd64
+    python3 scripts/build_deb.py --build-dir build --arch amd64
 
 为什么自己写：deb 就是一个 ar 归档，里面三个成员
     debian-binary   固定一行 "2.0\\n"
@@ -21,7 +21,7 @@ ar 头只有 60 字节，tar 是 ustar；标准库的 tarfile/gzip 已经够用�
 
 用法示例：
     # Linux CI / 本机：CMake 产出的可执行文件目录直接传给 --bin-dir
-    python3 scripts/mkdeb.py --bin-dir build/apps/fcp-proxy --arch amd64
+    python3 scripts/build_deb.py --bin-dir build/apps/fcp-proxy --arch amd64
 
     # Windows：打出来的二进制是 exe，除非 -DFCP_TARGET_OS=linux 交叉编译过，
     # 否则这包装不上 Linux。脚本会拒绝，除非显式 --allow-non-linux-bins。
@@ -46,7 +46,11 @@ ENV_PATH = "etc/fcp/fcp-proxy.env"
 # deb(5)：文件权限与所有者写死在 tar 头里；root:root 是包的规范。
 MODE_EXEC = 0o755
 MODE_FILE = 0o644
-MODE_CONFFILE = 0o644
+# conffile 里放的是运维自己填的 FCP_ARGS，通常含 --key=<PSK>，所以不能沿用
+# 普通文件的 0644：那等于把预共享密钥给本机所有用户读。0600 是安全的，因为
+# systemd 由 PID 1（root）在 fork 服务之前解析 EnvironmentFile，再把变量传下去，
+# 与 [Service] 里配的 DynamicUser 无关 —— 服务进程自己从不打开这个文件。
+MODE_CONFFILE = 0o600
 OWNER = "root"
 GROUP = "root"
 
@@ -155,6 +159,48 @@ def build_control(repo: str, version: str, arch: str, depends: str, recommends: 
 
 def finish_control(control: str, installed_kib: int) -> str:
     return control.replace("{installed_size}", str(installed_kib))
+
+
+def control_fields(control: str) -> list[tuple[str, str]]:
+    """(字段名, 值) 序列。续行（以空格开头）并入前一个字段，注释行跳过。"""
+    out: list[tuple[str, str]] = []
+    for line in control.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if line.startswith(" "):
+            if out:
+                name, value = out[-1]
+                out[-1] = (name, value + "\n" + line.strip())
+            continue
+        name, _, value = line.partition(":")
+        out.append((name.strip(), value.strip()))
+    return out
+
+
+def control_in_matches_generator(repo: str) -> bool:
+    """packaging/debian/control.in 是给人读的镜像，不是构建输入。
+
+    它挡不住自己漂移 —— 唯一的约束是这条自检。占位符（@VERSION@ 等）在镜像里
+    本来就是字面量，所以只比对字段名顺序和那些在两边都写死的值。
+    """
+    mirror_path = os.path.join(repo, "packaging", "debian", "control.in")
+    try:
+        mirror = read_text(mirror_path)
+    except OSError:
+        return False
+    generated = build_control(repo, version="0.0.1", arch="amd64",
+                              depends=DEFAULT_DEPENDS, recommends=DEFAULT_RECOMMENDS)
+    mirror_fields = control_fields(mirror)
+    gen_fields = control_fields(generated)
+    if [n for n, _ in mirror_fields] != [n for n, _ in gen_fields]:
+        return False
+    for (name, mirror_value), (_, gen_value) in zip(mirror_fields, gen_fields):
+        # 镜像里是 @PLACEHOLDER@ 的字段由构建期填充，不参与比对。
+        if "@" in mirror_value:
+            continue
+        if mirror_value != gen_value:
+            return False
+    return True
 
 
 def iter_package_files(repo: str, bin_dir: str, allow_non_linux: bool) -> list[tuple[str, str, int]]:
@@ -377,8 +423,13 @@ def self_test() -> int:
           all(ln.startswith(" ") for ln in control.splitlines()[2:]))
     check("control 以换行收尾", control.endswith("\n"))
 
-    # 2. 章节注释和空行不能被当成键值。
+    # 2. control.in 是给人读的镜像，必须与 build_control() 的实际输出一致。
+    #    它曾经只靠"改一边记得改另一边"维持，等于没有约束：有人改了
+    #    DEFAULT_DEPENDS 而忘了镜像，审包时看到的就是假的。这里逐字段比对。
     meta_repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    check("control.in 与生成器一致", control_in_matches_generator(meta_repo))
+
+    # 3. 章节注释和空行不能被当成键值。
     try:
         home = metadata_value(meta_repo, "FCP_HOMEPAGE")
         who = metadata_value(meta_repo, "FCP_MAINTAINER")
@@ -411,7 +462,7 @@ def self_test() -> int:
     if failures:
         print(f"::error::{len(failures)} 项自检失败", file=sys.stderr)
         return 1
-    print("mkdeb 自检全部通过")
+    print("build_deb 自检全部通过")
     return 0
 
 

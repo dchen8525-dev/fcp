@@ -1,11 +1,13 @@
 #!/bin/sh
-# fcp-proxy 卸载后脚本：purge 时清理配置与日志目录（remove 保留 conffile）。
+# fcp-proxy 卸载后脚本：purge 时清理运行期目录（remove 保留配置）。
 set -e
 
 if [ "$1" = "purge" ]; then
-  rm -rf /etc/fcp
-  rm -rf /var/log/fcp
-  rm -rf /var/lib/fcp
+  # 只清 dpkg 不负责的运行期目录：/etc/fcp 下的 conffile 由 dpkg 按 purge
+  # 语义自己删，这里再动它就是越权（可能删掉运维手放的其它文件）。
+  # systemd 的 LogsDirectory/StateDirectory 会在下次启动时重建，所以这两棵
+  # 树在 purge 后允许消失。
+  rm -rf /var/log/fcp /var/lib/fcp
 fi
 
 if [ -d /run/systemd/system ] && [ -x /bin/systemctl ]; then

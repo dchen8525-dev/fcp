@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Linux 发布构建：configure → build → ctest → scripts/mkdeb.py 打 deb。
+# Linux 发布构建：configure → build → ctest → scripts/build_deb.py 打 deb。
 #
 # 发布工作流（.github/workflows/release.yml 的 linux-deb job）就是跑这个脚本，
 # 本地（Linux / WSL / 容器）可以跑同一条命令复现，两边不会漂。
@@ -48,7 +48,7 @@ echo "== 安装自检（install 规则 + --version）"
 # 必须用 DESTDIR 而不是 `--prefix`：conffile 的落点是绝对路径 /etc/fcp，
 # `--prefix` 挪不动绝对路径，会把文件写到真实的 /etc 里（非 root 直接失败，
 # root 下更糟——污染构建机）。DESTDIR 给所有路径（含绝对路径）加前缀，
-# 与 mkdeb.py 造 deb 时用的是同一套落点。
+# 与 build_deb.py 造 deb 时用的是同一套落点。
 rm -rf "$STAGE_DIR"
 DESTDIR="$STAGE_DIR" cmake --install "$BUILD_DIR" --strip >/dev/null
 for bin in fcp-proxy-server fcp-proxy-client; do
@@ -63,15 +63,15 @@ test -f "$STAGE_DIR/etc/fcp/fcp-proxy.env"
 test -f "$STAGE_DIR/usr/lib/systemd/system/fcp-proxy.service"
 test -f "$STAGE_DIR/usr/share/doc/fcp-proxy/部署运维指南.md"
 
-# 打包：scripts/mkdeb.py 用标准库直接写 ar + tar.gz，Windows 上也能跑同一条命令。
+# 打包：scripts/build_deb.py 用标准库直接写 ar + tar.gz，Windows 上也能跑同一条命令。
 # 它自带结构自检（成员齐全、control 单段落、落点齐全），这里再补一道外部校验。
-echo "== mkdeb"
+echo "== build_deb"
 case "$(uname -m)" in
   x86_64|amd64) DEB_ARCH=amd64 ;;
   aarch64|arm64) DEB_ARCH=arm64 ;;
   *) DEB_ARCH="$(dpkg --print-architecture 2>/dev/null || echo unknown)" ;;
 esac
-python3 "$ROOT/scripts/mkdeb.py" \
+python3 "$ROOT/scripts/build_deb.py" \
   --bin-dir "$BUILD_DIR/apps/fcp-proxy" \
   --build-dir "$BUILD_DIR" \
   --version "$VERSION" \
@@ -81,7 +81,7 @@ python3 "$ROOT/scripts/mkdeb.py" \
 # 起因是首跑 v0.0.1：description 文件以换行结尾，生成器把 Installed-Size
 # 顶成了第二段落，`dpkg -i` 报 "missing 'Package' field"。
 # dpkg-deb --info 会把这种包照样打印出来（不报错），所以这里必须自己看结构。
-# mkdeb.py 已经查过一遍；这里用 dpkg-deb 复核，确认包是 dpkg 眼里的合法 deb。
+# build_deb.py 已经查过一遍；这里用 dpkg-deb 复核，确认包是 dpkg 眼里的合法 deb。
 deb="$(ls "$BUILD_DIR"/packages/*.deb)"
 if command -v dpkg-deb >/dev/null; then
   control_file="$BUILD_DIR/packages/control.txt"
@@ -89,7 +89,7 @@ if command -v dpkg-deb >/dev/null; then
   cat "$control_file"
   # 段落只允许一个，也就是**一个空行都不许有**：control 以最后一个字段的
   # 结尾换行收尾，多一个空行就是第二个段落，dpkg 会在那里截断。
-  # （CPack 时代末尾会补一个空行，所以那时的期望是 1；mkdeb.py 不补，期望是 0。）
+  # （CPack 时代末尾会补一个空行，所以那时的期望是 1；build_deb.py 不补，期望是 0。）
   # 数文件而不是管道接命令替换：$(...) 会吃掉结尾换行，会把 1 数成 0。
   # 计数器用 awk 不用 grep -c：grep -c 零匹配返回 1，与 set -e 相加会变成假警报。
   blank_lines="$(awk '$0 == "" { n++ } END { print n + 0 }' "$control_file")"
@@ -104,7 +104,7 @@ if command -v dpkg-deb >/dev/null; then
     fi
   done
 else
-  echo "::notice::没有 dpkg-deb，跳过外部复核（mkdeb.py 的自检已通过）"
+  echo "::notice::没有 dpkg-deb，跳过外部复核（build_deb.py 的自检已通过）"
 fi
 
 echo "== 产出"

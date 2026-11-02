@@ -123,7 +123,7 @@ jobs:
 
       # 构建 / ctest / 打 deb 三步都在 scripts/release_build_linux.sh 里：
       # 本地复现同一条命令，CI 与手工构建不会漂（docs/发布流程.md §2）。
-      - name: 构建 + ctest + mkdeb（发布门禁）
+      - name: 构建 + ctest + build_deb（发布门禁）
         run: bash scripts/release_build_linux.sh build "${{ needs.prep.outputs.version }}"
 
       - name: 安装冒烟（dpkg -i → 自检 → 服务起停 → 卸载）

@@ -110,15 +110,15 @@ else()
   message(STATUS "python3 未找到；跳过 test_baseline 护栏")
 endif()
 
-# 打包器自检（scripts/mkdeb.py）：用 --self-test 跑纯逻辑单元（control 段落
+# 打包器自检（scripts/build_deb.py）：用 --self-test 跑纯逻辑单元（control 段落
 # 规则、ar 头、架构/版本校验），不需要已构建的二进制，也不写任何产物，
 # 两个平台都跑。真正的出包由 scripts/release_build_linux.sh 做。
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
-  add_test(NAME mkdeb_self_test
+  add_test(NAME build_deb_self_test
            COMMAND ${Python3_EXECUTABLE}
-                   ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/mkdeb.py --self-test)
-  set_tests_properties(mkdeb_self_test PROPERTIES TIMEOUT 60)
+                   ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build_deb.py --self-test)
+  set_tests_properties(build_deb_self_test PROPERTIES TIMEOUT 60)
 else()
-  message(STATUS "Python3 未找到：跳过 mkdeb_self_test（deb 打包器自检）")
+  message(STATUS "Python3 未找到：跳过 build_deb_self_test（deb 打包器自检）")
 endif()

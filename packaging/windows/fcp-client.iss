@@ -27,9 +27,13 @@
 #define MyAppPublisher "dchen8525-dev"
 #define MyAppURL "https://github.com/dchen8525-dev/fcp"
 #define MyAppExeName "fcp_client.exe"
-; QSettings 在 Windows 上写注册表（organization FCP / application FCPClient，
-; 见 apps/fcp-client/main.cc），卸载时清掉。
-#define MyAppRegKey "Software\FCP"
+; QSettings 在 Windows 上按 organization + application 两级写注册表：org 取
+; apps/fcp-client/main.cc 的 setOrganizationName("FCP")，app 取
+; setApplicationName("FCPClient")，落点就是 Software\FCP\FCPClient。卸载时
+; 精确删这一层。
+; 不要退到父键 Software\FCP：那是所有 FCP 产品共用的命名空间，删它会连带
+; 抹掉别的组件的配置。
+#define MyAppRegKey "Software\FCP\FCPClient"
 ; 运维文档目录（仓库 docs\），由调用方 /DDocsDir= 传入。
 #ifndef DocsDir
   #define DocsDir "..\..\docs"

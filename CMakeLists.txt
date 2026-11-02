@@ -57,6 +57,7 @@ add_library(fcp
   src/fcp/fecstat.cc
   src/fcp/frame_tx.cc
   src/fcp/frame_rx.cc
+  src/fcp/frame_rx_decode.cc
   src/fcp/settle.cc
   src/fcp/reporter.cc
   src/fcp/strategy.cc

@@ -177,7 +177,12 @@ class FrameRx {
   void create_placeholders(uint32_t first, uint32_t last, int64_t now_ms);
   void deliver_payload(const uint8_t* payload, size_t len, bool recovered, bool late,
                        int64_t now_ms, uint32_t repair_ms);
+  // RS decode + the structural re-check of every reconstruction
+  // (frame_rx_decode.cc).
   void try_decode(RxSet* set, int64_t now_ms);
+  // Records an index whose reconstruction failed the structural check, at most
+  // once per set (A23 keeps the index retryable).
+  void note_bad_recon(RxSet* set, size_t index);
   void emit_event(RxEvent event, uint32_t value);
 
   uint8_t d_;

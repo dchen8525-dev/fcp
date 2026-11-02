@@ -5,7 +5,6 @@
 #include <utility>
 
 #include "fcp/hdr.h"
-#include "fcp/rs.h"
 
 namespace fcp {
 
@@ -395,103 +394,6 @@ void FrameRx::deliver_payload(const uint8_t* payload, size_t len, bool recovered
     emit_event(RxEvent::kDataLate, 0);
   } else {
     emit_event(RxEvent::kDataDelivered, 0);
-  }
-}
-
-void FrameRx::try_decode(RxSet* set, int64_t now_ms) {
-  if (!set->n_known || !set->k_known || set->k == 0) {
-    return;
-  }
-  if (set->symbol_count < set->n) {
-    return;
-  }
-
-  std::vector<size_t> missing;
-  for (size_t i = 0; i < set->n; ++i) {
-    if (!set->orig_mask.test(i) && !set->recov_mask.test(i)) {
-      missing.push_back(i);
-    }
-  }
-  if (missing.empty()) {
-    return;
-  }
-
-  const size_t n = set->n;
-  const size_t k = set->k;
-  if (missing.size() > k || set->symbol_max < 2) {
-    return;
-  }
-  // A9: an n + k above the shard limit cannot decode (rs.cc rejects it), so
-  // never allocate the padded buffers for geometry the codec cannot handle.
-  if (n + k > kRsMaxShards) {
-    return;
-  }
-  const size_t symbol_max = set->symbol_max;
-
-  std::vector<std::vector<uint8_t>> padded(n + k, std::vector<uint8_t>(symbol_max, 0));
-  std::vector<const uint8_t*> symbols(n + k, nullptr);
-  for (size_t i = 0; i < n; ++i) {
-    if (!set->orig_mask.test(i)) {
-      continue;
-    }
-    const std::vector<uint8_t>& s = set->symbols[i];
-    std::memcpy(padded[i].data(), s.data(), std::min(s.size(), symbol_max));
-    symbols[i] = padded[i].data();
-  }
-  // No parity for j in [k_eff, k): those rows are ghost erasures.
-  for (size_t r = 0; r < k; ++r) {
-    const size_t idx = n + r;
-    if (idx >= kMaxS || !set->parity_mask.test(idx)) {
-      continue;
-    }
-    const std::vector<uint8_t>& s = set->symbols[idx];
-    std::memcpy(padded[idx].data(), s.data(), std::min(s.size(), symbol_max));
-    symbols[idx] = padded[idx].data();
-  }
-
-  std::vector<std::vector<uint8_t>> recovered;
-  ++set->decode_attempts;
-  ++decode_attempts_;
-  if (!decode(symbols.data(), n, k, symbol_max, &recovered)) {
-    return;
-  }
-
-  for (const size_t i : missing) {
-    const std::vector<uint8_t>& s = recovered[i];
-    if (s.size() != symbol_max) {
-      // A23: a structurally unusable reconstruction is not final (§4.5 makes
-      // decoding a retry: every new symbol may recover a different set of
-      // erasures). Leave the index open so later parity can still repair it,
-      // but count each bad index once -- retries must not inflate the
-      // struct_fail that the peer sees in FECSTAT.
-      if (!set->bad_recon.test(i)) {
-        set->bad_recon.set(i);
-        ++struct_fail_;
-      }
-      continue;
-    }
-    const size_t declared = static_cast<size_t>(s[0]) | (static_cast<size_t>(s[1]) << 8);
-    bool ok = declared >= 2 && declared <= symbol_max;
-    for (size_t b = declared; ok && b < symbol_max; ++b) {
-      if (s[b] != 0) {
-        ok = false;
-      }
-    }
-    if (!ok) {
-      if (!set->bad_recon.test(i)) {
-        set->bad_recon.set(i);
-        ++struct_fail_;
-      }
-      continue;
-    }
-    set->bad_recon.reset(i);
-    set->recov_mask.set(i);
-    ++recovered_;
-    const int64_t waited = now_ms - set->t_first_ms;
-    const uint32_t repair_ms = static_cast<uint32_t>(
-        std::clamp<int64_t>(waited, 0, static_cast<int64_t>(0xFFFFFFFF)));
-    deliver_payload(s.data() + 2, declared - 2, true,
-                    set->phase == SetPhase::kAccounted, now_ms, repair_ms);
   }
 }
 

@@ -243,6 +243,17 @@ class Reactor {
   // Dropped on success, on the final failure and when the conn goes away.
   std::unordered_map<uint64_t, std::deque<ResolvedAddr>> dial_addrs_;
   std::vector<uint8_t> udp_buf_ = std::vector<uint8_t>(kUdpRecvBytes);
+  // Per-iteration scratch, reused across passes instead of reallocated: run()
+  // is the proxy's hot loop and these are cleared (capacity kept) every time.
+  // build_sets() fills the four maps; the three id vectors carry the walks that
+  // must survive a callback erasing a connection mid-pass.
+  std::unordered_map<Sock, uint64_t> sel_read_;
+  std::unordered_map<Sock, uint64_t> sel_connect_;
+  std::unordered_map<Sock, uint64_t> sel_write_;
+  std::unordered_map<Sock, uint64_t> sel_except_;
+  std::vector<uint64_t> scratch_local_ids_;
+  std::vector<uint64_t> scratch_target_ids_;
+  std::vector<uint64_t> scratch_due_;
   std::shared_ptr<ResolveQueue> resolve_ = std::make_shared<ResolveQueue>();
   uint64_t next_local_conn_ = 1;
   int64_t next_tick_ms_ = 0;

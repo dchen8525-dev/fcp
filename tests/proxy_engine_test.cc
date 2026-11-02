@@ -61,6 +61,9 @@ struct Options {
   // because with no latency the window is never what holds the sender back.
   size_t wire_latency_ticks = 0;
   bool prewarm = true;
+  // A path MTU too small for one data symbol (compute_mtu_limits().valid
+  // false). Only the misconfiguration test sets this.
+  uint16_t mtu = 1400;
   std::string trace_prefix;  // #29a: per-session controller trace when set
 };
 
@@ -74,7 +77,7 @@ class Harness {
   explicit Harness(const Options& opt) {
     EngineConfig base;
     std::memset(base.key, 0x2A, sizeof(base.key));
-    base.mtu = 1400;
+    base.mtu = opt.mtu;
     base.flush_grace_ms = opt.flush_grace_ms;
     base.dial_timeout_ms = opt.dial_timeout_ms;
     base.prewarm = opt.prewarm;
@@ -703,6 +706,25 @@ void dial_timeout_and_grace_clock() {
   }
 }
 
+// A local request that cannot produce a session at all (the configured MTU is
+// smaller than one data symbol) must still end the local socket. The engine
+// holds no Conn for it, so nobody else can free it: leaving it open hangs the
+// application on a tunnel that will never be dialled.
+void bad_mtu_refusal_closes_the_local_socket() {
+  Options opt;
+  opt.mtu = 80;
+  Harness h{opt};
+  h.local_open(kLocalConn);
+  h.local_send(kLocalConn, greeting());
+
+  CHECK(h.app_closed(kLocalConn));
+  CHECK_EQ(h.client->counters().bad_config, 1u);
+  CHECK_EQ(h.client->counters().live, 0u);
+  // Nothing was attempted on the wire: this is a local misconfiguration, not a
+  // peer-visible refusal.
+  CHECK_EQ(h.datagrams, 0u);
+}
+
 // §3: the session ceiling is enforced on both ends, and hitting it is a refusal
 // the application can see rather than a silent drop.
 void session_limits() {
@@ -1120,6 +1142,7 @@ int main() {
   socks5_round_trip();
   socks5_request_corked_with_greeting();
   socks5_greeting_without_request_waits();
+  bad_mtu_refusal_closes_the_local_socket();
   http_connect_round_trip();
   open_error_maps_to_the_local_reply();
   malformed_local_requests();

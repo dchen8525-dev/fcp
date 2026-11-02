@@ -177,6 +177,10 @@ class ProxyEngine {
     uint32_t unknown_salt = 0;
     uint32_t salt_tombstone = 0;  // #29a: dropped as a dead session's tail
     uint32_t over_limit = 0;  // refused: max_sessions reached
+    // Refused before any traffic: the configured D/P'/MTU cannot carry a data
+    // symbol (Session::config_valid()). Every connection is refused, so a
+    // non-zero value here means the engine was misconfigured, not a peer.
+    uint32_t bad_config = 0;
     uint32_t bad_entry = 0;   // malformed local request
     uint32_t open_failed = 0;  // OPEN_ERR sent or received
     uint32_t handshake_failed = 0;

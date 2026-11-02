@@ -309,13 +309,12 @@ void Reactor::run() {
     FD_ZERO(&read_set);
     FD_ZERO(&write_set);
     FD_ZERO(&except_set);
-    std::unordered_map<Sock, uint64_t> read_conn;
-    std::unordered_map<Sock, uint64_t> connect_conn;
-    std::unordered_map<Sock, uint64_t> write_conn;
-    std::unordered_map<Sock, uint64_t> except_conn;
-    const int nfds =
-        build_sets(&read_set, &write_set, &except_set, &read_conn, &connect_conn, &write_conn,
-                   &except_conn);
+    sel_read_.clear();
+    sel_connect_.clear();
+    sel_write_.clear();
+    sel_except_.clear();
+    const int nfds = build_sets(&read_set, &write_set, &except_set, &sel_read_, &sel_connect_,
+                                &sel_write_, &sel_except_);
 
     timeval tv{};
     const int64_t wait = wait_ms(now);
@@ -343,22 +342,22 @@ void Reactor::run() {
       if (listener_ != kBadSock && FD_ISSET(listener_, &read_set)) {
         accept_local(now);
       }
-      for (const auto& e : connect_conn) {
+      for (const auto& e : sel_connect_) {
         if (FD_ISSET(e.first, &write_set)) {
           connect_event(e.first, e.second, now);
         }
       }
-      for (const auto& e : read_conn) {
+      for (const auto& e : sel_read_) {
         if (FD_ISSET(e.first, &read_set)) {
           read_socket(e.first, e.second, targets_.count(e.second) != 0, now);
         }
       }
-      for (const auto& e : write_conn) {
+      for (const auto& e : sel_write_) {
         if (FD_ISSET(e.first, &write_set)) {
           flush_conn(e.second, now);
         }
       }
-      for (const auto& e : except_conn) {
+      for (const auto& e : sel_except_) {
         if (FD_ISSET(e.first, &except_set)) {
           except_event(e.first, e.second, now);
         }
@@ -375,22 +374,22 @@ void Reactor::run() {
       // app_close(), which erases from these maps. Walk an id snapshot and
       // re-find each entry (the reactor has no nested loop today, but the
       // invariant should not rest on that).
-      std::vector<uint64_t> local_ids;
-      local_ids.reserve(locals_.size());
+      scratch_local_ids_.clear();
+      scratch_local_ids_.reserve(locals_.size());
       for (const auto& e : locals_) {
-        local_ids.push_back(e.first);
+        scratch_local_ids_.push_back(e.first);
       }
-      for (uint64_t id : local_ids) {
+      for (uint64_t id : scratch_local_ids_) {
         if (locals_.find(id) != locals_.end() && engine_.pending_app_bytes(id) != 0) {
           flush_conn(id, now);
         }
       }
-      std::vector<uint64_t> target_ids;
-      target_ids.reserve(targets_.size());
+      scratch_target_ids_.clear();
+      scratch_target_ids_.reserve(targets_.size());
       for (const auto& e : targets_) {
-        target_ids.push_back(e.first);
+        scratch_target_ids_.push_back(e.first);
       }
-      for (uint64_t id : target_ids) {
+      for (uint64_t id : scratch_target_ids_) {
         if (targets_.find(id) != targets_.end() && engine_.pending_app_bytes(id) != 0) {
           flush_conn(id, now);
         }
@@ -734,13 +733,13 @@ void Reactor::except_event(Sock sock, uint64_t conn, int64_t now_ms) {
 }
 
 void Reactor::expire_connects(int64_t now_ms) {
-  std::vector<uint64_t> due;
+  scratch_due_.clear();
   for (const auto& e : pending_) {
     if (e.second.deadline_ms <= now_ms) {
-      due.push_back(e.first);
+      scratch_due_.push_back(e.first);
     }
   }
-  for (uint64_t conn : due) {
+  for (uint64_t conn : scratch_due_) {
     const auto it = pending_.find(conn);
     if (it == pending_.end()) {
       continue;
@@ -1062,10 +1061,12 @@ void Reactor::print_stats(int64_t now_ms) {
   const ProxyEngine::Counters& c = engine_.counters();
   std::printf(
       "stats %6.1fs live=%zu up=%zu tunnels=%zu tx=%" PRIu64 "B rx=%" PRIu64
-      "B bad_entry=%u refused=%u hs_failed=%u reset=%u idle=%u clash=%u over=%u unknown=%u tomb=%u duprec=%u\n",
+      "B bad_entry=%u refused=%u hs_failed=%u reset=%u idle=%u clash=%u over=%u bad_cfg=%u"
+      " unknown=%u tomb=%u duprec=%u\n",
       (now_ms - started_ms_) / 1000.0, c.live, c.established, c.tunnels, c.bytes_tx, c.bytes_rx,
       c.bad_entry, c.open_failed, c.handshake_failed, c.reset, c.idle_closed, c.salt_clash,
-      c.over_limit, c.unknown_salt, c.salt_tombstone, engine_.dup_after_recovered());
+      c.over_limit, c.bad_config, c.unknown_salt, c.salt_tombstone,
+      engine_.dup_after_recovered());
   std::fflush(stdout);
 }
 

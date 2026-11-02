@@ -154,7 +154,17 @@ void ProxyEngine::on_local_open(uint64_t conn, uint64_t peer, int64_t now_ms) {
     }
     return;
   }
-  create_client_conn(conn, peer, now_ms);
+  // A refusal here (the configured MTU leaves no room for a data symbol) has to
+  // look like every other refusal: the engine holds no Conn for this socket, so
+  // unless the host is told to close it the local socket is never freed and the
+  // application waits on a tunnel that will never exist.
+  if (!create_client_conn(conn, peer, now_ms)) {
+    ++counters_.bad_config;
+    log(label(conn) + " refused: MTU leaves no room for a data symbol");
+    if (host_.app_close) {
+      host_.app_close(conn);
+    }
+  }
   reap(now_ms);
 }
 

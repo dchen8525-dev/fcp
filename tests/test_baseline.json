@@ -66,8 +66,8 @@
       "checks": 103
     },
     "proxy_engine_test": {
-      "functions": 18,
-      "checks": 165
+      "functions": 21,
+      "checks": 180
     },
     "proxy_proto_test": {
       "functions": 18,

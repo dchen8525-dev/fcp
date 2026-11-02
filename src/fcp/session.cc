@@ -7,30 +7,11 @@
 #include <vector>
 
 #include "fcp/random.h"
+#include "fcp/session_log.h"
 #include "fcp/wire.h"
 
 namespace fcp {
 namespace {
-
-const char* fecstat_reason(FecstatStatus status) {
-  switch (status) {
-    case FecstatStatus::kOk:
-      return "ok";
-    case FecstatStatus::kBadLength:
-      return "bad_length";
-    case FecstatStatus::kBadMagic:
-      return "bad_magic";
-    case FecstatStatus::kBadSalt:
-      return "bad_salt";
-    case FecstatStatus::kBadVer:
-      return "bad_ver";
-    case FecstatStatus::kStale:
-      return "stale";
-    case FecstatStatus::kDuplicate:
-      return "duplicate";
-  }
-  return "unknown";
-}
 
 uint32_t ppm_of(uint64_t part, uint64_t whole) {
   if (whole == 0) {
@@ -159,55 +140,11 @@ bool Session::on_wire(const uint8_t* wire, size_t len, int64_t now_ms) {
   }
 
   if (bootstrap) {
-    // Only handshake messages may travel under the bootstrap key. Anything
-    // else that authenticates with it is a peer that never left the handshake
-    // epoch (or a sealing bug); it is dropped rather than fed to the frame
-    // layer, which would accept data the session key never protected.
-    if (plain.size() < kFecHdrLen) {
-      ++pre_struct_fail_;
-      sync_report_counters();
-      return true;
-    }
-    const uint8_t* symbol = plain.data() + kFecHdrLen;
-    const size_t symbol_len = plain.size() - kFecHdrLen;
-    FecHdr hdr{};
-    if (parse_hdr(plain.data(), plain.size(), &hdr) &&
-        hdr_type(hdr.type_k) == SymbolType::kOob &&
-        (is_hello(symbol, symbol_len) || is_hello_ack(symbol, symbol_len))) {
-      on_oob(symbol, symbol_len, now_ms);
-    } else {
-      // §4.1: only HELLO/HELLO_ACK may ride the bootstrap key. Anything else
-      // that authenticates with it comes from a peer that never left the
-      // handshake epoch (or from a sealing bug). Counting it as a structural
-      // failure is what makes that visible: dropping it silently put the
-      // symptom in a gap between auth_fail and struct_fail, so an operator saw
-      // an idle tunnel with flat counters and no clue which side was stale.
-      ++pre_struct_fail_;
-    }
-    sync_report_counters();
-    return true;
+    return on_wire_bootstrap(plain, now_ms);
   }
 
   if (rx_) {
-    FecHdr hdr{};
-    if (parse_hdr(plain.data(), plain.size(), &hdr)) {
-      const SymbolType type = hdr_type(hdr.type_k);
-      // Reuse the shared constant from frame_tx.h instead of shadowing it:
-      // get_limits() derives payload_max from the same value, so the two must
-      // never drift apart.
-      if (type == SymbolType::kData) {
-        data_payload_rx_ +=
-            len > kDataWireOverhead ? len - kDataWireOverhead : 0;
-        if (reporter_ != nullptr) {
-          reporter_->add_data_bytes(static_cast<uint32_t>(len));
-        }
-      } else if (type == SymbolType::kParity && reporter_ != nullptr) {
-        reporter_->add_parity_bytes(static_cast<uint32_t>(len));
-      }
-    }
-    rx_->on_datagram(plain.data(), plain.size(), now_ms);
-    sync_report_counters();
-    return true;
+    return on_wire_data(plain, len, now_ms);
   }
 
   // Before negotiation only oob (including HELLO/ACK) is actionable (§6.2).
@@ -253,6 +190,58 @@ bool Session::on_wire(const uint8_t* wire, size_t len, int64_t now_ms) {
       ++pre_struct_fail_;
       break;
   }
+  sync_report_counters();
+  return true;
+}
+
+bool Session::on_wire_bootstrap(const std::vector<uint8_t>& plain, int64_t now_ms) {
+  // Only handshake messages may travel under the bootstrap key. Anything
+  // else that authenticates with it is a peer that never left the handshake
+  // epoch (or a sealing bug); it is dropped rather than fed to the frame
+  // layer, which would accept data the session key never protected.
+  if (plain.size() < kFecHdrLen) {
+    ++pre_struct_fail_;
+    sync_report_counters();
+    return true;
+  }
+  const uint8_t* symbol = plain.data() + kFecHdrLen;
+  const size_t symbol_len = plain.size() - kFecHdrLen;
+  FecHdr hdr{};
+  if (parse_hdr(plain.data(), plain.size(), &hdr) &&
+      hdr_type(hdr.type_k) == SymbolType::kOob &&
+      (is_hello(symbol, symbol_len) || is_hello_ack(symbol, symbol_len))) {
+    on_oob(symbol, symbol_len, now_ms);
+  } else {
+    // §4.1: only HELLO/HELLO_ACK may ride the bootstrap key. Anything else
+    // that authenticates with it comes from a peer that never left the
+    // handshake epoch (or from a sealing bug). Counting it as a structural
+    // failure is what makes that visible: dropping it silently put the
+    // symptom in a gap between auth_fail and struct_fail, so an operator saw
+    // an idle tunnel with flat counters and no clue which side was stale.
+    ++pre_struct_fail_;
+  }
+  sync_report_counters();
+  return true;
+}
+
+bool Session::on_wire_data(const std::vector<uint8_t>& plain, size_t wire_len,
+                           int64_t now_ms) {
+  FecHdr hdr{};
+  if (parse_hdr(plain.data(), plain.size(), &hdr)) {
+    const SymbolType type = hdr_type(hdr.type_k);
+    // Reuse the shared constant from frame_tx.h instead of shadowing it:
+    // get_limits() derives payload_max from the same value, so the two must
+    // never drift apart.
+    if (type == SymbolType::kData) {
+      data_payload_rx_ += wire_len > kDataWireOverhead ? wire_len - kDataWireOverhead : 0;
+      if (reporter_ != nullptr) {
+        reporter_->add_data_bytes(static_cast<uint32_t>(wire_len));
+      }
+    } else if (type == SymbolType::kParity && reporter_ != nullptr) {
+      reporter_->add_parity_bytes(static_cast<uint32_t>(wire_len));
+    }
+  }
+  rx_->on_datagram(plain.data(), plain.size(), now_ms);
   sync_report_counters();
   return true;
 }
@@ -453,20 +442,30 @@ void Session::configure(int64_t now_ms) {
 }
 
 void Session::on_oob(const uint8_t* payload, size_t len, int64_t now_ms) {
+  if (dispatch_handshake(payload, len, now_ms)) {
+    return;
+  }
+  handle_fecstat(payload, len, now_ms);
+}
+
+bool Session::dispatch_handshake(const uint8_t* payload, size_t len, int64_t now_ms) {
   // Erratum #25: HELLO/HELLO_ACK arrive as oob frames and are dispatched by
   // their 16-byte magic before the FECSTAT validator ever sees them. The length
   // gate must be the *shortest* handshake message: HELLO (36) is shorter than
   // HELLO_ACK (52) since R3-1 added the nonce pair, and gating on the ACK size
   // silently dropped every HELLO that arrived on the data-envelope path.
-  if (len >= kHelloLen && payload != nullptr &&
-      (is_hello(payload, len) || is_hello_ack(payload, len))) {
-    if (hs_.on_oob(payload, len) == HandshakeStatus::kProtocolFailure) {
-      log(std::string("FEC handshake failed: ") + handshake_error_text(hs_.error()));
-    }
-    ensure_configured(now_ms);
-    return;
+  if (len < kHelloLen || payload == nullptr ||
+      (!is_hello(payload, len) && !is_hello_ack(payload, len))) {
+    return false;
   }
+  if (hs_.on_oob(payload, len) == HandshakeStatus::kProtocolFailure) {
+    log(std::string("FEC handshake failed: ") + handshake_error_text(hs_.error()));
+  }
+  ensure_configured(now_ms);
+  return true;
+}
 
+void Session::handle_fecstat(const uint8_t* payload, size_t len, int64_t now_ms) {
   FecstatPacket stat{};
   const FecstatStatus status = validator_.validate(payload, len, cfg_.salt, &stat);
   if (status == FecstatStatus::kDuplicate) {
@@ -481,10 +480,7 @@ void Session::on_oob(const uint8_t* payload, size_t len, int64_t now_ms) {
     if (status == FecstatStatus::kStale) {
       ++fecstat_stale_;
     }
-    char line[96];
-    std::snprintf(line, sizeof(line), "FECSTAT dropped: reason=%s count=1",
-                  fecstat_reason(status));
-    log(line);
+    log_fecstat_dropped(log_, status);
     return;
   }
   if (strategy_ == nullptr) {
@@ -516,26 +512,22 @@ void Session::on_oob(const uint8_t* payload, size_t len, int64_t now_ms) {
                                  static_cast<double>(stat.data_bytes_rx)
                            : 0.0;
 
-  const uint32_t sets = stat.sets_expected;
-  if (static_cast<uint64_t>(stat.sets_k_unknown) * 10 > std::max<uint32_t>(1, sets)) {
-    char line[96];
-    std::snprintf(line, sizeof(line), "FEC sample untrusted: k_unknown=%u/%u (>10%%)",
-                  stat.sets_k_unknown, sets);
-    log(line);
+  // The two sample gates run after the strategy was fed on purpose: a report
+  // that is too lossy to trust still moves the machine off the raw numbers,
+  // and only the *log* line is suppressed.
+  if (static_cast<uint64_t>(stat.sets_k_unknown) * 10 >
+      std::max<uint32_t>(1, stat.sets_expected)) {
+    log_fecstat_untrusted(log_, stat);
     return;
   }
   if (stat.data_expected < kMinSamplePackets) {
-    char line[96];
-    std::snprintf(line, sizeof(line), "FEC sample too small: expected=%u",
-                  stat.data_expected);
-    log(line);
+    log_fecstat_too_small(log_, stat);
     return;
   }
 
   const int64_t lost_signed = static_cast<int64_t>(stat.data_expected) -
                               stat.data_rx_orig - stat.data_recovered_dl -
                               stat.data_late_rx;
-  const uint32_t lost = lost_signed > 0 ? static_cast<uint32_t>(lost_signed) : 0;
   const uint32_t pre = ppm_of(stat.data_expected > stat.data_rx_orig
                                   ? stat.data_expected - stat.data_rx_orig
                                   : 0,
@@ -544,51 +536,30 @@ void Session::on_oob(const uint8_t* payload, size_t len, int64_t now_ms) {
       stat.data_expected > stat.data_rx_orig + stat.data_recovered_dl
           ? stat.data_expected - stat.data_rx_orig - stat.data_recovered_dl
           : 0;
-  const uint32_t usable = ppm_of(usable_part, stat.data_expected);
-  last_pre_ppm_ = pre;
-  last_usable_ppm_ = usable;
+  FecSampleRates rates;
+  rates.lost = lost_signed > 0 ? static_cast<uint32_t>(lost_signed) : 0;
+  rates.pre_ppm = pre;
+  rates.usable_ppm = ppm_of(usable_part, stat.data_expected);
+  last_pre_ppm_ = rates.pre_ppm;
+  last_usable_ppm_ = rates.usable_ppm;
 
-  char line[512];
-  std::snprintf(line, sizeof(line),
-                "FECSTAT sets=%u expect=%u rx=%u rec=%u late=%u lost=%u pre=%uppm "
-                "usable=%uppm -> k=%u state=%s",
-                stat.sets_expected, stat.data_expected, stat.data_rx_orig,
-                stat.data_recovered_dl, stat.data_late_rx, lost, pre, usable,
-                strategy_->k(), fec_state_name(strategy_->state()));
-  log(line);
+  log_fecstat_report(log_, stat, rates, strategy_->k(), strategy_->state());
 
   // M3 R(k) correction (M3控制设计.md §1.2): peer's ledger lifted the
   // loss input; own line keeps the §10 format untouched.
   if (strategy_->ledger_active()) {
-    std::snprintf(line, sizeof(line),
-                  "FEC ledger: groups=%u fail=%uppm k=%u peff=%.4f "
-                  "(binomial %.4f) kl=%.2f applied=%u skipped=%u",
-                  stat.ledger_groups, stat.ledger_fail_ppm, ledger_k(stat),
-                  strategy_->last_p_eff(), strategy_->last_loss(),
-                  ledger_burst_kl(stat) / 100.0,
-                  strategy_->ledger_reports(), strategy_->ledger_skipped());
-    log(line);
+    FecLedgerView view;
+    view.k = ledger_k(stat);
+    view.p_eff = strategy_->last_p_eff();
+    view.loss = strategy_->last_loss();
+    view.reports = strategy_->ledger_reports();
+    view.skipped = strategy_->ledger_skipped();
+    log_fec_ledger(log_, stat, view);
   }
 
   // M3 byte budget transitions (§2), greppable for WAN calibration.
-  if (before != FecState::kCapped && strategy_->state() == FecState::kCapped) {
-    std::snprintf(line, sizeof(line),
-                  "FEC capped: parity/data=%.1f%% > budget=%.1f%% (k=%u)",
-                  ratio * 100.0, cfg_.fec_budget * 100.0, strategy_->k());
-    log(line);
-  } else if (before == FecState::kCapped && strategy_->state() == FecState::kOn) {
-    std::snprintf(line, sizeof(line),
-                  "FEC budget restored: parity/data=%.1f%% <= budget=%.1f%% (k=%u)",
-                  ratio * 100.0, cfg_.fec_budget * 100.0, strategy_->k());
-    log(line);
-  }
-
-  if (before == FecState::kOn && strategy_->state() == FecState::kOff) {
-    std::snprintf(line, sizeof(line),
-                  "FEC off: pre<0.30%% for 5 reports (last %.2f%%)",
-                  strategy_->last_loss() * 100.0);
-    log(line);
-  }
+  log_fec_budget_transitions(log_, before, strategy_->state(), ratio, cfg_.fec_budget,
+                             strategy_->k(), strategy_->last_loss());
 }
 
 void Session::sync_report_counters() {

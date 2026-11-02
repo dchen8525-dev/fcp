@@ -62,6 +62,7 @@ add_library(fcp
   src/fcp/strategy.cc
   src/fcp/handshake.cc
   src/fcp/session.cc
+  src/fcp/session_log.cc
   src/fcp/stream.cc
   src/fcp/prewarm.cc
   src/fcp/trace.cc

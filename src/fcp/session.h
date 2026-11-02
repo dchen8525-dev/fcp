@@ -189,7 +189,18 @@ class Session {
   void configure(int64_t now_ms);
   // Oob dispatch: HELLO/HELLO_ACK magic -> handshake, else FECSTAT/KEEPALIVE.
   void on_oob(const uint8_t* payload, size_t len, int64_t now_ms);
+  // Returns true when the payload was a handshake message and has been fed to
+  // hs_; false means "not ours", so on_oob can fall through to FECSTAT.
+  bool dispatch_handshake(const uint8_t* payload, size_t len, int64_t now_ms);
+  // Validate -> feed the strategy -> record trace -> log (session_log.cc).
+  void handle_fecstat(const uint8_t* payload, size_t len, int64_t now_ms);
   void sync_report_counters();
+
+  // The two key epochs of on_wire() after authentication: HELLO/HELLO_ACK only
+  // under the bootstrap key, everything else through the frame layer once the
+  // codec exists.
+  bool on_wire_bootstrap(const std::vector<uint8_t>& plain, int64_t now_ms);
+  bool on_wire_data(const std::vector<uint8_t>& plain, size_t wire_len, int64_t now_ms);
 
   void emit_symbol(const TxSymbol& symbol, bool bootstrap = false);
   // `bootstrap` routes the frame through the handshake envelope instead of the

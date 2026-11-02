@@ -218,6 +218,11 @@ class Stream {
   void pump(int64_t now_ms);
   void handle_data(const uint8_t* seg, size_t len, int64_t now_ms);
   void handle_ack(const uint8_t* seg, size_t len, int64_t now_ms);
+  // The three duties one ACK can carry, split out of handle_ack() but called
+  // from it in a fixed order (see stream_send.cc).
+  void ack_dup_burst(uint32_t cum, int64_t now_ms);
+  void ack_advance_cum(uint32_t cum, int64_t now_ms);
+  void ack_fill_sack(uint32_t sack_start, uint32_t sack_end, int64_t now_ms);
   void insert_chunk(uint32_t offset, const uint8_t* data, size_t len);
   void deliver_prefix(int64_t now_ms);
   void fill_holes(uint32_t sack_start, int64_t now_ms);

@@ -64,6 +64,9 @@ add_library(fcp
   src/fcp/session.cc
   src/fcp/session_log.cc
   src/fcp/stream.cc
+  src/fcp/stream_recv.cc
+  src/fcp/stream_send.cc
+  src/fcp/stream_window.cc
   src/fcp/prewarm.cc
   src/fcp/trace.cc
 )

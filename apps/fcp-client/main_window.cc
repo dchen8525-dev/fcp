@@ -183,12 +183,11 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
 }
 
 MainWindow::~MainWindow() {
-  // P4' N2: closing the window used to destroy the widgets first and the
-  // ProxyHost last; ~ProxyHost calls stop(), which emits statsUpdated/finished
-  // synchronously and reached slots that dereference the already-deleted
-  // engine_, logView_ and buttons. Stop both hosts while the UI is still
-  // alive, and mute their signals: nothing on screen needs the teardown
-  // events of a window that is going away.
+  // Stop both hosts while the UI is still alive, and mute their signals first.
+  // Widget destruction order is not something to rely on here: ~ProxyHost
+  // calls stop(), which emits statsUpdated/finished synchronously, and those
+  // slots dereference engine_, logView_ and the buttons. Nothing on screen
+  // needs the teardown events of a window that is going away.
   if (engine_ != nullptr) {
     engine_->blockSignals(true);
     engine_->stop();
@@ -383,34 +382,14 @@ QWidget* MainWindow::buildOverview() {
   auto* cardLayout = new QHBoxLayout(card);
   cardLayout->setContentsMargins(22, 16, 22, 16);
   cardLayout->setSpacing(26);
-  auto cell = [&](bool down, QLabel** rate, QLabel** cap, Sparkline** spark) {
-    auto* cellWidget = new QWidget(card);
-    auto* cellLayout = new QVBoxLayout(cellWidget);
-    cellLayout->setContentsMargins(0, 0, 0, 0);
-    cellLayout->setSpacing(4);
-    auto* dir = new QLabel(down ? "↓ 下载" : "↑ 上传", cellWidget);
-    dir->setObjectName("trafficDir");
-    auto* rateLabel = new QLabel("0.00 Mbps", cellWidget);
-    rateLabel->setObjectName("trafficRate");
-    auto* sparkline = new Sparkline(down ? QColor(0x2e, 0x5f, 0x74) : QColor(0x47, 0x68, 0x5a),
-                                    cellWidget);
-    auto* capLabel = new QLabel("峰值 0.00 Mbps · 累计 0 B", cellWidget);
-    capLabel->setObjectName("trafficCap");
-    cellLayout->addWidget(dir);
-    cellLayout->addWidget(rateLabel);
-    cellLayout->addWidget(sparkline, 1);
-    cellLayout->addWidget(capLabel);
-    *rate = rateLabel;
-    *cap = capLabel;
-    *spark = sparkline;
-    return cellWidget;
-  };
-  cardLayout->addWidget(cell(true, &downRate_, &downCap_, &downSpark_), 1);
+  cardLayout->addWidget(makeTrafficCell("↓ 下载", "峰值 0.00 Mbps · 累计 0 B", true, &downRate_,
+                                        &downCap_, &downSpark_), 1);
   auto* divider = new QFrame(card);
   divider->setObjectName("trafficDivider");
   divider->setFixedWidth(1);
   cardLayout->addWidget(divider);
-  cardLayout->addWidget(cell(false, &upRate_, &upCap_, &upSpark_), 1);
+  cardLayout->addWidget(makeTrafficCell("↑ 上传", "峰值 0.00 Mbps · 累计 0 B", false, &upRate_,
+                                        &upCap_, &upSpark_), 1);
   auto* cardWrap = new QWidget(page);
   auto* cardWrapLayout = new QVBoxLayout(cardWrap);
   cardWrapLayout->setContentsMargins(0, 22, 0, 0);
@@ -464,7 +443,29 @@ QWidget* MainWindow::makeMetric(const QString& caption, QLabel** value) {
   return cell;
 }
 
-QWidget* MainWindow::makeField(const QString& label, QWidget* input) {
+QWidget* MainWindow::makeTrafficCell(const char* text, const char* cap, bool down,
+                                     QLabel** rate, QLabel** capLabel, Sparkline** spark) {
+  auto* cell = new QWidget;
+  auto* layout = new QVBoxLayout(cell);
+  layout->setContentsMargins(0, 0, 0, 0);
+  layout->setSpacing(4);
+  auto* dir = new QLabel(QString::fromUtf8(text), cell);
+  dir->setObjectName("trafficDir");
+  auto* rateLabel = new QLabel("0.00 Mbps", cell);
+  rateLabel->setObjectName("trafficRate");
+  auto* sparkline = new Sparkline(down ? QColor(0x2e, 0x5f, 0x74) : QColor(0x47, 0x68, 0x5a), cell);
+  auto* capWidget = new QLabel(QString::fromUtf8(cap), cell);
+  capWidget->setObjectName("trafficCap");
+  layout->addWidget(dir);
+  layout->addWidget(rateLabel);
+  layout->addWidget(sparkline, 1);
+  layout->addWidget(capWidget);
+  *rate = rateLabel;
+  *capLabel = capWidget;
+  *spark = sparkline;
+  return cell;
+}
+
   auto* field = new QWidget;
   auto* layout = new QVBoxLayout(field);
   layout->setContentsMargins(0, 0, 0, 0);
@@ -691,34 +692,14 @@ QWidget* MainWindow::buildProxy() {
   auto* cardLayout = new QHBoxLayout(card);
   cardLayout->setContentsMargins(22, 16, 22, 16);
   cardLayout->setSpacing(26);
-  auto cell = [&](bool down, QLabel** rate, QLabel** cap, Sparkline** spark) {
-    auto* cellWidget = new QWidget(card);
-    auto* cellLayout = new QVBoxLayout(cellWidget);
-    cellLayout->setContentsMargins(0, 0, 0, 0);
-    cellLayout->setSpacing(4);
-    auto* dir = new QLabel(down ? "↓ 隧道下行" : "↑ 隧道上行", cellWidget);
-    dir->setObjectName("trafficDir");
-    auto* rateLabel = new QLabel("0.00 Mbps", cellWidget);
-    rateLabel->setObjectName("trafficRate");
-    auto* sparkline = new Sparkline(down ? QColor(0x2e, 0x5f, 0x74) : QColor(0x47, 0x68, 0x5a),
-                                    cellWidget);
-    auto* capLabel = new QLabel("累计 0 B", cellWidget);
-    capLabel->setObjectName("trafficCap");
-    cellLayout->addWidget(dir);
-    cellLayout->addWidget(rateLabel);
-    cellLayout->addWidget(sparkline, 1);
-    cellLayout->addWidget(capLabel);
-    *rate = rateLabel;
-    *cap = capLabel;
-    *spark = sparkline;
-    return cellWidget;
-  };
-  cardLayout->addWidget(cell(true, &proxyDownRate_, &proxyDownCap_, &proxyDownSpark_), 1);
+  cardLayout->addWidget(makeTrafficCell("↓ 隧道下行", "累计 0 B", true, &proxyDownRate_,
+                                        &proxyDownCap_, &proxyDownSpark_), 1);
   auto* divider = new QFrame(card);
   divider->setObjectName("trafficDivider");
   divider->setFixedWidth(1);
   cardLayout->addWidget(divider);
-  cardLayout->addWidget(cell(false, &proxyUpRate_, &proxyUpCap_, &proxyUpSpark_), 1);
+  cardLayout->addWidget(makeTrafficCell("↑ 隧道上行", "累计 0 B", false, &proxyUpRate_,
+                                        &proxyUpCap_, &proxyUpSpark_), 1);
   auto* cardWrap = new QWidget(page);
   auto* cardWrapLayout = new QVBoxLayout(cardWrap);
   cardWrapLayout->setContentsMargins(0, 18, 0, 0);

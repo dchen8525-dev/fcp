@@ -371,9 +371,9 @@ void Reactor::run() {
       // Anything the engine still owes an application socket gets another try
       // here, whether or not select reported it: the pending byte count is the
       // engine's, so this is the only place a stalled write can be retried.
-      // P4' N4: same hazard as A5 in the Qt host — flush_conn can synchronously
-      // reach app_close(), which erases from these maps. Walk an id snapshot
-      // and re-find each entry (reactor has no nested loop today, but the
+      // Same hazard as A5 in the Qt host: flush_conn can synchronously reach
+      // app_close(), which erases from these maps. Walk an id snapshot and
+      // re-find each entry (the reactor has no nested loop today, but the
       // invariant should not rest on that).
       std::vector<uint64_t> local_ids;
       local_ids.reserve(locals_.size());

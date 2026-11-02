@@ -47,6 +47,11 @@ class MainWindow : public QMainWindow {
   QWidget* buildLogs();
   QWidget* makeField(const QString& label, QWidget* input);
   QWidget* makeMetric(const QString& caption, QLabel** value);
+  // One half of a throughput card: direction label, live rate, sparkline and the
+  // running caption. Shared by the benchmark and the proxy page, which differ
+  // only in wording (and in whether the caption carries the peak).
+  QWidget* makeTrafficCell(const char* text, const char* cap, bool down, QLabel** rate,
+                           QLabel** capLabel, Sparkline** spark);
 
   void loadSettings();
   void saveSettings();

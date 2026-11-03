@@ -384,12 +384,9 @@ void Session::configure(int64_t now_ms) {
 
   reporter_ = std::make_unique<FcpReporter>(
       settle_.get(), [this](const uint8_t* packet, size_t len) {
-        TxSymbol symbol;
-        symbol.set_id = 0;  // §4.7: oob headers carry set_id = 0, index = 0
-        symbol.index = 0;
-        symbol.type_k = pack_type_k(0, 0, static_cast<uint8_t>(SymbolType::kOob));
-        symbol.symbol.assign(packet, packet + len);
-        emit_symbol(symbol);
+        // 与 send_oob() 同一构造（§4.7 oob 头 set_id = index = 0）：不再
+        // 手搭第二份帧组装（对抗分析第九轮——两份 §4.7 注释曾各自跟踪自己）。
+        send_oob(packet, len);
       });
   reporter_->set_salt(cfg_.salt);
 
@@ -489,7 +486,8 @@ void Session::handle_fecstat(const uint8_t* payload, size_t len, int64_t now_ms)
   ++fecstat_rx_;
   fecstat_rx_pending_ = true;
 
-  const bool queued = min_srtt_ms_ > 0 && srtt_ms_ - min_srtt_ms_ >= 40;
+  const bool queued =
+      min_srtt_ms_ > 0 && srtt_ms_ - min_srtt_ms_ >= kQueueGuardrailGapMs;
   const FecState before = strategy_->state();
   strategy_->on_report(stat, queued);
   if (tx_) {
@@ -514,9 +512,10 @@ void Session::handle_fecstat(const uint8_t* payload, size_t len, int64_t now_ms)
 
   // The two sample gates run after the strategy was fed on purpose: a report
   // that is too lossy to trust still moves the machine off the raw numbers,
-  // and only the *log* line is suppressed.
-  if (static_cast<uint64_t>(stat.sets_k_unknown) * 10 >
-      std::max<uint32_t>(1, stat.sets_expected)) {
+  // and only the *log* line is suppressed. 同 strategy 样本门一阈值：
+  // kUntrustedKUnknownPct 是唯一定义。
+  if (static_cast<uint64_t>(stat.sets_k_unknown) * 100 >
+      std::max<uint32_t>(1, stat.sets_expected) * kUntrustedKUnknownPct) {
     log_fecstat_untrusted(log_, stat);
     return;
   }

@@ -17,11 +17,18 @@
 #include <functional>
 #include <vector>
 
+#include "fcp/defaults.h"
+#include "fcp/envelope.h"
 #include "fcp/hdr.h"
 
 namespace fcp {
 
+// The three overhead constants below used to copy the envelope layout by hand;
+// the static_assert keeps them from drifting when the envelope budget changes
+// (each is a single spelling of its own decomposition).
 constexpr size_t kFrameEnvelopeOverhead = 28;  // salt 8 + nonce 8 + tag 12
+static_assert(kFrameEnvelopeOverhead == Envelope::kOverhead,
+              "kFrameEnvelopeOverhead must stay == Envelope::kOverhead");
 // data wire = ip + udp + 28 + hdr(6) + len(2) + payload
 constexpr size_t kDataWireOverhead = kFrameEnvelopeOverhead + kFecHdrLen + 2;  // 36
 // parity wire = ip + udp + 28 + hdr(6) + symbol_max
@@ -117,7 +124,7 @@ class FrameTx {
   uint8_t next_k_ = 0;
   size_t symbol_max_ = 0;
   int64_t t_last_ms_ = 0;
-  int64_t flush_ms_ = 200;
+  int64_t flush_ms_ = kDefaultFlushMs;
   std::vector<std::vector<uint8_t>> symbols_;
 
   uint32_t closed_full_ = 0;

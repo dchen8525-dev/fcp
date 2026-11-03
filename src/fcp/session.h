@@ -37,9 +37,9 @@ namespace fcp {
 // Poll interval for T_flush, settlement and the FECSTAT cadence.
 constexpr int64_t kSessionTickMs = 25;
 
-// srtt assumed until the first RTT sample arrives, i.e. what a session without
-// a prewarm value starts from.
-constexpr int64_t kDefaultSrttMs = 200;
+// srtt assumed until the first RTT sample arrives: the value lives in
+// defaults.h (单一定义，对抗分析第九轮), alongside the other collected
+// operator-default constants this header used to duplicate.
 
 // The frame layer's cross-set duplicate check needs a replayable id out of the
 // payload. §4 assumed the payload to be a KCP segment, whose sn sits at offset

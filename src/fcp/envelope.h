@@ -87,6 +87,11 @@ class Envelope {
   // from it and the salt (see derive_session_key, #28①).
   Envelope(const uint8_t key[16], const uint8_t salt[kSaltLen],
            Direction send_direction, Direction recv_direction);
+  // 零化两头 GcmKey（轮密钥 + H）。析构后密钥不得再留在自由堆里
+  // （PSK 是长期静态配置的，派生方向密钥本属"逐会话即弃"）。
+  ~Envelope();
+  Envelope(const Envelope&) = delete;
+  Envelope& operator=(const Envelope&) = delete;
 
   // Appends the sealed datagram to `wire` and advances the nonce counter.
   // Returns false once the counter reaches 2^32 (the session must disconnect).
@@ -135,6 +140,10 @@ class Envelope {
   // The value-level work of seal_at, without either ceiling check.
   bool seal_unchecked(uint64_t nonce_ctr, const uint8_t* plain, size_t len,
                       std::vector<uint8_t>* wire) const;
+  // 布尔纯成员测试："这条计数器按当前窗口会不会被收下"，不落任何状态。
+  // open() 在跑 AES 前用它廉价拒掉重放；真正的窗口更新仍只由
+  // accept_nonce() 在 tag 验证通过后做（窗口绝不被未认证包污染）。
+  bool nonce_window_may_accept(uint64_t nonce_ctr) const;
   bool accept_nonce(uint64_t nonce_ctr);
   // Derives both direction keys from a session key and resets all per-key state.
   void install_keys(const uint8_t session_key[16]);

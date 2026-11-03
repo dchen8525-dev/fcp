@@ -52,9 +52,15 @@ void kdf_ctr_aes128(const uint8_t key[16], const char* label, size_t label_len,
     aes128_encrypt_block(aes_key, block, stream);
     const size_t n = (out_len - done) < kAesBlockLen ? (out_len - done) : kAesBlockLen;
     std::memcpy(out + done, stream, n);
+    // 离开本次迭代的中间值（普通字节栈变量，防优化喂给 volatile 抹除）。
+    secure_zero(block, sizeof(block));
+    secure_zero(stream, sizeof(stream));
     done += n;
     ++counter;
   }
+
+  // 展开的轮密钥属于密钥材料，离开作用域前抹除。
+  secure_zero(&aes_key, sizeof(aes_key));
 }
 
 }  // namespace
@@ -71,6 +77,8 @@ void derive_session_key(const uint8_t psk[16], const uint8_t salt[8],
   std::memcpy(block, salt, Envelope::kSaltLen);
   std::memset(block + Envelope::kSaltLen, 0, 16 - Envelope::kSaltLen);
   aes128_encrypt_block(aes_key, block, out);
+  secure_zero(&aes_key, sizeof(aes_key));
+  secure_zero(block, sizeof(block));
 }
 
 void derive_direction_keys(const uint8_t session_key[16],
@@ -107,6 +115,10 @@ void derive_session_key_v7(const uint8_t psk[16], const uint8_t salt[8],
     block[i] = static_cast<uint8_t>(chain[i] ^ server_nonce[i]);
   }
   aes128_encrypt_block(aes_key, block, out);  // X2
+
+  secure_zero(&aes_key, sizeof(aes_key));
+  secure_zero(block, sizeof(block));
+  secure_zero(chain, sizeof(chain));
 }
 
 Envelope::Envelope(const uint8_t key[16], const uint8_t salt[kSaltLen],
@@ -128,6 +140,13 @@ Envelope::Envelope(const uint8_t key[16], const uint8_t salt[kSaltLen],
   derive_session_key(key, salt, session_key);
   install_keys(session_key);
   std::memcpy(salt_, salt, kSaltLen);
+}
+
+Envelope::~Envelope() {
+  // 会话退出后，轮密钥与 H 不得留在已释放的堆页上。salt 本身就是明文
+  // wire 字段，无需抹除。
+  secure_zero(&send_key_, sizeof(send_key_));
+  secure_zero(&recv_key_, sizeof(recv_key_));
 }
 
 void Envelope::install_keys(const uint8_t session_key[16]) {
@@ -188,6 +207,19 @@ bool Envelope::seal_unchecked(uint64_t nonce_ctr, const uint8_t* plain, size_t l
   return gcm_seal_keyed(send_key_, iv, nullptr, 0, plain, len, cipher, tag);
 }
 
+// 见 envelope.h：纯判定，先于 AES。状态只由 accept_nonce() 落。
+bool Envelope::nonce_window_may_accept(uint64_t nonce_ctr) const {
+  if (!recv_has_nonce_) {
+    return true;
+  }
+  if (nonce_ctr > recv_highest_) {
+    // 前跳无论 delta 大小都会被接受（reset 或左移，见 accept_nonce）。
+    return true;
+  }
+  const uint64_t delta = recv_highest_ - nonce_ctr;
+  return delta < recv_seen_.size() && !recv_seen_[static_cast<size_t>(delta)];
+}
+
 bool Envelope::open(const uint8_t* wire, size_t len, std::vector<uint8_t>* plain) {
   if (wire == nullptr || plain == nullptr || len < kOverhead) {
     return false;
@@ -200,6 +232,13 @@ bool Envelope::open(const uint8_t* wire, size_t len, std::vector<uint8_t>* plain
   // sender that crossed the block budget is a protocol violation, not a replay
   // candidate.
   if (nonce_ctr >= counter_ceiling_) {
+    return false;
+  }
+  // Replay pre-check, also before AES: a replay of an authentic datagram is
+  // guaranteed to die at accept_nonce(), so it must not pay the full CTR +
+  // GHASH bill first（重放洪泛的 CPU 放大就此关闭）。判定不落状态，窗口仍
+  // 只在 tag 验证通过后由 accept_nonce() 更新，未认证包无法污染窗口。
+  if (!nonce_window_may_accept(nonce_ctr)) {
     return false;
   }
   uint8_t iv[kGcmIvLen];

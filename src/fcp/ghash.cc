@@ -92,10 +92,11 @@ void ghash_init_table(const uint8_t h[16], GhashTable* table) {
 Ghash::Ghash(const GhashTable& table) : table_(&table), y_{} {}
 
 void Ghash::update_block(const uint8_t block[16]) {
-  // y = (y ^ block) * H. The operand of the multiply is the public accumulator
-  // (ciphertext-derived), so indexing a table with its nibbles reveals nothing
-  // about H: the access pattern is identical for every key, which is the
-  // constant-time property the bit-serial version had.
+  // y = (y ^ block) * H. 只有第一块的操作数是纯公开数据（y 从 0 起）；从第二
+  // 块起 y 已是先前 (块, H) 乘积的函数，因此下面对 8 KiB 表的索引本身就依赖
+  // 密钥——本路径会泄漏 H 相关的缓存时序，并不比被换下的逐比特 gf128_mul
+  // 更"常数时间"。这与已接受的风险 A12/R3-27 是同一条（docs/对抗分析报告.md：
+  // 部署前提为受控链路 + PSK 不泄露），不要把本注释读成已消除该风险。
   for (int i = 0; i < 16; ++i) {
     y_[i] ^= block[i];
   }

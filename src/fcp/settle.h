@@ -34,7 +34,11 @@ constexpr int64_t kLateGuardMinMs = 100;
 constexpr int64_t kLateGuardMaxMs = 700;
 constexpr int64_t kTombstoneMinMs = 200;
 constexpr int64_t kTombstoneMaxMs = 1400;
-constexpr double kUntrustedKUnknownRatio = 0.10;
+// "k-unknown 集占比超 10% 则本区段不可信" —— 同一条规则现在只有这一处定义：
+// FcpSettle::untrusted()、strategy 的样本门 1、session 的日志门、以及日志
+// 文本里的百分比都读它（对抗分析第九轮：原先四处 0.10 独立拼写，改门槛会
+// 静默只改到其中一处）。
+constexpr uint32_t kUntrustedKUnknownPct = 10;
 
 // Burst detection (M3控制设计.md §3, #26). The reference is the exact
 // i.i.d. law of the max raw-loss run M over one full-size group of `d` slots

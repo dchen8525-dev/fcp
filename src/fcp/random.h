@@ -37,6 +37,14 @@ bool random_bytes(void* out, size_t len);
 // by production code.
 void set_random_failure_injection(bool enabled);
 
+// Wipes len bytes at p in a way the compiler may not optimize away
+// (SecureZeroMemory on Windows, a volatile byte store otherwise). Use it on
+// key material leaving scope: expanded key schedules, derived direction keys,
+// handshake nonces. It is deliberately one implementation here so the crypto
+// paths cannot pick a weaker spelling (plain memset is dead-store-eliminable
+// at scope exit, and a plaintext key in freed heap outlives the session).
+void secure_zero(void* p, size_t len);
+
 }  // namespace fcp
 
 #endif  // FCP_RANDOM_H_

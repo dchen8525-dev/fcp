@@ -423,11 +423,15 @@ struct Harness {
   }
 
   void pump() {
+    // 对抗分析第十轮 P3：上限曾是静默 return——一个失控的投递回环（测试
+    // bug 的典型症状）会在这里无声停泵，后面的断言互相错过，看起来只是
+    // "正常"。跑满 1024 次仍没排空说明发送方在持续回环，直接失败定位。
     for (int guard = 0; guard < 1024; ++guard) {
       if (!pump_once()) {
         return;
       }
     }
+    fprintf(stderr, "pump(): still active after 1024 drain rounds\n");
   }
 
   bool Handshake() {

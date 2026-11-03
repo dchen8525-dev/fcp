@@ -24,9 +24,10 @@
 #include <set>
 #include <vector>
 
+#include "fcp/limits.h"
+
 namespace fcp {
 
-constexpr size_t kMaxS = 256;           // index is u8; D + P <= 256
 constexpr size_t kMaxActiveSets = 256;
 constexpr size_t kSnWindow = 4096;
 // Forward jumps larger than this are treated as a session discontinuity: no

@@ -11,10 +11,19 @@
 #include <cstdint>
 #include <vector>
 
+#include "fcp/limits.h"
+
 namespace fcp {
 
 constexpr size_t kRsMaxShards = 256;  // n + k, limited by the u8 index
 constexpr size_t kRsMaxParity = 7;    // k occupies 3 header bits
+
+// RS bounds are pinned together with the sites that live off them — the u8
+// code length (frame_rx's set arrays), the 3-bit wire field (hdr/strategy),
+// and settle's ledger histogram. Each was independently editable before; the
+// asserts make the geometry unbreakable (对抗分析第九轮).
+static_assert(kRsMaxShards == kMaxS, "code length bound must match kMaxS");
+static_assert(kRsMaxParity == kMaxParity, "parity bound must match kMaxParity");
 
 // Computes all k parity symbols. Every data symbol points to exactly
 // `symbol_max` bytes (callers zero-extend shorter payloads); parity_out[j]

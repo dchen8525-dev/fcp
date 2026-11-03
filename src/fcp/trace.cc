@@ -192,9 +192,9 @@ bool decode_trace_line(const std::string& line, TraceEntry* e) {
   // P8' N9: a failed decode used to leave the previous entry's ver intact while
   // every other failure cleared it. Make the contract uniform: failure leaves a
   // default-initialised entry.
-  if (e != nullptr) {
-    *e = TraceEntry{};
-  }
+  TraceEntry scratch;
+  TraceEntry& out = e != nullptr ? *e : scratch;
+  out = TraceEntry{};
   if (!scan_fields(line, &fields)) {
     return false;
   }
@@ -247,7 +247,7 @@ bool decode_trace_line(const std::string& line, TraceEntry* e) {
     return true;
   };
 
-  TraceConfigSnapshot& c = e->snapshot;
+  TraceConfigSnapshot& c = out.snapshot;
   if (!u8("c_d", 10, &c.d) || !u8("c_pmax", kDefaultPmax, &c.p_max) ||
       !i32("c_ik", -1, &c.initial_k) || !i32("c_pin", -1, &c.pinned)) {
     return false;
@@ -258,9 +258,9 @@ bool decode_trace_line(const std::string& line, TraceEntry* e) {
   if (!field_in_range(fields, "now", -9007199254740992.0, 9007199254740992.0, 0.0, &v)) {
     return false;
   }
-  e->now_ms = static_cast<int64_t>(v);
-  e->window_queued = field_or(fields, "queued", 0.0) != 0.0;
-  if (!u8("k", 0, &e->k_after)) {
+  out.now_ms = static_cast<int64_t>(v);
+  out.window_queued = field_or(fields, "queued", 0.0) != 0.0;
+  if (!u8("k", 0, &out.k_after)) {
     return false;
   }
   uint8_t state = 0;
@@ -270,10 +270,10 @@ bool decode_trace_line(const std::string& line, TraceEntry* e) {
   if (state > static_cast<uint8_t>(FecState::kCapped)) {
     return false;  // P8' N8: reject a non-enum state instead of casting it
   }
-  e->state_after = static_cast<FecState>(state);
-  e->last_loss = field_or(fields, "loss", 0.0);
+  out.state_after = static_cast<FecState>(state);
+  out.last_loss = field_or(fields, "loss", 0.0);
 
-  FecstatPacket& s = e->stat;
+  FecstatPacket& s = out.stat;
   s = MakeFecstatPacket(s.session_salt);
   if (!u8("s_ver", kFecstatVersion, &s.ver) || !u8("s_flg", 0, &s.flg) ||
       !u16("s_ivl", 0, &s.interval_ms) ||

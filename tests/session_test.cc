@@ -83,13 +83,14 @@ Bytes OobHello(const uint8_t draw[fcp::kHandshakeNonceLen]) {
 // R3-1: after the handshake the data envelope is keyed by both draws, so a
 // test that peeks at a session's output has to derive the same key. Handshake
 // messages still use the bootstrap key, hence the plain readers further down.
-fcp::Envelope DataReader(fcp::Direction send, fcp::Direction recv,
-                         const uint8_t client_nonce[16],
-                         const uint8_t server_nonce[16]) {
-  fcp::Envelope env(kKey, kSalt, send, recv);
+// (Envelope 不可拷贝——析构会零化密钥材料——所以以 owns 指针交还。)
+std::unique_ptr<fcp::Envelope> DataReader(fcp::Direction send, fcp::Direction recv,
+                                          const uint8_t client_nonce[16],
+                                          const uint8_t server_nonce[16]) {
+  auto env = std::make_unique<fcp::Envelope>(kKey, kSalt, send, recv);
   uint8_t key[16];
   fcp::derive_session_key_v7(kKey, kSalt, client_nonce, server_nonce, key);
-  env.rekey(key);
+  env->rekey(key);
   return env;
 }
 
@@ -347,10 +348,10 @@ void TestFullLoop() {
   // Decode the second report end to end and check the fields the design §11
   // line and the strategy rely on. b_oob_wires[0] is the handshake ACK; [1]/[2]
   // are the two copies of report 1, [3]/[4] of report 2 (#28⑤ F3).
-  fcp::Envelope reader = DataReader(fcp::Direction::kS2C, fcp::Direction::kS2C,
-                                  a.handshake_nonce(), b.handshake_nonce());
+  auto reader = DataReader(fcp::Direction::kS2C, fcp::Direction::kS2C,
+                           a.handshake_nonce(), b.handshake_nonce());
   Bytes plain;
-  CHECK(reader.open(link.b_oob_wires[3].data(), link.b_oob_wires[3].size(), &plain));
+  CHECK(reader->open(link.b_oob_wires[3].data(), link.b_oob_wires[3].size(), &plain));
   fcp::FecHdr hdr{};
   CHECK(fcp::parse_hdr(plain.data(), plain.size(), &hdr));
   CHECK(fcp::hdr_type(hdr.type_k) == fcp::SymbolType::kOob);
@@ -372,10 +373,10 @@ void TestFullLoop() {
 
   // The first interval has no parity at all; the byte counters must reflect the
   // inbound wire budget (28B envelope + 6B header + 2B len + 16B payload = 52B).
-  fcp::Envelope reader0 = DataReader(fcp::Direction::kS2C, fcp::Direction::kS2C,
-                                   a.handshake_nonce(), b.handshake_nonce());
+  auto reader0 = DataReader(fcp::Direction::kS2C, fcp::Direction::kS2C,
+                            a.handshake_nonce(), b.handshake_nonce());
   Bytes plain0;
-  CHECK(reader0.open(link.b_oob_wires[1].data(), link.b_oob_wires[1].size(), &plain0));
+  CHECK(reader0->open(link.b_oob_wires[1].data(), link.b_oob_wires[1].size(), &plain0));
   fcp::FecHdr hdr0{};
   CHECK(fcp::parse_hdr(plain0.data(), plain0.size(), &hdr0));
   CHECK(fcp::hdr_type(hdr0.type_k) == fcp::SymbolType::kOob);
@@ -653,11 +654,11 @@ void TestPreNegotiationCache() {
   CHECK_EQ(sent.size(), 1u);  // the cached segment is replayed after setup
   CHECK(sent[0].second == fcp::SymbolType::kData);
 
-  fcp::Envelope reader =
+  auto reader =
       DataReader(fcp::Direction::kC2S, fcp::Direction::kC2S, s.handshake_nonce(),
                  PeerDraw());
   Bytes data_plain;
-  CHECK(reader.open(sent[0].first.data(), sent[0].first.size(), &data_plain));
+  CHECK(reader->open(sent[0].first.data(), sent[0].first.size(), &data_plain));
   fcp::FecHdr hdr{};
   CHECK(fcp::parse_hdr(data_plain.data(), data_plain.size(), &hdr));
   CHECK(fcp::hdr_type(hdr.type_k) == fcp::SymbolType::kData);
@@ -811,11 +812,11 @@ void TestPreNegotiationInboundDropped() {
   CHECK(s.established());
   CHECK_EQ(sent.size(), 1u);  // only our segment: nothing was reflected
   CHECK(sent[0].second == fcp::SymbolType::kData);
-  fcp::Envelope reader =
+  auto reader =
       DataReader(fcp::Direction::kC2S, fcp::Direction::kC2S, s.handshake_nonce(),
                  PeerDraw());
   Bytes out_plain;
-  CHECK(reader.open(sent[0].first.data(), sent[0].first.size(), &out_plain));
+  CHECK(reader->open(sent[0].first.data(), sent[0].first.size(), &out_plain));
   fcp::FecHdr hdr{};
   CHECK(fcp::parse_hdr(out_plain.data(), out_plain.size(), &hdr));
   CHECK_EQ(hdr.set_id, 0u);
@@ -859,9 +860,9 @@ void TestQueuedGuardrailUsesObservedMinRtt() {
   feed(ack_plain);
   CHECK(s.established());
 
-  fcp::Envelope data_env = DataReader(fcp::Direction::kS2C, fcp::Direction::kS2C,
-                                      s.handshake_nonce(), PeerDraw());
-  active = &data_env;
+  auto data_env = DataReader(fcp::Direction::kS2C, fcp::Direction::kS2C,
+                             s.handshake_nonce(), PeerDraw());
+  active = data_env.get();
 
   auto report = [&feed](uint32_t key, uint32_t expect, uint32_t rx) {
     fcp::FecstatPacket p = fcp::MakeFecstatPacket(kSalt);
@@ -900,6 +901,78 @@ void TestQueuedGuardrailUsesObservedMinRtt() {
   CHECK_EQ(s.k(), 3);  // still no growth while queued
   report(7, 1000, 800);
   CHECK_EQ(s.k(), 2);  // third consecutive queued report -> k - 1
+}
+
+// 会话级单调键的接线（对抗分析第十轮）：一个 key 回退、但编码完全合法的
+// FECSTAT 在 session 层被分类为 kStale —— 落进 fecstat_stale()（连同
+// fecstat_dropped()），不进策略，拓扑计数与 k 不动，刷新不了报告钟。
+// 策略自身的回退阈值行为在 adv_test R8.4 有覆盖。
+void TestStaleReportNeverFeedsStrategy() {
+  fcp::Session s(MakeConfig(fcp::Direction::kC2S, fcp::Direction::kS2C), nullptr,
+                 nullptr, nullptr);
+  s.start(0);
+
+  fcp::Envelope boot(kKey, kSalt, fcp::Direction::kS2C, fcp::Direction::kS2C);
+  fcp::Envelope* active = &boot;
+  auto feed = [&active, &s](const Bytes& plain) {
+    Bytes wire;
+    CHECK(active->seal(plain.data(), plain.size(), &wire));
+    s.on_wire(wire.data(), wire.size(), 10);
+  };
+
+  uint8_t ack[fcp::kHelloAckLen];
+  fcp::build_hello_ack(
+      fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, fcp::kLocalFlagsM1},
+      s.handshake_nonce(), PeerDraw(), ack);
+  Bytes ack_plain(fcp::kFecHdrLen + sizeof(ack));
+  fcp::pack_hdr(
+      fcp::FecHdr{0, 0, fcp::pack_type_k(0, 0, static_cast<uint8_t>(fcp::SymbolType::kOob))},
+      ack_plain.data());
+  std::memcpy(ack_plain.data() + fcp::kFecHdrLen, ack, sizeof(ack));
+  feed(ack_plain);
+  CHECK(s.established());
+
+  auto data_env = DataReader(fcp::Direction::kS2C, fcp::Direction::kS2C,
+                             s.handshake_nonce(), PeerDraw());
+  active = data_env.get();
+
+  auto report = [&feed](uint32_t key, uint32_t expect, uint32_t rx) {
+    fcp::FecstatPacket p = fcp::MakeFecstatPacket(kSalt);
+    p.flg = fcp::kFlgDirection;
+    p.interval_ms = 2000;
+    p.accounted_through_set_id = key;
+    p.sets_expected = expect / 10;
+    p.data_expected = expect;
+    p.data_rx_orig = rx;
+    uint8_t packet[fcp::kFecstatLen];
+    fcp::encode_fecstat(p, packet);
+    Bytes plain(fcp::kFecHdrLen + fcp::kFecstatLen);
+    fcp::pack_hdr(
+        fcp::FecHdr{0, 0, fcp::pack_type_k(0, 0, static_cast<uint8_t>(fcp::SymbolType::kOob))},
+        plain.data());
+    std::memcpy(plain.data() + fcp::kFecHdrLen, packet, sizeof(packet));
+    feed(plain);
+  };
+
+  report(10, 1000, 980);  // 2%: OFF -> ON at k_for(2%)
+  CHECK(s.strategy()->state() == fcp::FecState::kOn);
+  CHECK_EQ(s.fecstat_rx(), 1u);
+  CHECK_EQ(s.fecstat_stale(), 0u);
+  CHECK_EQ(s.fecstat_dropped(), 0u);
+
+  // key 10 之后送 key 8：完全合法的 8 字节/k 整数，但落在单调键的后面。
+  report(8, 1000, 980);
+  CHECK_EQ(s.fecstat_stale(), 1u);
+  CHECK_EQ(s.fecstat_dropped(), 1u);
+  CHECK_EQ(s.fecstat_rx(), 1u);   // 没进来
+  CHECK_EQ(s.fecstat_dup(), 0u);  // 分开计数：这不算 duplicate
+  CHECK_EQ(s.k(), 1u);            // 策略没动
+
+  // 正常前推恢复：回到的 key 报告仍能驱动策略。
+  report(11, 1000, 960);
+  CHECK_EQ(s.fecstat_rx(), 2u);
+  CHECK_EQ(s.fecstat_dropped(), 1u);
+  CHECK_EQ(s.fecstat_stale(), 1u);
 }
 
 // Spec §8 "无报告": while outbound data keeps flowing, three local 2s report
@@ -1585,6 +1658,7 @@ int main() {
   TestPreNegotiationMtuReject();
   TestMtuMustCarryOob();
   TestQueuedGuardrailUsesObservedMinRtt();
+  TestStaleReportNeverFeedsStrategy();
   TestMissingFecstatWarning();
   TestSessionTable();
   TestLedgerLiftsKUnderBursts();

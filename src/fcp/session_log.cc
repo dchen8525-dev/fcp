@@ -2,6 +2,7 @@
 
 #include <cstdio>
 
+#include "fcp/settle.h"    // kUntrustedKUnknownPct（日志文本里的百分比）
 #include "fcp/strategy.h"  // FecState and fec_state_name()
 
 namespace fcp {
@@ -46,8 +47,10 @@ void log_fecstat_untrusted(const SessionLogFn& log, const FecstatPacket& stat) {
     return;
   }
   char line[96];
-  std::snprintf(line, sizeof(line), "FEC sample untrusted: k_unknown=%u/%u (>10%%)",
-                stat.sets_k_unknown, stat.sets_expected);
+  // 百分比不再写死：门槛只有一个定义（kUntrustedKUnknownPct），文本跟着走。
+  std::snprintf(line, sizeof(line), "FEC sample untrusted: k_unknown=%u/%u (>%u%%)",
+                stat.sets_k_unknown, stat.sets_expected,
+                static_cast<unsigned>(kUntrustedKUnknownPct));
   log(line);
 }
 

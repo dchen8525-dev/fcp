@@ -1699,6 +1699,47 @@ void ProbeR10Session() {
   }
 }
 
+// ---------------------------------------------------------------- R11 ------
+// KCP 段/负载层 fuzz（对抗分析第十轮补的空白）：认证面之后的下一层是
+// FrameRx 的投递通道——它把每个 data symbol 的有效负载原样交给宿主
+// （这里由 sn_dedup + 计数回调消费）。这里直接在 FrameRx 层批量注入
+// data symbol：每一发都结构合法（declared == symbol_len、index < D），
+// 但 set_id 全域随机（含绕回邻域）、k/j 结构字段随机、段体随机。边际
+// 校验失败形态（index 越界、k 冲突、声明不符）由 R4 的定向用例覆盖，
+// 会话层的 MTU 门由 R10.2 覆盖，不在这里重复。
+void ProbeR11Stream() {
+  RxFixture f;
+  uint32_t rng = 0x5eed1234u;
+  const size_t delivered_pre = f.delivered_sn.size();
+  for (int i = 0; i < 600; ++i) {
+    rng = rng * 1103515245u + 12345u;
+    const uint32_t set_id = i < 8
+        ? 0xFFFFFF00u + static_cast<uint32_t>(i)  // 绕回邻域开头几发
+        : rng;                                    // 其余全域随机
+    const uint8_t index = static_cast<uint8_t>((rng >> 20) % 10);  // 0..9 < D
+    const uint8_t k_field = (rng >> 30) & 0x07;                    // 0..7，超 P' 的被钳
+    const uint8_t j_field = static_cast<uint8_t>((rng >> 16) & 0x03);
+    const size_t body_len = 1 + ((rng >> 24) & 0x3F);  // 1..64
+    // dedup 键取段内高位 sn：远远避开其它用例的小 sn，i*31 < 2^24 内
+    // 两两不同，不会让两发互相吃掉。
+    f.feed(set_id, index, fcp::pack_type_k(k_field, j_field, 0),
+           f.data_symbol(body_len, 0x01000000u | static_cast<uint32_t>(i) * 31u));
+  }
+  // 600 发里最可能的三种出路是：投递一次、同 set 同 index 的晚到重复、
+  // 某 k 先到把 k 钉死后后来者走 struct_fail。共同点是"多一个字节的负
+  // 效应都没有"——不发帐外投递，不把有效 set 状态写歪。
+  CHECK(static_cast<uint32_t>(f.delivered_sn.size() - delivered_pre) > 0);
+
+  // fuzz 之后同一条接收端立即消化干净流：anchor 不被一波随机 id 拖进死
+  // 胡同，紧贴 anchor 之上的新 set 干净整距投递，一段不少、一段不重。
+  const uint32_t anchor = f.rx.anchor();
+  const size_t before = f.delivered_sn.size();
+  for (uint8_t idx = 0; idx < 10; ++idx) {
+    f.feed(anchor + 1, idx, fcp::pack_type_k(0, 0, 0), f.data_symbol(8, 900 + idx));
+  }
+  CHECK_EQ(f.delivered_sn.size(), before + 10);
+}
+
 }  // namespace
 
 int main() {
@@ -1717,6 +1758,7 @@ int main() {
       {"R8 strategy", ProbeR8Strategy},
       {"R9 handshake", ProbeR9Handshake},
       {"R10 session fuzz", ProbeR10Session},
+      {"R11 kcp-segment fuzz", ProbeR11Stream},
   };
   const char* only = std::getenv("ADV_ONLY");
   for (const Round& r : rounds) {

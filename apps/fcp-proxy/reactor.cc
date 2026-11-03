@@ -587,6 +587,7 @@ void Reactor::read_socket(Sock sock, uint64_t conn, bool target, int64_t now_ms)
       continue;
     }
     if (n == 0) {
+      // 对端的 FIN；对端半关闭后仍可能收我们的字节，socket 保留在表里。
       if (target) {
         engine_.on_target_closed(conn, now_ms);
       } else {
@@ -594,10 +595,26 @@ void Reactor::read_socket(Sock sock, uint64_t conn, bool target, int64_t now_ms)
       }
       return;
     }
+    // 真错误（对端 RST、句柄失效……）：这一刻起 recv 永远命中同一个错误。
+    // socket 留在表里的话，select 每一轮都会因为持久错误把它报为可读，
+    // 于是 on_*_closed 以一次读一轮的频率反复进入引擎 —— 一个被 RST 的
+    // 客户端能把整个 tick 预算烧成千次同步回调（defeating flush grace）。
+    // 因此先摘句柄再通知引擎；反向 flush 路径会查不到 socket 而自然跳过
+    // （engine 的 teardown 心跳与计时照常），与“句柄已死”之情一致。
     if (!WouldBlock(SockErr())) {
       if (target) {
+        const auto it = targets_.find(conn);
+        if (it != targets_.end()) {
+          CloseSock(it->second);
+          targets_.erase(it);
+        }
         engine_.on_target_closed(conn, now_ms);
       } else {
+        const auto it = locals_.find(conn);
+        if (it != locals_.end()) {
+          CloseSock(it->second);
+          locals_.erase(it);
+        }
         engine_.on_local_closed(conn, now_ms);
       }
     }
@@ -1061,12 +1078,12 @@ void Reactor::print_stats(int64_t now_ms) {
   const ProxyEngine::Counters& c = engine_.counters();
   std::printf(
       "stats %6.1fs live=%zu up=%zu tunnels=%zu tx=%" PRIu64 "B rx=%" PRIu64
-      "B bad_entry=%u refused=%u hs_failed=%u reset=%u idle=%u clash=%u over=%u bad_cfg=%u"
-      " unknown=%u tomb=%u duprec=%u\n",
+      "B bad_entry=%u refused=%u hs_failed=%u reset=%u idle=%u clash=%u over=%u"
+      " bad_cfg=%u no_entropy=%u budget=%u unknown=%u tomb=%u duprec=%u\n",
       (now_ms - started_ms_) / 1000.0, c.live, c.established, c.tunnels, c.bytes_tx, c.bytes_rx,
       c.bad_entry, c.open_failed, c.handshake_failed, c.reset, c.idle_closed, c.salt_clash,
-      c.over_limit, c.bad_config, c.unknown_salt, c.salt_tombstone,
-      engine_.dup_after_recovered());
+      c.over_limit, c.bad_config, c.no_entropy, c.over_budget, c.unknown_salt,
+      c.salt_tombstone, engine_.dup_after_recovered());
   std::fflush(stdout);
 }
 

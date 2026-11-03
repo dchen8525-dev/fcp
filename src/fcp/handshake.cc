@@ -120,6 +120,13 @@ Handshake::Handshake(uint8_t local_d, uint8_t local_p, SendFn send,
   }
 }
 
+Handshake::~Handshake() {
+  // 两侧 nonce 是 v7 会话密钥的派生输入，生命周期结束后不留明文
+  // （会话拆除 = 密钥纪元即弃）。
+  secure_zero(local_nonce_, sizeof(local_nonce_));
+  secure_zero(peer_nonce_, sizeof(peer_nonce_));
+}
+
 void Handshake::start(int64_t now_ms) {
   if (state_ != HandshakeState::kIdle) {
     return;

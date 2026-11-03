@@ -2,7 +2,8 @@
 
 #include <cstdio>
 #include <cstring>
-#include <random>
+
+#include "fcp/random.h"
 
 #ifdef _WIN32
 #include <direct.h>
@@ -40,6 +41,9 @@ constexpr int64_t kSaltTombstoneMs = 5 * 60 * 1000;
 // Only authenticated sessions insert here, so this bound is a flood ceiling
 // for PSK holders, not for arbitrary UDP senders.
 constexpr size_t kSaltTombstoneMax = 8192;
+// 预认证会话构筑预算（见 create_server_conn）：收费窗口宽度与窗口内配额。
+constexpr int64_t kNewConnWindowMs = 250;
+constexpr int32_t kMaxNewServerConnsPerWindow = 256;
 
 std::string salt_key_of(const uint8_t* salt) {
   return std::string(reinterpret_cast<const char*>(salt), Envelope::kSaltLen);
@@ -65,11 +69,12 @@ void make_directories_for(const std::string& path) {
   }
 }
 
-void random_salt(uint8_t out[Envelope::kSaltLen]) {
-  static std::random_device rd;
-  for (size_t i = 0; i < Envelope::kSaltLen; ++i) {
-    out[i] = static_cast<uint8_t>(rd() & 0xFFu);
-  }
+// 唯一的熵源是核心库的 random_bytes（BCryptGenRandom // /dev/urandom）。
+// std::random_device 在 MinGW 一类工具链下是固定种子 PRNG，用它画盐会让
+// #28① 的逐会话密钥派生拿到同一个盐值（跨会话 key, IV 重用），所以这里
+// 沿用库的约定：失败即失败，caller 负责拒绝建会话。
+bool random_salt(uint8_t out[Envelope::kSaltLen]) {
+  return random_bytes(out, Envelope::kSaltLen);
 }
 
 const char* stream_reason_text(CloseReason reason) {
@@ -154,17 +159,28 @@ void ProxyEngine::on_local_open(uint64_t conn, uint64_t peer, int64_t now_ms) {
     }
     return;
   }
-  // A refusal here (the configured MTU leaves no room for a data symbol) has to
-  // look like every other refusal: the engine holds no Conn for this socket, so
-  // unless the host is told to close it the local socket is never freed and the
-  // application waits on a tunnel that will never exist.
-  if (!create_client_conn(conn, peer, now_ms)) {
-    ++counters_.bad_config;
-    log(label(conn) + " refused: MTU leaves no room for a data symbol");
-    if (host_.app_close) {
-      host_.app_close(conn);
-    }
-  }
+  // A refusal here has to look like every other refusal: the engine holds no
+  // Conn for this socket, so unless the host is told to close it the local
+  // socket is never freed and the application waits on a tunnel that will
+  // never exist. The *reason* lines and counters must not merge: an entropy
+  // failure is "fix the OS entropy story", a bad config is "fix --mtu".
+  switch (create_client_conn(conn, peer, now_ms)) {
+    case CreateStatus::kNoEntropy:
+      ++counters_.no_entropy;
+      if (host_.app_close) {
+        host_.app_close(conn);
+      }
+      return;
+    case CreateStatus::kBadConfig:
+      ++counters_.bad_config;
+      log(label(conn) + " refused: MTU leaves no room for a data symbol");
+      if (host_.app_close) {
+        host_.app_close(conn);
+      }
+      return;
+    case CreateStatus::kOk:
+      break;
+  };
   reap(now_ms);
 }
 
@@ -512,7 +528,13 @@ std::unique_ptr<Session> ProxyEngine::make_session(uint64_t cid, const SessionCo
       sc,
       [this, cid](const uint8_t* wire, size_t len, SymbolType) {
         Conn* p = find(cid);
-        if (p == nullptr || p->phase == Phase::kDone || !host_.wire_send) {
+        // §14.6 (#30)：reap 里的最后一份 FECSTAT（flush_report）必须能出门。
+        // teardown 先标 kDone、后 flush，若对 kDone 一刀切，"the last report
+        // interval rides out before the session dies" 就成了死代码——对端的
+        // 控制器永远丢最后一个区段的账。in_reap_ 正是本轮的独占标记，且
+        // reap 期间该 session 是唯一在发送的，放开这一扇不会放进别的包。
+        if (p == nullptr || (p->phase == Phase::kDone && !in_reap_) ||
+            !host_.wire_send) {
           return;
         }
         counters_.bytes_tx += len;
@@ -528,7 +550,11 @@ std::unique_ptr<Session> ProxyEngine::make_session(uint64_t cid, const SessionCo
       [this](const std::string& line) { log(line); });
 }
 
-bool ProxyEngine::create_client_conn(uint64_t id, uint64_t peer, int64_t now_ms) {
+// 会话建立失败的两种本质上不同的原因。混淆它们会让运维把一条熵源故障
+// （CSPRNG 不可用）当成 MTU 配置错误去排查——stats 行的 bad_config 会一路
+// 增长，而配置明明是对的。
+ProxyEngine::CreateStatus ProxyEngine::create_client_conn(uint64_t id, uint64_t peer,
+                                                          int64_t now_ms) {
   auto conn = std::make_unique<Conn>();
   Conn* raw = conn.get();
   raw->id = id;
@@ -543,8 +569,10 @@ bool ProxyEngine::create_client_conn(uint64_t id, uint64_t peer, int64_t now_ms)
   fill_session_config(&sc, id);
   if (host_.new_salt) {
     host_.new_salt(sc.salt);
-  } else {
-    random_salt(sc.salt);
+  } else if (!random_salt(sc.salt)) {
+    // 熵源不可用时不建会话：固定盐会把 #28① 的跨会话密钥隔离整个打掉。
+    log(label(id) + " no CSPRNG entropy for session salt");
+    return ProxyEngine::CreateStatus::kNoEntropy;
   }
   sc.send_direction = Direction::kC2S;
   sc.recv_direction = Direction::kS2C;
@@ -558,7 +586,7 @@ bool ProxyEngine::create_client_conn(uint64_t id, uint64_t peer, int64_t now_ms)
   raw->session = make_session(id, sc);
   if (!raw->session->config_valid()) {
     log(label(id) + " bad MTU configuration");
-    return false;
+    return ProxyEngine::CreateStatus::kBadConfig;
   }
   raw->salt_key = salt_key_of(sc.salt);
   attach_stream(*raw);
@@ -566,11 +594,29 @@ bool ProxyEngine::create_client_conn(uint64_t id, uint64_t peer, int64_t now_ms)
   by_salt_.emplace(raw->salt_key, id);
   ++counters_.live;
   raw->session->start(now_ms);
-  return true;
+  return ProxyEngine::CreateStatus::kOk;
 }
 
 ProxyEngine::Conn* ProxyEngine::create_server_conn(uint64_t peer, const uint8_t* salt,
                                                    int64_t now_ms) {
+  // 预认证防.cpu 放大（对抗分析第七轮 P2）：每一个未认证的 8 字节伪造包都能
+  // 买一次完整的 Session 构造（两次 CSPRNG 抽取 + 四套 AES 轮密钥扩展 + KDF
+  // 链 + 一次分配回收），毫秒内即被丢弃。这扇门不是认证（那要协议级
+  // cookie），而是收费窗口：每 250ms 至多 kMaxNewServerConnsPerWindow 次
+  // 构造，超出即丢。合法流首包即认证（HELLO 在 on_wire 的同一调用里通过
+  // 验证），256/250ms = 1024 新建/秒，远超正常流量的到达率；只要 budget
+  // 放得足够宽，它只对"恶意洪泛"形状收敛。
+  const int64_t window = now_ms / kNewConnWindowMs;
+  if (window != create_window_) {
+    create_window_ = window;
+    create_budget_ = kMaxNewServerConnsPerWindow;
+  }
+  if (create_budget_ == 0) {
+    ++counters_.over_budget;
+    return nullptr;
+  }
+  --create_budget_;
+
   if (by_conn_.size() >= cfg_.max_sessions) {
     ++counters_.over_limit;
     return nullptr;
@@ -692,10 +738,18 @@ void ProxyEngine::session_events(Conn& conn, int64_t now_ms) {
   }
   if (conn.session->state() == HandshakeState::kFailed) {
     ++counters_.handshake_failed;
-    if (cfg_.role == EngineRole::kClient && !in_entry_phase(conn.phase)) {
-      queue_local_reply(conn, Socks5Rep::kGeneralFailure, HttpReply::kBadGateway);
+    if (cfg_.role == EngineRole::kClient) {
+      if (in_entry_phase(conn.phase)) {
+        // 应用还没发出请求，谈不上下一步的协议回复：立即关。
+        finish_conn(conn, now_ms, "handshake failed");
+      } else {
+        // kAwaitReply：应用收到的是 SOCKS5/HTTP 失败码，而不是被 RST。
+        refuse_local(conn, "handshake failed", Socks5Rep::kGeneralFailure,
+                     HttpReply::kBadGateway);
+      }
+    } else {
+      finish_conn(conn, now_ms, "handshake failed");
     }
-    finish_conn(conn, now_ms, "handshake failed");
     return;
   }
   // #26①: past 2^32 packets the GCM block budget is spent and Session stops
@@ -737,15 +791,14 @@ bool ProxyEngine::parse_entry(Conn& conn, int64_t now_ms) {
         return false;
       }
       counters_.bad_entry++;
-      // The SOCKS5 rep is irrelevant on the HTTP path: queue_local_reply picks
+      // The SOCKS5 rep is irrelevant on the HTTP path: refuse_local picks
       // the body by conn.socks5, which is false here.
-      queue_local_reply(conn, Socks5Rep::kGeneralFailure,
-                        r == HttpParse::kMethodNotAllowed
-                            ? HttpReply::kMethodNotAllowed
-                            : (r == HttpParse::kHeadTooLarge
-                                   ? HttpReply::kRequestHeaderTooLarge
-                                   : HttpReply::kBadRequest));
-      finish_conn(conn, now_ms, "rejected HTTP CONNECT");
+      refuse_local(conn, "rejected HTTP CONNECT", Socks5Rep::kGeneralFailure,
+                   r == HttpParse::kMethodNotAllowed
+                       ? HttpReply::kMethodNotAllowed
+                       : (r == HttpParse::kHeadTooLarge
+                              ? HttpReply::kRequestHeaderTooLarge
+                              : HttpReply::kBadRequest));
       return false;
     }
 
@@ -799,11 +852,14 @@ bool ProxyEngine::parse_entry(Conn& conn, int64_t now_ms) {
     }
     counters_.bad_entry++;
     if (r == Socks5Parse::kCommandNotSupported) {
-      queue_local_reply(conn, Socks5Rep::kCommandNotSupported, HttpReply::kMethodNotAllowed);
+      refuse_local(conn, "rejected SOCKS5 request", Socks5Rep::kCommandNotSupported,
+                   HttpReply::kMethodNotAllowed);
     } else if (r == Socks5Parse::kAtypNotSupported) {
-      queue_local_reply(conn, Socks5Rep::kAtypNotSupported, HttpReply::kBadRequest);
+      refuse_local(conn, "rejected SOCKS5 request", Socks5Rep::kAtypNotSupported,
+                   HttpReply::kBadRequest);
+    } else {
+      finish_conn(conn, now_ms, "rejected SOCKS5 request");
     }
-    finish_conn(conn, now_ms, "rejected SOCKS5 request");
     return false;
   }
   return !in_entry_phase(conn.phase);
@@ -824,6 +880,24 @@ void ProxyEngine::start_tunnel_client(Conn& conn, int64_t now_ms) {
   conn.phase = Phase::kAwaitReply;
   drain_stream(conn);
   log(label(conn) + " OPEN sent");
+}
+
+// 一个带回复的本地拒绝：把回复排队后走 grace 关机而不是立即 finish_conn。
+// 与 send_open_error() 同一模型：回复先于 socket 消失，应用（比如按
+// RFC 1928 处理失败码的 curl）能读到置位的原因，而不是收到连接重置。
+// 立即 finish 的话，应用写缓冲已满时回复根本没机会出门（flush_app 的
+// sendto 返回 0 不再给第二次机会），只能凭空送一个 RST。
+void ProxyEngine::refuse_local(Conn& conn, const char* why, Socks5Rep rep,
+                               HttpReply http) {
+  if (conn.closing || conn.phase == Phase::kDone) {
+    return;
+  }
+  conn.closing = true;
+  queue_local_reply(conn, rep, http);
+  conn.want_fin = true;
+  arm_grace(conn, /*only_if_idle=*/true);
+  maybe_fin(conn);
+  log(label(conn) + why);
 }
 
 void ProxyEngine::queue_local_reply(Conn& conn, Socks5Rep rep, HttpReply http) {
@@ -867,15 +941,15 @@ void ProxyEngine::parse_open_reply(Conn& conn) {
   }
   if (r != OpenParse::kOk) {
     counters_.open_failed++;
-    queue_local_reply(conn, Socks5Rep::kGeneralFailure, HttpReply::kBadGateway);
-    finish_conn(conn, now_ms_, "malformed OPEN reply");
+    refuse_local(conn, "malformed OPEN reply", Socks5Rep::kGeneralFailure,
+                 HttpReply::kBadGateway);
     return;
   }
   drop_front(&conn.stream_in, consumed);
   if (!ok) {
     counters_.open_failed++;
-    queue_local_reply(conn, socks5_rep_for_open_error(err), HttpReply::kBadGateway);
-    finish_conn(conn, now_ms_, "server refused the tunnel");
+    refuse_local(conn, "server refused the tunnel", socks5_rep_for_open_error(err),
+                 HttpReply::kBadGateway);
     return;
   }
   conn.phase = Phase::kTunnel;
@@ -1123,17 +1197,24 @@ void ProxyEngine::reap(int64_t now_ms) {
       if (conn.session) {
         conn.session->flush_report(now_ms);
       }
-      if (!conn.salt_key.empty() && conn.authenticated_once) {
+      if (!conn.salt_key.empty()) {
+        // by_salt_ 的条目无条件摘除：只有认证过的会话才配留下面的死盐墓碑。
+        // 未认证的会话（每个首包伪造盐买到的）本来就不该留下半点路由痕迹，
+        // 否则 ~8 字节垃圾包 × 不同随机盐 = 无上限的表生长（每条目数十节
+        // 点，永不被 reap 触及，因为墓碑分支只在 authenticated_once 下执行）。
         const auto salt_it = by_salt_.find(conn.salt_key);
         if (salt_it != by_salt_.end() && salt_it->second == id) {
           by_salt_.erase(salt_it);
+        }
+        if (conn.authenticated_once) {
           // #29a (M2 §8.1 tail race): the peer's retransmit tail keeps
           // arriving after our side is gone. Keep the salt known-but-dead so
           // those datagrams drop as tombstones instead of counting as
           // unknown_salt (client) or — worse on the server — being mistaken
           // for a fresh HELLO and rebirthing a phantom session. Only an
           // authenticated session may insert (A1 follow-up): otherwise every
-          // 8-byte forgery would buy a five-minute table entry.
+          // 8-byte forgery would buy a five-minute table entry. 伪造盐不同：
+          // 它不进墓碑——否则攻击者可用猜测的盐把墓碑表顶满。
           if (salt_tombstones_.size() >= kSaltTombstoneMax) {
             salt_tombstones_.erase(salt_tombstones_.begin());
           }

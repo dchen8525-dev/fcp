@@ -1334,6 +1334,59 @@ void TestSackBeyondSentIgnored() {
   CHECK(f.sa().retransmits() >= 1u);
 }
 
+// A24 (对抗分析第 3 轮)：snd_max_ 的普通 std::max 前移在字节偏移越过 2^32
+// 回绕后把它钉死在 0xFFFFFFFF 上 —— 此后对面送来的每一份诚实 cum（已回绕成
+// 小值）都满足 seq_after(cum, snd_max_)，被 A4 门槛错杀；tx_ 永远弹不出、
+// 每 25ms 的 RTO 重灌整窗，而对面 ACK 还在刷新 idle 时钟，永不超时。修复后：
+// snd_max_ 按模半窗只向前移动，回绕后的 ACK 正常推进。
+void TestSndMaxAdvancesAcrossWrap() {
+  Fixture f;
+  f.cut_all();  // ACK 是手工喂的，wire 上不路过
+
+  // snd 空间几乎走满：下一段从 0xFFFFFFF0 起排，段尾跨过回绕。
+  f.sa().test_set_send_offsets(0xFFFFFFF0u, 0xFFFFFFF0u, 0xFFFFFFF0u);
+  const size_t chunk = 48;
+  const std::vector<uint8_t> src = MakeBytes(chunk, 7);
+  CHECK_EQ(f.sa().write(src.data(), src.size()), src.size());
+  f.tick(25);  // 段已上 wire（对端窗口足够）
+  CHECK_EQ(f.sa().unacked_segs(), 1u);
+
+  // 诚实 cum = 已交付字节末端。流的字节编号只数 payload（6 字节段头不在
+  // 序号空间里），所以 cum = 0xFFFFFFF0 + 48 = 回绕后的 0x20。旧实现把它
+  // 错杀（bad_segs++）；修复后整段被弹走。
+  const uint32_t cum = 0xFFFFFFF0u + chunk;  // 模 2^32 = 0x20
+  f.feed(kA, MakeAck(cum, f.cfg().rcv_buf_bytes, 0, 0));
+  CHECK_EQ(f.sa().bad_segs(), 0u);
+  CHECK_EQ(f.sa().bytes_acked(), chunk);
+  CHECK_EQ(f.sa().unacked_segs(), 0u);
+  CHECK_EQ(f.sa().in_flight(), 0u);
+
+  // 伪造的"future" cum 仍要被拒：回绕到小值侧后欺诈空间同样存在——
+  // snd_max_ 现在是 0x30（48 个 payload 字节），假 cum越过段尾到 2^31 半窗内。
+  f.sa().test_set_send_offsets(0u, 0u, 0u);
+  CHECK_EQ(f.sa().write(src.data(), src.size()), src.size());
+  f.tick(25);
+  f.feed(kA, MakeAck(48u + 100u, f.cfg().rcv_buf_bytes, 0, 0));
+  CHECK_EQ(f.sa().bad_segs(), 1u);
+  CHECK_EQ(f.sa().bytes_acked(), chunk);
+}
+
+// A24 续（同一替补修复）：fin 躺在最后一个序号上的收尾场景。fin 占据
+// 0xFFFFFFFF 时它覆盖的 cum 会回绕成 0 —— 旧门槛把它一并错杀，发送侧永远
+// 确认不了自己的 fin，对端也就等不到该侧的收尾。
+void TestFinAckAcrossWrap() {
+  Fixture f;
+  f.cut_all();
+  f.sa().test_set_send_offsets(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
+  f.sa().close(0);  // 无数据：fin 直接占据 0xFFFFFFFF，snd_nxt_ 回绕到 0
+  CHECK_EQ(f.sa().state(), StreamState::kSendingFin);
+
+  // 诚实 fin 覆盖 cum = fin_offset + 1 = 回绕后的 0。
+  f.feed(kA, MakeAck(0, f.cfg().rcv_buf_bytes, 0, 0));
+  CHECK_EQ(f.sa().bad_segs(), 0u);
+  CHECK_EQ(f.sa().state(), StreamState::kSendingFin);  // 等对端 fin，别误关
+}
+
 // A22: the peer's fin offset is fixed once seen. A later fin at another offset
 // must not move the end of the stream -- doing so keeps the EOF from ever being
 // delivered and the fin from ever being cumulatively acked.
@@ -1861,6 +1914,8 @@ int main() {
   TestAckBeyondSndNxtIgnored();
   TestAckBeyondSentIgnored();
   TestSackBeyondSentIgnored();
+  TestSndMaxAdvancesAcrossWrap();
+  TestFinAckAcrossWrap();
   TestInvalidSackBlockIgnored();
   TestPeerFinDoesNotDropUnackedData();
   TestDeepReorderStaysUnderCap();

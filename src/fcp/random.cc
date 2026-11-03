@@ -56,4 +56,24 @@ bool random_bytes(void* out, size_t len) {
 #endif
 }
 
+void secure_zero(void* p, size_t len) {
+  if (p == nullptr || len == 0) {
+    return;
+  }
+#if defined(_WIN32)
+  // Intrinsic-style inline in the SDK and documented as non-optimizable-away.
+  SecureZeroMemory(p, len);
+#else
+  // Volatile byte stores: the compiler must keep them because the value can
+  // be observed. Not formally guaranteed by the standard, but no mainstream
+  // optimizer drops a volatile store through this shape, and this is the
+  // spelling every non-Windows C library (BoringSSL's OPENSSL_cleanse and
+  // friends) ships.
+  volatile uint8_t* vp = static_cast<volatile uint8_t*>(p);
+  while (len-- != 0) {
+    *vp++ = 0;
+  }
+#endif
+}
+
 }  // namespace fcp

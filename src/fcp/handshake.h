@@ -152,6 +152,10 @@ class Handshake {
             uint8_t local_flags = kLocalFlagsM1,
             size_t max_cached_segments = kHandshakeMaxCachedSegments,
             size_t max_cached_bytes = kHandshakeMaxCachedBytes);
+  // 两侧 nonce 一旦生命周期结束就零化：它们绑定了 v7 会话密钥的派生输入。
+  ~Handshake();
+  Handshake(const Handshake&) = delete;
+  Handshake& operator=(const Handshake&) = delete;
 
   // Idle -> HelloSent; the first HELLO goes out on the next on_tick().
   void start(int64_t now_ms);

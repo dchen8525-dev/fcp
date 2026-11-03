@@ -113,11 +113,11 @@ struct StreamConfig {
   size_t window_max_bytes = kDefaultWindowMaxBytes;
   // Standing-queue allowance: an epoch whose minimum RTT is this far above the
   // historical minimum holds the window; two consecutive epochs at twice this
-  // shrink it. Kept comfortably below the Session §8 guardrail (srtt -
-  // min_srtt >= 40ms trims FEC k) so the two controllers do not fight.
-  // 0 disables the delay brake.
-  int64_t window_queue_ms = 20;
-  int64_t initial_srtt_ms = 200;
+  // shrink it. Sized against Session's §8 guardrail (kQueueGuardrailGapMs
+  // trims FEC k on the same evidence); half of it is short enough that the two
+  // controllers do not fight. 0 disables the delay brake.
+  int64_t window_queue_ms = kQueueGuardrailGapMs / 2;
+  int64_t initial_srtt_ms = kDefaultSrttMs;
   int64_t rto_min_ms = 100;
   int64_t rto_max_ms = 5000;
   // Teardown after this long with no inbound segment. Own traffic does not
@@ -166,6 +166,15 @@ class Stream {
   StreamState state() const { return state_; }
   CloseReason reason() const { return reason_; }
   bool closed() const { return state_ == StreamState::kClosed; }
+
+  // Tests only: pins the send-side offsets so the 4 GiB wrap of the byte
+  // numbering (seq.h) can be exercised without pushing gigabytes. Caller owns
+  // the state invariant (both queues empty; call before write()/close()).
+  void test_set_send_offsets(uint32_t snd_nxt, uint32_t snd_una, uint32_t snd_max) {
+    snd_nxt_ = snd_nxt;
+    snd_una_ = snd_una;
+    snd_max_ = snd_max;
+  }
 
   // Bytes already delivered to the host that it has not taken back yet -- a
   // local socket whose send buffer is full, a target that is not reading. The

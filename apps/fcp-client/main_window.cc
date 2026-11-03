@@ -623,7 +623,7 @@ QWidget* MainWindow::buildProxy() {
   proxyBudgetSpin_ = new QDoubleSpinBox(page);
   proxyBudgetSpin_->setRange(0.0, 1.0);
   proxyBudgetSpin_->setSingleStep(0.05);
-  proxyBudgetSpin_->setValue(0.50);
+  proxyBudgetSpin_->setValue(fcp::kDefaultFecBudget);  // 唯一默认定义（defaults.h）
   proxyBudgetSpin_->setToolTip("冗余字节比上限 parity/data，0 = 不限（M3 §8.2）");
   proxyTraceEdit_ = new QLineEdit(page);
   proxyTraceEdit_->setPlaceholderText("留空 = 不录制（每会话一个 .jsonl）");
@@ -873,7 +873,8 @@ void MainWindow::loadSettings() {
   proxyMtuSpin_->setValue(settings.value("proxy/mtu", 1400).toInt());
   proxyKSpin_->setValue(settings.value("proxy/pinned_k", -1).toInt());
   proxyPrewarmCheck_->setChecked(settings.value("proxy/prewarm", true).toBool());
-  proxyBudgetSpin_->setValue(settings.value("proxy/fec_budget", 0.50).toDouble());
+  proxyBudgetSpin_->setValue(
+      settings.value("proxy/fec_budget", fcp::kDefaultFecBudget).toDouble());
   proxyTraceEdit_->setText(settings.value("proxy/trace_prefix").toString());
 }
 

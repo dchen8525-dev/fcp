@@ -31,6 +31,20 @@ constexpr size_t kDefaultIpHeaderLen = 20;
 // M3 byte budget (M3控制设计.md §2): parity/data bytes for one interval.
 constexpr double kDefaultFecBudget = 0.50;
 
+// RTT / flush timing defaults. srtt seeds every engine until the first sample
+// arrives; T_flush is the frame layer's flush retransmit deadline. Same number
+// by coincidence, not by coupling: raise one and leave the other alone.
+constexpr int64_t kDefaultSrttMs = 200;
+constexpr int64_t kDefaultFlushMs = 200;
+
+// §8 queue guardrail (session → FEC strategy): this much srtt inflation over
+// the observed minimum means our own queue is standing and k shrinks. Stream's
+// delay brake is sized as half of this (StreamConfig::window_queue_ms) so the
+// two controllers never trim (k 和窗口) on the same evidence at the same time;
+// raising it past 2x window_queue_ms or shrinking it below that would have the
+// session poke the queue the stream is already braking against.
+constexpr int64_t kQueueGuardrailGapMs = 40;
+
 // Stream buffers and window bounds (StreamConfig / EngineConfig).
 constexpr size_t kDefaultSendWindowBytes = 256 * 1024;
 constexpr size_t kDefaultRcvBufBytes = 256 * 1024;

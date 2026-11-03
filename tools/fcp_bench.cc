@@ -22,7 +22,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -48,6 +47,7 @@
 #include "fcp/fecstat.h"
 #include "fcp/frame_tx.h"
 #include "fcp/handshake.h"
+#include "fcp/random.h"
 #include "fcp/session.h"
 
 namespace {
@@ -111,7 +111,8 @@ struct Stats {
   uint64_t rx_datagrams = 0;
   uint64_t rx_data_bytes = 0;
   uint64_t rx_data_segs = 0;
-  // Data symbols as they arrive on the wire (fixed 36 + seg size), before the
+  // Data symbols as they arrive on the wire (fixed kDataWireOverhead + seg
+  // size), before the
   // session decodes, dedups or drops them. Phase timing uses this clock: the
   // delivery callbacks lag behind arrival when the receiver falls behind.
   // A datagram's type is inside the envelope, so this is classified by exact
@@ -405,9 +406,11 @@ constexpr int64_t kRendezvousTimeoutMs = 15000;
 // auth_fail, which the RESULT line reports.
 bool Rendezvous(Endpoint* ep, bool server, uint8_t salt[kSaltLen]) {
   if (!server) {
-    std::random_device rd;
-    for (size_t i = 0; i < kSaltLen; ++i) {
-      salt[i] = static_cast<uint8_t>(rd() & 0xFF);
+    // 与 random_salt 同一约定：盐只走核心库 CSPRNG（std::random_device 在
+    // MinGW 下可为固定种子 PRNG，固定盐 = 跨 run (key, IV) 重用，P2' N7）。
+    if (!fcp::random_bytes(salt, kSaltLen)) {
+      std::fprintf(stderr, "no CSPRNG entropy for session salt\n");
+      return false;
     }
   }
   static const uint8_t kMeet[kMeetLen] = {'F', 'C', 'P', 'B', 'E', 'N', 'C', 'H'};
@@ -550,8 +553,10 @@ int main(int argc, char** argv) {
         if (type == fcp::SymbolType::kData) {
           stats.tx_wire_bytes += len;
           ++stats.tx_data_segs;
-          if (len > 36) {
-            stats.tx_data_bytes += len - 36;
+          // 与 kDataWireOverhead 同源（对抗分析第九轮：36 的裸常数会在
+          // 信封/头预算变化时静默偏离）。
+          if (len > fcp::kDataWireOverhead) {
+            stats.tx_data_bytes += len - fcp::kDataWireOverhead;
           }
         } else if (type == fcp::SymbolType::kParity) {
           ++stats.tx_parity_segs;
@@ -573,7 +578,8 @@ int main(int argc, char** argv) {
   session.start(0);
   session.on_tick(0);
   const double rate_bytes_per_s = opt.mbps * 1000000.0 / 8.0;
-  const double wire_per_seg = 36.0 + static_cast<double>(opt.seg);
+  const double wire_per_seg =
+      static_cast<double>(fcp::kDataWireOverhead) + static_cast<double>(opt.seg);
   const size_t data_wire_len = static_cast<size_t>(wire_per_seg);
   constexpr int64_t kSendWindowMs = static_cast<int64_t>(kPhaseSeconds * 1000);
   double tokens = 0.0;

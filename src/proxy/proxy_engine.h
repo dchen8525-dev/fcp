@@ -184,6 +184,13 @@ class ProxyEngine {
     // symbol (Session::config_valid()). Every connection is refused, so a
     // non-zero value here means the engine was misconfigured, not a peer.
     uint32_t bad_config = 0;
+    // Refused because the OS CSPRNG could not draw the session salt. Never
+    // blame the config for this one: the fix is in the entropy environment,
+    // not in --mtu.
+    uint32_t no_entropy = 0;
+    // 拒在预认证构筑预算门外的新会话（见 create_server_conn）。正常运行
+    // 应恒为 0；非 0 说明对端以新盐洪泛，或者该预算被顶满要求调参。
+    uint32_t over_budget = 0;
     uint32_t bad_entry = 0;   // malformed local request
     uint32_t open_failed = 0;  // OPEN_ERR sent or received
     uint32_t handshake_failed = 0;
@@ -295,7 +302,14 @@ class ProxyEngine {
   void fill_stream_config(StreamConfig* sc) const;
   std::unique_ptr<Session> make_session(uint64_t conn_id, const SessionConfig& sc);
 
-  bool create_client_conn(uint64_t conn, uint64_t peer, int64_t now_ms);
+  // 会话建立退出码。熵源失败与配置失败是两类故障，stats 行分开计数
+  // （bad_config 会归因到 --mtu/--fec；no_entropy 指向 OS 熵源）。
+  enum class CreateStatus : uint8_t {
+    kOk = 0,
+    kNoEntropy,
+    kBadConfig,
+  };
+  CreateStatus create_client_conn(uint64_t conn, uint64_t peer, int64_t now_ms);
   Conn* create_server_conn(uint64_t peer, const uint8_t* salt, int64_t now_ms);
   void attach_stream(Conn& conn);
   // Handshake completion and failure, watched after every inbound pump.
@@ -316,6 +330,10 @@ class ProxyEngine {
   // The answer this proxy gives its application socket when the tunnel did not
   // come up: the SOCKS5 reply or the HTTP status, whichever the client speaks.
   void queue_local_reply(Conn& conn, Socks5Rep rep, HttpReply http);
+  // queue_local_reply + the graceful close choreography (want_fin/fin/grace
+  // clock), so the reply actually reaches the application instead of dying
+  // with the socket when the flush cannot complete on the spot.
+  void refuse_local(Conn& conn, const char* why, Socks5Rep rep, HttpReply http);
 
   // Close the application socket, drop the session and its table entries, and
   // write the peer profile back into the prewarm cache.
@@ -355,6 +373,9 @@ class ProxyEngine {
   // therefore into reap(); the flag makes the nested call a no-op so only the
   // owner walks the id list.
   bool in_reap_ = false;
+  // 预认证会话构筑预算（对抗分析第七轮 P2，见 create_server_conn）。
+  int64_t create_window_ = -1;
+  int32_t create_budget_ = 0;
   Counters counters_;
 };
 

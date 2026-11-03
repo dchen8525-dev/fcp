@@ -9,12 +9,14 @@
 
 #include <cstdint>
 
+#include "fcp/defaults.h"
 #include "fcp/fecstat.h"
+#include "fcp/limits.h"
 
 namespace fcp {
 
-// Hard bounds from the wire format: k occupies 3 bits, so 7 is absolute.
-constexpr uint8_t kMaxParity = 7;
+// Hard bounds from the wire format: k occupies 3 bits, so 7 is absolute —
+// the value's definition moved to limits.h (单一 home，rs.h 的 assert 钉着).
 // M1 default; raising it to 5..7 is a config change, not a protocol change.
 constexpr uint8_t kDefaultPmax = 4;
 // Target probability that a group needs no KCP retransmission (§8).
@@ -52,7 +54,7 @@ enum class FecState : uint8_t {
 const char* fec_state_name(FecState state);
 
 struct FecStrategyConfig {
-  uint8_t d = 10;
+  uint8_t d = kDefaultD;  // 对抗分析第九轮：与 SessionConfig 的 d 同一处定义
   uint8_t p_max = kDefaultPmax;
   double target_recovery = kTargetRecovery;
   int pinned_k = -1;  // --fec-parity-pinned; >= 0 bypasses the state machine
@@ -67,7 +69,7 @@ struct FecStrategyConfig {
   // leaves k <= 5 untouched at D = 10 and only constrains the k = 6..7
   // extremes — the #28 replay test caught the original 0.40 default binding
   // exactly at k = 4, the 20%-loss operating point.
-  double budget_ratio = 0.50;
+  double budget_ratio = kDefaultFecBudget;
 };
 
 class FecStrategy {

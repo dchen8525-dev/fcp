@@ -22,7 +22,8 @@ Stream::Stream(const StreamConfig& config, SegmentFn send, ReadFn read, ClosedFn
       snd_una_(0),
       peer_rwnd_(config.rcv_buf_bytes),
       rcv_nxt_(0),
-      srtt_ms_(config.initial_srtt_ms > 0 ? config.initial_srtt_ms : 200) {
+      srtt_ms_(config.initial_srtt_ms > 0 ? config.initial_srtt_ms
+                                          : kDefaultSrttMs) {
   rto_ms_ = stream_detail::clamp_ms(2 * srtt_ms_, cfg_.rto_min_ms, cfg_.rto_max_ms);
 
   // Autotune floor: two segments is the smallest window that can make
@@ -242,10 +243,17 @@ void Stream::pump(int64_t now_ms) {
     seg.sent_ms = now_ms;
     in_flight_ += seg.wire_len();
     // A reentrant pump may already have put a later segment on the wire, so
-    // this is a max, not an assignment: snd_max_ bounds ACKs and must never go
-    // backwards (a regressed bound rejects the peer's honest cumulative ACK).
-    snd_max_ = std::max(snd_max_,
-                        seg.offset + static_cast<uint32_t>(seg.wire_len()));
+    // the bound only moves forward -- and "forward" is measured modularly
+    // (seq.h): the byte offsets wrap at 4 GiB by design (~27 min at 20 Mbps),
+    // so once snd_nxt_ crosses the wrap a plain std::max pins snd_max_ at
+    // 0xFFFFFFFF and the A4 gate (seq_after(cum, snd_max_)) rejects every
+    // honest post-wrap cumulative ACK -- the stream stalls forever while the
+    // peer's ACKs keep resetting the idle clock. The fin at offset
+    // 0xFFFFFFFF stalls the same way (its covering ACK cum wraps to 0).
+    const uint32_t seg_end = seg.offset + static_cast<uint32_t>(seg.wire_len());
+    if (seq_after(seg_end, snd_max_)) {
+      snd_max_ = seg_end;
+    }
     const uint32_t emitted_offset = seg.offset;
     emit_seg(seg);
     // Relocate. A synchronous host can ACK from inside send_ and pop this

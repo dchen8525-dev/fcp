@@ -1,5 +1,5 @@
 #!/bin/sh
-# fcp-proxy 卸载后脚本：purge 时清理运行期目录（remove 保留配置）。
+# fcp 卸载后脚本：purge 时清理运行期目录（remove 保留配置）。
 set -e
 
 if [ "$1" = "purge" ]; then

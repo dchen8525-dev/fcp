@@ -8,10 +8,7 @@
 //
 // Hosts not yet routed through it (left as-is, both are still OS-backed):
 //   src/proxy/proxy_engine.cc random_salt()          std::random_device
-//   tools/fcp_bench.cc        meet-greeting salt     std::random_device
-//   apps/fcp-client/*         session salt / PSK      QRandomGenerator::system()
-// Note `QRandomGenerator::system()` is a CSPRNG (unlike `global()`, which is a
-// deterministic PRNG and must never be used for a nonce or a key).
+//   tools/fcp-bench.cc        meet-greeting salt     std::random_device
 
 #ifndef FCP_RANDOM_H_
 #define FCP_RANDOM_H_

@@ -18,7 +18,13 @@ BUILD_DIR=build/coverage
 LINE_MIN=90
 BRANCH_MIN=80
 
+if [ -z "${VCPKG_ROOT:-}" ] || [ ! -f "$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" ]; then
+  echo "[coverage] VCPKG_ROOT 未设置或不是 vcpkg checkout；见 docs/部署运维指南.md §1" >&2
+  exit 1
+fi
+
 cmake -S . -B "$BUILD_DIR" -G Ninja \
+  -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
   -DCMAKE_BUILD_TYPE=Debug \
   -DFCP_BUILD_TESTS=ON \
   -DFCP_COVERAGE=ON

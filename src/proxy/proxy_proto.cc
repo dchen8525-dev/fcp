@@ -473,6 +473,16 @@ OpenParse open_parse_request(const uint8_t* buf, size_t len, size_t* consumed,
   if (win < total) {
     return OpenParse::kNeedMore;
   }
+  if (atyp == kAtypDomain) {
+    // Same rule as the SOCKS5 entry: a domain the far end will hand to
+    // getaddrinfo has to be a host name. Without it a peer could smuggle CR/LF
+    // or ANSI escapes into audit logs and drive pointless DNS lookups (B-13).
+    for (size_t i = 0; i < addr_len; ++i) {
+      if (!host_char_ok(buf[7 + i])) {
+        return OpenParse::kBadAddress;
+      }
+    }
+  }
   const uint16_t port = get_be16(buf + 7 + addr_len);
   if (port == 0) {
     return OpenParse::kBadAddress;  // nothing to dial

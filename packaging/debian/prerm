@@ -1,12 +1,12 @@
 #!/bin/sh
-# fcp-proxy 卸载前脚本：停掉服务（remove 或 purge 才停，升级不动）。
+# fcp 卸载前脚本：停掉服务（remove 或 purge 才停，升级不动）。
 set -e
 
 if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
   if [ -d /run/systemd/system ] && [ -x /bin/systemctl ]; then
-    systemctl --system stop fcp-proxy.service >/dev/null 2>&1 || true
+    systemctl --system stop fcp.service >/dev/null 2>&1 || true
     if [ "$1" = "purge" ]; then
-      systemctl --system disable fcp-proxy.service >/dev/null 2>&1 || true
+      systemctl --system disable fcp.service >/dev/null 2>&1 || true
     fi
   fi
 fi

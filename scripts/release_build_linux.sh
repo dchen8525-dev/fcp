@@ -10,7 +10,7 @@
 #   version 缺省取仓库根 VERSION 文件；CI 传 tag 去掉前导 v 的版本号，
 #   CMake 侧会再次校验格式（顶层 CMakeLists 的 FCP_RELEASE_VERSION）。
 #
-# 产出：<build>/packages/fcp-proxy_<version>_<arch>.deb
+# 产出：<build>/packages/fcp_<version>_<arch>.deb
 #
 # 需要：build-essential cmake ninja-build python3（见 docs/发布流程.md §2）。
 # 打包本身不依赖 dpkg-dev / fakeroot / cpack —— 那些只在本脚本最后一步
@@ -22,10 +22,19 @@ BUILD_DIR="${1:-$ROOT/build/release}"
 VERSION="${2:-$(tr -d '[:space:]' < "$ROOT/VERSION")}"
 STAGE_DIR="$BUILD_DIR/release-deploy"
 
+# vcpkg manifest mode: vcpkg.json declares dependencies, and the toolchain is
+# what makes find_package() see them. CI bootstraps vcpkg before calling this
+# script; a local run needs the same VCPKG_ROOT (docs/部署运维指南.md §1).
+if [ -z "${VCPKG_ROOT:-}" ] || [ ! -f "$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" ]; then
+  echo "::error::VCPKG_ROOT 未设置或不是 vcpkg checkout（先 bootstrap 并 export VCPKG_ROOT）" >&2
+  exit 1
+fi
+
 echo "== fcp ${VERSION} release build"
 echo "   build: $BUILD_DIR"
 
 cmake -S "$ROOT" -B "$BUILD_DIR" -G "${CMAKE_GENERATOR:-Ninja}" \
+  -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
   -DCMAKE_BUILD_TYPE=Release \
   -DFCP_RELEASE_VERSION="$VERSION" \
   -DFCP_BUILD_PROXY=ON \
@@ -51,7 +60,7 @@ echo "== 安装自检（install 规则 + --version）"
 # 与 build_deb.py 造 deb 时用的是同一套落点。
 rm -rf "$STAGE_DIR"
 DESTDIR="$STAGE_DIR" cmake --install "$BUILD_DIR" --strip >/dev/null
-for bin in fcp-proxy-server fcp-proxy-client; do
+for bin in fcp-server fcp-client; do
   ver="$("$STAGE_DIR/usr/bin/$bin" --version | awk '{print $2}')"
   if [ "$ver" != "$VERSION" ]; then
     echo "::error::$bin 报出版本 '$ver'，期望 '$VERSION'" >&2
@@ -59,9 +68,9 @@ for bin in fcp-proxy-server fcp-proxy-client; do
   fi
   echo "   $bin $ver"
 done
-test -f "$STAGE_DIR/etc/fcp/fcp-proxy.env"
-test -f "$STAGE_DIR/usr/lib/systemd/system/fcp-proxy.service"
-test -f "$STAGE_DIR/usr/share/doc/fcp-proxy/部署运维指南.md"
+test -f "$STAGE_DIR/etc/fcp/fcp.env"
+test -f "$STAGE_DIR/usr/lib/systemd/system/fcp.service"
+test -f "$STAGE_DIR/usr/share/doc/fcp/部署运维指南.md"
 
 # 打包：scripts/build_deb.py 用标准库直接写 ar + tar.gz，Windows 上也能跑同一条命令。
 # 它自带结构自检（成员齐全、control 单段落、落点齐全），这里再补一道外部校验。
@@ -72,7 +81,7 @@ case "$(uname -m)" in
   *) DEB_ARCH="$(dpkg --print-architecture 2>/dev/null || echo unknown)" ;;
 esac
 python3 "$ROOT/scripts/build_deb.py" \
-  --bin-dir "$BUILD_DIR/apps/fcp-proxy" \
+  --bin-dir "$BUILD_DIR/apps/cli" \
   --build-dir "$BUILD_DIR" \
   --version "$VERSION" \
   --arch "$DEB_ARCH"

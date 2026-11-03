@@ -1,4 +1,4 @@
-// CLI argument parsing (apps/fcp-proxy/cli.cc), T-cli.
+// CLI argument parsing (apps/cli/cli.cc), T-cli.
 //
 // Every range check in the CLI exists because a typo used to be silently
 // wrapped or clamped: --mtu=70000 became 4464 (uint16 wrap), --d=266 became
@@ -32,7 +32,7 @@ struct Argv {
   std::vector<char*> ptrs;
 
   explicit Argv(const std::vector<std::string>& args) : store(args) {
-    ptrs.push_back(const_cast<char*>("fcp-proxy"));
+    ptrs.push_back(const_cast<char*>("fcp"));
     for (const std::string& a : store) {
       ptrs.push_back(const_cast<char*>(a.c_str()));
     }
@@ -577,7 +577,7 @@ void TestFlagsAndValues() {
   CHECK(a.help);
 
   // --version does the same: an installed package must answer
-  // `fcp-proxy-server --version` without being handed a PSK.
+  // `fcp-server --version` without being handed a PSK.
   CHECK(TryParse(EngineRole::kServer, {"--version"}, &a, &error));
   CHECK(a.version);
   CHECK(!a.help);

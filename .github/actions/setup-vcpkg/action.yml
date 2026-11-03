@@ -1,0 +1,52 @@
+name: setup-vcpkg
+description: >-
+  Fetch the vcpkg commit pinned by vcpkg.json's builtin-baseline, bootstrap it,
+  and export VCPKG_ROOT for the following steps.
+
+runs:
+  using: composite
+  steps:
+    # Cache the whole checkout: the pinned commit plus the bootstrapped binary.
+    # The key follows vcpkg.json, so changing the baseline or a dependency
+    # invalidates it. vcpkg itself installs into <build>/vcpkg_installed.
+    - name: Cache vcpkg
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ github.workspace }}/.vcpkg
+        key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+
+    # Fetch exactly the baseline commit instead of today's master: the release
+    # build then uses the same ports tree as every developer machine, and a
+    # shallow fetch keeps the clone small.
+    - name: Fetch pinned vcpkg
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        baseline="$(grep -oE '"builtin-baseline"[[:space:]]*:[[:space:]]*"[0-9a-f]{40}"' vcpkg.json \
+                    | grep -oE '[0-9a-f]{40}')"
+        if [ -z "$baseline" ]; then
+          echo "::error::vcpkg.json 缺少 builtin-baseline（40 位提交哈希）"
+          exit 1
+        fi
+        git init .vcpkg
+        git -C .vcpkg remote add origin https://github.com/microsoft/vcpkg.git
+        git -C .vcpkg fetch --depth 1 origin "$baseline"
+        git -C .vcpkg checkout --detach FETCH_HEAD
+
+    - name: Bootstrap vcpkg (Linux)
+      if: runner.os == 'Linux' && steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: .vcpkg/bootstrap-vcpkg.sh -disableMetrics
+
+    - name: Bootstrap vcpkg (Windows)
+      if: runner.os == 'Windows' && steps.cache.outputs.cache-hit != 'true'
+      shell: cmd
+      run: .vcpkg\bootstrap-vcpkg.bat -disableMetrics
+
+    # CMakePresets.json expands $env{VCPKG_ROOT}; GITHUB_ENV makes it visible
+    # to every later step in the job.
+    - name: Export VCPKG_ROOT
+      shell: bash
+      run: echo "VCPKG_ROOT=$GITHUB_WORKSPACE/.vcpkg" >> "$GITHUB_ENV"

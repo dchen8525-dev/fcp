@@ -1,0 +1,22 @@
+[package]
+name = "fcp-desktop"
+version = "0.0.1"
+edition = "2021"
+description = "FCP 客户端（Tauri 2 壳；代理由 fcp-client sidecar 承载）"
+license = "MIT"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

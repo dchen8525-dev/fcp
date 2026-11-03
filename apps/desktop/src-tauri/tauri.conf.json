@@ -1,0 +1,45 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "FCP",
+  "version": "0.0.1",
+  "identifier": "com.fcp.client",
+  "build": {
+    "frontendDist": "../src-ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "FCP",
+        "width": 960,
+        "height": 680,
+        "minWidth": 760,
+        "minHeight": 560,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "app"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/icon.png",
+      "icons/icon.ico"
+    ],
+    "externalBin": [
+      "binaries/fcp-client"
+    ],
+    "resources": [],
+    "category": "Utility",
+    "shortDescription": "FCP 客户端",
+    "longDescription": "FCP 可靠传输客户端：本地 SOCKS5/HTTP 入口，经 FEC+AEAD 隧道转发。便携版，不安装。"
+  },
+  "mainBinaryName": "FCP"
+}

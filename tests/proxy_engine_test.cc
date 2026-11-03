@@ -232,6 +232,7 @@ class Harness {
       emit(std::move(d), is_client);
       ++datagrams;
       (void)peer;
+      return len;
     };
     h.dial = [this](uint64_t conn, const ProxyTarget& target) {
       dials.push_back(DialRequest{conn, target});
@@ -500,7 +501,9 @@ void malformed_local_requests() {
     h.local_open(kLocalConn);
     h.local_send(kLocalConn, std::vector<uint8_t>{0x05, 0x01, 0x02});
     CHECK_EQ(text_of(h.app_bytes(kLocalConn)), std::string("\x05\xFF", 2));
-    CHECK(h.app_closed(kLocalConn));
+    // The 0xFF method-selection reply rides the grace clock now: the socket
+    // must live long enough for the application to read it.
+    CHECK(h.run_until([&] { return h.app_closed(kLocalConn); }, 80));
     CHECK_EQ(h.client->counters().bad_entry, 1u);
     CHECK_EQ(h.client->counters().live, 0u);
   }
@@ -625,8 +628,11 @@ void salt_routing_and_replay_binding() {
   CHECK(hijacker.seal_at(UINT64_MAX - 1, payload.data(), payload.size(), &hijack));
   h.server->on_wire(kOtherPeer, hijack.data(), hijack.size(), h.now_ms);
   CHECK_EQ(h.server->counters().salt_clash, 1u);
-  CHECK_EQ(h.server->counters().live, 0u);
-  CHECK(logged(h.server_log, "salt re-bound to a new address"));
+  // A valid tag does not prove freshness (the hijack still lands inside the
+  // replay window), so the packet is dropped and the live tunnel survives
+  // instead of being torn down by a replayed/sealed datagram from elsewhere.
+  CHECK_EQ(h.server->counters().live, 1u);
+  CHECK(logged(h.server_log, "authenticated datagram from another address dropped"));
 
   // A datagram with no salt at all is neither routed nor fatal.
   const std::vector<uint8_t> stub{0x00, 0x01};

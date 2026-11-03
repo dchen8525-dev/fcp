@@ -108,7 +108,15 @@ class Session {
   Session(const Session&) = delete;
   Session& operator=(const Session&) = delete;
 
-  void start(int64_t now_ms);
+  // Why start() refused. A refusal must reach the caller: logging it and
+  // returning as if the session had begun left an unstarted session that an
+  // inbound HELLO could still establish (B-04).
+  enum class StartStatus : uint8_t {
+    kOk = 0,
+    kNoEntropy,  // the OS CSPRNG could not draw the handshake nonce start
+    kBadConfig,  // MTU / caps cannot carry a data symbol or a FECSTAT oob
+  };
+  StartStatus start(int64_t now_ms);
 
   // Authenticates and routes one inbound datagram. Returns true only when the
   // envelope authenticated: a false result means the datagram carried no valid

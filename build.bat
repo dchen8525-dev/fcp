@@ -1,6 +1,34 @@
 @echo off
 rem Build + test FCP on Windows (MSVC + Ninja). Usage: build.bat [Debug|Release]
 setlocal
+rem cmake --preset only looks for CMakePresets.json in the current directory;
+rem a double-click, a scheduled task or a CI step can start anywhere (C-07).
+pushd "%~dp0" >nul
+
+rem --- vcpkg (manifest mode) -----------------------------------------------
+rem CMakePresets.json resolves the toolchain through $env{VCPKG_ROOT}, so the
+rem variable has to exist before `cmake --preset`. One-time setup:
+rem   git clone https://github.com/microsoft/vcpkg.git D:\vcpkg
+rem   D:\vcpkg\bootstrap-vcpkg.bat
+rem   setx VCPKG_ROOT D:\vcpkg        (reopen the terminal afterwards)
+if not defined VCPKG_ROOT (
+  echo [fcp] VCPKG_ROOT is not set; see the deployment guide, section 1.
+  popd
+  exit /b 1
+)
+if not exist "%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake" (
+  echo [fcp] VCPKG_ROOT="%VCPKG_ROOT%" is not a vcpkg checkout.
+  popd
+  exit /b 1
+)
+if not exist "%VCPKG_ROOT%\vcpkg.exe" (
+  echo [fcp] vcpkg is not bootstrapped; run "%VCPKG_ROOT%\bootstrap-vcpkg.bat".
+  popd
+  exit /b 1
+)
+rem vcvars64.bat exports VCPKG_ROOT pointing at Visual Studio's bundled vcpkg.
+rem Keep the checkout the user (or CI) pinned; restore it after vcvars runs.
+set "FCP_VCPKG_ROOT=%VCPKG_ROOT%"
 
 set CONFIG=%1
 if "%CONFIG%"=="" set CONFIG=Debug
@@ -27,6 +55,7 @@ if errorlevel 1 (
   echo [fcp] vcvars64.bat failed
   exit /b 1
 )
+set "VCPKG_ROOT=%FCP_VCPKG_ROOT%"
 
 rem Prefer the CMake + Ninja that ship with VS, so the build works without a separate install.
 set "PATH=%VSDIR%\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;%VSDIR%\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;%VSDIR%\VC\Tools\Llvm\x64\bin;%PATH%"
@@ -62,8 +91,11 @@ echo [fcp] ctest (%CONFIG%)
 ctest --preset windows-x64-%CFG_PRESET% || goto :error
 
 echo [fcp] OK
+popd
 exit /b 0
 
 :error
-echo [fcp] FAILED with error %errorlevel%
-exit /b %errorlevel%
+set "RC=%errorlevel%"
+popd
+echo [fcp] FAILED with error %RC%
+exit /b %RC%

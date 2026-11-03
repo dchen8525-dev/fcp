@@ -1,0 +1,9 @@
+# Tauri 2 客户端构建产物
+node_modules/
+src-tauri/target/
+src-tauri/gen/
+src-tauri/bin/
+# sidecar 输入是构建产物（Windows 从 CMake 目录拷、Linux 在 VPS 上现编），
+# 不进仓库；scripts/prepare_sidecar.ps1 / build_linux.sh 负责放入。
+src-tauri/binaries/
+dist/

@@ -1,0 +1,56 @@
+[Unit]
+Description=FCP server (UDP tunnel endpoint with FEC)
+Documentation=file:///usr/share/doc/fcp/部署运维指南.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 一个只做 UDP 中继和本地 TCP 出站拨号的服务不需要任何特权身份。DynamicUser
+# 让 systemd 每次启动分配一个无特权用户，并把下面 LogsDirectory/StateDirectory
+# 建给它 —— 下面那段"目录归服务用户所有"的说明在此之前并不成立，因为没配
+# User= 时服务是以 root 跑的，目录自然归 root。
+# 代价：默认 --port=4460 无需特权端口，若运维把它改到 1024 以下会启动失败。
+DynamicUser=yes
+# 参数全部来自 /etc/fcp/fcp.env 的 FCP_ARGS（包内的 conffile）；PSK 用
+# 该文件里的 FCP_PSK + --key-env=FCP_PSK——DynamicUser 读不了 root 的 0600
+# 密钥文件，而 EnvironmentFile 是 systemd 以 root 读取后注入的。
+# 未填 FCP_ARGS 时服务会以 "--key ... is required" 退出，这是有意的：
+# 装了包不等于配好了密钥，见 部署运维指南.md §3/§4。
+EnvironmentFile=-/etc/fcp/fcp.env
+ExecStart=/usr/bin/fcp-server $FCP_ARGS
+Restart=on-failure
+RestartSec=3
+
+# trace 与日志目录由 systemd 创建并归服务用户所有：
+#   LogsDirectory   -> /var/log/fcp   （--trace 前缀写这里）
+#   StateDirectory  -> /var/lib/fcp
+LogsDirectory=fcp
+LogsDirectoryMode=0750
+StateDirectory=fcp
+StateDirectoryMode=0750
+
+# 每连接最坏 2 × --window-cap 内存（部署运维指南.md §5.1）：自适应默认
+# 1024 KiB × 256 会话 ≈ 512 MiB，再加上 FEC/流缓冲。这里刻意不设 MemoryMax
+# （默认即无限制）——真正的内存上限由 --max-sessions 和 --window-cap 决定，
+# 写 MemoryMax=infinity 只是重复默认值，看不出任何意图。
+LimitNOFILE=65536
+
+# 服务端只需要 UDP 出站与本地 TCP 出站拨号，不需要任何特权。
+# AF_NETLINK 是 getifaddrs() 的依赖：自动 --mtu 默认要枚举本机接口，裸的
+# AF_INET/AF_INET6 白名单会让 socket(NETLINK_ROUTE) 返回 EAFNOSUPPORT，默认
+# 静默退化成不按接口下调（文档承诺的行为只在手工运行时成立）。
+# AF_UNIX 留给 NSS（nss-resolve 等）解析 --host，否则某些主机上 DNS 会失败。
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=full
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

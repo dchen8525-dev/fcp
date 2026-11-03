@@ -336,9 +336,15 @@ void FrameRx::create_placeholders(uint32_t first, uint32_t last, int64_t now_ms)
     return;
   }
   for (uint32_t id = first; id != last; ++id) {
-    RxSet& set = sets_.emplace(id, RxSet{}).first->second;
+    const auto inserted = sets_.emplace(id, RxSet{});
+    RxSet& set = inserted.first->second;
     set.set_id = id;
-    set.t_first_ms = now_ms;
+    // Only a new placeholder starts the tail-drop clock. Rewriting it on an
+    // existing set pushed its settlement/tail-drop deadline forward every time
+    // a later gap created placeholders (B-14).
+    if (inserted.second) {
+      set.t_first_ms = now_ms;
+    }
   }
 }
 

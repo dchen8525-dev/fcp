@@ -6,18 +6,18 @@
 #
 # 已安装文件（6 类，与 cmake/FCPPackaging.cmake 的 install() 和 build_deb.py 的
 # iter_package_files() 逐条对齐）：
-#   /usr/bin/fcp-proxy-server
-#   /usr/bin/fcp-proxy-client
-#   /usr/lib/systemd/system/fcp-proxy.service
-#   /etc/fcp/fcp-proxy.env                (conffile)
-#   /usr/share/doc/fcp-proxy/*.md + VERSION
-#   /usr/share/doc/fcp-proxy/copyright
+#   /usr/bin/fcp-server
+#   /usr/bin/fcp-client
+#   /usr/lib/systemd/system/fcp.service
+#   /etc/fcp/fcp.env                (conffile)
+#   /usr/share/doc/fcp/*.md + VERSION
+#   /usr/share/doc/fcp/copyright
 #
 # 结构铁律：control 是**单个段落**，字段之间不许有空行（dpkg 按空行分段，
 # 多一个空行就把后面的字段拆成第二个段落，`dpkg -i` 报 missing 'Package'
 # field）。build_deb.py 写完会自检这一点，release_build_linux.sh 再用 dpkg-deb
 # 复核一次。
-Package: fcp-proxy
+Package: fcp
 Version: @VERSION@
 Architecture: @ARCH@
 Maintainer: @MAINTAINER@

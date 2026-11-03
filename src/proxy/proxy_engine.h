@@ -42,9 +42,12 @@ namespace fcp {
 
 // #29a/#35: one JSONL controller-trace sink per session, written to
 // `<prefix>.<cid>.jsonl`; the parent directory chain is created on demand and
-// an unopenable path disables recording with a stderr note. Shared by the CLI
-// (--trace) and the Qt client (settings proxy/trace_prefix).
-SessionConfig::TraceFn make_trace_sink(const std::string& prefix, uint64_t cid);
+// an unopenable path disables recording. Shared by the CLI (--trace) and the
+// Qt client (settings proxy/trace_prefix). `log` routes the diagnostic to the
+// host too: a GUI has no stderr, so a trace that silently records nothing used
+// to be invisible (C-16).
+SessionConfig::TraceFn make_trace_sink(const std::string& prefix, uint64_t cid,
+                                       std::function<void(const std::string&)> log = {});
 
 enum class EngineRole : uint8_t {
   kClient = 0,  // local SOCKS5/HTTP listener, one session per connection
@@ -65,7 +68,7 @@ struct EngineConfig {
   double fec_budget = kDefaultFecBudget;
   // #29a controller trace: when non-empty, every session writes a JSONL
   // controller trace (SessionConfig::trace) to `<prefix>.<cid>.jsonl` —
-  // the calibration input for tools/fcp_replay.
+  // the calibration input for tools/fcp-replay.
   std::string trace_prefix;
   size_t send_window_bytes = kDefaultSendWindowBytes;
   // True when the start was set explicitly (CLI --window / GUI spinbox), which
@@ -107,7 +110,10 @@ struct EngineHost {
   std::function<void(uint64_t conn)> app_close;
   // One sealed datagram for `peer`. On the client there is a single peer (the
   // server); on the server `peer` is the client address the reactor saw first.
-  std::function<void(uint64_t peer, const uint8_t* wire, size_t len)> wire_send;
+  // Returns the bytes the transport accepted (0 = dropped/would-block). The
+  // engine counts only what actually left, so a dead UDP path cannot inflate
+  // `bytes_tx` while the tunnel silently loses every datagram (M-05).
+  std::function<size_t(uint64_t peer, const uint8_t* wire, size_t len)> wire_send;
   // Resolve and connect the target. The answer comes back through
   // on_dial_result(); the engine only enforces the deadline.
   std::function<void(uint64_t conn, const ProxyTarget& target)> dial;
@@ -196,8 +202,12 @@ class ProxyEngine {
     uint32_t handshake_failed = 0;
     uint32_t reset = 0;        // stream RST either way
     uint32_t idle_closed = 0;
-    uint64_t bytes_tx = 0;
+    uint64_t bytes_tx = 0;  // accepted by the transport, not merely attempted
     uint64_t bytes_rx = 0;
+    // Sealed datagrams the host could not send (`send`/`sendto`/writeDatagram
+    // returned an error). Non-zero means the wire path is failing even though
+    // the session layer looks healthy (M-05).
+    uint64_t wire_errors = 0;
   };
 
   const Counters& counters() const { return counters_; }
@@ -278,6 +288,11 @@ class ProxyEngine {
 
     ProxyTarget target;
     int64_t dial_deadline_ms = 0;
+    // Deadline for kAwaitReply / kAwaitOpen: without it a peer that completes
+    // the handshake but never sends OPEN/OPEN_OK keeps the session (and its
+    // max_sessions slot) alive forever, because plain ACKs refresh the stream's
+    // idle clock (B-06).
+    int64_t phase_deadline_ms = 0;
     int64_t flush_deadline_ms = 0;
     // Bytes the application socket has taken, counted with the stream's own
     // progress to decide whether the grace clock should keep running.
@@ -366,6 +381,10 @@ class ProxyEngine {
   uint64_t next_server_conn_ = 1;
   int64_t now_ms_ = 0;
   int64_t next_prune_ms_ = 0;
+  // Rate limit for the "authenticated datagram from another address" line: the
+  // drop path is reachable by a replayer, so it must not turn into a log flood.
+  int64_t last_rebind_drop_log_ms_ = 0;
+  bool rebind_drop_logged_ = false;
   std::vector<uint64_t> reap_ids_;
   std::vector<uint64_t> dial_queue_;
   bool in_flush_dials_ = false;

@@ -1,12 +1,21 @@
 #include "proxy/proxy_engine.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 #include "fcp/random.h"
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <direct.h>
+#include <windows.h>
 #else
 #include <sys/stat.h>
 #endif
@@ -19,6 +28,47 @@ void append_bytes(std::vector<uint8_t>* dst, const uint8_t* src, size_t len) {
     dst->insert(dst->end(), src, src + len);
   }
 }
+
+// The CLI passes argv bytes (the ANSI code page on Windows) while the Qt host
+// passes QString::toUtf8(); try UTF-8 first and fall back to the ANSI code page
+// so both spellings reach the wide-char API instead of being mangled by
+// toLocal8Bit/_mkdir/fopen (C-11).
+#ifdef _WIN32
+std::wstring path_to_wide(const std::string& path) {
+  if (path.empty()) {
+    return std::wstring();
+  }
+  auto convert = [&path](UINT cp, DWORD flags) {
+    const int n = MultiByteToWideChar(cp, flags, path.data(),
+                                      static_cast<int>(path.size()), nullptr, 0);
+    if (n <= 0) {
+      return std::wstring();
+    }
+    std::wstring w(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(cp, flags, path.data(), static_cast<int>(path.size()),
+                        w.data(), n);
+    return w;
+  };
+  std::wstring w = convert(CP_UTF8, MB_ERR_INVALID_CHARS);
+  if (w.empty()) {
+    w = convert(CP_ACP, 0);
+  }
+  return w;
+}
+
+std::FILE* open_trace_file(const std::string& path) {
+  const std::wstring w = path_to_wide(path);
+  if (w.empty()) {
+    return nullptr;
+  }
+  std::FILE* f = nullptr;
+  return _wfopen_s(&f, w.c_str(), L"wb") == 0 ? f : nullptr;
+}
+#else
+std::FILE* open_trace_file(const std::string& path) {
+  return std::fopen(path.c_str(), "wb");
+}
+#endif
 
 void drop_front(std::vector<uint8_t>* v, size_t n) {
   if (n >= v->size()) {
@@ -62,7 +112,10 @@ void make_directories_for(const std::string& path) {
     }
     const std::string dir = path.substr(0, i);
 #ifdef _WIN32
-    _mkdir(dir.c_str());
+    const std::wstring wide = path_to_wide(dir);
+    if (!wide.empty()) {
+      _wmkdir(wide.c_str());  // a failed mkdir surfaces at fopen below
+    }
 #else
     mkdir(dir.c_str(), 0755);
 #endif
@@ -75,6 +128,23 @@ void make_directories_for(const std::string& path) {
 // 沿用库的约定：失败即失败，caller 负责拒绝建会话。
 bool random_salt(uint8_t out[Envelope::kSaltLen]) {
   return random_bytes(out, Envelope::kSaltLen);
+}
+
+// B-03: before negotiation the session buffers KCP output. The stream can hand
+// it at most one send window of segments, so the cache has to cover that window
+// -- the fixed 512 segments / 512 KiB default silently failed the handshake for
+// any --window above 512 KiB (and for a small --mtu, where 512 segments is only
+// ~96 KiB). Size from the window this connection will actually use, after
+// apply_prewarm() has had its say, and keep the documented floor.
+void size_handshake_cache(const StreamConfig& stream_cfg, size_t mtu,
+                          size_t ip_hdr_len, SessionConfig* sc) {
+  const MtuLimits limits = compute_mtu_limits(mtu, ip_hdr_len);
+  const size_t seg = limits.payload_max != 0 ? limits.payload_max : 1;
+  const size_t window = stream_cfg.send_window_bytes;
+  sc->handshake_cache_bytes =
+      std::max(kHandshakeMaxCachedBytes, window + seg);
+  sc->handshake_cache_segments =
+      std::max(kHandshakeMaxCachedSegments, window / seg + 2);
 }
 
 const char* stream_reason_text(CloseReason reason) {
@@ -101,7 +171,8 @@ const char* stream_reason_text(CloseReason reason) {
 // file per forged 8-byte salt (a trivially amplified inode DoS). Only
 // authenticated sessions emit a controller report, so the file appears only
 // for those.
-SessionConfig::TraceFn make_trace_sink(const std::string& prefix, uint64_t cid) {
+SessionConfig::TraceFn make_trace_sink(const std::string& prefix, uint64_t cid,
+                                       std::function<void(const std::string&)> log) {
   if (prefix.empty()) {
     return nullptr;
   }
@@ -109,33 +180,45 @@ SessionConfig::TraceFn make_trace_sink(const std::string& prefix, uint64_t cid) 
     std::string path;
     std::shared_ptr<std::FILE> file;
     bool attempted = false;
+    bool disabled = false;
   };
   auto state = std::make_shared<Lazy>();
   state->path = prefix + "." + std::to_string(cid) + ".jsonl";
-  return [state](const TraceEntry& e) {
+  auto report = [state, log](const std::string& why) {
+    state->disabled = true;
+    const std::string line = "trace path " + state->path + " " + why +
+                             "; recording disabled";
+    // stderr for the CLI, host log for the GUI (which has no console).
+    std::fprintf(stderr, "fcp: %s\n", line.c_str());
+    if (log) {
+      log(line);
+    }
+  };
+  return [state, report](const TraceEntry& e) {
     if (!state->attempted) {
       state->attempted = true;
       make_directories_for(state->path);
-      state->file = std::shared_ptr<std::FILE>(
-          std::fopen(state->path.c_str(), "wb"),
-          [](std::FILE* f) {
-            if (f != nullptr) {
-              std::fclose(f);
-            }
-          });
-      if (!state->file || state->file.get() == nullptr) {
-        // #33: never silent again — stderr is the only surface here.
-        std::fprintf(stderr, "fcp: trace path %s unopenable; recording disabled\n",
-                     state->path.c_str());
+      state->file = std::shared_ptr<std::FILE>(open_trace_file(state->path), [](std::FILE* f) {
+        if (f != nullptr) {
+          std::fclose(f);
+        }
+      });
+      if (!state->file) {
+        report("unopenable");
+        return;
       }
     }
-    if (!state->file || state->file.get() == nullptr) {
+    if (state->disabled || !state->file) {
       return;
     }
     std::string line;
     encode_trace_line(e, &line);
     line.push_back('\n');
-    std::fwrite(line.data(), 1, line.size(), state->file.get());
+    // A short write means the audit record is incomplete: say so once and stop
+    // pretending the file is a full trace (disk full / read-only media).
+    if (std::fwrite(line.data(), 1, line.size(), state->file.get()) != line.size()) {
+      report("write failed (disk full or read-only)");
+    }
   };
 }
 
@@ -237,6 +320,14 @@ void ProxyEngine::on_target_closed(uint64_t conn, int64_t now_ms) {
   if (c == nullptr || c->phase == Phase::kDone) {
     return;
   }
+  // Only a dialed socket that is actually carrying the tunnel may close it.
+  // During kDialing the connect result is still on its way; a stray
+  // disconnected() (a failed connect can emit it before errorOccurred) used to
+  // arm the fin, so the tunnel was closed before OPEN_OK was ever written
+  // (B-07).
+  if (c->phase != Phase::kTunnel) {
+    return;
+  }
   c->local_eof = true;
   c->want_fin = true;
   maybe_fin(*c);
@@ -331,14 +422,19 @@ void ProxyEngine::on_wire(uint64_t peer, const uint8_t* data, size_t len, int64_
       // session (no tag, no nonce accepted), so dropping it is enough.
       return;
     }
-    // Same salt, different source address, and a fresh nonce that only the
-    // session key could have sealed: a fourth-party replay (or the peer after
-    // a NAT rebind). No envelope can attribute the source address, so this is
-    // the only place the binding is enforceable.
+    // Same salt, a different source address, and a valid tag. The tag proves
+    // possession of the session key but NOT freshness: a recorded datagram the
+    // original address never delivered still authenticates inside the replay
+    // window, so tearing the tunnel down here was a no-PSK single-packet DoS
+    // (B-01). The envelope cannot attribute an address, so the packet is
+    // dropped and the binding stays with the address that created the session.
+    // A genuine NAT rebind is indistinguishable; it has to reconnect.
     ++counters_.salt_clash;
-    log(label(*c) + " salt replay from another address");
-    finish_conn(*c, now_ms, "salt re-bound to a new address");
-    reap(now_ms);
+    if (!rebind_drop_logged_ || now_ms - last_rebind_drop_log_ms_ >= 5000) {
+      rebind_drop_logged_ = true;
+      last_rebind_drop_log_ms_ = now_ms;
+      log(label(*c) + " authenticated datagram from another address dropped");
+    }
     return;
   }
   session_events(*c, now_ms);
@@ -412,7 +508,19 @@ void ProxyEngine::on_tick(int64_t now_ms) {
     // dial deadline already refused stays in kDialing, and the first branch would
     // keep winning the else-if on every tick, so the grace clock would never be
     // read and the session would live until the idle timeout.
-    if (c->phase == Phase::kDialing && !c->closing && now_ms >= c->dial_deadline_ms) {
+    if (!c->closing && c->phase_deadline_ms != 0 &&
+        (c->phase == Phase::kAwaitReply || c->phase == Phase::kAwaitOpen) &&
+        now_ms >= c->phase_deadline_ms) {
+      // The handshake completed but the OPEN exchange never did. Without this
+      // deadline every ACK refreshed the stream's idle clock, so an
+      // authenticated peer could hold a max_sessions slot forever (B-06).
+      if (cfg_.role == EngineRole::kServer) {
+        finish_conn(*c, now_ms, "no OPEN after the handshake");
+      } else {
+        refuse_local(*c, "server never answered OPEN", Socks5Rep::kGeneralFailure,
+                     HttpReply::kBadGateway);
+      }
+    } else if (c->phase == Phase::kDialing && !c->closing && now_ms >= c->dial_deadline_ms) {
       send_open_error(*c, OpenError::kTargetTimeout);
     } else if (c->flush_deadline_ms != 0 && now_ms >= c->flush_deadline_ms) {
       const bool wedged = !c->app_in.empty() || !c->to_stream.empty();
@@ -492,7 +600,8 @@ void ProxyEngine::fill_session_config(SessionConfig* sc, uint64_t conn_id) const
   sc->ip_hdr_len = cfg_.ip_hdr_len;
   sc->pinned_k = cfg_.pinned_k;
   sc->fec_budget = cfg_.fec_budget;
-  sc->trace = make_trace_sink(cfg_.trace_prefix, conn_id);
+  sc->trace = make_trace_sink(cfg_.trace_prefix, conn_id,
+                              [this](const std::string& line) { log(line); });
   // A stream numbers bytes, so a retransmission deliberately repeats an id the
   // peer has to see again; the frame-layer dedup keyed on the KCP sn would eat
   // it and stall the send window (session.h, SessionConfig::sn_of).
@@ -537,8 +646,14 @@ std::unique_ptr<Session> ProxyEngine::make_session(uint64_t cid, const SessionCo
             !host_.wire_send) {
           return;
         }
-        counters_.bytes_tx += len;
-        host_.wire_send(p->peer, wire, len);
+        // Count only what the transport actually took: a failing UDP path used
+        // to show a rising tx counter while every datagram was dropped.
+        const size_t sent = host_.wire_send(p->peer, wire, len);
+        if (sent != 0) {
+          counters_.bytes_tx += sent;
+        } else {
+          ++counters_.wire_errors;
+        }
       },
       [this, cid](const uint8_t* payload, size_t len) {
         Conn* p = find(cid);
@@ -583,17 +698,24 @@ ProxyEngine::CreateStatus ProxyEngine::create_client_conn(uint64_t id, uint64_t 
   fill_stream_config(&raw->stream_cfg);
   apply_prewarm(profile_for(peer, now_ms), &sc, &raw->stream_cfg);
 
+  size_handshake_cache(raw->stream_cfg, cfg_.mtu, cfg_.ip_hdr_len, &sc);
   raw->session = make_session(id, sc);
-  if (!raw->session->config_valid()) {
-    log(label(id) + " bad MTU configuration");
-    return ProxyEngine::CreateStatus::kBadConfig;
+  // The refusal has to reach the caller: this used to log and return kOk, so
+  // an unstarted session still sat in the tables and an inbound HELLO could
+  // establish it (B-04).
+  switch (raw->session->start(now_ms)) {
+    case Session::StartStatus::kOk:
+      break;
+    case Session::StartStatus::kNoEntropy:
+      return ProxyEngine::CreateStatus::kNoEntropy;
+    case Session::StartStatus::kBadConfig:
+      return ProxyEngine::CreateStatus::kBadConfig;
   }
   raw->salt_key = salt_key_of(sc.salt);
   attach_stream(*raw);
   by_conn_[id] = std::move(conn);
   by_salt_.emplace(raw->salt_key, id);
   ++counters_.live;
-  raw->session->start(now_ms);
   return ProxyEngine::CreateStatus::kOk;
 }
 
@@ -615,7 +737,6 @@ ProxyEngine::Conn* ProxyEngine::create_server_conn(uint64_t peer, const uint8_t*
     ++counters_.over_budget;
     return nullptr;
   }
-  --create_budget_;
 
   if (by_conn_.size() >= cfg_.max_sessions) {
     ++counters_.over_limit;
@@ -623,9 +744,15 @@ ProxyEngine::Conn* ProxyEngine::create_server_conn(uint64_t peer, const uint8_t*
   }
   const std::string key = salt_key_of(salt);
   if (by_salt_.count(key) != 0) {
+    // A replayed salt must not consume the construction budget: charging it
+    // here let an 8-byte flood starve a legitimate first HELLO that arrived in
+    // the same 250ms window (B-05).
     ++counters_.salt_clash;
     return nullptr;
   }
+  // Only a datagram that will actually build a session is charged, and the
+  // charge happens before the (expensive) construction below.
+  --create_budget_;
   const uint64_t id = next_server_conn_++;
 
   auto conn = std::make_unique<Conn>();
@@ -646,9 +773,19 @@ ProxyEngine::Conn* ProxyEngine::create_server_conn(uint64_t peer, const uint8_t*
   fill_stream_config(&raw->stream_cfg);
   apply_prewarm(profile_for(peer, now_ms), &sc, &raw->stream_cfg);
 
+  size_handshake_cache(raw->stream_cfg, cfg_.mtu, cfg_.ip_hdr_len, &sc);
   raw->session = make_session(id, sc);
-  if (!raw->session->config_valid()) {
-    return nullptr;
+  // B-09: a config refusal used to return nullptr with no log and no counter,
+  // so the server looked like it ignored every HELLO while bad_config stayed 0.
+  switch (raw->session->start(now_ms)) {
+    case Session::StartStatus::kOk:
+      break;
+    case Session::StartStatus::kNoEntropy:
+      ++counters_.no_entropy;
+      return nullptr;
+    case Session::StartStatus::kBadConfig:
+      ++counters_.bad_config;
+      return nullptr;
   }
   raw->salt_key = key;
   by_conn_[id] = std::move(conn);
@@ -663,7 +800,6 @@ ProxyEngine::Conn* ProxyEngine::create_server_conn(uint64_t peer, const uint8_t*
   // table) forever. "Both sides may send HELLO simultaneously" (§6), so this
   // costs nothing when the creating datagram was a HELLO -- it negotiates
   // before the next tick and the scheduled HELLO never goes out.
-  raw->session->start(now_ms);
   return raw;
 }
 
@@ -734,6 +870,7 @@ void ProxyEngine::session_events(Conn& conn, int64_t now_ms) {
     if (cfg_.role == EngineRole::kServer) {
       attach_stream(conn);
       conn.phase = Phase::kAwaitOpen;
+      conn.phase_deadline_ms = now_ms + cfg_.dial_timeout_ms;
     }
   }
   if (conn.session->state() == HandshakeState::kFailed) {
@@ -826,7 +963,15 @@ bool ProxyEngine::parse_entry(Conn& conn, int64_t now_ms) {
       flush_app(conn);
       if (!greeting.no_auth) {
         counters_.bad_entry++;
-        finish_conn(conn, now_ms, "no acceptable SOCKS5 method");
+        // Same choreography as refuse_local: let the 0xFF method-selection
+        // reply (already queued above) leave before the socket dies. Calling
+        // finish_conn here reaped the conn on the spot and turned a protocol
+        // reply into a RST whenever the write had not completed (B-12).
+        conn.closing = true;
+        conn.want_fin = true;
+        arm_grace(conn, /*only_if_idle=*/true);
+        maybe_fin(conn);
+        log(label(conn) + "no acceptable SOCKS5 method");
         return false;
       }
       conn.phase = Phase::kSocks5Request;
@@ -878,6 +1023,10 @@ void ProxyEngine::start_tunnel_client(Conn& conn, int64_t now_ms) {
   append_bytes(&conn.to_stream, conn.entry.data(), conn.entry.size());
   conn.entry.clear();
   conn.phase = Phase::kAwaitReply;
+  // Strictly longer than the server's dial budget: the server's OPEN_ERR is
+  // the answer this deadline must not race. Equal budgets made the client give
+  // up locally in the same tick the server refused, losing the real reason.
+  conn.phase_deadline_ms = now_ms + cfg_.dial_timeout_ms + cfg_.flush_grace_ms;
   drain_stream(conn);
   log(label(conn) + " OPEN sent");
 }
@@ -1145,9 +1294,12 @@ void ProxyEngine::finish_conn(Conn& conn, int64_t now_ms, const char* why) {
   // that stopped delivering turns "upload froze" into a localizable defect.
   // The same line is the only place the autotune's verdict survives the run, so
   // it also prints on a clean finish whenever the window actually moved.
+  // Only the send direction can be judged from these two: acked < queued means
+  // this side still had bytes on the wire. bytes_delivered() is the *receive*
+  // side's delivery count, so comparing it with acked (the send side) made
+  // almost every clean close look stuck and drowned the real cases (B-11).
   const bool stuck = conn.stream != nullptr &&
-                     (conn.stream->bytes_acked() != conn.stream->bytes_queued() ||
-                      conn.stream->bytes_delivered() != conn.stream->bytes_acked());
+                     conn.stream->bytes_acked() != conn.stream->bytes_queued();
   // Compare against the start this stream actually used, not the configured
   // default: apply_prewarm() may have seeded a prior, and a connection that
   // ended exactly at its prior has not "moved" relative to it.

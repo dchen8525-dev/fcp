@@ -69,6 +69,12 @@ void Stream::update_window(int64_t now_ms) {
     // to climb back at one segment/RTT).
     const size_t cut = send_window_ - send_window_ * 3 / 10;
     send_window_ = std::min(send_window_, std::max(loss_floor_, cut));
+    // Keep the pre-loss *target* as the slow-start reference. When no credible
+    // BDP reading exists yet (last_target_ == 0) there is no such target, and
+    // the just-cut window is the only defensible reference: the pre-loss window
+    // was not measured to be reachable, so growing straight back to it would
+    // repeat whatever caused the loss (B-15 note, see stream_test
+    // TestDupAckCutWaitsForSecondBurst).
     ssthresh_ = std::max(send_window_, last_target_);
     queue_over_ = 0;
   } else if (limited_epoch_ && acked > 0) {

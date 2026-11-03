@@ -1,0 +1,7 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "fcp",
+  "version-string": "0.0.1",
+  "builtin-baseline": "817892b0ecbc6af994dd6df999c73faf795adbf2",
+  "dependencies": []
+}

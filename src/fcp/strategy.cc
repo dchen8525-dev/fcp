@@ -132,6 +132,11 @@ void FecStrategy::on_report(const FecstatPacket& stat, bool window_queued) {
     return;
   }
 
+  // Deliberately the raw wire loss (orig only): the strategy sizes parity for
+  // what the path drops, so repaired and late arrivals stay "lost" here. The
+  // settlement view (FcpSettle::data_lost) subtracts recovered_dl/late_rx
+  // because it reports what never reached the application. The two numbers
+  // differ by design; do not "unify" them without changing what k means.
   const int64_t lost = std::max<int64_t>(
       0, static_cast<int64_t>(stat.data_expected) - static_cast<int64_t>(stat.data_rx_orig));
   const double loss = static_cast<double>(lost) / static_cast<double>(stat.data_expected);

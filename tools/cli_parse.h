@@ -1,5 +1,5 @@
-// Argument parsing shared by the proxy CLI (apps/fcp-proxy/cli.cc) and the two
-// tools (fcp_bench, fcp_replay).
+// Argument parsing shared by the proxy CLI (apps/cli/cli.cc) and the two
+// tools (fcp-bench, fcp-replay).
 //
 // Two things live here, for the same reason: they are a single fact written
 // once instead of a copy per binary that drifts in its diagnostics.

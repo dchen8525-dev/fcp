@@ -93,24 +93,33 @@ Session::Session(const SessionConfig& config, SendFn send, DeliverFn deliver, Lo
   bootstrap_seed_ok_ = hs_env_.init_bootstrap_nonce(kHandshakeSendBudget);
 }
 
-void Session::start(int64_t now_ms) {
+Session::StartStatus Session::start(int64_t now_ms) {
   if (!bootstrap_seed_ok_) {
     log("FCP session refused: OS CSPRNG unavailable for the handshake nonce start");
-    return;
+    return StartStatus::kNoEntropy;
+  }
+  // The Handshake constructor draws its own nonce and fails closed on a CSPRNG
+  // error. A failed object must not be started either: it would sit in kIdle
+  // forever while looking like a live session.
+  if (hs_.state() == HandshakeState::kFailed) {
+    log(std::string("FCP handshake refused: ") + handshake_error_text(hs_.error()));
+    return hs_.error() == HandshakeError::kBadNonce ? StartStatus::kNoEntropy
+                                                    : StartStatus::kBadConfig;
   }
   if (!limits_.valid) {
     log("FCP config invalid: MTU leaves no room for a data symbol");
-    return;
+    return StartStatus::kBadConfig;
   }
   if (!mtu_fits_largest_oob(cfg_)) {
     log("FCP config invalid: MTU too small for a 128-byte FECSTAT oob");
-    return;
+    return StartStatus::kBadConfig;
   }
   if (!local_caps_valid(cfg_)) {
     log("FCP config invalid: local D/P out of range");
-    return;
+    return StartStatus::kBadConfig;
   }
   hs_.start(now_ms);
+  return StartStatus::kOk;
 }
 
 bool Session::on_wire(const uint8_t* wire, size_t len, int64_t now_ms) {

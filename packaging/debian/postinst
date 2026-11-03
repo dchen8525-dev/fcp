@@ -1,6 +1,6 @@
 #!/bin/sh
-# fcp-proxy 安装后脚本：注册 systemd unit，处理从无到有的首次启用。
-# 不自动 start：装好包不等于配好密钥（/etc/fcp/fcp-proxy.env 默认是空的）。
+# fcp 安装后脚本：注册 systemd unit，处理从无到有的首次启用。
+# 不自动 start：装好包不等于配好密钥（/etc/fcp/fcp.env 默认是空的）。
 set -e
 
 if [ "$1" = "configure" ]; then
@@ -11,8 +11,8 @@ if [ "$1" = "configure" ]; then
   # 或旧写法的 --key/--key-file 参数，必须是 0600。dpkg 升级时只解包新版本
   # 提供的文件，不会收紧既有文件的权限，所以老版本装过的机器要在这里补一次。
   # 只在文件存在时改，避免在 dpkg 尚未落地时创建出空文件。
-  if [ -e /etc/fcp/fcp-proxy.env ]; then
-    chmod 0600 /etc/fcp/fcp-proxy.env || true
+  if [ -e /etc/fcp/fcp.env ]; then
+    chmod 0600 /etc/fcp/fcp.env || true
   fi
 
   if [ -d /run/systemd/system ] && [ -x /bin/systemctl ]; then
@@ -25,12 +25,12 @@ if [ "$1" = "configure" ]; then
   if [ -z "$2" ]; then
     cat <<'EOF'
 
-FCP proxy 已安装。下一步：
-  1. 编辑 /etc/fcp/fcp-proxy.env，填写 FCP_ARGS（至少要有 --key=HEX32 或 --key-file=FILE）
-  2. systemctl enable --now fcp-proxy
-  3. journalctl -u fcp-proxy -f
+FCP 服务端已安装。下一步：
+  1. 编辑 /etc/fcp/fcp.env，填写 FCP_ARGS（至少要有 --key=HEX32 或 --key-file=FILE）
+  2. systemctl enable --now fcp
+  3. journalctl -u fcp -f
 
-版本自检：fcp-proxy-server --version
+版本自检：fcp-server --version
 EOF
   fi
 fi

@@ -3,15 +3,16 @@ name: release
 # 打 tag 即发布：`git tag v0.0.1 && git push origin v0.0.1`
 #
 # 产出三件发布物，挂在同一条 GitHub Release 上：
-#   * fcp-proxy_<版本>_<arch>.deb         Ubuntu 服务端（同包带 CLI client、systemd unit、conffile）
-#   * FCP-Client-<版本>-win64.exe          Windows 客户端（单文件，双击运行，免安装）
-#   * FCP-Client-<版本>-x86_64.AppImage    Linux 客户端（双击运行，免安装）
+#   * fcp_<版本>_<arch>.deb         Ubuntu 服务端（同包带 CLI client、systemd unit、conffile）
+#   * FCP-<版本>-win64.exe          Windows 客户端（单文件，双击运行，免安装）
+#   * FCP-<版本>-linux-x86_64.AppImage  Linux 客户端（双击运行，免安装）
 #
-# 门禁顺序是"测试在前、打包在后"：三个构建 job 都先跑 ctest 全绿才允许产出发布物
-# （与 部署运维指南.md §1 的"四套 ctest 全绿"口径一致，CI 里跑 Release 两套）。
-# 打包之后还有启动冒烟：deb 走 dpkg -i + --version + conffile 登记 + 服务起停；
-# Windows 单文件 exe 走 --smoke-test（GUI 自行退出，查退出码）；AppImage 走
-# 离屏启动并活过 6 秒。
+# 客户端是 Tauri 2 壳 + fcp-client sidecar（apps/desktop）。隧道仍由 CLI
+# 承载，所以两个客户端 job 先构建 FCP_BUILD_PROXY=ON 的 CLI。
+#
+# 门禁顺序是"测试在前、打包在后"：linux-deb 跑完整 ctest（Linux Release），
+# 测试红了就没有任何产物。客户端 job 另做冒烟：sidecar `--version` 与
+# AppImage 离屏启动 6 秒。
 #
 # 手工触发（workflow_dispatch）：只产出 artifacts、不发 Release，
 # 用来在打 tag 之前把整条流水线跑通一遍。
@@ -40,12 +41,6 @@ concurrency:
 
 permissions:
   contents: write
-
-env:
-  # Qt 版本钉死：aqtinstall 的官方预编译包，也进了 actions 缓存。
-  # 升级时只改这两行，并与本地 vcpkg 的 qtbase 版本对齐一次（docs/发布流程.md §4）。
-  QT_VERSION: "6.8.3"
-  QT_ARCH: "win64_msvc2022_64"
 
 jobs:
   # 版本号只有一个真源：仓库根 VERSION。tag 必须与它逐字符一致，
@@ -117,6 +112,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # vcpkg manifest 模式：按 vcpkg.json 的 builtin-baseline 取同一份 ports
+      # 树并导出 VCPKG_ROOT，release_build_linux.sh 把它传给 CMake。
+      - uses: ./.github/actions/setup-vcpkg
+
       - name: 构建依赖
         run: |
           sudo apt-get update
@@ -137,23 +136,23 @@ jobs:
           sudo dpkg -i "$deb"
 
           echo "== 版本自检"
-          fcp-proxy-server --version | tee /tmp/ver.txt
-          grep -qF "fcp-proxy-server ${version}" /tmp/ver.txt
-          fcp-proxy-client --version | grep -qF "fcp-proxy-client ${version}"
+          fcp-server --version | tee /tmp/ver.txt
+          grep -qF "fcp-server ${version}" /tmp/ver.txt
+          fcp-client --version | grep -qF "fcp-client ${version}"
 
           echo "== dpkg 记录的文件清单"
           # 先打清单再逐条检查：落点类失败（第五次跑挂在文档路径上）只有
           # 清单在手才能判断是"没装"还是"装到别的路径/别的文件名"。
-          dpkg -L fcp-proxy
-          echo "== /usr/share/doc/fcp-proxy 实际内容"
-          ls -la /usr/share/doc/fcp-proxy || true
+          dpkg -L fcp
+          echo "== /usr/share/doc/fcp 实际内容"
+          ls -la /usr/share/doc/fcp || true
 
           echo "== /etc/fcp 目录与 conffile 状态"
           # /etc/fcp 是 0750 root:root（env 里有 PSK，不能放宽），所以下面凡是
           # 碰 /etc 的检查都得 sudo：非 root 的 test -f 因父目录不可搜索而 EACCES，
           # 返回假——第六次跑就挂在这条上，日志里 dpkg -L 明明列着该文件。
           sudo ls -ld /etc/fcp
-          sudo stat -c '%n  mode=%a  owner=%U:%G  size=%s' /etc/fcp/fcp-proxy.env
+          sudo stat -c '%n  mode=%a  owner=%U:%G  size=%s' /etc/fcp/fcp.env
 
           echo "== 包内文件落点"
           # 每一步都带一行回显：第四次跑时这里直接 exit 1，日志里只看到
@@ -162,19 +161,19 @@ jobs:
             echo "  - $1"; shift
             if ! "$@"; then echo "::error::落点检查失败：$*"; return 1; fi
           }
-          check "/usr/bin/fcp-proxy-server 可执行" test -x /usr/bin/fcp-proxy-server
-          check "/usr/bin/fcp-proxy-client 可执行" test -x /usr/bin/fcp-proxy-client
-          check "/etc/fcp/fcp-proxy.env 存在" sudo test -f /etc/fcp/fcp-proxy.env
-          check "文档已装" test -f "/usr/share/doc/fcp-proxy/部署运维指南.md"
+          check "/usr/bin/fcp-server 可执行" test -x /usr/bin/fcp-server
+          check "/usr/bin/fcp-client 可执行" test -x /usr/bin/fcp-client
+          check "/etc/fcp/fcp.env 存在" sudo test -f /etc/fcp/fcp.env
+          check "文档已装" test -f "/usr/share/doc/fcp/部署运维指南.md"
           echo "  - systemd unit 已注册"
-          systemctl cat fcp-proxy >/dev/null || {
-            echo "::error::systemctl cat fcp-proxy 失败；包内 unit 落点："
-            dpkg -L fcp-proxy | grep -i systemd || echo "(包里没有 systemd 目录)"
+          systemctl cat fcp >/dev/null || {
+            echo "::error::systemctl cat fcp 失败；包内 unit 落点："
+            dpkg -L fcp | grep -i systemd || echo "(包里没有 systemd 目录)"
             exit 1
           }
           echo "== conffile 登记（升级不覆盖运维配置的前提）"
-          dpkg-query -W -f='${Conffiles}\n' fcp-proxy | tee /tmp/conf.txt
-          grep -q '/etc/fcp/fcp-proxy.env' /tmp/conf.txt
+          dpkg-query -W -f='${Conffiles}\n' fcp | tee /tmp/conf.txt
+          grep -q '/etc/fcp/fcp.env' /tmp/conf.txt
 
           echo "== 服务起停（systemd 可用时）"
           if [ "$(systemctl is-system-running 2>/dev/null || true)" = "running" ] ||
@@ -185,22 +184,22 @@ jobs:
             # 0600 key file, so the packaged deployment has to obtain the PSK
             # through --key-env. A --key-only smoke test would not catch that.
             printf 'FCP_PSK=%s\nFCP_ARGS=--key-env=FCP_PSK --bind=127.0.0.1 --port=45000 --log=stats:5000\n' \
-              "$key" | sudo tee /etc/fcp/fcp-proxy.env >/dev/null
-            sudo systemctl start fcp-proxy
+              "$key" | sudo tee /etc/fcp/fcp.env >/dev/null
+            sudo systemctl start fcp
             sleep 2
-            if ! systemctl is-active --quiet fcp-proxy; then
-              sudo journalctl -u fcp-proxy --no-pager | tail -40
+            if ! systemctl is-active --quiet fcp; then
+              sudo journalctl -u fcp --no-pager | tail -40
               exit 1
             fi
             sudo ss -uln | grep -q ':45000'
-            sudo systemctl stop fcp-proxy
+            sudo systemctl stop fcp
           else
             echo "::notice::本 runner 没有可用的 systemd，跳过服务起停检查"
           fi
 
           echo "== 卸载"
-          sudo dpkg -r fcp-proxy
-          test ! -e /usr/bin/fcp-proxy-server
+          sudo dpkg -r fcp
+          test ! -e /usr/bin/fcp-server
 
       - uses: actions/upload-artifact@v4
         with:
@@ -213,33 +212,58 @@ jobs:
   linux-appimage:
     name: Linux 客户端 AppImage
     needs: prep
-    # 与 deb 同一个构建机下限：AppImage 里的 Qt 由 aqtinstall 打进包里，但
-    # glibc/libstdc++ 仍来自构建机；22.04 构建可在 22.04/24.04 上运行。
+    # 与 deb 同一个构建机下限：AppImage 里打包 webkit2gtk，但 glibc/libstdc++
+    # 仍来自构建机；22.04 构建可在 22.04/24.04 上运行。
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
-      # 与 Windows 同一个 Qt 版本真源（env.QT_VERSION）；发行版 22.04 自带的
-      # Qt 6.2 没有 qt_standard_project_setup()，不能直接用来构建客户端。
-      - uses: jurplel/install-qt-action@v4
-        with:
-          version: ${{ env.QT_VERSION }}
-          arch: linux_gcc_64
-          cache: true
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: ./.github/actions/setup-vcpkg
 
       - name: 构建依赖
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build curl file librsvg2-bin xvfb xauth \
-            libgl1-mesa-dev libegl1-mesa-dev libxkbcommon-dev \
-            libxkbcommon-x11-0 libxcb-cursor0 \
-            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
-            libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
+            build-essential cmake ninja-build pkg-config libssl-dev file curl \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libayatana-appindicator3-dev libxdo-dev patchelf \
+            xvfb xauth
 
-      # build + ctest + AppDir + AppImage + 启动冒烟都在脚本里；本地同一命令可复现。
-      - name: 构建 + ctest + AppImage（发布门禁）
-        run: bash scripts/release_build_linux_appimage.sh build "${{ needs.prep.outputs.version }}"
+      # tauri.conf.json / package.json 里的版本先对齐到 VERSION（唯一真源），
+      # 否则 AppImage 的文件名和包内元数据会停在旧版本。
+      - name: 同步版本
+        run: |
+          node -e '
+            const fs = require("fs");
+            const v = fs.readFileSync("VERSION", "utf8").trim();
+            for (const p of ["apps/desktop/package.json",
+                             "apps/desktop/src-tauri/tauri.conf.json"]) {
+              const j = JSON.parse(fs.readFileSync(p, "utf8"));
+              j.version = v;
+              fs.writeFileSync(p, JSON.stringify(j, null, 2) + "\n");
+            }
+          '
+
+      # CLI 构建 + sidecar + AppImage 都在脚本里；本地同一命令可复现。
+      - name: 构建 + AppImage（发布门禁）
+        run: bash apps/desktop/scripts/build_linux.sh
+
+      # WebKit 在无显示环境下用 xvfb 起；6 秒后被 timeout 杀掉（rc=124）
+      # 说明它没有启动即崩。GUI 无法做更强的无头断言。
+      - name: 启动冒烟（离屏存活 6 秒）
+        run: |
+          set +e
+          appimage="$(ls dist/*.AppImage | head -1)"
+          chmod +x "$appimage"
+          APPIMAGE_EXTRACT_AND_RUN=1 WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 \
+            timeout 6 xvfb-run -a "$appimage"
+          rc=$?
+          if [ "$rc" -ne 124 ]; then
+            echo "::error::AppImage 启动后提前退出（rc=$rc）"
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
@@ -256,41 +280,56 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # aqtinstall 拉官方预编译 Qt（约 3–5 分钟）；vcpkg 源码编 qtbase 要
-      # 1–2 小时，在 runner 上既慢又容易超时。理由见 docs/发布流程.md §4。
-      - uses: jurplel/install-qt-action@v4
-        with:
-          version: ${{ env.QT_VERSION }}
-          arch: ${{ env.QT_ARCH }}
-          cache: true
+      - uses: dtolnay/rust-toolchain@stable
 
-      # 构建 / ctest / windeployqt / 启动冒烟 / 单文件 SFX 全在
-      # scripts/release_build_windows.ps1 里，本地同一命令可复现。
-      - name: 构建 + ctest + 便携 exe（发布门禁）
+      - uses: ./.github/actions/setup-vcpkg
+
+      # sidecar：Tauri 壳不链接引擎，隧道跑在这两个 CLI 可执行文件里的 client。
+      # 用默认的 Visual Studio 生成器（multi-config），runner 里不需要 vcvars。
+      - name: 构建 CLI（sidecar）
         shell: pwsh
         run: |
-          pwsh -File scripts/release_build_windows.ps1 `
-            -QtRoot "$env:QT_ROOT_DIR" `
-            -Version "${{ needs.prep.outputs.version }}" `
-            -BuildDir build
+          cmake -S . -B build/release-win `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DFCP_BUILD_PROXY=ON -DFCP_BUILD_TESTS=OFF -DFCP_BUILD_TOOLS=OFF
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build/release-win --config Release --parallel
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      # 脚本已经冒烟过产物；这里再从 dist 独立跑一次，验证上传的就是能运行的
-      # 那个文件。--smoke-test 让 GUI 2.5 秒后自行退出，退出码可判断。
-      - name: 单文件冒烟（--smoke-test）
+      # 版本真源是仓库根 VERSION；JS 侧的两处副本在这里对齐。
+      - name: 同步版本
         shell: pwsh
         run: |
-          $exe = (Get-ChildItem dist\*.exe | Select-Object -First 1).FullName
+          $v = (Get-Content VERSION -Raw).Trim()
+          foreach ($p in @("apps/desktop/package.json",
+                           "apps/desktop/src-tauri/tauri.conf.json")) {
+            $j = Get-Content $p -Raw | ConvertFrom-Json
+            $j.version = $v
+            $j | ConvertTo-Json -Depth 20 | Set-Content $p -Encoding utf8
+          }
+
+      # sidecar 准备 + tauri build + 7zSD 单文件都在脚本里。
+      - name: 构建 + 单文件便携 exe
+        shell: pwsh
+        run: |
+          pwsh -File apps/desktop/scripts/build_windows.ps1 `
+            -ProxyBin build\release-win\apps\cli\Release\fcp-client.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # 无头环境无法启动 WebView GUI；这里验证 sidecar 可执行、产物已生成。
+      - name: 冒烟（sidecar --version + 产物存在）
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem dist\FCP-*-win64.exe | Select-Object -First 1
           if (!$exe) { throw "没找到单文件便携 exe" }
-          Write-Host "== 启动 $exe"
-          $p = Start-Process -FilePath $exe -ArgumentList '--smoke-test' -PassThru
-          if (!$p.WaitForExit(30000)) { throw "客户端 30 秒内未退出" }
-          if ($p.ExitCode -ne 0) { throw "客户端退出码 $($p.ExitCode)" }
+          Write-Host "产物：$($exe.FullName) ($([math]::Round($exe.Length / 1MB, 1)) MiB)"
+          & build\release-win\apps\cli\Release\fcp-client.exe --version
+          if ($LASTEXITCODE -ne 0) { throw "sidecar --version 退出码 $LASTEXITCODE" }
 
       - uses: actions/upload-artifact@v4
         with:
           name: windows-portable
-          path: dist/FCP-Client-*-win64.exe
+          path: dist/FCP-*-win64.exe
           if-no-files-found: error
           retention-days: 14
 

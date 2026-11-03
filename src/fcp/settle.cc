@@ -228,6 +228,10 @@ bool FcpSettle::untrusted() const {
 }
 
 uint32_t FcpSettle::data_lost() const {
+  // Post-repair loss: nothing the application did not receive. FecStrategy's
+  // loss is the raw wire loss on purpose (it sizes parity for the path), so the
+  // two figures legitimately differ whenever FEC or late delivery recovered
+  // anything -- see the comment at the strategy calculation.
   const int64_t lost = static_cast<int64_t>(counters_.data_expected) -
                        counters_.data_rx_orig - counters_.data_recovered_dl -
                        counters_.data_late_rx;

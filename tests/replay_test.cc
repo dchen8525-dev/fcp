@@ -397,7 +397,7 @@ void TestTraceDoubleRoundTrip() {
   CHECK(back.last_loss == e.last_loss);
 }
 
-// Golden trace for the fcp_replay ctest smoke: run with
+// Golden trace for the fcp-replay ctest smoke: run with
 // FCP_WRITE_TRACE_GOLDEN=<path> to (re)generate.
 void MaybeWriteGolden(const std::vector<fcp::TraceEntry>& trace) {
   const char* path = std::getenv("FCP_WRITE_TRACE_GOLDEN");

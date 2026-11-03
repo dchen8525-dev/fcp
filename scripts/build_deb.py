@@ -12,16 +12,16 @@ ar 头只有 60 字节，tar 是 ustar；标准库的 tarfile/gzip 已经够用�
 与 CPack DEB 生成器逐字节同构，`dpkg -i` / `apt` 认的就是这些字节。
 
 包内文件与落点（与 docs/发布流程.md 的清单一一对应）：
-    /usr/bin/fcp-proxy-server             Release/<...>/apps/fcp-proxy/fcp-proxy-server
-    /usr/bin/fcp-proxy-client             Release/<...>/apps/fcp-proxy/fcp-proxy-client
-    /usr/lib/systemd/system/fcp-proxy.service
-    /etc/fcp/fcp-proxy.env                conffile（升级不覆盖运维修改）
-    /usr/share/doc/fcp-proxy/*.md + VERSION
-    /usr/share/doc/fcp-proxy/copyright    （来自 packaging/debian/copyright）
+    /usr/bin/fcp-server             Release/<...>/apps/cli/fcp-server
+    /usr/bin/fcp-client             Release/<...>/apps/cli/fcp-client
+    /usr/lib/systemd/system/fcp.service
+    /etc/fcp/fcp.env                conffile（升级不覆盖运维修改）
+    /usr/share/doc/fcp/*.md + VERSION
+    /usr/share/doc/fcp/copyright    （来自 packaging/debian/copyright）
 
 用法示例：
     # Linux CI / 本机：CMake 产出的可执行文件目录直接传给 --bin-dir
-    python3 scripts/build_deb.py --bin-dir build/apps/fcp-proxy --arch amd64
+    python3 scripts/build_deb.py --bin-dir build/apps/cli --arch amd64
 
     # Windows：打出来的二进制是 exe，除非 -DFCP_TARGET_OS=linux 交叉编译过，
     # 否则这包装不上 Linux。脚本会拒绝，除非显式 --allow-non-linux-bins。
@@ -38,10 +38,10 @@ import sys
 import tarfile
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PACKAGE = "fcp-proxy"
+PACKAGE = "fcp"
 DOC_DIR = "usr/share/doc/" + PACKAGE
-UNIT_PATH = "usr/lib/systemd/system/fcp-proxy.service"
-ENV_PATH = "etc/fcp/fcp-proxy.env"
+UNIT_PATH = "usr/lib/systemd/system/fcp.service"
+ENV_PATH = "etc/fcp/fcp.env"
 
 # deb(5)：文件权限与所有者写死在 tar 头里；root:root 是包的规范。
 MODE_EXEC = 0o755
@@ -207,7 +207,7 @@ def iter_package_files(repo: str, bin_dir: str, allow_non_linux: bool) -> list[t
     """(包内路径, 磁盘路径, 权限)。顺序即 data.tar 里的顺序。"""
     files: list[tuple[str, str, int]] = []
 
-    for name in ("fcp-proxy-server", "fcp-proxy-client"):
+    for name in ("fcp-server", "fcp-client"):
         src = os.path.join(bin_dir, name)
         alt = os.path.join(bin_dir, name + ".exe")
         if os.path.isfile(src):
@@ -223,8 +223,8 @@ def iter_package_files(repo: str, bin_dir: str, allow_non_linux: bool) -> list[t
             raise PackagingError(
                 f"{bin_dir} 下找不到 {name}（或 {name}.exe）。"
                 "先构建代理 CLI：-DFCP_BUILD_PROXY=ON")
-    unit = os.path.join(repo, "packaging/debian/fcp-proxy.service")
-    env = os.path.join(repo, "packaging/debian/fcp-proxy.env")
+    unit = os.path.join(repo, "packaging/debian/fcp.service")
+    env = os.path.join(repo, "packaging/debian/fcp.env")
     for src, dst, mode in ((unit, UNIT_PATH, MODE_FILE), (env, ENV_PATH, MODE_CONFFILE)):
         if not os.path.isfile(src):
             raise PackagingError(f"缺少 {src}")
@@ -416,7 +416,7 @@ def self_test() -> int:
     # 1. description 段落规则：空行变 " ."，续行缩进一格，不留空行。
     desc = normalize_description("首行摘要\n第二行\n\n第四行\n")
     check("description 空行 -> '.'", desc == ["首行摘要", "第二行", ".", "第四行"])
-    control = "\n".join(["Package: fcp-proxy", f"Description: {SUMMARY}"]
+    control = "\n".join(["Package: fcp", f"Description: {SUMMARY}"]
                         + [f" {ln}" for ln in desc]) + "\n"
     check("control 无空行", "\n\n" not in control)
     check("control 续行都缩进",
@@ -467,12 +467,12 @@ def self_test() -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="打 fcp-proxy 的 .deb（纯 Python 标准库）")
+    ap = argparse.ArgumentParser(description="打 fcp 的 .deb（纯 Python 标准库）")
     ap.add_argument("--self-test", action="store_true",
                     help="只跑打包器的纯逻辑自检（不出包，不需要构建产物）")
     ap.add_argument("--repo", default=REPO_ROOT, help="仓库根（默认按脚本位置推）")
     ap.add_argument("--bin-dir", default=None,
-                    help="fcp-proxy-server / fcp-proxy-client 所在目录（--self-test 之外必填）")
+                    help="fcp-server / fcp-client 所在目录（--self-test 之外必填）")
     ap.add_argument("--out-dir", default=None,
                     help="deb 输出目录（默认 <bin-dir>/../../../packages 或 --build-dir/packages）")
     ap.add_argument("--build-dir", default=None, help="构建目录，用于推默认 --out-dir")

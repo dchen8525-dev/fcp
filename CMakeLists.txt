@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.20)
 
 # 发布版本号的唯一真源是仓库根的 VERSION 文件；打 tag 时发布工作流把 tag 名
 # （去掉前导 v）传进 FCP_RELEASE_VERSION 覆盖它，并拒绝与 VERSION 不一致的 tag。
@@ -39,12 +39,22 @@ endif()
 
 option(FCP_BUILD_TESTS "Build FCP tests" ON)
 option(FCP_BUILD_TOOLS "Build FCP tools (benchmark harness)" ON)
-option(FCP_BUILD_APP "Build the Qt desktop client" OFF)
 option(FCP_BUILD_PROXY "Build the FCP proxy CLI (client and server)" OFF)
 
-file(GLOB fcp_headers CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/fcp/*.h)
+# 覆盖率门禁：line ≥ 90 / branch ≥ 80（gcc/clang；MSVC 用 OpenCPP 或单独跑）。
+# 部署级 flag：静态库自身没有链接步骤，PRIVATE link option 不会传给测试，
+# 因此这里用目录级 add_compile_options/add_link_options。必须放在任何
+# add_library 之前：add_compile_options 只影响之后创建的目标，而 fcp /
+# fcp_proxy_core 定义在下面（C-01）。
+option(FCP_COVERAGE "Enable coverage instrumentation" OFF)
+if(FCP_COVERAGE)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(--coverage -O0)
+    add_link_options(--coverage)
+  endif()
+endif()
 
-add_library(fcp
+add_library(fcp STATIC
   src/fcp/gf256.cc
   src/fcp/cauchy.cc
   src/fcp/rs.cc
@@ -83,7 +93,7 @@ if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i.86")
 endif()
 
 # random.cc uses the OS CSPRNG: BCryptGenRandom on Windows, /dev/urandom
-# elsewhere. Public because the proxy/Qt/tools hosts link this library and may
+# elsewhere. Public because the proxy/tools/test hosts link this library and may
 # call random_bytes() for their own salts.
 if(WIN32)
   target_link_libraries(fcp PUBLIC bcrypt)
@@ -92,26 +102,15 @@ endif()
 # The proxy application layer: the socket-free ProxyEngine (M2代理设计.md §6) and
 # the SOCKS5/HTTP-CONNECT/OPEN entry codecs (§4). Neither belongs in libfcp --
 # libfcp is the protocol (crypto, FEC, transport, control) and never parses a
-# proxy message -- and both are shared by the CLI executables, the Qt client and
-# ctest, which is why the pair lives in src/ rather than inside one app.
-if(FCP_BUILD_PROXY OR FCP_BUILD_APP OR FCP_BUILD_TESTS)
+# proxy message -- and both are shared by the CLI executables and ctest, which is
+# why the pair lives in src/ rather than inside one app.
+if(FCP_BUILD_PROXY OR FCP_BUILD_TESTS)
   add_library(fcp_proxy_core STATIC
     src/proxy/proxy_engine.cc
     src/proxy/proxy_proto.cc
   )
   target_include_directories(fcp_proxy_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(fcp_proxy_core PUBLIC fcp)
-endif()
-
-# 覆盖率门禁：line ≥ 90 / branch ≥ 80（gcc/clang；MSVC 用 OpenCPP 或单独跑）。
-# 部署级 flag：静态库自身没有链接步骤，PRIVATE link option 不会传给测试，
-# 因此这里用目录级 add_compile_options/add_link_options。
-option(FCP_COVERAGE "Enable coverage instrumentation" OFF)
-if(FCP_COVERAGE)
-  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    add_compile_options(--coverage -O0)
-    add_link_options(--coverage)
-  endif()
 endif()
 
 if(FCP_BUILD_TESTS)
@@ -128,17 +127,15 @@ endif()
 # FCP_BUILD_PROXY. tests/cli_test.cc compiles cli.cc and reactor.cc directly so
 # the argv guards stay under the default test gate.
 if(FCP_BUILD_PROXY)
-  add_subdirectory(apps/fcp-proxy)
+  add_subdirectory(apps/cli)
 endif()
 
-if(FCP_BUILD_APP)
-  add_subdirectory(apps/fcp-client)
-endif()
+# 桌面客户端不走 CMake：apps/desktop 用 Tauri 2 打包，隧道由 CLI 的
+# fcp-client 以 sidecar 承载（见 apps/desktop/README.md）。
 
-# 发布打包（Linux 服务端 deb）：只有同时构建代理 CLI 时才有意义 —— Windows
-# Windows 单文件 exe 与 Linux AppImage 由 scripts/release_build_*.{ps1,sh} 组装，不经过
-# CPack。该文件自身也会再判一次平台与开关，这里保留条件只为让"为什么没生成
-# deb"显式。
+# 发布打包（Linux 服务端 deb）：只有同时构建代理 CLI 时才有意义。桌面客户端的
+# 单文件 exe / AppImage 由 apps/desktop/scripts 组装，不经过 CPack。该文件自身
+# 也会再判一次平台与开关，这里保留条件只为让"为什么没生成 deb"显式。
 if(FCP_BUILD_PROXY)
   include(cmake/FCPPackaging.cmake)
 endif()

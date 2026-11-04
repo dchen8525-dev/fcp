@@ -19,6 +19,10 @@ const LS_SECRET = "fcp.client.secret";
 const SIMPLE = ["host", "port", "key", "listenPort"];
 const ADVANCED = ["listen", "mtu", "budget", "k", "trace"];
 const ALL = SIMPLE.concat(ADVANCED, ["remember"]);
+// 测速面板的输入不属于连接配置：运行中也要能改，所以单独列出（持久化但不随
+// setRunning 禁用）。
+const SPEED = ["speedSeconds"];
+const PERSIST = ALL.concat(SPEED);
 
 // sidecar 的缺省值（apps/cli/cli.cc 的 flag 默认）。
 const DEFAULTS = { listen: "127.0.0.1", mtu: 1400, k: -1, budget: 0.5, trace: "" };
@@ -30,6 +34,10 @@ let advanced = false;
 let lastT = 0;
 let lastTx = 0;
 let lastRx = 0;
+let speedRunning = false;
+// 测速的丢包率随 done 事件一起回来（测速进程自己的 FEC 统计），代理 stats 里
+// 的 loss_*_n 与它无关：测速根本不经过代理会话。
+const speedLoss = { inPpm: 0, inN: 0, outPpm: 0, outN: 0 };
 
 const isAdvOpen = () => {
   const body = $("advBody");
@@ -105,6 +113,11 @@ function setRunning(state, hint) {
   if ($("advToggle")) $("advToggle").disabled = state;
   const dot = $("dot");
   if (dot) dot.className = "dot" + (state ? " on" : "");
+  // 测速走独立的 fcp-client 进程，不依赖代理会话，所以空闲时也能点。
+  if ($("speedStart")) $("speedStart").disabled = speedRunning;
+  if ($("speedHint") && !speedRunning) {
+    $("speedHint").textContent = state ? "约 2 × 单程时长" : "服务端需以 --speedtest 启动";
+  }
   if (hint !== undefined && $("hint")) $("hint").textContent = hint;
   if (!state && $("uptime")) $("uptime").textContent = "--";
   document.body.classList.toggle("is-running", state);
@@ -119,7 +132,7 @@ function loadSettings() {
     saved = null;
   }
   if (saved) {
-    for (const id of ALL) {
+    for (const id of PERSIST) {
       if (id === "remember" || saved[id] === undefined) continue;
       const el = $(id);
       if (el) el.value = saved[id];
@@ -140,7 +153,7 @@ function saveSettings() {
     return;
   }
   const saved = { advanced };
-  for (const id of ALL) {
+  for (const id of PERSIST) {
     if (id === "remember" || id === "key") continue;
     const el = $(id);
     if (el) saved[id] = el.value;
@@ -223,6 +236,63 @@ async function onStop() {
   setRunning(false, "已断开");
 }
 
+function speedHint(text, bad) {
+  const el = $("speedHint");
+  if (!el) return;
+  el.textContent = text;
+  el.classList.toggle("error", !!bad);
+}
+
+async function onSpeedStart() {
+  if (speedRunning) return;
+  const seconds = Number($("speedSeconds").value);
+  if (!Number.isInteger(seconds) || seconds < 3 || seconds > 30) {
+    speedHint("时长应在 3..30 秒", true);
+    return;
+  }
+  const { cfg, err } = collect();
+  if (err) {
+    speedHint(err, true);
+    return;
+  }
+  if (!cfg.host) {
+    speedHint("服务器地址不能为空", true);
+    return;
+  }
+
+  speedRunning = true;
+  speedLoss.inPpm = speedLoss.inN = speedLoss.outPpm = speedLoss.outN = 0;
+  paintSpeedLoss();
+  if ($("speedStart")) $("speedStart").disabled = true;
+  if ($("sp-down")) $("sp-down").textContent = "--";
+  if ($("sp-up")) $("sp-up").textContent = "--";
+  if ($("sp-down-sub")) $("sp-down-sub").textContent = "下行…";
+  if ($("sp-up-sub")) $("sp-up-sub").textContent = "排队中";
+  if ($("sp-progress")) $("sp-progress").style.width = "0%";
+  speedHint(`测速中… 下行 ${seconds}s + 上行 ${seconds}s`);
+
+  try {
+    saveSettings();
+    // 帧层裸测速：第二个 fcp-client 直连服务端的 UDP 端口，不经代理会话。
+    await invoke("start_speedtest", {
+      cfg: { host: cfg.host, port: cfg.port, keyHex: cfg.keyHex, seconds, mtu: cfg.mtu },
+    });
+  } catch (e) {
+    speedRunning = false;
+    if ($("speedStart")) $("speedStart").disabled = false;
+    speedHint(String(e), true);
+  }
+}
+
+function paintSpeedLoss() {
+  const pct = (ppm, n) => (n > 0 ? (ppm / 10000).toFixed(2) + "%" : "--");
+  const set = (id, v) => { if ($(id)) $(id).textContent = v; };
+  set("sp-loss-in", pct(speedLoss.inPpm, speedLoss.inN));
+  set("sp-loss-in-n", speedLoss.inN > 0 ? `n=${speedLoss.inN}` : "");
+  set("sp-loss-out", pct(speedLoss.outPpm, speedLoss.outN));
+  set("sp-loss-out-n", speedLoss.outN > 0 ? `n=${speedLoss.outN}` : "");
+}
+
 function onStats(s) {
   const num = (k) => Number(s[k] || 0);
   const set = (id, v) => {
@@ -292,6 +362,7 @@ function boot() {
   setRunning(false, "");
   if ($("start")) $("start").addEventListener("click", onStart);
   if ($("stop")) $("stop").addEventListener("click", onStop);
+  if ($("speedStart")) $("speedStart").addEventListener("click", onSpeedStart);
   if ($("clear")) $("clear").addEventListener("click", () => $("log").replaceChildren());
   if ($("keyToggle")) {
     $("keyToggle").addEventListener("click", () => {
@@ -307,12 +378,62 @@ function boot() {
     $("advToggle").addEventListener("click", () => setAdvanced(!isAdvOpen()));
   }
   if ($("key")) $("key").addEventListener("input", paintKeyState);
-  for (const id of ALL) {
+  for (const id of PERSIST) {
     const el = $(id);
     if (el) el.addEventListener("change", saveSettings);
   }
 
   listen("proxy-stats", (e) => onStats(e.payload));
+  listen("speedtest-progress", (e) => {
+    if (!speedRunning) return;
+    const p = e.payload || {};
+    const up = p.direction === "up";
+    const secs = Number(p.elapsedMs || 0) / 1000;
+    const bytes = Number(p.bytes || 0);
+    const total = Math.max(3, Number($("speedSeconds").value) || 8);
+    if ($("sp-progress")) {
+      const base = up ? 50 : 0;
+      $("sp-progress").style.width = Math.min(99, base + (secs / total) * 50) + "%";
+    }
+    const sub = $(up ? "sp-up-sub" : "sp-down-sub");
+    if (sub) sub.textContent = `${fmtBytes(bytes)} / ${secs.toFixed(1)}s`;
+  });
+  listen("speedtest-done", (e) => {
+    // 上一轮迟到的 done 可能落在新的一轮里；只认当前这一轮。
+    if (!speedRunning) return;
+    const r = e.payload || {};
+    speedRunning = false;
+    if ($("speedStart")) $("speedStart").disabled = false;
+    const fill = (sample, id, subId) => {
+      if (!sample) {
+        if ($(id)) $(id).textContent = "--";
+        if ($(subId)) $(subId).textContent = "未完成";
+        return;
+      }
+      if ($(id)) $(id).textContent = Number(sample.mbps || 0).toFixed(2);
+      const secs = Number(sample.seconds || 0);
+      const ack = sample.acked === false ? "（未确认）" : "";
+      if ($(subId)) {
+        $(subId).textContent = `${fmtBytes(Number(sample.bytes || 0))} / ${secs.toFixed(1)}s${ack}`;
+      }
+    };
+    fill(r.download, "sp-down", "sp-down-sub");
+    fill(r.upload, "sp-up", "sp-up-sub");
+    if ($("sp-progress")) $("sp-progress").style.width = "100%";
+    // 丢包随测速结果一起回来（帧层口径，测速进程自己统计），不再从代理 stats 采：
+    // 测速不经过代理会话，代理侧那时本来也没有流量。
+    const loss = (sample) => {
+      if (!sample || !(Number(sample.lossN || 0) > 0)) return null;
+      return { ppm: Number(sample.lossPpm || 0), n: Number(sample.lossN) };
+    };
+    const dl = loss(r.download);
+    const ul = loss(r.upload);
+    if (dl) { speedLoss.inPpm = dl.ppm; speedLoss.inN = dl.n; }
+    if (ul) { speedLoss.outPpm = ul.ppm; speedLoss.outN = ul.n; }
+    paintSpeedLoss();
+    if (r.error) speedHint(String(r.error), true);
+    else speedHint("测速完成");
+  });
   listen("proxy-log", (e) => {
     const { stream, line } = e.payload;
     if (stream === "out" && READY_PREFIXES.some((p) => line.startsWith(p))) logLine(line, "out");
@@ -361,8 +482,33 @@ function demoListen(name, cb) {
   return Promise.resolve(() => delete demo.handlers[name]);
 }
 
-async function demoInvoke(cmd) {
+async function demoInvoke(cmd, args) {
   if (cmd === "proxy_status") return "idle";
+  if (cmd === "start_speedtest") {
+    // 浏览器挑样式时给一个可看的假测速，免得面板永远停在“测速中”。
+    const seconds = Number(args && args.cfg ? args.cfg.seconds : 8);
+    let t = 0;
+    const timer = setInterval(() => {
+      t += 0.5;
+      const down = t <= seconds;
+      const bytes = Math.round((down ? 9.5 : 3.2) * 125000 * Math.min(t, seconds));
+      demoEmit("speedtest-progress", {
+        direction: down ? "down" : "up",
+        bytes,
+        elapsedMs: Math.round((down ? t : t - seconds) * 1000),
+      });
+      if (t >= seconds * 2) {
+        clearInterval(timer);
+        demoEmit("speedtest-done", {
+          seconds,
+          download: { mbps: 76.0, bytes: 76000000, seconds, acked: true, lossPpm: 4200, lossN: 12345 },
+          upload: { mbps: 25.6, bytes: 25600000, seconds, acked: true, lossPpm: 900, lossN: 12345 },
+          error: null,
+        });
+      }
+    }, 500);
+    return null;
+  }
   if (cmd === "start_proxy") {
     if (demo.timer) throw new Error("代理已在运行");
     demo.t = demo.tx = demo.rx = 0;

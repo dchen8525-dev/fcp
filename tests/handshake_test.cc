@@ -337,7 +337,7 @@ void TestInvalidCaps() {
       {1, 0, 3, 0x07},    // data < 1
       {1, 10, 8, 0x07},   // parity > 7
       {1, 250, 7, 0x07},  // 257 > 256, u8 math would wrap to 1
-      {1, 10, 3, 0x10},   // reserved flag bit
+      {1, 10, 3, 0x20},   // reserved flag bit (bit 4 is kCapPmtud)
       {1, 10, 3, 0x87},   // reserved high bit
   };
   for (const Case& c : kCases) {

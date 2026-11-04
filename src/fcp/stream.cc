@@ -31,9 +31,20 @@ Stream::Stream(const StreamConfig& config, SegmentFn send, ReadFn read, ClosedFn
   const size_t seg = cfg_.max_segment > 0 ? cfg_.max_segment : 1;
   window_min_ = std::max(cfg_.window_min_bytes, 2 * seg);
   window_max_ = std::max(cfg_.window_max_bytes, window_min_);
+  // The ceiling only follows the BDP in auto mode: a fixed window is the
+  // operator's decision, and the epoch controller has no rate model to derive a
+  // BDP from. Anything not strictly above the configured ceiling is ignored.
+  window_ceiling_ = (cfg_.auto_window && cfg_.bbr && cfg_.window_ceiling_bytes > window_max_)
+                        ? cfg_.window_ceiling_bytes
+                        : 0;
+  // A fixed window below two segments cannot make progress: pump() admits a
+  // segment only while in_flight + wire_len fits, and once a queue builds the
+  // window also has to cover the next one. `--no-auto-window --window=1` used
+  // to pass through and self-lock on the first write; the CLI rejects it, and
+  // this floor keeps every other caller (tests, embeds) safe too.
   send_window_ = cfg_.auto_window
                      ? std::clamp(cfg_.send_window_bytes, window_min_, window_max_)
-                     : cfg_.send_window_bytes;
+                     : std::max(cfg_.send_window_bytes, 2 * seg);
   // The loss floor is the operator's start, which stays put when the prewarm
   // prior raises the actual start. Clamp it into [window_min_, send_window_]:
   // above the start it would pin the window above where the stream began, and
@@ -53,6 +64,20 @@ Stream::Stream(const StreamConfig& config, SegmentFn send, ReadFn read, ClosedFn
   // otherwise the two ends tune against each other and neither moves.
   rcv_cap_ = cfg_.auto_window ? std::max(cfg_.rcv_buf_bytes, window_max_)
                               : cfg_.rcv_buf_bytes;
+
+  Bbr::Config bbr_cfg;
+  bbr_cfg.mss = seg;
+  bbr_cfg.initial_cwnd = send_window_;
+  bbr_cfg.min_cwnd = window_min_;
+  // BBR may grow to the ceiling even while the stream's own clamp follows the
+  // measured BDP; the stream is what decides which of the two binds.
+  bbr_cfg.max_cwnd = window_ceiling_ > 0 ? window_ceiling_ : window_max_;
+  bbr_cfg.initial_rtt_ms = srtt_ms_;
+  bbr_cfg.version = cfg_.bbr_version;
+  bbr_cfg.initial_bw_bps = cfg_.initial_bw_bps;
+  bbr_cfg.initial_min_rtt_ms = cfg_.initial_min_rtt_ms;
+  bbr_.configure(bbr_cfg);
+  pace_tokens_ = static_cast<double>(2 * seg);
 }
 
 size_t Stream::send_space() const {
@@ -144,6 +169,26 @@ void Stream::on_segment(const uint8_t* seg, size_t len, int64_t now_ms) {
   }
 }
 
+void Stream::set_max_segment(size_t bytes) {
+  if (bytes <= cfg_.max_segment) {
+    return;
+  }
+  // Upward PMTUD raises the session's payload_max while the stream is live. The
+  // new segment still has to fit the window pump() admits it against
+  // (in_flight + wire_len <= min(send_window_, peer_rwnd_)); the zero-window
+  // probe only covers a short *peer* window, so a local window smaller than one
+  // segment would send nothing at all, forever. That can happen with a fixed,
+  // deliberately small --window (the CLI only promises two segments at the
+  // *configured* MTU). Keep the old, smaller segment in that case: a few bytes
+  // of unused MTU beat a stall. bytes is the whole session payload bound, so
+  // the payload-only comparison below is conservative.
+  const size_t window = cfg_.auto_window ? window_min_ : send_window_;
+  if (bytes > window) {
+    return;
+  }
+  cfg_.max_segment = bytes;
+}
+
 void Stream::on_tick(int64_t now_ms) {
   if (state_ == StreamState::kClosed) {
     return;
@@ -151,10 +196,57 @@ void Stream::on_tick(int64_t now_ms) {
   if (last_activity_ms_ == 0) {
     last_activity_ms_ = now_ms;
   }
+  // Every step below emits through a host callback (send_/rtt_), and a host
+  // may answer synchronously with an ACK or an error that closes this stream
+  // from inside the call. Each step is therefore guarded on state_: the
+  // contract (stream.h, ClosedFn) is that closed_ may mark the stream finished
+  // but must not destroy it, so the members stay readable -- but nothing after
+  // a reset belongs on the wire.
   retransmit_timeouts(now_ms);
+  if (state_ == StreamState::kClosed) {
+    return;
+  }
+  // A stalled receive buffer produces no inbound data, hence no ACKs, and the
+  // sender's rotating SACK block -- the only thing that tells it which holes to
+  // fill -- freezes with it. The old fallback was the RTO: on the 205ms path a
+  // window stayed blocked ~400ms per hole, which held a 4 MiB window to ~1.5
+  // MB/s. Keep the rotation moving while the buffer is not contiguous.
+  //
+  // One block is all the wire carries, so the rotation has to be driven by the
+  // receiver: a burst of ACKs per tick reports the next few chunks in one go.
+  // With one ACK per tick (or only per arriving segment, which stops when the
+  // sender's window is full) the sender takes seconds to learn the buffer's
+  // chunks and spends that time guessing holes and re-sending them (~21k
+  // retransmissions on a 50 MB/2%-loss transfer).
+  // A coalesced ACK is owed: flush it once its deadline passes, so a burst's
+  // last segment is not left unacknowledged until the next arrival.
+  if (ack_pending_ && now_ms - last_ack_ms_ >= kAckDelayMs) {
+    emit_ack(now_ms);
+    if (state_ == StreamState::kClosed) {
+      return;
+    }
+  }
+  if (!oob_.empty() && now_ms - last_ack_ms_ >= 10) {
+    const size_t burst = std::min<size_t>(oob_.size(), 8);
+    for (size_t i = 0; i < burst; ++i) {
+      emit_ack(now_ms);
+      if (state_ == StreamState::kClosed) {
+        return;
+      }
+    }
+  }
   update_window(now_ms);
+  if (state_ == StreamState::kClosed) {
+    return;
+  }
   pump(now_ms);
+  if (state_ == StreamState::kClosed) {
+    return;
+  }
   probe_zero_window(now_ms);
+  if (state_ == StreamState::kClosed) {
+    return;
+  }
   if (cfg_.idle_timeout_ms > 0 && now_ms - last_activity_ms_ >= cfg_.idle_timeout_ms) {
     finish(now_ms, CloseReason::kIdle);
   }
@@ -217,6 +309,7 @@ void Stream::pump(int64_t now_ms) {
   // has no room, and only an arriving segment can make it advertise again.
   bool forced = probe_credit_;
   probe_credit_ = false;
+  bool held = false;
   // Bookkeeping is applied before handing the bytes to the host: a host that
   // delivers synchronously (in-process loopback) can reach handle_ack() from
   // inside send_, and that pops segments out of tx_. Indexing freshly each round
@@ -236,6 +329,14 @@ void Stream::pump(int64_t now_ms) {
       // peer has actually advertised, its room is our guess, so a full local
       // window against that guess is not evidence about the path.
       limited_epoch_ = cfg_.auto_window && peer_rwnd_seen_ && send_window_ <= peer_rwnd_;
+      held = true;
+      break;
+    }
+    // BBR pacing: the window says how much may be outstanding, the token
+    // bucket says how fast it may leave. Stopping here leaves the segment in
+    // tx_ for the next tick or the next ACK.
+    if (!forced && !pace_allow(seg.wire_len(), now_ms)) {
+      held = true;
       break;
     }
     forced = false;
@@ -254,6 +355,11 @@ void Stream::pump(int64_t now_ms) {
     if (seq_after(seg_end, snd_max_)) {
       snd_max_ = seg_end;
     }
+    if (using_bbr()) {
+      // Feed the model before emit_seg(): an in-process host can ACK from
+      // inside send_, and the ACK must see this packet in total_sent_.
+      bbr_.on_sent(now_ms, seg.wire_len(), in_flight_);
+    }
     const uint32_t emitted_offset = seg.offset;
     emit_seg(seg);
     // Relocate. A synchronous host can ACK from inside send_ and pop this
@@ -265,6 +371,11 @@ void Stream::pump(int64_t now_ms) {
       ++at;
     }
     i = at < tx_.size() ? at + 1 : 0;
+  }
+  // BBR: tell the sampler when this stream has nothing left to send, so the
+  // next low sample is blamed on the application rather than on the path.
+  if (using_bbr() && !held && tx_pending_.empty() && !fin_queued_) {
+    bbr_.on_app_limited(now_ms);
   }
   // The host respects backpressure (write() stops at send_space()), so a full
   // window often has nothing left to hold back above; bytes on the wire up to

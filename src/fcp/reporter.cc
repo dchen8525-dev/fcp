@@ -137,6 +137,10 @@ void FcpReporter::report(int64_t now_ms, int64_t elapsed_ms) {
     }
     packet.accounted_through_set_id = settle_->accounted_through_set_id();
     copy_settle_counters(c, &packet);
+    // reset_interval() below zeroes the settle counters; keep the raw inbound
+    // loss of this interval for the stats line (loss_in_*, reactor.cc).
+    last_expected_ = c.data_expected;
+    last_lost_ = c.data_expected > c.data_rx_orig ? c.data_expected - c.data_rx_orig : 0;
     // M3 R(k) ledger (M3控制设计.md §1.2) with the #26 burst metric in
     // the ledger_meta high half (0.01 nat, saturating).
     if (c.ledger_groups > 0) {

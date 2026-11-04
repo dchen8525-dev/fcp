@@ -8,6 +8,7 @@
 #include <thread>
 #include <utility>
 
+#include "bench.h"
 #include "fcp/session.h"
 
 #ifndef _WIN32
@@ -79,6 +80,27 @@ void TuneUdp(SOCKET s) {
   setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&size), sizeof(size));
 }
 
+// PMTUD (pmtu.h) is only sound when the kernel refuses to fragment: a router
+// that fragments an oversized probe lets it arrive, and the session would then
+// raise its MTU to a size the path cannot carry whole. Linux's default
+// (IP_PMTUDISC_WANT) only sets DF above the cached path MTU, so be explicit;
+// Windows needs IP_DONTFRAGMENT.
+bool SetDontFragment(SOCKET s) {
+#ifdef _WIN32
+#ifdef IP_DONTFRAGMENT
+  const int on = 1;
+  return setsockopt(s, IPPROTO_IP, IP_DONTFRAGMENT,
+                    reinterpret_cast<const char*>(&on), sizeof(on)) == 0;
+#else
+  (void)s;
+  return false;
+#endif
+#else
+  const int mode = IP_PMTUDISC_DO;
+  return setsockopt(s, IPPROTO_IP, IP_MTU_DISCOVER, &mode, sizeof(mode)) == 0;
+#endif
+}
+
 void EnableReuse(SOCKET s) {
   const int one = 1;
   setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&one), sizeof(one));
@@ -107,6 +129,7 @@ void OnSignal(int) { g_signalled.store(true); }
 
 Reactor::Reactor(const EngineConfig& engine_config, const ReactorOptions& options)
     : opt_(options),
+      base_config_(engine_config),
       engine_(engine_config, make_host(this)),
       max_sessions_(engine_config.max_sessions) {}
 
@@ -119,6 +142,7 @@ EngineHost Reactor::make_host(Reactor* self) {
     return self->app_send(conn, data, len);
   };
   host.app_close = [self](uint64_t conn) { self->app_close(conn); };
+  host.app_shutdown = [self](uint64_t conn) { self->app_shutdown(conn); };
   host.wire_send = [self](uint64_t peer, const uint8_t* wire, size_t len) {
     return self->wire_send(peer, wire, len);
   };
@@ -178,11 +202,24 @@ Reactor::~Reactor() {
   for (const auto& e : pending_) {
     CloseSock(e.second.sock);
   }
+  // The socket tables are cleared as well as closed: ~ProxyEngine runs after
+  // this body (it is declared before them, so it is destroyed last) and a
+  // teardown hook that sends or looks up a connection must find a consistent,
+  // empty world -- not a closed descriptor or a dangling entry.
+  locals_.clear();
+  targets_.clear();
+  pending_.clear();
+  dial_addrs_.clear();
+  // The bench session's teardown flushes through the UDP socket, so retire it
+  // before the descriptor goes away.
+  bench_.reset();
   if (udp_ != kBadSock) {
     CloseSock(udp_);
+    udp_ = kBadSock;
   }
   if (listener_ != kBadSock) {
     CloseSock(listener_);
+    listener_ = kBadSock;
   }
 #ifdef _WIN32
   if (wsa_owner_) {
@@ -198,6 +235,22 @@ bool Reactor::open_udp(std::string* error) {
     return false;
   }
   TuneUdp(udp_);
+  // DF is socket-wide, so it also covers the configured-size data path. Only
+  // ask for it when PMTUD is actually on: with --no-pmtud (or when the CLI
+  // disabled it because --mtu exceeds the local interface) the old behaviour --
+  // the kernel fragments an oversized datagram -- is what keeps the tunnel
+  // working, and turning DF on would replace it with EMSGSIZE on every send.
+  if (base_config_.pmtud) {
+    if (!SetDontFragment(udp_)) {
+      // Without DF an oversized probe is fragmented and arrives, so an ack
+      // stops being evidence that the path can carry that size. Stay at the
+      // configured MTU instead of measuring a lie.
+      engine_.set_pmtud(false);
+      // Not verbose-gated: this silently changes what the tunnel can discover,
+      // and the operator should see it exactly once at startup.
+      std::fprintf(stderr, "[fcp] note: UDP socket has no DF mode; PMTUD disabled\n");
+    }
+  }
   // P5-09: a failed start must not leak the descriptor it already created.
   auto fail = [this, error](std::string message) {
     *error = std::move(message);
@@ -302,6 +355,33 @@ bool Reactor::start(std::string* error) {
   if (!open_udp(error)) {
     return false;
   }
+  if (opt_.role == EngineRole::kServer && opt_.speedtest) {
+    bench::Options bench_options;
+    std::memcpy(bench_options.key, base_config_.key, sizeof(bench_options.key));
+    bench_options.d = base_config_.d;
+    bench_options.p = base_config_.p;
+    bench_options.p_max = base_config_.p_max;
+    bench_options.mtu = base_config_.mtu;
+    bench_options.ip_hdr_len = base_config_.ip_hdr_len;
+    bench_options.fec_budget = base_config_.fec_budget;
+    bench_ = std::make_unique<BenchServer>(
+        bench_options,
+        [this](const BenchServer::Peer& peer, const uint8_t* data, size_t len) {
+          sockaddr_in to{};
+          static_assert(sizeof(to) == sizeof(peer.bytes),
+                        "the bench peer key is a raw sockaddr_in");
+          std::memcpy(&to, peer.bytes, sizeof(to));
+          const int n =
+              ::sendto(udp_, reinterpret_cast<const char*>(data), static_cast<int>(len), 0,
+                       reinterpret_cast<const sockaddr*>(&to), sizeof(to));
+          return n > 0 ? static_cast<size_t>(n) : 0;
+        },
+        [this](const std::string& line) {
+          if (opt_.verbose) {
+            std::fprintf(stderr, "%s\n", line.c_str());
+          }
+        });
+  }
   if (opt_.role == EngineRole::kClient && !open_listener(error)) {
     if (udp_ != kBadSock) {
       CloseSock(udp_);
@@ -319,6 +399,9 @@ bool Reactor::start(std::string* error) {
                 host_port(opt_.remote_host, opt_.remote_port).c_str());
   } else {
     std::printf("server: fcp on %s\n", host_port(opt_.bind_addr, opt_.bind_port).c_str());
+    if (bench_ != nullptr) {
+      std::printf("server: speedtest responder on the same UDP port\n");
+    }
   }
   std::fflush(stdout);
   // Save the handlers this instance replaces: they are process-wide, and a
@@ -374,7 +457,12 @@ void Reactor::run() {
                                 &sel_write_, &sel_except_);
 
     timeval tv{};
-    const int64_t wait = wait_ms(now);
+    // Sub-tick deadline: a pending coalesced ACK or the pacer releasing the
+    // next segment. Without it the token bucket and delayed ACKs would only
+    // move on the 25 ms tick, which is what turned BBR pacing into a burst
+    // emitter and delayed a short exchange's ACK by up to a tick.
+    const int64_t wake = engine_.next_wake_ms(now);
+    const int64_t wait = wait_ms(now, wake);
     tv.tv_sec = static_cast<decltype(tv.tv_sec)>(wait / 1000);
     tv.tv_usec = static_cast<decltype(tv.tv_usec)>((wait % 1000) * 1000);
     const int ready = ::select(nfds, &read_set, &write_set, &except_set, &tv);
@@ -448,9 +536,18 @@ void Reactor::run() {
       }
     }
 
+    if (now < next_tick_ms_ && wake != 0 && now >= wake) {
+      // Woke early for the pacer / a coalesced ACK. Only the engine has work to
+      // do; the per-tick application flush below is left for the real tick so
+      // a sub-tick wake stays cheap. next_tick_ms_ is untouched.
+      engine_.on_tick(now);
+    }
     if (now >= next_tick_ms_) {
       next_tick_ms_ = now + kReactorTickMs;
       engine_.on_tick(now);
+      if (bench_ != nullptr) {
+        bench_->OnTick(now);
+      }
       // Anything the engine still owes an application socket gets another try
       // here, whether or not select reported it: the pending byte count is the
       // engine's, so this is the only place a stalled write can be retried.
@@ -489,8 +586,12 @@ void Reactor::run() {
   print_stats(NowMs());
 }
 
-int64_t Reactor::wait_ms(int64_t now_ms) const {
+int64_t Reactor::wait_ms(int64_t now_ms, int64_t wake_ms) const {
   int64_t wait = next_tick_ms_ > now_ms ? next_tick_ms_ - now_ms : 1;
+  if (wake_ms > 0) {
+    const int64_t left = wake_ms - now_ms;
+    wait = std::min(wait, left > 0 ? left : 1);
+  }
   for (const auto& e : pending_) {
     const int64_t left = e.second.deadline_ms - now_ms;
     if (left > 0) {
@@ -630,6 +731,15 @@ void Reactor::drain_udp(int64_t now_ms) {
     if (n <= 0) {
       return;
     }
+    if (bench_ != nullptr) {
+      BenchServer::Peer key{};
+      static_assert(sizeof(key.bytes) == sizeof(from),
+                    "the bench peer key is a raw sockaddr_in");
+      std::memcpy(key.bytes, &from, sizeof(from));
+      if (bench_->OnDatagram(key, udp_buf_.data(), static_cast<size_t>(n), now_ms)) {
+        continue;
+      }
+    }
     uint64_t peer = 0;
     if (opt_.role == EngineRole::kServer) {
       const auto it = peer_ids_.find(addr_key(reinterpret_cast<sockaddr*>(&from)));
@@ -697,7 +807,15 @@ void Reactor::read_socket(Sock sock, uint64_t conn, bool target, int64_t now_ms)
     // 客户端能把整个 tick 预算烧成千次同步回调（defeating flush grace）。
     // 因此先摘句柄再通知引擎；反向 flush 路径会查不到 socket 而自然跳过
     // （engine 的 teardown 心跳与计时照常），与“句柄已死”之情一致。
-    if (!WouldBlock(SockErr())) {
+    const int err = SockErr();
+    // EINTR is not an error: a signal (SIGINT/SIGTERM are handled by this
+    // reactor) interrupted the syscall before it moved any byte. Treating it as
+    // a persistent error used to close a healthy connection and report a
+    // spurious EOF to the engine. The socket is still readable, so retry.
+    if (Interrupted(err)) {
+      continue;
+    }
+    if (!WouldBlock(err)) {
       if (target) {
         const auto it = targets_.find(conn);
         if (it != targets_.end()) {
@@ -738,7 +856,13 @@ Reactor::ConnectAttempt Reactor::connect_once(uint64_t conn, const sockaddr* add
     return ConnectAttempt::kFailed;
   }
   if (::connect(s, addr, len) == 0) {
-    targets_.emplace(conn, s);
+    // emplace can fail when the id already has a target (a retry racing an
+    // earlier attempt); the fresh socket must not leak in that case, and the
+    // engine must not be told a target exists for a socket nobody owns.
+    if (!targets_.emplace(conn, s).second) {
+      CloseSock(s);
+      return ConnectAttempt::kFailed;
+    }
     engine_.on_dial_result(conn, true, OpenError::kRefused, now_ms);
     return ConnectAttempt::kConnected;
   }
@@ -751,16 +875,32 @@ Reactor::ConnectAttempt Reactor::connect_once(uint64_t conn, const sockaddr* add
   Pending p;
   p.sock = s;
   p.deadline_ms = now_ms + opt_.connect_timeout_ms;
-  pending_.emplace(conn, p);
+  // Same contract as targets_ above: if an earlier attempt for this id is
+  // still pending, keep it and close the socket this attempt just opened --
+  // overwriting the entry would leave the old descriptor with no owner.
+  if (!pending_.emplace(conn, p).second) {
+    CloseSock(s);
+    return ConnectAttempt::kFailed;
+  }
   return ConnectAttempt::kPending;
 }
 
 bool Reactor::connect_addresses(uint64_t conn, int64_t now_ms, int* last_err) {
-  const auto it = dial_addrs_.find(conn);
-  if (it == dial_addrs_.end()) {
-    return false;
+  // The queue is detached before connect_once() runs. A connect that succeeds
+  // immediately (loopback, LAN, a host already listening) calls
+  // engine_.on_dial_result() synchronously, and that can finish the connection
+  // and reap it -- which calls back into app_close() and erases this very entry.
+  // Holding a deque reference or a dial_addrs_ iterator across the call was a
+  // use-after-free; only an id may cross a host callback.
+  std::deque<ResolvedAddr> queue;
+  {
+    const auto it = dial_addrs_.find(conn);
+    if (it == dial_addrs_.end()) {
+      return false;
+    }
+    queue.swap(it->second);
+    dial_addrs_.erase(it);
   }
-  std::deque<ResolvedAddr>& queue = it->second;
   while (!queue.empty()) {
     const ResolvedAddr a = queue.front();
     queue.pop_front();
@@ -770,17 +910,18 @@ bool Reactor::connect_addresses(uint64_t conn, int64_t now_ms, int* last_err) {
       continue;
     }
     if (r == ConnectAttempt::kGone) {
-      dial_addrs_.erase(it);
       return true;
     }
-    if (queue.empty()) {
-      // The attempt in flight is the last record: a later connect failure has
-      // nothing left to try.
-      dial_addrs_.erase(it);
+    if (!queue.empty()) {
+      // Another address is still to be tried if this one fails; put the rest
+      // back (the connection may have disappeared in the callback, in which
+      // case the records are simply dropped with this scope).
+      dial_addrs_[conn].swap(queue);
     }
+    // The attempt in flight is the last record: a later connect failure has
+    // nothing left to try.
     return true;
   }
-  dial_addrs_.erase(it);
   return false;
 }
 
@@ -1073,6 +1214,30 @@ Sock Reactor::first_sock_of(const std::unordered_map<uint64_t, Sock>& m, uint64_
   return it == m.end() ? kBadSock : it->second;
 }
 
+void Reactor::app_shutdown(uint64_t conn) {
+  // The tunnel's peer finished sending, so the local socket must see EOF. Only
+  // the write half goes: the local application may still be producing bytes
+  // (the request body after a half-close, a target's response) and those keep
+  // flowing through the same conn's read direction.
+  const auto local = locals_.find(conn);
+  if (local != locals_.end()) {
+#ifdef _WIN32
+    ::shutdown(local->second, SD_SEND);
+#else
+    ::shutdown(local->second, SHUT_WR);
+#endif
+    return;
+  }
+  const auto target = targets_.find(conn);
+  if (target != targets_.end()) {
+#ifdef _WIN32
+    ::shutdown(target->second, SD_SEND);
+#else
+    ::shutdown(target->second, SHUT_WR);
+#endif
+  }
+}
+
 void Reactor::app_close(uint64_t conn) {
   const auto local = locals_.find(conn);
   if (local != locals_.end()) {
@@ -1094,6 +1259,39 @@ void Reactor::app_close(uint64_t conn) {
   dial_addrs_.erase(conn);
 }
 
+// A UDP send that fails permanently used to be indistinguishable from a full
+// socket: wire_send returned 0 and the tunnel stalled with no diagnostic. The
+// one that matters is EMSGSIZE -- an --mtu larger than the path is exactly the
+// "handshake works, data vanishes" failure the deployment guide warns about,
+// and the kernel knows the real number. Count every failure, say the first one
+// per second on stderr.
+void Reactor::note_udp_send_error(int err, size_t len) {
+  if (WouldBlock(err) || Interrupted(err)) {
+    return;  // transient: the engine retries on the next tick
+  }
+  ++udp_send_errors_;
+  const int64_t now = NowMs();
+  if (last_udp_send_error_ms_ != 0 && now - last_udp_send_error_ms_ < 1000) {
+    return;
+  }
+  last_udp_send_error_ms_ = now;
+#ifdef _WIN32
+  const bool too_big = err == WSAEMSGSIZE;
+#else
+  const bool too_big = err == EMSGSIZE;
+#endif
+  if (too_big) {
+    std::fprintf(stderr,
+                 "fcp: UDP send rejected a %zu-byte datagram (EMSGSIZE) at --mtu=%u: "
+                 "the path's MTU is smaller, so no data reaches the peer. Lower --mtu "
+                 "(1472 is safe on Ethernet/Wi-Fi paths, 1400 through tunnels).\n",
+                 len, static_cast<unsigned>(base_config_.mtu));
+  } else {
+    std::fprintf(stderr, "fcp: UDP send failed: %s\n", ErrText(err).c_str());
+  }
+  std::fflush(stderr);
+}
+
 size_t Reactor::wire_send(uint64_t peer, const uint8_t* wire, size_t len) {
   if (udp_ == kBadSock) {
     return 0;
@@ -1101,6 +1299,10 @@ size_t Reactor::wire_send(uint64_t peer, const uint8_t* wire, size_t len) {
   if (opt_.role == EngineRole::kClient) {
     const int n =
         ::send(udp_, reinterpret_cast<const char*>(wire), static_cast<int>(len), 0);
+    if (n < 0) {
+      note_udp_send_error(SockErr(), len);
+      return 0;
+    }
     return n > 0 ? static_cast<size_t>(n) : 0;
   }
   if (peer >= peers_.size() || !peers_[peer].used) {
@@ -1109,6 +1311,10 @@ size_t Reactor::wire_send(uint64_t peer, const uint8_t* wire, size_t len) {
   const sockaddr_in& to = peers_[peer].addr;
   const int n = ::sendto(udp_, reinterpret_cast<const char*>(wire), static_cast<int>(len), 0,
                          reinterpret_cast<const sockaddr*>(&to), sizeof(to));
+  if (n < 0) {
+    note_udp_send_error(SockErr(), len);
+    return 0;
+  }
   return n > 0 ? static_cast<size_t>(n) : 0;
 }
 
@@ -1225,15 +1431,26 @@ void Reactor::target_text(const ProxyTarget& target, std::string* host, uint16_t
 
 void Reactor::print_stats(int64_t now_ms) {
   const ProxyEngine::Counters& c = engine_.counters();
+  const ProxyEngine::LossSample loss = engine_.loss_sample();
+  const auto ppm = [](uint64_t lost, uint64_t expected) {
+    return expected == 0
+               ? 0u
+               : static_cast<unsigned>((lost * 1000000ull + expected / 2) / expected);
+  };
   std::printf(
       "stats %6.1fs live=%zu up=%zu tunnels=%zu tx=%" PRIu64 "B rx=%" PRIu64
       "B bad_entry=%u refused=%u hs_failed=%u reset=%u idle=%u clash=%u over=%u"
-      " bad_cfg=%u no_entropy=%u budget=%u unknown=%u tomb=%u duprec=%u wrerr=%llu\n",
+      " bad_cfg=%u no_entropy=%u budget=%u unknown=%u tomb=%u duprec=%u wrerr=%llu"
+      " loss_in_ppm=%u loss_in_n=%llu loss_out_ppm=%u loss_out_n=%llu\n",
       (now_ms - started_ms_) / 1000.0, c.live, c.established, c.tunnels, c.bytes_tx, c.bytes_rx,
       c.bad_entry, c.open_failed, c.handshake_failed, c.reset, c.idle_closed, c.salt_clash,
       c.over_limit, c.bad_config, c.no_entropy, c.over_budget, c.unknown_salt,
       c.salt_tombstone, engine_.dup_after_recovered(),
-      static_cast<unsigned long long>(c.wire_errors));
+      static_cast<unsigned long long>(c.wire_errors),
+      ppm(loss.in_lost, loss.in_expected),
+      static_cast<unsigned long long>(loss.in_expected),
+      ppm(loss.out_lost, loss.out_expected),
+      static_cast<unsigned long long>(loss.out_expected));
   std::fflush(stdout);
 }
 

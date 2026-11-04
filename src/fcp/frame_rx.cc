@@ -311,6 +311,7 @@ bool FrameRx::release_set(uint32_t set_id) {
     retired_.insert(set_id);
     prune_retired();
   }
+  symbol_bytes_ -= symbols_bytes_of(it->second);
   sets_.erase(it);
   return true;
 }
@@ -415,6 +416,7 @@ FrameRx::RxSet* FrameRx::get_or_create(uint32_t set_id, int64_t now_ms) {
       retired_.insert(victim_id);
       prune_retired();
     }
+    symbol_bytes_ -= symbols_bytes_of(victim->second);
     sets_.erase(victim);
     ++tail_dropped_;
     if (!victim_accounted) {
@@ -439,8 +441,27 @@ bool FrameRx::note_k(RxSet* set, uint8_t k) {
   return true;
 }
 
+size_t FrameRx::symbols_bytes_of(const RxSet& set) const {
+  size_t bytes = 0;
+  for (const std::vector<uint8_t>& slot : set.symbols) {
+    bytes += slot.size();
+  }
+  return bytes;
+}
+
 void FrameRx::store_symbol(RxSet* set, uint8_t index, const uint8_t* symbol, size_t len) {
-  set->symbols[index].assign(symbol, symbol + len);
+  std::vector<uint8_t>& slot = set->symbols[index];
+  const size_t old = slot.size();
+  if (symbol_bytes_ - old + len > kMaxRxSymbolBytes) {
+    // The session's symbol budget is full. Dropping is the right failure: the
+    // peer's ARQ retransmits, and evicting a set here could free state that a
+    // reentrant host callback is still walking. Counting it keeps the loss
+    // visible instead of turning it into a silent FEC-only slowdown.
+    ++symbol_budget_drops_;
+    return;
+  }
+  symbol_bytes_ = symbol_bytes_ - old + len;
+  slot.assign(symbol, symbol + len);
   ++set->symbol_count;
   set->has_any_symbol = true;
   set->symbol_max = std::max(set->symbol_max, len);

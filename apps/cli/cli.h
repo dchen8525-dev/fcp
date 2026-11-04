@@ -28,6 +28,11 @@ struct ProxyArgs {
   ReactorOptions ro;
   bool help = false;
   bool version = false;  // --version：打印发布版本后退出（安装包自检/排障用）
+  // Client only: --speedtest turns this process into a one-shot frame-layer
+  // bench (bench.h) instead of a proxy. The server side enables its responder
+  // through ro.speedtest.
+  bool speedtest = false;
+  int speedtest_seconds = 8;
   // An explicit --mtu wins over the interface-derived default applied just
   // before startup; parsing must not distinguish the two otherwise.
   bool mtu_explicit = false;
@@ -56,6 +61,15 @@ std::vector<std::string> ResourceNotes(EngineRole role, const EngineConfig& ec,
 // min. Never raises the configured value and returns it unchanged when the
 // interface is too small to produce a valid MTU.
 uint16_t MtuForInterface(uint16_t configured, size_t interface_mtu);
+
+// The interface-MTU half of ApplyEnvironmentDefaults, pure so it can be
+// tested: a smaller interface lowers both the configured MTU and the PMTUD
+// ceiling (probing above the local interface can only produce EMSGSIZE). A
+// larger interface changes nothing -- the ladder from the configured MTU up
+// to --pmtu-max is exactly what upward PMTUD is for. An *explicit* --mtu above
+// the interface is kept but disables PMTUD: DF would reject every datagram at
+// that size, while without it the kernel still fragments and the tunnel works.
+void ApplyInterfaceMtu(size_t interface_mtu, ProxyArgs* args);
 
 // Pure argv parsing: no I/O, no engine construction, no process exit. Returns
 // false on a usage error with a one-line reason in *error (the same text

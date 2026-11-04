@@ -186,6 +186,46 @@
   .empty code{font:11.5px var(--mono);background:#fff;border:1px solid var(--line);
     padding:1px 6px;border-radius:5px;color:var(--accent-2)}
 
+  /* ---------- 链路测速 ---------- */
+  .speed-controls{display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap}
+  .speed-controls .field{width:170px}
+  .speed-controls .field.select select{width:100%}
+  select{
+    height:38px;background:var(--surface-2);color:var(--fg);border:1px solid var(--line);
+    border-radius:10px;padding:0 30px 0 10px;font:inherit;font-size:13.5px;outline:none;
+    cursor:pointer;transition:.15s;appearance:none;
+    background-image:linear-gradient(45deg,transparent 50%,var(--muted) 50%),
+      linear-gradient(135deg,var(--muted) 50%,transparent 50%);
+    background-position:calc(100% - 15px) 16px, calc(100% - 10px) 16px;
+    background-size:5px 5px, 5px 5px;background-repeat:no-repeat;
+  }
+  select:hover{border-color:#d3e2da;background-color:#fff}
+  select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(15,157,118,.13);background-color:#fff}
+  #speedStart{height:38px;padding:0 20px;border-color:transparent;color:#fff;font-weight:600;
+    background:linear-gradient(180deg,#12a97f,var(--accent));
+    box-shadow:0 8px 18px -10px rgba(15,157,118,.9)}
+  #speedStart:hover:not(:disabled){background:linear-gradient(180deg,#0fa87e,var(--accent-2));border-color:transparent}
+  #speedHint{margin-left:auto;font-size:12px;color:var(--muted)}
+  #speedHint.error{color:var(--err)}
+  .speed-results{display:grid;grid-template-columns:1fr 1fr 1.15fr;gap:12px;margin-top:16px}
+  .speed-tile{padding:14px 16px;border:1px solid var(--line);border-radius:14px;background:var(--surface-2);
+    display:flex;flex-direction:column;gap:4px;min-width:0}
+  .speed-tile .cap{font-size:11.5px;color:var(--muted)}
+  .speed-tile .cap em{font-style:normal;color:var(--muted-2);margin-left:5px;font-size:11px}
+  .speed-tile .big{display:flex;align-items:baseline;gap:6px;min-width:0}
+  .speed-tile .big b{font-size:34px;line-height:1.15;font-weight:650;letter-spacing:-.025em;
+    font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .speed-tile .big em{font-style:normal;font-size:12px;color:var(--muted-2)}
+  .speed-tile .sub{font:11.5px var(--mono);color:var(--muted-2);white-space:nowrap;overflow:hidden;
+    text-overflow:ellipsis}
+  .speed-tile.loss .loss-row{display:flex;align-items:baseline;gap:8px;font-size:12.5px;color:var(--fg-2)}
+  .speed-tile.loss .loss-row + .loss-row{margin-top:6px}
+  .speed-tile.loss .loss-row b{font:16px var(--mono);color:var(--accent-2);font-variant-numeric:tabular-nums}
+  .speed-tile.loss .loss-row .sub{margin-left:auto}
+  .speed-bar{height:6px;border-radius:99px;background:var(--line-2);margin-top:14px;overflow:hidden;flex:0 0 auto}
+  .speed-bar i{display:block;height:100%;width:0;border-radius:99px;
+    background:linear-gradient(90deg,var(--accent),#57c9a4);transition:width .18s}
+
   /* 吞吐折线：填满状态页剩余高度 */
   .chart{flex:1;min-height:92px;margin-top:12px;display:flex;flex-direction:column;gap:6px;
     padding:10px 12px 8px;border:1px solid var(--line);border-radius:12px;background:var(--surface-2)}
@@ -221,7 +261,8 @@
     .rail-foot{margin:0 0 0 auto;padding:0;border:0;background:transparent}
     .rail-foot .row + .row{display:none}
     .stage{padding:12px}
-    .row2,.adv-body{grid-template-columns:1fr}
+    .row2,.adv-body,.speed-results{grid-template-columns:1fr}
+    #speedHint{margin-left:0;width:100%}
   }
 </style>
 </head>
@@ -241,6 +282,10 @@
       <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 13h4l2.5-6 4 12 2.5-6h5"/></svg>
       运行状态
       <span class="badge" id="badge-live">0</span>
+    </button>
+    <button type="button" data-panel="speed">
+      <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 14a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z"/><path d="m14.5 9.5 3-3"/><path d="M4.2 17a9 9 0 1 1 15.6 0"/></svg>
+      链路测速
     </button>
     <button type="button" data-panel="log">
       <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16M4 10h16M4 15h10M4 20h7"/></svg>
@@ -356,6 +401,54 @@
     </div>
   </section>
 
+  <!-- 4. 链路测速 -->
+  <section class="card" id="panel-speed" hidden>
+    <div class="head"><h2>链路测速</h2><span>FCP 帧层裸吞吐，上下行各跑一次</span></div>
+
+    <div class="speed-controls">
+      <div class="field select">
+        <span class="lbl">单程时长</span>
+        <select id="speedSeconds">
+          <option value="5">5 秒</option>
+          <option value="8" selected>8 秒</option>
+          <option value="12">12 秒</option>
+          <option value="20">20 秒</option>
+        </select>
+      </div>
+      <button id="speedStart" type="button" disabled>开始测速</button>
+      <span id="speedHint">服务端需以 --speedtest 启动</span>
+    </div>
+
+    <div class="speed-results">
+      <div class="speed-tile">
+        <span class="cap">下行下载</span>
+        <div class="big"><b id="sp-down">--</b><em>Mbps</em></div>
+        <span class="sub" id="sp-down-sub">等待测速</span>
+      </div>
+      <div class="speed-tile">
+        <span class="cap">上行上传</span>
+        <div class="big"><b id="sp-up">--</b><em>Mbps</em></div>
+        <span class="sub" id="sp-up-sub">等待测速</span>
+      </div>
+      <div class="speed-tile loss">
+        <span class="cap">链路丢包 <em>FEC 恢复前</em></span>
+        <div class="loss-row"><span>下行</span><b id="sp-loss-in">--</b><span class="sub" id="sp-loss-in-n"></span></div>
+        <div class="loss-row"><span>上行</span><b id="sp-loss-out">--</b><span class="sub" id="sp-loss-out-n"></span></div>
+      </div>
+    </div>
+
+    <div class="speed-bar"><i id="sp-progress"></i></div>
+
+    <div class="tip" id="speed-note">
+      服务端需以 <code>--speedtest</code> 启动。测速不复用代理会话：客户端另起一个
+      fcp-client 直连服务端同一个 UDP 端口，两端直接向 FCP 帧/FEC 层灌数据符号，
+      绕开代理的 TCP 流窗口和 HTTP 靶子，量到的是隧道本身能承载的裸吞吐。发送速率
+      从 20 Mbps 起每 0.5 秒 ×1.5 自动爬升，面板取接收端最好的一秒窗口。丢包取
+      测速期间最后一个 FEC 统计窗口（约 2 秒）的原始丢包率，即 FEC 恢复前就丢掉
+      的比例，后续被补齐也不会减少；下行由本端统计，上行随服务端回报带回。
+    </div>
+  </section>
+
   <!-- 3. 日志 -->
   <section class="card" id="panel-log" hidden>
     <div class="head">
@@ -373,7 +466,7 @@
   // 三块内容只显示一块：左栏切换；启动/停止时自动跳到对应页。
   (function () {
     const nav = document.getElementById("nav");
-    const PANELS = { conn: "panel-conn", status: "panel-status", log: "panel-log" };
+    const PANELS = { conn: "panel-conn", status: "panel-status", speed: "panel-speed", log: "panel-log" };
     function show(name) {
       for (const [k, id] of Object.entries(PANELS)) {
         document.getElementById(id).hidden = k !== name;

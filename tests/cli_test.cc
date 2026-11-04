@@ -1,22 +1,23 @@
 // CLI argument parsing (apps/cli/cli.cc), T-cli.
 //
 // Every range check in the CLI exists because a typo used to be silently
-// wrapped or clamped: --mtu=70000 became 4464 (uint16 wrap), --d=266 became
-// 10, a fec-budget above 1 silently disabled the cap, plain atoi() turned
-// "abc" into 0. These tests pin the loud-failure contract: bad input returns
-// false with a reason, good input lands in EngineConfig/ReactorOptions
-// verbatim, and defaults survive an option-less command line.
+// wrapped or clamped: --mtu=70000 became 4464 (uint16 wrap), an oversized
+// --fec pair used to reach the handshake, a fec-budget above 1 silently
+// disabled the cap, plain atoi() turned "abc" into 0. These tests pin the
+// loud-failure contract: bad input returns false with a reason, good input
+// lands in EngineConfig/ReactorOptions verbatim, and defaults survive an
+// option-less command line.
 //
-// The alias tests pin the 2026-11-02 merge: --fec=D:P is --d/--p,
-// --window=START:MAX is --window/--window-cap, --log is --stats/-v. The
-// legacy spellings stay valid because deployments and the deb's conffile are
-// written against them; what must not stay is the silent last-one-wins when
-// two spellings of one setting are combined.
+// 0.0.1 has exactly one spelling per setting (--fec=D:P, --window=START[:MAX],
+// --log=LEVEL/-v) and the removed aliases must stay removed: a silently
+// accepted dead flag reads as "configured" in a script.
 
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
+#include "bench.h"
 #include "cli.h"
 #include "test_util.h"
 
@@ -196,12 +197,14 @@ void TestNumericRanges() {
   CHECK(ok({}));
   CHECK(!a.mtu_explicit);  // a reused ProxyArgs must not keep the old flag
 
-  // --d / --p individual ranges, then the pair limit (P8-4).
-  CHECK(!ok({"--d=0"}));
-  CHECK(!ok({"--d=266"}));       // used to wrap to 10
-  CHECK(!ok({"--p=8"}));
-  CHECK(!ok({"--d=250", "--p=7"}));  // 257 > 256
-  CHECK(ok({"--d=249", "--p=7"}));   // exactly 256
+  // The pair limit (P8-4) on the one spelling there is. --d/--p were removed
+  // with the 0.0.1 parameter cleanup: --p would also collide with -p (port).
+  CHECK(!ok({"--fec=250:7"}));  // 257 > 256
+  CHECK(ok({"--fec=249:7"}));   // exactly 256
+  CHECK(!ok({"--d=10"}));
+  CHECK(error.find("unknown") != std::string::npos);
+  CHECK(!ok({"--p=3"}));
+  CHECK(error.find("unknown") != std::string::npos);
 
   // --k: -1 is adaptive, 0..7 pins, 8 rejects.
   CHECK(ok({"--k=-1"}));
@@ -232,6 +235,12 @@ void TestNumericRanges() {
   CHECK(error.find("above MAX") != std::string::npos);
   CHECK(ok({"--window=4096:4096"}));
   CHECK(!ok({"--window=8192"}));  // autotune start above the 4096 ceiling
+  // A fixed window below two segments cannot put one segment on the wire, so
+  // the stream would accept the app's bytes and never send them.
+  CHECK(!ok({"--no-auto-window", "--window=1"}));
+  CHECK(error.find("two segments") != std::string::npos);
+  CHECK(!ok({"--no-auto-window", "--window=2"}));
+  CHECK(ok({"--no-auto-window", "--window=4"}));
   CHECK(!ok({"--window=256:1024:2048"}));
   CHECK(!ok({"--window=256:"}));
   CHECK(!ok({"--window:"}));
@@ -279,7 +288,7 @@ void TestFecAliases() {
   CHECK_EQ(a.ec.d, 30);
   CHECK_EQ(a.ec.p, 3);
 
-  // Same ranges and the same pair limit as the legacy halves.
+  // Both halves are range-checked, and their sum has the protocol limit.
   CHECK(!ok({"--fec=0:3"}));
   CHECK(!ok({"--fec=10:8"}));
   CHECK(!ok({"--fec=250:7"}));
@@ -291,11 +300,8 @@ void TestFecAliases() {
   CHECK(!ok({"--fec="}));
   CHECK(!error.empty());
 
-  // Mixing spellings of the pair is one setting given twice: reject rather
-  // than let whichever came last win silently.
-  CHECK(!ok({"--fec=10:3", "--p=2"}));
-  CHECK(!ok({"--d=10", "--fec=10:3"}));
-  CHECK(!ok({"--d=10", "--d=10"}));
+  CHECK(!ok({"--fec=10:3", "--fec=10:4"}));
+  CHECK(error.find("more than once") != std::string::npos);
 
   // --p-max is the controller's ceiling, not dead config: the spec's 5..7
   // range is unreachable at its default 4. A pinned k above either bound would
@@ -304,19 +310,19 @@ void TestFecAliases() {
   CHECK(ok({"--p-max=7"}));
   CHECK_EQ(a.ec.p_max, 7);
   CHECK(!ok({"--p-max=8"}));
-  CHECK(ok({"--p-max=7", "--p=7", "--k=7"}));
+  CHECK(ok({"--p-max=7", "--fec=10:7", "--k=7"}));
   CHECK_EQ(a.ec.pinned_k, 7);
-  CHECK(!ok({"--k=4"}));  // default --p=3 caps it even though --p-max is 4
+  CHECK(!ok({"--k=4"}));  // default p=3 caps it even though --p-max is 4
   CHECK(error.find("--k=4") != std::string::npos);
-  CHECK(!ok({"--p=7", "--k=5"}));  // --p-max still 4
-  CHECK(!ok({"--p-max=5", "--p=5", "--k=6"}));
-  CHECK(ok({"--p-max=5", "--p=5", "--k=5"}));
+  CHECK(!ok({"--fec=10:7", "--k=5"}));  // --p-max still 4
+  CHECK(!ok({"--p-max=5", "--fec=10:5", "--k=6"}));
+  CHECK(ok({"--p-max=5", "--fec=10:5", "--k=5"}));
   CHECK(ok({"--k=0"}));  // pinning OFF is always representable
   CHECK(ok({"--p-max=0"}));
   CHECK(!ok({"--p-max=0", "--k=1"}));
 }
 
-void TestWindowAliases() {
+void TestWindowForms() {
   ProxyArgs a;
   std::string error;
   const auto ok = [&](const std::vector<std::string>& args) {
@@ -334,20 +340,20 @@ void TestWindowAliases() {
   CHECK_EQ(a.ec.send_window_bytes, 512u * 1024);
   CHECK_EQ(a.ec.window_max_bytes, 1024u * 1024);
 
-  // The legacy spellings land in the same fields.
-  CHECK(ok({"--window-cap=2048"}));
+  // ":MAX" pins the ceiling and leaves the start implicit, so the prewarm
+  // prior can still replace it (this is what the GUI passes).
+  CHECK(ok({"--window=:2048"}));
   CHECK_EQ(a.ec.window_max_bytes, 2048u * 1024);
-  CHECK(ok({"--window=512", "--window-cap=2048"}));
-  CHECK_EQ(a.ec.send_window_bytes, 512u * 1024);
-  CHECK_EQ(a.ec.window_max_bytes, 2048u * 1024);
-  // ...and combining one with the compound is still one setting given twice.
-  CHECK(!ok({"--window=256:1024", "--window-cap=2048"}));
-  CHECK(error.find("--window-cap") != std::string::npos);
-  // ...in either order.
-  CHECK(!ok({"--window-cap=2048", "--window=256:1024"}));
-  CHECK(error.find("--window-cap") != std::string::npos);
-  CHECK(!ok({"--window-cap=512", "--window-cap=1024"}));
+  CHECK_EQ(a.ec.send_window_bytes, 256u * 1024);
+  CHECK(!a.ec.window_explicit);
+  CHECK_EQ(a.ec.window_ceiling_bytes, 0u);  // a pinned MAX is a decision
+  // --window-cap is gone: one spelling, no alias to keep in sync.
+  CHECK(!ok({"--window-cap=2048"}));
+  CHECK(error.find("unknown") != std::string::npos);
+  CHECK(!ok({"--window=512", "--window=1024"}));
   CHECK(error.find("more than once") != std::string::npos);
+  CHECK(!ok({"--window=:"}));  // no field at all
+  CHECK(!error.empty());
 
   // Below the engine's autotune floor used to be silently raised.
   CHECK(!ok({"--window=32"}));
@@ -356,7 +362,7 @@ void TestWindowAliases() {
   CHECK(ok({"--no-auto-window", "--window=512"}));
   CHECK(!a.ec.auto_window);
   CHECK(!ok({"--no-auto-window", "--window=512:2048"}));
-  CHECK(!ok({"--no-auto-window", "--window-cap=2048"}));
+  CHECK(!ok({"--no-auto-window", "--window=:2048"}));
   // The fixed window keeps its old 1 GiB range; only autotune is 64..4096.
   CHECK(ok({"--no-auto-window", "--window=8192"}));
   CHECK_EQ(a.ec.send_window_bytes, 8192u * 1024);
@@ -372,11 +378,10 @@ void TestWindowAliases() {
   CHECK_EQ(a.ec.rcv_buf_bytes, 256u * 1024);
   CHECK(!ok({"--window=8192"}));  // autotune start must fit under MAX 4096
 
-  // --auto-window is the default spelled out; it only has to not conflict.
-  CHECK(ok({"--auto-window"}));
-  CHECK(a.ec.auto_window);
-  CHECK(!ok({"--auto-window", "--no-auto-window"}));
-  CHECK(!ok({"--auto-window=1"}));  // bare flag: a value is a typo
+  // --auto-window is the default spelled out, so it is gone too: there is no
+  // way to make autotune "more on", and a dead flag reads as configured.
+  CHECK(!ok({"--auto-window"}));
+  CHECK(error.find("unknown") != std::string::npos);
 
   // --rcv-buf survives as the fixed-mode receive buffer (removing it outright
   // would take away the only way to size the receive side of a fixed window),
@@ -471,6 +476,71 @@ void TestRoleRequirements() {
   CHECK_EQ(static_cast<int>(a.ro.role), static_cast<int>(EngineRole::kServer));
 }
 
+// Short spellings and ADDR:PORT. Both are pure ergonomics: the same options,
+// one argument shorter. They must land in exactly the same fields as the long
+// form (there is one ApplyValue, reached after the rewrite), and combining the
+// two port sources has to fail rather than silently pick one.
+void TestShortAndCompoundAddresses() {
+  ProxyArgs a;
+  std::string error;
+  const std::string key = "--key=" + std::string(kGoodKey);
+
+  // Separate, attached and =value forms of a value option.
+  CHECK(TryParse(EngineRole::kClient,
+                 {key, "-H", "198.51.100.9:4700", "-l", "127.0.0.1:1180", "-m", "1500"},
+                 &a, &error));
+  CHECK_EQ(a.ro.remote_host, std::string("198.51.100.9"));
+  CHECK_EQ(a.ro.remote_port, 4700);
+  CHECK_EQ(a.ro.listen_addr, std::string("127.0.0.1"));
+  CHECK_EQ(a.ro.listen_port, 1180);
+  CHECK_EQ(a.ec.mtu, 1500);
+
+  CHECK(TryParse(EngineRole::kClient, {key, "-H=203.0.113.7", "-p5000"}, &a, &error));
+  CHECK_EQ(a.ro.remote_host, std::string("203.0.113.7"));
+  CHECK_EQ(a.ro.remote_port, 5000);
+
+  // -b :PORT keeps the default address; the server needs nothing else but keys.
+  CHECK(TryParse(EngineRole::kServer, {key, "-b", ":40000"}, &a, &error));
+  CHECK_EQ(a.ro.bind_addr, std::string("0.0.0.0"));
+  CHECK_EQ(a.ro.bind_port, 40000);
+
+  // -k is --key-file (a path, not the key itself): the short form must not
+  // become a way to put the PSK back into `ps`.
+  const std::string path = TempPath("short_key");
+  CHECK(WriteFile(path, kGoodKey));
+  CHECK(TryParse(EngineRole::kServer, {"-k", path}, &a, &error));
+  std::remove(path.c_str());
+
+  // One port, one source.
+  CHECK(!TryParse(EngineRole::kClient, {key, "-H", "10.0.0.1:5000", "-p", "6000"}, &a,
+                  &error));
+  CHECK(error.find("twice") != std::string::npos);
+  CHECK(!TryParse(EngineRole::kClient,
+                  {key, "--host=10.0.0.1", "-l", "127.0.0.1:1180", "--local-port=1190"},
+                  &a, &error));
+  CHECK(error.find("twice") != std::string::npos);
+
+  // A non-numeric suffix is not a port: the whole value stays the address.
+  CHECK(TryParse(EngineRole::kClient, {key, "-H", "host.example"}, &a, &error));
+  CHECK_EQ(a.ro.remote_host, std::string("host.example"));
+  CHECK_EQ(a.ro.remote_port, 4460);
+  // Several colons are an IPv6 literal (unsupported: the tunnel socket is
+  // AF_INET), not host:port -- it must not be split into ":" plus port 1.
+  CHECK(TryParse(EngineRole::kClient, {key, "--host=::1", "--port=4000"}, &a, &error));
+  CHECK_EQ(a.ro.remote_host, std::string("::1"));
+  CHECK_EQ(a.ro.remote_port, 4000);
+
+  // Short-option errors name the short spelling and the value it needs.
+  CHECK(!TryParse(EngineRole::kServer, {key, "-k"}, &a, &error));
+  CHECK(error.find("-k") != std::string::npos);
+  CHECK(!TryParse(EngineRole::kClient, {key, "--host=10.0.0.1", "-vx"}, &a, &error));
+  CHECK(error.find("takes no value") != std::string::npos);
+  CHECK(!TryParse(EngineRole::kClient, {key, "--host=10.0.0.1", "-z"}, &a, &error));
+  CHECK(error.find("unknown") != std::string::npos);
+  CHECK(!TryParse(EngineRole::kClient, {key, "--host=10.0.0.1", "-m", "70000"}, &a, &error));
+  CHECK(error.find("--mtu") != std::string::npos);
+}
+
 void TestDefaultsSurvive() {
   ProxyArgs a;
   std::string error;
@@ -492,6 +562,47 @@ void TestDefaultsSurvive() {
   CHECK_EQ(a.ro.stats_ms, 0);
   CHECK_EQ(a.ro.connect_timeout_ms, 5000);
   CHECK(a.ec.trace_prefix.empty());
+  // Wire-side defaults: coalesced ACKs. The BDP-following ceiling scales with
+  // --max-sessions so the documented 512 MiB worst case does not move: 256
+  // sessions get no extra room over the 1 MiB MAX, 64 sessions get 4 MiB.
+  CHECK_EQ(static_cast<int>(a.ec.ack_every), 2);
+  CHECK_EQ(a.ec.window_ceiling_bytes, 0u);
+  ProxyArgs few;
+  CHECK(Ok(EngineRole::kServer, {"--max-sessions=64"}, &few, &error));
+  CHECK_EQ(few.ec.window_ceiling_bytes, 4u * 1024 * 1024);
+
+  // Pinning the ceiling is a decision: the default does not raise it, and the
+  // ACK ratio is independent of the window mode.
+  ProxyArgs pinned;
+  CHECK(Ok(EngineRole::kClient, {"--window=:2048"}, &pinned, &error));
+  CHECK_EQ(pinned.ec.window_max_bytes, 2048u * 1024);
+  CHECK_EQ(pinned.ec.window_ceiling_bytes, 0u);
+  CHECK_EQ(static_cast<int>(pinned.ec.ack_every), 2);
+  ProxyArgs fixed;
+  CHECK(Ok(EngineRole::kClient, {"--no-auto-window", "--window=4096"}, &fixed, &error));
+  CHECK_EQ(fixed.ec.window_ceiling_bytes, 0u);
+  CHECK_EQ(static_cast<int>(fixed.ec.ack_every), 2);
+
+  // Upward PMTUD is on with a 1500 ceiling; --no-pmtud turns it off, and a
+  // ceiling at or below the configured MTU is clamped to "do not probe".
+  CHECK(a.ec.pmtud);
+  CHECK_EQ(a.ec.pmtu_max_mtu, 1500);
+  ProxyArgs no_pmtu;
+  CHECK(Ok(EngineRole::kClient, {"--no-pmtud"}, &no_pmtu, &error));
+  CHECK(!no_pmtu.ec.pmtud);
+  ProxyArgs jumbo;
+  CHECK(Ok(EngineRole::kClient, {"--pmtu-max=9000"}, &jumbo, &error));
+  CHECK_EQ(jumbo.ec.pmtu_max_mtu, 9000);
+  ProxyArgs below;
+  CHECK(Ok(EngineRole::kClient, {"--mtu=1500", "--pmtu-max=1280"}, &below, &error));
+  CHECK_EQ(below.ec.pmtu_max_mtu, 1500u);  // clamped to the starting MTU
+  ProxyArgs big_mtu;
+  CHECK(Ok(EngineRole::kClient, {"--mtu=2000"}, &big_mtu, &error));
+  CHECK_EQ(big_mtu.ec.pmtu_max_mtu, 2000u);  // default ceiling follows the start
+  CHECK(!Ok(EngineRole::kClient, {"--pmtu-max=1000"}, &no_pmtu, &error));
+  // The positive spelling is gone: PMTUD is on unless told otherwise.
+  CHECK(!Ok(EngineRole::kClient, {"--pmtud"}, &no_pmtu, &error));
+  CHECK(error.find("unknown") != std::string::npos);
 }
 
 void TestMetaFlagsWinOverBadValues() {
@@ -521,23 +632,24 @@ void TestFlagsAndValues() {
   ProxyArgs a;
   std::string error;
   CHECK(Ok(EngineRole::kServer,
-           {"--no-prewarm", "-v", "--trace=/tmp/calib", "--stats=1000",
-            "--connect-timeout=2500"},
+           {"--no-prewarm", "-v", "--trace=/tmp/calib", "--connect-timeout=2500"},
            &a, &error));
   CHECK(!a.ec.prewarm);
   CHECK(a.ro.verbose);
   CHECK_EQ(a.ec.trace_prefix, std::string("/tmp/calib"));
-  CHECK_EQ(a.ro.stats_ms, 1000);
   CHECK_EQ(a.ro.connect_timeout_ms, 2500);
   CHECK(Ok(EngineRole::kServer,
-           {"-v", "--stats=10000", "--max-sessions=512", "--idle=1000", "--no-prewarm"},
-           &a, &error));
+           {"-v", "--max-sessions=512", "--idle=1000", "--no-prewarm"}, &a, &error));
   CHECK(a.ro.verbose);
   CHECK(!a.ec.prewarm);
   CHECK_EQ(a.ec.max_sessions, 512u);
   CHECK_EQ(a.ec.idle_timeout_ms, 1000);
-  CHECK(!Ok(EngineRole::kServer, {"--stats=1000", "--log=off"}, &a, &error));
-  CHECK(error.find("--log already") != std::string::npos);
+  // --stats is gone; -v rewrites to --log=verbose, so the two still collide
+  // as one setting.
+  CHECK(!Ok(EngineRole::kServer, {"--stats=1000"}, &a, &error));
+  CHECK(error.find("unknown") != std::string::npos);
+  CHECK(!Ok(EngineRole::kServer, {"-v", "--log=off"}, &a, &error));
+  CHECK(error.find("more than once") != std::string::npos);
 
   // Outside help/version, a value error always has a message.
   CHECK(!Ok(EngineRole::kServer, {"--mtu=abc"}, &a, &error));
@@ -558,15 +670,7 @@ void TestFlagsAndValues() {
   CHECK(!Ok(EngineRole::kServer, {"--log=chatty"}, &a, &error));
   CHECK(!Ok(EngineRole::kServer, {"--log=stats:0"}, &a, &error));
   CHECK(!Ok(EngineRole::kServer, {"--log=stats:"}, &a, &error));
-  // --stats keeps its old range (0 = off), unlike --log=stats:ms.
-  CHECK(Ok(EngineRole::kServer, {"--stats=0"}, &a, &error));
-  CHECK_EQ(a.ro.stats_ms, 0);
-  // -v and --stats stay independent (the deploy docs use them together)...
-  CHECK(Ok(EngineRole::kServer, {"-v", "--stats=1000"}, &a, &error));
-  CHECK(a.ro.verbose);
-  CHECK_EQ(a.ro.stats_ms, 1000);
-  // ...but --log already says both, so mixing it with either is ambiguous.
-  CHECK(!Ok(EngineRole::kServer, {"--log=verbose", "--stats=1000"}, &a, &error));
+  // A given -v cannot be combined with --log: one logger, one value.
   CHECK(!Ok(EngineRole::kServer, {"--log=stats:1000", "-v"}, &a, &error));
   CHECK(!Ok(EngineRole::kServer, {"--log=verbose", "--log=off"}, &a, &error));
 
@@ -592,6 +696,142 @@ void TestFlagsAndValues() {
   CHECK(!Ok(EngineRole::kServer, {"--no-prewarm=1"}, &a, &error));
 }
 
+void TestSpeedTestFlags() {
+  ProxyArgs a;
+  std::string error;
+
+  // Server: the bare flag enables the frame-layer responder on the FCP port.
+  CHECK(Ok(EngineRole::kServer, {"--speedtest"}, &a, &error));
+  CHECK(a.ro.speedtest);
+  // --speedtest-seconds belongs to the client's one-shot run only.
+  CHECK(!Ok(EngineRole::kServer, {"--speedtest", "--speedtest-seconds=8"}, &a, &error));
+  CHECK(error.find("client") != std::string::npos);
+
+  // Client: --speedtest switches to one bench run and leaves the proxy alone.
+  CHECK(Ok(EngineRole::kClient, {"--speedtest"}, &a, &error));
+  CHECK(a.speedtest);
+  CHECK_EQ(a.speedtest_seconds, 8);
+  CHECK(Ok(EngineRole::kClient, {"--speedtest", "--speedtest-seconds=12"}, &a, &error));
+  CHECK_EQ(a.speedtest_seconds, 12);
+
+  // Seconds without the mode flag would be silently ignored.
+  CHECK(!Ok(EngineRole::kClient, {"--speedtest-seconds=12"}, &a, &error));
+  // Bare flags take no value, and the old --speedtest-port spelling is gone.
+  CHECK(!Ok(EngineRole::kClient, {"--speedtest=1"}, &a, &error));
+  CHECK(!Ok(EngineRole::kServer, {"--speedtest-port=9001"}, &a, &error));
+  // Range guards: the run takes 2 x N seconds, so the window is bounded.
+  CHECK(!Ok(EngineRole::kClient, {"--speedtest", "--speedtest-seconds=2"}, &a, &error));
+  CHECK(!Ok(EngineRole::kClient, {"--speedtest", "--speedtest-seconds=31"}, &a, &error));
+  CHECK(!Ok(EngineRole::kClient, {"--speedtest", "--speedtest-seconds=abc"}, &a, &error));
+}
+
+void TestBbrFlags() {
+  ProxyArgs a;
+  std::string error;
+
+  // BBR owns the adaptive window by default; v2 is the shipping version
+  // (it learns the path's own loss floor before treating loss as congestion).
+  CHECK(Ok(EngineRole::kServer, {}, &a, &error));
+  CHECK(a.ec.bbr);
+  CHECK_EQ(a.ec.bbr_version, 2);
+
+  // v1 stays selectable for comparison.
+  CHECK(Ok(EngineRole::kServer, {"--bbr-version=1"}, &a, &error));
+  CHECK_EQ(a.ec.bbr_version, 1);
+  CHECK(!Ok(EngineRole::kServer, {"--bbr-version=3"}, &a, &error));
+  CHECK(error.find("--bbr-version") != std::string::npos);
+  CHECK(!Ok(EngineRole::kServer, {"--bbr-version=v2"}, &a, &error));
+
+  // The epoch controller is the fallback; a version with no controller to
+  // apply it to is a mistake, not a silent no-op.
+  CHECK(Ok(EngineRole::kServer, {"--no-bbr"}, &a, &error));
+  CHECK(!a.ec.bbr);
+  CHECK(!Ok(EngineRole::kServer, {"--no-bbr", "--bbr-version=1"}, &a, &error));
+  CHECK(!Ok(EngineRole::kServer, {"--bbr"}, &a, &error));  // removed: BBR is the default
+  CHECK(error.find("unknown") != std::string::npos);
+
+  // A fixed window has no controller either; --bbr-version is then only
+  // noted, because --no-auto-window is the deliberate flag.
+  CHECK(Ok(EngineRole::kServer,
+           {"--no-auto-window", "--window=512", "--bbr-version=1"}, &a, &error));
+  bool noted = false;
+  for (const std::string& n : a.notes) {
+    if (n.find("--bbr-version") != std::string::npos) {
+      noted = true;
+    }
+  }
+  CHECK(noted);
+}
+
+void TestBenchCodec() {
+  using namespace fcp::bench;
+
+  uint8_t salt[kSaltLen] = {1, 2, 3, 4, 5, 6, 7, 8};
+  uint8_t rendezvous[kRendezvousLen] = {};
+  CHECK(EncodeRendezvous(salt, 8, rendezvous));
+  uint8_t got_salt[kSaltLen] = {};
+  uint16_t seconds = 0;
+  CHECK(DecodeRendezvous(rendezvous, sizeof(rendezvous), got_salt, &seconds));
+  CHECK(std::memcmp(salt, got_salt, sizeof(salt)) == 0);
+  CHECK_EQ(seconds, 8);
+  // A short datagram, or a 20-byte one that is not the magic, is not ours.
+  CHECK(!DecodeRendezvous(rendezvous, sizeof(rendezvous) - 1, got_salt, &seconds));
+  uint8_t junk[kRendezvousLen] = {};
+  CHECK(!DecodeRendezvous(junk, sizeof(junk), got_salt, &seconds));
+  // The echo is exactly the 8-byte magic, not the full rendezvous.
+  CHECK(IsMagic(kMagic, kMagicLen));
+  CHECK(!IsMagic(rendezvous, sizeof(rendezvous)));
+  CHECK(!IsMagic(rendezvous, kMagicLen - 1));
+
+  const uint64_t user = UserBytes(kDataPayloadLen);
+  CHECK_EQ(user, static_cast<uint64_t>(kDataPayloadLen - kHeaderLen));
+
+  uint8_t payload[kDataPayloadLen] = {};
+  EncodeData(42, payload, sizeof(payload));
+  DecodedPayload decoded;
+  CHECK(DecodePayload(payload, sizeof(payload), &decoded));
+  CHECK(decoded.type == PayloadType::kData);
+  CHECK_EQ(decoded.sn, 42u);
+  CHECK_EQ(decoded.delivered, 0ull);
+
+  uint8_t report[kReportPayloadLen] = {};
+  EncodeReport(7, 123456789ull, 987654321ull, report, sizeof(report));
+  CHECK(DecodePayload(report, sizeof(report), &decoded));
+  CHECK(decoded.type == PayloadType::kReport);
+  CHECK_EQ(decoded.sn, 7u);
+  CHECK_EQ(decoded.delivered, 123456789ull);
+  CHECK_EQ(decoded.best_bps, 987654321ull);
+  // Truncated report, truncated header, and a wrong version are all rejected.
+  CHECK(!DecodePayload(report, kHeaderLen + 4, &decoded));
+  CHECK(!DecodePayload(report, kHeaderLen - 1, &decoded));
+  uint8_t bad_version[kReportPayloadLen];
+  std::memcpy(bad_version, report, sizeof(report));
+  bad_version[kMagicLen] = static_cast<uint8_t>(bad_version[kMagicLen] ^ 0xFF);
+  CHECK(!DecodePayload(bad_version, sizeof(bad_version), &decoded));
+
+  // Ramp: x1.5 per interval, saturating at the ceiling.
+  Ramp ramp;
+  CHECK(ramp.bps() == kStartBps);
+  ramp.Advance();
+  CHECK(ramp.bps() == kStartBps * 1.5);
+  for (int i = 0; i < 100; ++i) {
+    ramp.Advance();
+  }
+  CHECK(ramp.bps() == kMaxBps);
+
+  // RateWindow: 1000 bytes per 100ms for one second = 80000 bps. A single
+  // burst narrower than half a window must not set a peak.
+  RateWindow window;
+  for (int i = 0; i < 10; ++i) {
+    window.Add(i * 100, 1000);
+  }
+  CHECK_EQ(window.total_bytes(), 10000ull);
+  CHECK_EQ(window.best_bps(), 80000ull);
+  RateWindow burst;
+  burst.Add(0, 100000);
+  CHECK_EQ(burst.best_bps(), 0ull);
+}
+
 void TestEnvironmentDefaults() {
   using fcp::MtuForInterface;
   // Both arguments are IP packet sizes, so the adjustment is a plain min; the
@@ -603,6 +843,44 @@ void TestEnvironmentDefaults() {
   CHECK_EQ(MtuForInterface(1200, 1500), 1200);  // explicit lower stays
   CHECK_EQ(MtuForInterface(1400, 0), 1400);     // query failed
   CHECK_EQ(MtuForInterface(1400, 100), 1400);   // no valid budget
+
+  // The interface only ever lowers the start; when it does, the PMTUD ceiling
+  // follows it down (a probe above the local interface is an EMSGSIZE). A
+  // larger interface must leave the ladder intact -- clamping the ceiling on
+  // every run silently disabled PMTUD on the usual 1500 interfaces.
+  ProxyArgs on_lan;
+  fcp::ApplyInterfaceMtu(1500, &on_lan);
+  CHECK_EQ(on_lan.ec.mtu, 1400);
+  CHECK_EQ(on_lan.ec.pmtu_max_mtu, 1500);
+  CHECK(on_lan.notes.empty());
+  ProxyArgs on_vpn;
+  fcp::ApplyInterfaceMtu(1280, &on_vpn);
+  CHECK_EQ(on_vpn.ec.mtu, 1280);
+  CHECK_EQ(on_vpn.ec.pmtu_max_mtu, 1280);
+  CHECK_EQ(on_vpn.notes.size(), 1u);
+
+  // An explicit --mtu above the interface is the operator's call and is kept,
+  // but PMTUD has to go: DF is set on the whole socket, so every datagram at
+  // that size would come back EMSGSIZE instead of being fragmented.
+  ProxyArgs explicit_too_big;
+  explicit_too_big.mtu_explicit = true;
+  explicit_too_big.ec.pmtu_max_mtu = 1500;
+  fcp::ApplyInterfaceMtu(1280, &explicit_too_big);
+  CHECK_EQ(explicit_too_big.ec.mtu, 1400);
+  CHECK(!explicit_too_big.ec.pmtud);
+  CHECK_EQ(explicit_too_big.notes.size(), 1u);
+  CHECK(explicit_too_big.notes[0].find("PMTUD disabled") != std::string::npos);
+  // Already off: saying it twice helps nobody.
+  fcp::ApplyInterfaceMtu(1280, &explicit_too_big);
+  CHECK_EQ(explicit_too_big.notes.size(), 1u);
+
+  // Explicit but fitting: PMTUD stays, and the ceiling is untouched.
+  ProxyArgs explicit_fits;
+  explicit_fits.mtu_explicit = true;
+  fcp::ApplyInterfaceMtu(1500, &explicit_fits);
+  CHECK(explicit_fits.ec.pmtud);
+  CHECK_EQ(explicit_fits.ec.pmtu_max_mtu, 1500);
+  CHECK(explicit_fits.notes.empty());
 
   fcp::ResourceLimits unknown;  // -1 = platform has no equivalent (Windows)
   fcp::EngineConfig ec;         // auto window, 256 sessions, 1 MiB ceiling
@@ -642,12 +920,16 @@ int main() {
   TestKeyEnv();
   TestNumericRanges();
   TestFecAliases();
-  TestWindowAliases();
+  TestWindowForms();
   TestAutotuneNotes();
   TestRoleRequirements();
   TestDefaultsSurvive();
   TestMetaFlagsWinOverBadValues();
   TestFlagsAndValues();
+  TestSpeedTestFlags();
+  TestBbrFlags();
+  TestBenchCodec();
   TestEnvironmentDefaults();
+  TestShortAndCompoundAddresses();
   return fcp_test::finish();
 }

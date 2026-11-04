@@ -1401,7 +1401,8 @@ void ProbeR9Handshake() {
   check_caps(2, 10, 3, 0x03);
   check_caps(1, 0, 3, 0x03);    // data must be >= 1
   check_caps(1, 10, 8, 0x03);   // parity > 7
-  check_caps(1, 10, 3, 0x10);   // reserved bit 4 set
+  check_caps(1, 10, 3, 0x17);   // M1 + PMTUD: valid
+  check_caps(1, 10, 3, 0x20);   // reserved bit 5 set (bit 4 is kCapPmtud)
   check_caps(1, 10, 3, 0x80);   // reserved bit 7 set
   check_caps(1, 10, 3, 0x01);   // framing without FECSTAT -> ERROR
   check_caps(1, 10, 3, 0x02);   // FECSTAT without framing -> ERROR

@@ -27,6 +27,10 @@ constexpr uint8_t kDefaultP = 3;
 // applies (see strategy.h, kDefaultPmax for the controller side).
 constexpr uint16_t kDefaultMtu = 1400;
 constexpr size_t kDefaultIpHeaderLen = 20;
+// PMTUD ceiling (pmtu.h): the largest IP packet a probe will try. 1500 is the
+// Ethernet path every deployment can be expected to have; jumbo frames are
+// opt-in (--pmtu-max) because they are a LAN property, not an internet one.
+constexpr uint16_t kDefaultPmtuMaxMtu = 1500;
 
 // M3 byte budget (M3控制设计.md §2): parity/data bytes for one interval.
 constexpr double kDefaultFecBudget = 0.50;
@@ -50,6 +54,12 @@ constexpr size_t kDefaultSendWindowBytes = 256 * 1024;
 constexpr size_t kDefaultRcvBufBytes = 256 * 1024;
 constexpr size_t kDefaultWindowMinBytes = 64 * 1024;
 constexpr size_t kDefaultWindowMaxBytes = 1024 * 1024;
+// Ceiling the adaptive window may follow the measured BDP up to when the
+// operator did not pin one (--window=:MAX). The configured MAX stays its floor,
+// so this only widens a session that keeps proving a larger path; 4 MiB is the
+// same value the desktop client has been shipping as its cap, and it is what a
+// 200 ms path needs for ~160 Mbps. Memory is bounded by --max-sessions.
+constexpr size_t kDefaultWindowCeilingBytes = 4 * 1024 * 1024;
 constexpr int64_t kDefaultIdleTimeoutMs = 300000;
 
 }  // namespace fcp

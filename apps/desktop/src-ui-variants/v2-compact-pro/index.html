@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>FCP · 方案 2 紧凑专业</title>
+<style>
+  :root{
+    --bg:#15171a; --side:#1b1e22; --main:#212429; --card:#262a30;
+    --line:#33383f; --line-2:#2a2f35; --fg:#e6e8eb; --fg-2:#b9bec6; --muted:#868d97;
+    --accent:#f59e0b; --accent-hi:#fbbf24; --ok:#58d68d; --err:#ff6b6b;
+    --mono:ui-monospace,"Cascadia Mono","JetBrains Mono",Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    background:var(--bg);color:var(--fg);font:13px/1.5 system-ui,-apple-system,"Segoe UI","Noto Sans SC","Microsoft YaHei UI",sans-serif;
+    display:flex;min-height:100vh;user-select:none;-webkit-user-select:none;-webkit-font-smoothing:antialiased;
+  }
+
+  /* ---------- 左栏 ---------- */
+  .side{
+    width:232px;flex:0 0 232px;background:var(--side);border-right:1px solid #0f1113;
+    display:flex;flex-direction:column;padding:16px 12px;
+  }
+  .brand{display:flex;align-items:center;gap:10px;padding:2px 6px 18px}
+  [data-mark]{width:28px;height:28px;display:block;flex:0 0 auto}
+  .mark-bg{fill:#262a30;stroke:#3a3f47;stroke-width:1}
+  .mark-f{fill:#f3f4f6}
+  .mark-dot{fill:var(--accent)}
+  .brand b{display:block;font-size:14px;letter-spacing:.16em}
+  .brand em{display:block;font-style:normal;font-size:11px;color:var(--muted);letter-spacing:.04em}
+
+  .side-label{font-size:10.5px;letter-spacing:.14em;color:var(--muted);padding:6px 6px 8px;text-transform:uppercase}
+  .nav{display:flex;flex-direction:column;gap:2px;margin-bottom:18px}
+  .nav a{
+    display:flex;align-items:center;gap:9px;padding:7px 10px;border-radius:6px;color:var(--fg-2);
+    text-decoration:none;font-size:12.5px;border:1px solid transparent;
+  }
+  .nav a.on{background:#262a30;color:var(--fg);border-color:var(--line)}
+  .nav a .k{margin-left:auto;font:11px var(--mono);color:var(--muted)}
+  .nav a:hover{background:#22252a}
+
+  .quick{background:#17191c;border:1px solid var(--line-2);border-radius:8px;padding:10px 11px;margin-bottom:auto}
+  .quick .row{display:flex;justify-content:space-between;font-size:11.5px;padding:3px 0;color:var(--muted)}
+  .quick .row b{color:var(--fg-2);font:12px var(--mono);font-weight:500}
+
+  .side-status{
+    margin-top:14px;padding:10px 11px;border-radius:8px;background:#17191c;border:1px solid var(--line-2);
+    display:flex;align-items:center;gap:9px;font-size:12px;color:var(--fg-2);
+  }
+  .dot{width:8px;height:8px;border-radius:50%;background:#5b636e;flex:0 0 auto}
+  .dot.on{background:var(--ok);box-shadow:0 0 0 3px #58d68d22}
+  .dot.bad{background:var(--err);box-shadow:0 0 0 3px #ff6b6b22}
+  .side-status .ss-time{margin-left:auto;font:12px var(--mono);color:var(--fg)}
+
+  /* ---------- 右区 ---------- */
+  .main{flex:1;min-width:0;display:flex;flex-direction:column;background:var(--main)}
+  .topbar{
+    height:44px;flex:0 0 auto;display:flex;align-items:center;gap:10px;padding:0 16px;
+    border-bottom:1px solid var(--line-2);background:#1e2126;font-size:12px;color:var(--muted);
+  }
+  .topbar .path b{color:var(--fg-2);font-weight:500}
+  .topbar .right{margin-left:auto;display:flex;gap:8px;align-items:center}
+
+  .content{flex:1;min-height:0;overflow:auto;padding:16px;display:flex;flex-direction:column;gap:12px}
+  .content > .panel{flex:0 0 auto}
+  .content::-webkit-scrollbar{width:10px}
+  .content::-webkit-scrollbar-thumb{background:#383e46;border-radius:10px;border:2px solid var(--main)}
+
+  .panel{background:var(--card);border:1px solid var(--line-2);border-radius:8px}
+  .panel-h{
+    display:flex;align-items:center;gap:8px;padding:9px 14px;border-bottom:1px solid var(--line-2);
+    font-size:12px;font-weight:600;letter-spacing:.04em;color:var(--fg-2);
+  }
+  .panel-h .tag{
+    font:10.5px var(--mono);color:var(--accent);background:#f59e0b15;border:1px solid #f59e0b33;
+    padding:1px 6px;border-radius:4px;letter-spacing:0;
+  }
+  .panel-h .right{margin-left:auto}
+  .panel-b{padding:12px 14px 14px}
+
+  /* 两栏表单：左侧说明，右侧控件 */
+  .form{display:grid;grid-template-columns:1fr 1fr;gap:8px 18px}
+  .field{display:grid;grid-template-columns:104px 1fr;align-items:center;gap:10px;font-size:12px;color:var(--fg-2)}
+  .field > span{color:var(--muted);text-align:right}
+  .field.wide{grid-column:1/-1}
+  .field .row{display:flex;gap:6px}
+  .field .row input{flex:1;min-width:0}
+  input{
+    width:100%;background:#1b1e22;color:var(--fg);border:1px solid var(--line);
+    border-radius:6px;padding:6px 9px;font:12.5px var(--mono);outline:none;
+    user-select:text;-webkit-user-select:text;transition:border-color .12s,box-shadow .12s;
+  }
+  input:focus{border-color:var(--accent);box-shadow:0 0 0 3px #f59e0b1f}
+  input:disabled{opacity:.5}
+  input[type=number]{-moz-appearance:textfield}
+
+  .check{display:flex;align-items:center;gap:8px;margin:12px 0 0;font-size:12px;color:var(--muted)}
+  .check input{width:14px;height:14px;padding:0;accent-color:var(--accent)}
+
+  .actions{display:flex;align-items:center;gap:8px;margin-top:12px;padding-top:12px;border-top:1px dashed var(--line)}
+  button{
+    background:#2c3138;color:var(--fg);border:1px solid var(--line);border-radius:6px;
+    padding:6px 14px;font:inherit;font-size:12.5px;font-weight:550;cursor:pointer;transition:.12s;
+  }
+  button:hover:not(:disabled){background:#343a42;border-color:#454c55}
+  button:disabled{opacity:.4;cursor:default}
+  button.primary{background:var(--accent);border-color:#d97706;color:#1a1300;font-weight:650}
+  button.primary:hover:not(:disabled){background:var(--accent-hi)}
+  button.ghost{background:transparent;padding:5px 9px;font-size:11.5px;color:var(--fg-2)}
+  button.right{margin-left:auto}
+  #hint{margin-left:auto;font:11.5px var(--mono);color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+  /* 指标：表格风 */
+  .stats{width:100%;border-collapse:collapse;font-size:12px}
+  .stats td{padding:7px 4px;border-bottom:1px solid var(--line-2)}
+  .stats tr:last-child td{border-bottom:0}
+  .stats td:first-child{width:34%;color:var(--muted)}
+  .stats td.val{font:12.5px var(--mono);color:var(--fg);font-variant-numeric:tabular-nums}
+  .stats td.bar{width:34%}
+  .bar-track{height:5px;border-radius:3px;background:#1b1e22;overflow:hidden}
+  .bar-fill{height:100%;width:0;background:linear-gradient(90deg,#d97706,var(--accent-hi));transition:width .35s}
+  #diag{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+  #diag .metric{
+    display:flex;gap:6px;align-items:baseline;padding:3px 8px;border-radius:4px;
+    background:#f59e0b12;border:1px solid #f59e0b30;font:11px var(--mono);color:var(--accent-hi);
+  }
+  #diag .metric .cap{color:#caa05a}
+  #diag .metric b{font-weight:600}
+
+  /* 日志 */
+  .term{
+    flex:1;min-height:110px;overflow:auto;background:#111315;border-top:0;
+    border:1px solid var(--line-2);border-radius:0 0 8px 8px;margin:0;padding:9px 12px;
+    font:12px/1.55 var(--mono);white-space:pre-wrap;word-break:break-all;color:#aeb4bd;
+    user-select:text;-webkit-user-select:text;
+  }
+  .term::-webkit-scrollbar{width:10px}
+  .term::-webkit-scrollbar-thumb{background:#383e46;border-radius:10px;border:2px solid #111315}
+  .term .err{color:var(--accent-hi)}
+  .term .out{color:#8c939d}
+  #log-panel{display:flex;flex-direction:column;flex:1 1 auto;min-height:170px}
+  #log-panel .term{flex:1;min-height:0}
+
+  @media (max-width:880px){
+    .side{display:none}
+    .form{grid-template-columns:1fr}
+  }
+</style>
+</head>
+<body>
+<aside class="side">
+  <div class="brand">
+    <span data-mark></span>
+    <div><b>FCP</b><em>可靠传输客户端</em></div>
+  </div>
+
+  <div class="side-label">面板</div>
+  <nav class="nav">
+    <a class="on" href="#conn">连接配置 <span class="k">⌘1</span></a>
+    <a href="#status">运行指标 <span class="k">⌘2</span></a>
+    <a href="#log-panel">实时日志 <span class="k">⌘3</span></a>
+  </nav>
+
+  <div class="side-label">本机监听</div>
+  <div class="quick">
+    <div class="row"><span>SOCKS5</span><b id="s-socks">127.0.0.1:1080</b></div>
+    <div class="row"><span>HTTP</span><b id="s-http">127.0.0.1:1080</b></div>
+    <div class="row"><span>传输</span><b>UDP/FEC</b></div>
+  </div>
+
+  <div class="side-status">
+    <span class="dot" id="dot"></span><span id="side-text">未启动</span><time class="ss-time" id="uptime">--</time>
+  </div>
+</aside>
+
+<div class="main">
+  <div class="topbar">
+    <span class="path"><b>连接</b> / 新建会话</span>
+    <span class="right">
+      <button class="ghost" type="button" disabled>导入配置</button>
+      <button class="ghost" type="button" disabled>导出</button>
+    </span>
+  </div>
+
+  <div class="content">
+    <section class="panel" id="conn">
+      <div class="panel-h">连接配置 <span class="tag">主</span></div>
+      <div class="panel-b">
+        <div class="form">
+          <div class="field"><span>服务器地址</span><input id="host" placeholder="1.2.3.4 或 vpn.example.com" /></div>
+          <div class="field"><span>UDP 端口</span><input id="port" type="number" min="1" max="65535" value="4460" /></div>
+          <div class="field"><span>预共享密钥</span>
+            <div class="row">
+              <input id="key" type="password" maxlength="32" spellcheck="false" placeholder="32 位十六进制" autocomplete="off" />
+              <button class="ghost" id="keyToggle" type="button">显示</button>
+            </div>
+          </div>
+          <div class="field"><span>本地监听</span><input id="listen" value="127.0.0.1" /></div>
+          <div class="field"><span>本地端口</span><input id="listenPort" type="number" min="1" max="65535" value="1080" /></div>
+          <div class="field"><span>MTU</span><input id="mtu" type="number" min="576" max="9000" value="1400" /></div>
+          <div class="field"><span>FEC 冗余上限</span><input id="budget" type="number" step="0.05" min="0" max="1" value="0.5" /></div>
+          <div class="field"><span>固定 k</span><input id="k" type="number" min="-1" max="7" value="-1" /></div>
+        </div>
+        <label class="check"><input id="remember" type="checkbox" checked /> 记住设置（密钥以明文保存在本机，按需勾选）</label>
+        <div class="actions">
+          <button id="start" class="primary" type="button">启动代理</button>
+          <button id="stop" type="button" disabled>停止</button>
+          <span id="hint"></span>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="status">
+      <div class="panel-h">运行指标 <span class="tag">实时</span></div>
+      <div class="panel-b">
+        <table class="stats">
+          <tr><td>运行时长</td><td class="val" id="m-t">--</td><td class="bar"></td></tr>
+          <tr><td>活动会话</td><td class="val" id="m-live">0</td><td class="bar"><div class="bar-track"><div class="bar-fill" id="bar-live"></div></div></td></tr>
+          <tr><td>已建立</td><td class="val" id="m-est">0</td><td class="bar"></td></tr>
+          <tr><td>隧道</td><td class="val" id="m-tun">0</td><td class="bar"><div class="bar-track"><div class="bar-fill" id="bar-tun"></div></div></td></tr>
+          <tr><td>上行</td><td class="val" id="m-tx">0 B</td><td class="bar"></td></tr>
+          <tr><td>下行</td><td class="val" id="m-rx">0 B</td><td class="bar"><div class="bar-track"><div class="bar-fill" id="bar-rx"></div></div></td></tr>
+        </table>
+        <div id="diag"></div>
+      </div>
+    </section>
+
+    <section class="panel" id="log-panel">
+      <div class="panel-h">实时日志 <span class="tag">stdout/stderr</span>
+        <button class="ghost right" id="clear" type="button">清空</button>
+      </div>
+      <pre id="log" class="term"></pre>
+    </section>
+  </div>
+</div>
+
+<script src="tokens.js"></script>
+<script>
+  // 本方案特有的小装饰：进度条 + 侧栏文案，全部挂在公共事件上。
+  document.addEventListener("DOMContentLoaded", () => {
+    const cap = (v, max) => Math.max(0, Math.min(100, (Number(v || 0) / max) * 100)) + "%";
+    document.addEventListener("fcp:stats", (e) => {
+      const s = e.detail;
+      const live = Number(s.live || 0), tun = Number(s.tunnels || 0);
+      const rx = Number(s.rx || 0);
+      document.getElementById("bar-live").style.width = cap(live, 32);
+      document.getElementById("bar-tun").style.width = cap(tun, 500);
+      document.getElementById("bar-rx").style.width = cap(rx % (1 << 20), 1 << 20);
+      document.getElementById("uptime").textContent = s.t >= 3600
+        ? new Date(s.t * 1000).toISOString().slice(11, 19)
+        : String(Math.floor(s.t / 60)).padStart(2, "0") + ":" + String(Math.floor(s.t % 60)).padStart(2, "0");
+    });
+    document.addEventListener("fcp:state", (e) => {
+      document.getElementById("side-text").textContent = e.detail.running ? "运行中" : "未启动";
+    });
+    const listen = document.getElementById("listen"), lp = document.getElementById("listenPort");
+    const sync = () => {
+      const a = listen.value.trim() || "127.0.0.1", b = lp.value || "1080";
+      document.getElementById("s-socks").textContent = a + ":" + b;
+      document.getElementById("s-http").textContent = a + ":" + b;
+    };
+    listen.addEventListener("input", sync);
+    lp.addEventListener("input", sync);
+    sync();
+  });
+</script>
+<script src="app.js"></script>
+</body>
+</html>

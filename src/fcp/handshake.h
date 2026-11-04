@@ -45,7 +45,13 @@ constexpr uint8_t kCapFraming = 1u << 0;   // required
 constexpr uint8_t kCapFecstat = 1u << 1;   // required
 constexpr uint8_t kCapPerSetK = 1u << 2;   // optional
 constexpr uint8_t kCapDeadline = 1u << 3;  // optional, M2
-constexpr uint8_t kCapKnownMask = 0x0F;    // bits 4..7 must be zero
+// PMTUD (pmtu.h): the peer may send path-MTU probes and expects acks. The
+// flag is only advertised when the session is configured for it; a peer that
+// does not know the bit rejects the caps (reserved bits are a hard gate), so
+// this release requires both ends to be updated -- the same policy as the v7
+// handshake magic (#31).
+constexpr uint8_t kCapPmtud = 1u << 4;     // optional, M2
+constexpr uint8_t kCapKnownMask = 0x1F;    // bits 5..7 must be zero
 
 // M1 advertises framing + FECSTAT + per-set k.
 constexpr uint8_t kLocalFlagsM1 = kCapFraming | kCapFecstat | kCapPerSetK;

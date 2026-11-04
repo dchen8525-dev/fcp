@@ -489,6 +489,28 @@ void TestCapacityEviction() {
   CHECK(f.rx.view(256, &v));
 }
 
+// kMaxActiveSets bounds the set count, not their bytes: D+P MTU-sized symbols
+// per set means an authenticated peer could pin ~85 MB with 256 incomplete
+// sets. The session-wide symbol budget caps that; past it symbols are dropped
+// (ARQ recovers them) and counted.
+void TestSymbolBudgetBoundsMemory() {
+  Fixture f(200, 0);
+  std::vector<uint8_t> symbol(1332, 0x5A);
+  symbol[0] = static_cast<uint8_t>(symbol.size() & 0xFF);
+  symbol[1] = static_cast<uint8_t>(symbol.size() >> 8);
+  uint32_t sid = 0;
+  uint8_t index = 0;
+  for (uint32_t i = 0; i < 50000 && f.rx.symbol_budget_drops() == 0; ++i) {
+    f.feed(sid, index, fcp::pack_type_k(0, 0, 0), symbol, 1000);
+    if (++index == 200) {
+      index = 0;
+      ++sid;
+    }
+  }
+  CHECK(f.rx.symbol_budget_drops() > 0);
+  CHECK(f.rx.active_sets() <= fcp::kMaxActiveSets);
+}
+
 // A synchronous host delivers re-entrantly from inside the deliver callback.
 // With the table full, the eviction path used to pick the lowest id — which
 // could be the very set whose symbol was still on the stack — freeing the
@@ -820,6 +842,7 @@ int main() {
   TestStaleAnchor();
   TestMalformedDoesNotMoveAnchor();
   TestCapacityEviction();
+  TestSymbolBudgetBoundsMemory();
   TestReentrantDeliveryCannotEvictTheCurrentSet();
   TestZeroK();
   TestDupAfterRecovered();

@@ -55,18 +55,25 @@ void encode_fecstat(const FecstatPacket& packet, uint8_t out[kFecstatLen]) {
 
 FecstatStatus decode_fecstat(const uint8_t* in, size_t len, const uint8_t salt[8],
                              FecstatPacket* out) {
-  if (in == nullptr || out == nullptr || len != kFecstatLen) {
+  if (in == nullptr || out == nullptr || len < offsetof(FecstatPacket, ver) + 1) {
     return FecstatStatus::kBadLength;
   }
   if (std::memcmp(in, kFecstatMagic, sizeof(kFecstatMagic)) != 0) {
     return FecstatStatus::kBadMagic;
   }
+  // Version before the exact-length check: a peer speaking a newer revision with
+  // a longer body is an unsupported version, not a malformed packet. Classifying
+  // it as bad_length hid a protocol-revision mismatch in the counters and sent
+  // operators hunting for corruption.
+  if (in[offsetof(FecstatPacket, ver)] != kFecstatVersion) {
+    return FecstatStatus::kBadVer;
+  }
+  if (len != kFecstatLen) {
+    return FecstatStatus::kBadLength;
+  }
   if (std::memcmp(in + offsetof(FecstatPacket, session_salt), salt,
                   sizeof(out->session_salt)) != 0) {
     return FecstatStatus::kBadSalt;
-  }
-  if (in[offsetof(FecstatPacket, ver)] != kFecstatVersion) {
-    return FecstatStatus::kBadVer;
   }
 
   FecstatPacket packet{};

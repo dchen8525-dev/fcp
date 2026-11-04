@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>FCP · 浅色 1 靛蓝柔和</title>
+<style>
+  :root{
+    --bg:#f6f7fb;
+    --surface:#ffffff;
+    --surface-2:#f8f9fc;
+    --line:#e8ebf2;
+    --line-2:#f0f2f7;
+    --fg:#1a1f2b;
+    --fg-2:#3d4557;
+    --muted:#6b7280;
+    --muted-2:#9aa3b2;
+    --accent:#4f46e5;
+    --accent-2:#6366f1;
+    --accent-soft:#eef0ff;
+    --ok:#0ea472;
+    --ok-soft:#e7f7f0;
+    --warn:#b45309;
+    --warn-soft:#fff6e8;
+    --err:#d92d20;
+    --r:18px;
+    --shadow:0 1px 2px #1018280a, 0 12px 32px -16px #1018281f;
+    --mono:ui-monospace,"Cascadia Mono","JetBrains Mono",Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    background:radial-gradient(1200px 500px at 15% -10%, #eceeff 0%, transparent 60%), var(--bg);
+    color:var(--fg);
+    font:14px/1.5 system-ui,-apple-system,"Segoe UI","Noto Sans SC","Microsoft YaHei UI",sans-serif;
+    display:flex;flex-direction:column;padding:0 26px 24px;
+    user-select:none;-webkit-user-select:none;-webkit-font-smoothing:antialiased;
+  }
+
+  /* ---------- 顶栏 ---------- */
+  .bar{display:flex;align-items:center;gap:12px;height:72px;flex:0 0 auto}
+  .brand{display:flex;align-items:center;gap:12px}
+  [data-mark]{width:36px;height:36px;display:block;flex:0 0 auto;border-radius:11px;box-shadow:0 6px 16px -8px #1a1f2b66}
+  .mark-bg{fill:#1a1f2b}
+  .mark-f{fill:#fff}
+  .mark-dot{fill:#8c8cff}
+  .brand b{font-size:16px;letter-spacing:.02em}
+  .brand small{display:block;font-size:12px;color:var(--muted);margin-top:1px}
+  .bar .spacer{flex:1}
+  .pill{
+    display:flex;align-items:center;gap:9px;height:36px;padding:0 16px;border-radius:999px;
+    background:var(--surface);border:1px solid var(--line);box-shadow:0 1px 2px #10182808;
+    font-size:12.5px;color:var(--muted);
+  }
+  .pill time{font:13px var(--mono);font-variant-numeric:tabular-nums;color:var(--fg);font-weight:600;min-width:44px;text-align:right}
+  .dot{width:8px;height:8px;border-radius:50%;background:#c5cbd6;transition:.25s}
+  .dot.on{background:var(--ok);box-shadow:0 0 0 4px #0ea4721f}
+  .dot.bad{background:var(--err);box-shadow:0 0 0 4px #d92d201f}
+
+  /* ---------- 布局 ---------- */
+  main{
+    flex:1;min-height:0;display:grid;gap:18px;
+    grid-template-columns:minmax(0,1.15fr) minmax(330px,.85fr);
+    grid-template-rows:auto minmax(150px,1fr);
+    grid-template-areas:"conn status" "log log";
+    max-width:1320px;width:100%;margin:0 auto;
+  }
+  .conn{grid-area:conn} .side{grid-area:status} .card.log{grid-area:log}
+
+  .card{
+    background:var(--surface);border:1px solid var(--line);border-radius:var(--r);
+    box-shadow:var(--shadow);padding:26px 28px;min-height:0;display:flex;flex-direction:column;
+    position:relative;
+  }
+  h2{
+    margin:0 0 20px;font-size:15px;font-weight:650;color:var(--fg);
+    display:flex;align-items:center;gap:10px;
+  }
+  h2 small{font-size:12.5px;font-weight:400;color:var(--muted)}
+  .card.log h2{margin-bottom:12px}
+
+  /* ---------- 表单：4 项，大而舒展 ---------- */
+  .field-list{display:flex;flex-direction:column;gap:16px}
+  .field{display:flex;flex-direction:column;gap:7px}
+  .field > .lbl{font-size:12.5px;font-weight:550;color:var(--fg-2);display:flex;align-items:center;gap:8px}
+  .field > .lbl em{font-style:normal;font-weight:400;color:var(--muted);font-size:11.5px}
+  .field .hintline{font-size:11.5px;color:var(--muted-2);margin-top:-2px}
+  .field.dual{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .field.dual > div{display:flex;flex-direction:column;gap:7px}
+
+  .input-wrap{position:relative;display:flex;align-items:center}
+  input{
+    width:100%;height:46px;background:var(--surface-2);color:var(--fg);
+    border:1px solid var(--line);border-radius:12px;padding:0 14px;
+    font:inherit;font-size:14px;font-weight:450;outline:none;transition:.16s;
+    user-select:text;-webkit-user-select:text;
+  }
+  input:hover:not(:disabled){border-color:#d5dae4;background:#fff}
+  input:focus{background:#fff;border-color:var(--accent);box-shadow:0 0 0 4px #4f46e514}
+  input:disabled{opacity:.6;background:#f4f5f9}
+  input::placeholder{color:#aab1bf;font-weight:400}
+  .input-wrap input.has-trail{padding-right:92px}
+  .trail{position:absolute;right:6px;display:flex;align-items:center;gap:4px}
+  .key-state{font-size:11.5px;color:var(--muted-2);font-variant-numeric:tabular-nums;padding:0 4px}
+  .key-state.ok{color:var(--ok)}
+  .key-state.bad{color:var(--err)}
+
+  button{
+    font:inherit;cursor:pointer;border-radius:11px;transition:.16s;border:1px solid var(--line);
+    background:var(--surface);color:var(--fg-2);padding:0 16px;height:42px;font-size:13.5px;font-weight:550;
+  }
+  button:hover:not(:disabled){border-color:#cdd3de;color:var(--fg);background:#fafbfd}
+  button:disabled{opacity:.45;cursor:default}
+  button.primary{
+    height:48px;padding:0 28px;font-size:14.5px;font-weight:600;color:#fff;
+    background:linear-gradient(180deg,#5b55ea,var(--accent));border-color:transparent;
+    box-shadow:0 10px 22px -12px #4f46e5e6, inset 0 1px 0 #ffffff2e;
+  }
+  button.primary:hover:not(:disabled){background:linear-gradient(180deg,#615cf0,#4740d6);color:#fff}
+  button.ghost{height:32px;padding:0 11px;font-size:12px;color:var(--fg-2);background:#fff}
+  button.icon{padding:0;width:34px;height:34px;display:grid;place-items:center;font-size:14px;color:var(--muted)}
+  button.right{margin-left:auto;height:32px;padding:0 12px;font-size:12px}
+
+  .actions{display:flex;align-items:center;gap:12px;margin-top:20px}
+  .actions .status-line{font-size:12.5px;color:var(--muted);margin-left:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .actions .status-line.error{color:var(--err)}
+
+  /* 「高级」折叠区 */
+  .adv-toggle{
+    display:flex;align-items:center;gap:8px;margin-top:22px;padding:12px 0 0;border-top:1px solid var(--line-2);
+    color:var(--muted);font-size:12.5px;background:transparent;border-left:0;border-right:0;border-bottom:0;
+    height:auto;border-radius:0;width:100%;justify-content:flex-start;font-weight:500;
+  }
+  .adv-toggle:hover:not(:disabled){color:var(--accent);background:transparent;border-color:var(--line-2)}
+  .adv-toggle .chev{transition:transform .2s;font-size:10px;color:var(--muted-2)}
+  .adv-toggle[aria-expanded="true"] .chev{transform:rotate(90deg)}
+  .adv-toggle .defaults{margin-left:auto;font-size:11.5px;color:var(--muted-2);font-weight:400}
+  .adv-body{
+    margin-top:14px;padding:16px 16px 4px;border-radius:14px;background:var(--surface-2);
+    border:1px dashed #dfe3ec;display:grid;grid-template-columns:1fr 1fr;gap:14px 16px;
+  }
+  .adv-body[hidden]{display:none}
+  .adv-body .field > .lbl{font-size:12px}
+  .adv-body input{height:38px;font-size:13px;background:#fff}
+  .adv-body .full{grid-column:1/-1}
+  .adv-note{grid-column:1/-1;font-size:11.5px;color:var(--muted-2);margin:0 0 4px}
+
+  .check{display:flex;align-items:center;gap:9px;margin-top:16px;font-size:12.5px;color:var(--muted);font-weight:400}
+  .check input{width:16px;height:16px;padding:0;accent-color:var(--accent)}
+
+  /* ---------- 状态卡 ---------- */
+  .status-card{padding:20px 22px}
+  .big{display:flex;align-items:baseline;gap:10px;margin:-4px 0 16px}
+  .big b{font-size:34px;font-weight:650;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+  .big span{font-size:13px;color:var(--muted)}
+  .mini-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px 18px}
+  .mini{display:flex;align-items:baseline;justify-content:space-between;gap:8px;padding:5px 0;border-bottom:1px dashed var(--line-2)}
+  .mini .cap{font-size:12px;color:var(--muted)}
+  .mini b{font-size:13.5px;font-weight:600;font-variant-numeric:tabular-nums}
+  #diag{display:flex;flex-wrap:wrap;gap:6px;margin-top:14px}
+  #diag[hidden]{display:none}
+  #diag .metric{
+    display:flex;gap:7px;align-items:baseline;padding:4px 10px;border-radius:8px;
+    background:var(--warn-soft);color:var(--warn);font-size:11.5px;border:1px solid #f7e2c2;
+  }
+  #diag .metric .cap{color:#b8762a}
+  #diag .metric b{font-weight:600}
+
+  /* ---------- 日志 ---------- */
+  .card.log{flex:1 1 auto;min-height:150px}
+  /* 运行时只留一个主操作：启动 -> 停止 */
+  body.is-running #start{display:none}
+  body.is-running #stop{
+    height:48px;padding:0 28px;font-size:14.5px;font-weight:600;color:#fff;
+    background:linear-gradient(180deg,#3c4353,#272c38);border-color:transparent;
+    box-shadow:0 10px 22px -14px #1a1f2bcc;
+  }
+  body.is-running #stop:hover{background:linear-gradient(180deg,#454c5d,#2d3340);color:#fff}
+
+  /* 空态引导：没运行时状态区写明下一步 */
+  .idle-note{
+    margin-top:16px;padding:12px 14px;border-radius:12px;background:var(--surface-2);
+    border:1px dashed #dfe3ec;font-size:12.5px;color:var(--muted);line-height:1.7;
+  }
+  .idle-note code{
+    font:12px var(--mono);background:var(--accent-soft);color:#3b34c4;
+    padding:1px 6px;border-radius:5px;
+  }
+  body.is-running .idle-note{display:none}
+  .log pre{
+    flex:1;min-height:0;margin:0;overflow:auto;background:var(--surface-2);
+    border:1px solid var(--line-2);border-radius:12px;padding:12px 14px;
+    font:12px/1.6 var(--mono);white-space:pre-wrap;word-break:break-all;color:#57627a;
+    user-select:text;-webkit-user-select:text;
+  }
+  .log pre::-webkit-scrollbar{width:10px}
+  .log pre::-webkit-scrollbar-thumb{background:#dde1ea;border-radius:10px;border:2px solid var(--surface-2)}
+  .log .err{color:var(--warn)}
+  .log .out{color:#7a8598}
+
+  @media (max-width:980px){
+    main{grid-template-columns:1fr;grid-template-rows:auto auto minmax(160px,1fr);grid-template-areas:"conn" "side" "side"}
+  }
+</style>
+</head>
+<body>
+<header class="bar">
+  <div class="brand">
+    <span data-mark></span>
+    <div><b>FCP</b><small>可靠传输客户端</small></div>
+  </div>
+  <div class="spacer"></div>
+  <div class="pill">
+    <span class="dot" id="dot"></span>
+    <span id="state-text">未连接</span>
+    <time id="uptime">--</time>
+  </div>
+</header>
+
+<main>
+  <section class="card conn">
+    <h2>连接</h2>
+
+    <div class="field-list">
+      <div class="field">
+        <span class="lbl">服务器地址</span>
+        <div class="input-wrap"><input id="host" placeholder="1.2.3.4 或 vpn.example.com" autocomplete="off" spellcheck="false" /></div>
+      </div>
+
+      <div class="field dual">
+        <div>
+          <span class="lbl">UDP 端口</span>
+          <div class="input-wrap"><input id="port" type="number" min="1" max="65535" value="4460" /></div>
+        </div>
+        <div>
+          <span class="lbl">本地代理端口 <em>SOCKS5 / HTTP</em></span>
+          <div class="input-wrap"><input id="listenPort" type="number" min="1" max="65535" value="1080" /></div>
+        </div>
+      </div>
+
+      <div class="field">
+        <span class="lbl">预共享密钥 <em>32 位十六进制</em></span>
+        <div class="input-wrap">
+          <input id="key" class="has-trail" type="password" maxlength="32" spellcheck="false" placeholder="与服务端一致" autocomplete="off" />
+          <span class="trail">
+            <span class="key-state" id="keyState"></span>
+            <button class="icon" id="keyToggle" type="button" title="显示 / 隐藏">👁</button>
+          </span>
+        </div>
+      </div>
+    </div>
+
+    <label class="check"><input id="remember" type="checkbox" checked /> 记住设置</label>
+
+    <button class="adv-toggle" id="advToggle" type="button" aria-expanded="false" aria-controls="advBody">
+      <span class="chev">▶</span><span data-label>高级设置</span>
+      <span class="defaults">MTU 1400 · FEC 0.5 · k 自适应 · 127.0.0.1</span>
+    </button>
+    <div class="adv-body" id="advBody" hidden>
+      <div class="field"><span class="lbl">本地监听地址</span><input id="listen" value="127.0.0.1" /></div>
+      <div class="field"><span class="lbl">MTU</span><input id="mtu" type="number" min="576" max="9000" value="1400" /></div>
+      <div class="field"><span class="lbl">FEC 冗余上限 <em>0–1</em></span><input id="budget" type="number" step="0.05" min="0" max="1" value="0.5" /></div>
+      <div class="field"><span class="lbl">固定 k <em>-1 = 自适应</em></span><input id="k" type="number" min="-1" max="7" value="-1" /></div>
+      <p class="adv-note">不展开时使用上面的默认值，效果与显式填写相同。</p>
+    </div>
+
+    <div class="actions">
+      <button id="start" class="primary" type="button">启动代理</button>
+      <button id="stop" type="button" disabled>停止</button>
+      <span id="hint" class="status-line"></span>
+    </div>
+  </section>
+
+  <section class="card status-card side">
+    <h2>运行状态</h2>
+    <div class="big"><b id="m-live">0</b><span>个活动会话</span></div>
+    <div class="mini-grid">
+      <div class="mini"><span class="cap">已建立</span><b id="m-est">0</b></div>
+      <div class="mini"><span class="cap">隧道</span><b id="m-tun">0</b></div>
+      <div class="mini"><span class="cap">上行</span><b id="m-tx">0 B</b></div>
+      <div class="mini"><span class="cap">下行</span><b id="m-rx">0 B</b></div>
+      <div class="mini"><span class="cap">采样</span><b id="m-t">--</b></div>
+      <div class="mini"><span class="cap">传输</span><b>UDP / FEC</b></div>
+    </div>
+    <div class="idle-note">填好服务器和密钥后点「启动代理」，再把系统的 SOCKS5 / HTTP 代理指向 <code>127.0.0.1:1080</code>。</div>
+    <div id="diag" hidden></div>
+  </section>
+
+  <section class="card log">
+    <h2>日志 <button class="ghost right" id="clear" type="button">清空</button></h2>
+    <pre id="log"></pre>
+  </section>
+</main>
+
+<script src="tokens.js"></script>
+<script src="app-light.js"></script>
+<script>
+  document.addEventListener("fcp:state", (e) => {
+    const t = document.getElementById("state-text");
+    if (t) t.textContent = e.detail.running ? "已连接" : "未连接";
+  });
+</script>
+</body>
+</html>

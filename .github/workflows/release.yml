@@ -308,7 +308,7 @@ jobs:
             $j | ConvertTo-Json -Depth 20 | Set-Content $p -Encoding utf8
           }
 
-      # sidecar 准备 + tauri build + 7zSD 单文件都在脚本里。
+      # sidecar 准备 + tauri build + 引导器单文件都在脚本里。
       - name: 构建 + 单文件便携 exe
         shell: pwsh
         run: |
@@ -316,13 +316,23 @@ jobs:
             -ProxyBin build\release-win\apps\cli\Release\fcp-client.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      # 无头环境无法启动 WebView GUI；这里验证 sidecar 可执行、产物已生成。
-      - name: 冒烟（sidecar --version + 产物存在）
+      # 无头环境无法启动 WebView GUI；这里验证引导器能把载荷解到缓存、
+      # sidecar 可执行、产物已生成。
+      - name: 冒烟（引导器自检 + sidecar --version）
         shell: pwsh
         run: |
           $exe = Get-ChildItem dist\FCP-*-win64.exe | Select-Object -First 1
           if (!$exe) { throw "没找到单文件便携 exe" }
           Write-Host "产物：$($exe.FullName) ($([math]::Round($exe.Length / 1MB, 1)) MiB)"
+          $proc = Start-Process -FilePath $exe.FullName `
+            -ArgumentList "--fcp-launcher-selftest" -Wait -PassThru
+          if ($proc.ExitCode -ne 0) { throw "引导器自检退出码 $($proc.ExitCode)" }
+          $report = Join-Path $env:LOCALAPPDATA "FCP\selftest.txt"
+          if (!(Test-Path $report)) { throw "自检没有写 $report" }
+          Get-Content $report
+          $cached = Get-ChildItem (Join-Path $env:LOCALAPPDATA "FCP\bin") -Directory |
+                    Where-Object { Test-Path (Join-Path $_.FullName "FCP.exe") }
+          if (!$cached) { throw "缓存里没有 FCP.exe" }
           & build\release-win\apps\cli\Release\fcp-client.exe --version
           if ($LASTEXITCODE -ne 0) { throw "sidecar --version 退出码 $LASTEXITCODE" }
 

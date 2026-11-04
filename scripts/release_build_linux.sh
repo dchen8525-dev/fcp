@@ -91,7 +91,9 @@ python3 "$ROOT/scripts/build_deb.py" \
 # 顶成了第二段落，`dpkg -i` 报 "missing 'Package' field"。
 # dpkg-deb --info 会把这种包照样打印出来（不报错），所以这里必须自己看结构。
 # build_deb.py 已经查过一遍；这里用 dpkg-deb 复核，确认包是 dpkg 眼里的合法 deb。
-deb="$(ls "$BUILD_DIR"/packages/*.deb)"
+# 取**最新**的那个：同一个 build 目录里升级版本号重跑时，旧的 fcp_<旧版本>.deb
+# 还在，通配符会展开成两个路径，dpkg-deb 直接把两个参数当非法调用而失败。
+deb="$(ls -t "$BUILD_DIR"/packages/*.deb | head -n1)"
 if command -v dpkg-deb >/dev/null; then
   control_file="$BUILD_DIR/packages/control.txt"
   dpkg-deb --ctrl-tarfile "$deb" | tar -xO ./control > "$control_file"

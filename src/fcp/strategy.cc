@@ -114,9 +114,8 @@ void FecStrategy::on_report(const FecstatPacket& stat, bool window_queued) {
   last_set_id_ = stat.accounted_through_set_id;
 
   // Sample gate 1: a group whose k never arrived cannot be accounted (§5.2).
-  // 阈值与 FcpSettle::untrusted()、session 日志门共用 kUntrustedKUnknownPct。
-  const uint64_t sets = std::max<uint32_t>(1, stat.sets_expected);
-  if (static_cast<uint64_t>(stat.sets_k_unknown) * 100 > sets * kUntrustedKUnknownPct) {
+  // 阈值与 FcpSettle::untrusted()、session 日志门共用同一个谓词。
+  if (k_unknown_untrusted(stat.sets_expected, stat.sets_k_unknown)) {
     ++untrusted_reports_;
     return;
   }

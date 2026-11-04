@@ -27,6 +27,7 @@
 #include <string>
 #include <vector>
 
+#include "fcp/bbr.h"
 #include "fcp/defaults.h"
 
 namespace fcp {
@@ -46,6 +47,35 @@ constexpr uint8_t kStreamFlagFin = 1u << 0;
 // the SACK-fill bookkeeping. The receiver rotates the single SACK block per
 // dup-ACK so every buffered hole gets reported within a few duplicates.
 constexpr uint32_t kDupAckThresh = 3;
+
+// Bound on the *number* of chunks in the out-of-order buffer, not just their
+// bytes. A chunk costs ~32 B of bookkeeping whatever it carries, so a peer that
+// fills the receive window with 1-byte segments would otherwise turn a 1 MiB
+// window into tens of MB (and one sort+rebuild per packet once the arrival
+// order dips behind the tail). One chunk per 512 bytes of capacity leaves the
+// legitimate case -- segments of ~1.3 KiB, so ~800 chunks in 1 MiB -- untouched.
+constexpr size_t kMinOobChunks = 1024;
+constexpr size_t kMaxOobChunks = 8192;
+
+// How long the historical min RTT stays valid. Mirrors Bbr's
+// min_rtt_expiry_ms: after a route change the path is slower, and a floor that
+// never rises turns every epoch into a standing queue (the delay brake reads
+// epoch_min - min as queueing) so the window brakes forever.
+constexpr int64_t kMinRttExpiryMs = 10000;
+
+// Delayed-ACK deadline for a coalesced ACK (StreamConfig::ack_every > 1). A
+// single-segment request must not wait for the reactor's 25 ms tick -- that
+// would add a tick of latency to every short exchange -- so the pending ACK
+// carries its own deadline and the host wakes for it (next_wake_ms). 4 ms keeps
+// the coalescing effective on a burst while staying well under the tick.
+constexpr int64_t kAckDelayMs = 4;
+
+// Largest slice of the pacing rate the token bucket may bank. It used to be one
+// reactor tick (30 ms), which turned the pacer into a burst emitter: at 20 Mbps
+// every tick released ~62 KB back-to-back, exactly the micro-burst a shallow
+// queue drops. With next_wake_ms() the host can wake mid-tick, so the allowance
+// only has to cover scheduling jitter, not a whole tick.
+constexpr double kPaceBurstMs = 6.0;
 
 constexpr uint8_t kStreamRstAbort = 1;
 
@@ -111,6 +141,35 @@ struct StreamConfig {
   bool auto_window = false;
   size_t window_min_bytes = kDefaultWindowMinBytes;
   size_t window_max_bytes = kDefaultWindowMaxBytes;
+  // Auto mode with BBR: let the ceiling follow the measured BDP instead of
+  // stopping at the configured window_max_bytes (which is then only the floor
+  // of the ceiling). A 1 MiB ceiling holds a 200 ms path to 40 Mbps however
+  // good the controller is, so a session that keeps proving a larger BDP is
+  // allowed to grow to this bound. 0 keeps the ceiling fixed (the old
+  // behaviour); the engine derives a value from the operator's configuration.
+  size_t window_ceiling_bytes = 0;
+  // Emit one ACK per this many in-order data segments while the receive buffer
+  // has no hole; out-of-order bytes, a fin and a closed window still ACK
+  // immediately (the peer is waiting on those), and a pending ACK is flushed
+  // after kAckDelayMs. 1 = one ACK per segment (the old behaviour, kept as the
+  // unit-test default so the protocol tests stay bit-precise).
+  uint8_t ack_every = 1;
+  // Congestion controller for auto mode. BBR (bbr.h) is the default: it
+  // derives the window from a delivery-rate estimate and paces the stream, so
+  // loss is answered with retransmission rather than with a window cut. The
+  // epoch controller (auto_window + slow start / AIMD / window_probe) remains
+  // available with --no-bbr for comparison and for pinned regression tests.
+  bool bbr = true;
+  // BBR generation: 1 = BBRv1 (loss only stops a probe), 2 = BBRv2 (learns
+  // inflight_hi/inflight_lo from the stream-level loss residue). Default 2.
+  int bbr_version = 2;
+  // Rate probe for the *epoch* controller only (auto mode, no BBR). A
+  // stream-level hole on a FEC-protected path is not clean congestion evidence:
+  // the parity already absorbed what it could, so the residue is a mix of
+  // contention and random loss. When a lossy epoch still delivered data, has
+  // no standing-queue evidence, and its delivery rate is still rising, the
+  // window grows 25% instead of cutting. Ignored when `bbr` is on.
+  bool window_probe = true;
   // Standing-queue allowance: an epoch whose minimum RTT is this far above the
   // historical minimum holds the window; two consecutive epochs at twice this
   // shrink it. Sized against Session's §8 guardrail (kQueueGuardrailGapMs
@@ -118,6 +177,13 @@ struct StreamConfig {
   // controllers do not fight. 0 disables the delay brake.
   int64_t window_queue_ms = kQueueGuardrailGapMs / 2;
   int64_t initial_srtt_ms = kDefaultSrttMs;
+  // Prewarm priors for the controller (BBR only): the previous session's
+  // delivery rate and minimum RTT. They let a new connection start at the
+  // operating point the link already proved instead of re-running slow start
+  // from the default window -- the per-connection cold start is what makes a
+  // page of short-lived TCP connections feel slow. 0 = no prior.
+  uint64_t initial_bw_bps = 0;
+  int64_t initial_min_rtt_ms = 0;
   int64_t rto_min_ms = 100;
   int64_t rto_max_ms = 5000;
   // Teardown after this long with no inbound segment. Own traffic does not
@@ -139,6 +205,10 @@ class Stream {
   // not. A proxy maps this to shutdown(local, SHUT_WR) and keeps flushing.
   using EofFn = std::function<void()>;
   // Full teardown: nothing left in either direction, or a reset/idle timeout.
+  // Fired at most once, from inside a send_/read_/tick path. Contract: this
+  // callback may record the teardown, but must not destroy the Stream -- the
+  // caller is still on its stack and checks state_ afterwards. Destroy the
+  // Stream only from the host's own loop, outside any Stream call.
   using ClosedFn = std::function<void(CloseReason)>;
   // Smoothed RTT in ms; the host forwards it to Session::on_rtt_sample() so the
   // settlement guards (§5) and the queue guardrail (§8) see a real RTT.
@@ -162,6 +232,16 @@ class Stream {
   // Timer pump. 5-25ms is enough; it drives retransmit, zero-window probes,
   // fin completion and the idle clock.
   void on_tick(int64_t now_ms);
+  // Earliest time this stream wants the host to call on_tick() again: the
+  // coalesced ACK's deadline, or the moment the pacing token bucket has banked
+  // enough for the next segment. 0 = nothing pending (the host's own tick is
+  // enough). The reactor folds this into its select() timeout, which is what
+  // lets the pacer work at a finer granularity than the 25 ms tick.
+  int64_t next_wake_ms(int64_t now_ms) const;
+  // PMTUD raised the session's payload size. Growth only: bytes already queued
+  // were cut at the old segment size, and shrinking would strand segments the
+  // path can still carry. The next pump() simply cuts larger ones.
+  void set_max_segment(size_t bytes);
 
   StreamState state() const { return state_; }
   CloseReason reason() const { return reason_; }
@@ -170,6 +250,12 @@ class Stream {
   // Tests only: pins the send-side offsets so the 4 GiB wrap of the byte
   // numbering (seq.h) can be exercised without pushing gigabytes. Caller owns
   // the state invariant (both queues empty; call before write()/close()).
+  // Tests only: drive the RTT estimator directly, so the expiry of the
+  // historical min RTT can be exercised without waiting kMinRttExpiryMs.
+  void test_update_rtt(int64_t sample_ms, int64_t now_ms) {
+    update_srtt(sample_ms, now_ms);
+  }
+
   void test_set_send_offsets(uint32_t snd_nxt, uint32_t snd_una, uint32_t snd_max) {
     snd_nxt_ = snd_nxt;
     snd_una_ = snd_una;
@@ -189,6 +275,10 @@ class Stream {
   uint64_t bytes_acked() const { return bytes_acked_; }
   uint64_t bytes_delivered() const { return bytes_delivered_; }
   uint64_t retransmits() const { return retransmits_; }
+  uint64_t retx_fast() const { return retx_fast_; }
+  uint64_t retx_fill() const { return retx_fill_; }
+  uint64_t retx_rto() const { return retx_rto_; }
+  uint64_t fill_passes() const { return fill_passes_; }
   uint64_t dup_bytes() const { return dup_bytes_; }
   uint64_t segs_sent() const { return segs_sent_; }
   // F-3: zero-window probes are real segments on the wire, but they are a
@@ -197,11 +287,23 @@ class Stream {
   uint64_t probes_sent() const { return probes_sent_; }
   uint64_t segs_rx() const { return segs_rx_; }
   uint64_t bad_segs() const { return bad_segs_; }
+  uint64_t oob_drops() const { return oob_drops_; }
+  size_t oob_chunks() const { return oob_.size(); }
   // Current send window (== send_window_bytes when auto_window is off) and the
   // autotune's state, for the teardown diagnostics and the unit tests.
   size_t send_window() const { return send_window_; }
   size_t ssthresh() const { return ssthresh_; }
   size_t loss_floor() const { return loss_floor_; }
+  // BBR diagnostics (auto mode with bbr on).
+  bool using_bbr() const { return cfg_.auto_window && cfg_.bbr; }
+  Bbr::Mode bbr_mode() const { return bbr_.mode(); }
+  uint64_t bbr_bandwidth_bps() const { return bbr_.bandwidth_bps(); }
+  size_t bbr_bdp_bytes() const { return bbr_.bdp_bytes(); }
+  double bbr_pacing_rate_bps() const { return bbr_.pacing_rate_bps(); }
+  double bbr_pacing_gain() const { return bbr_.pacing_gain(); }
+  double bbr_efficiency() const { return bbr_.delivery_efficiency(); }
+  size_t bbr_inflight_hi() const { return bbr_.inflight_hi(); }
+  size_t bbr_inflight_lo() const { return bbr_.inflight_lo(); }
   // Loss attribution for the shrink terms above.
   uint64_t dup_loss_events() const { return dup_loss_events_; }
   uint64_t rto_loss_events() const { return rto_loss_events_; }
@@ -226,7 +328,12 @@ class Stream {
     bool fin = false;
     bool sent = false;
     bool retrans = false;
-    bool sacked = false;  // #27: covered by a SACK block; never a hole
+    // #27: covered by a SACK block; never a hole. The mark is a timestamp, not
+    // a flag, because the evidence has to expire: a receiver cannot retract a
+    // SACK, so one stale block (its out-of-order tail dropped under buffer
+    // pressure, a forged packet, a lost-and-forgotten range) would otherwise
+    // keep these segments out of both the RTO pass and fill_holes forever.
+    int64_t sacked_ms = -1;
     int64_t sent_ms = 0;
     size_t wire_len() const { return bytes.size() + (fin ? 1 : 0); }
   };
@@ -236,7 +343,16 @@ class Stream {
   };
 
   void emit_seg(const PendingSeg& seg);
-  void emit_ack();
+  // `now_ms` stamps the ACK so on_tick can keep the SACK rotation alive while
+  // the receive buffer is stalled and no new data arrives.
+  void emit_ack(int64_t now_ms);
+  // Apply the ACK coalescing policy for one delivered data segment. `urgent`
+  // covers the cases where the peer is provably waiting on this ACK (its fin,
+  // a hole, a closed window).
+  void maybe_ack(int64_t now_ms, bool urgent);
+  // Grow the send ceiling toward twice the BBR-measured BDP, bounded by
+  // cfg_.window_ceiling_bytes. No-op when the ceiling is fixed.
+  void refresh_window_ceiling();
   void emit_rst(uint8_t code);
   void pump(int64_t now_ms);
   void handle_data(const uint8_t* seg, size_t len, int64_t now_ms);
@@ -247,12 +363,24 @@ class Stream {
   void ack_advance_cum(uint32_t cum, int64_t now_ms);
   void ack_fill_sack(uint32_t sack_start, uint32_t sack_end, int64_t now_ms);
   void insert_chunk(uint32_t offset, const uint8_t* data, size_t len);
+  // Bytes this stream may still buffer out of order: the receive capacity minus
+  // the out-of-order buffer *and* what the host has not taken back yet, which
+  // is exactly what rwnd_out() advertises. Counting only the buffer would let
+  // the receiver hold twice the window it promised.
+  size_t oob_room() const;
+  size_t oob_max_chunks() const;
   void deliver_prefix(int64_t now_ms);
   void fill_holes(uint32_t sack_start, int64_t now_ms);
+  // Whether a SACK mark is still recent enough to keep the segment out of the
+  // repair paths. See PendingSeg::sacked_ms for why it cannot be permanent.
+  bool sack_fresh(const PendingSeg& seg, int64_t now_ms) const;
   void retransmit_timeouts(int64_t now_ms);
   void probe_zero_window(int64_t now_ms);
-  void update_srtt(int64_t sample_ms);
+  void update_srtt(int64_t sample_ms, int64_t now_ms);
   void update_window(int64_t now_ms);
+  // Token bucket for BBR pacing. Returns false when this segment must wait for
+  // the next tick; a successful call charges the bytes.
+  bool pace_allow(size_t bytes, int64_t now_ms);
   void finish(int64_t now_ms, CloseReason reason);
   uint32_t cum_out() const;
   size_t rwnd_out() const;
@@ -294,6 +422,7 @@ class Stream {
   bool peer_fin_ = false;
   uint32_t peer_fin_at_ = 0;         // offset where the peer's data ends
   uint32_t sack_filled_up_to_ = 0;   // never re-fill a hole below this
+  int64_t last_ack_ms_ = 0;          // last ACK emitted (out-of-order tick ACK)
   // #27: on repeated ACKs of the same cumulative point (the peer has data we
   // do not), rotate which oob chunk the single SACK block reports, so the
   // sender learns every hole in a few duplicates instead of one per RTT.
@@ -310,6 +439,13 @@ class Stream {
   size_t ssthresh_ = 0;
   size_t window_min_ = 0;
   size_t window_max_ = 0;
+  // Hard bound for the BDP-following ceiling (cfg_.window_ceiling_bytes), or 0
+  // when the ceiling is fixed at the configured window_max_bytes.
+  size_t window_ceiling_ = 0;
+  // ACK coalescing: segments delivered since the last ACK, and whether an ACK
+  // is owed before the next kAckDelayMs deadline (see maybe_ack).
+  uint32_t acks_owed_ = 0;
+  bool ack_pending_ = false;
   // The deepest the loss term alone may take the window: the window the stream
   // started with. A stream-level hole on this stack is not clean congestion
   // evidence -- the FEC layer already absorbed what it could, so the residue is
@@ -325,12 +461,21 @@ class Stream {
   // buffer that is smaller than the window it is allowed to reach.
   size_t rcv_cap_ = 0;
   int64_t min_rtt_ms_ = 0;
+  int64_t min_rtt_stamp_ms_ = 0;  // when min_rtt_ms_ was last refreshed
   int64_t epoch_min_rtt_ms_ = 0;  // lowest sample inside the current epoch
   int epoch_samples_ = 0;         // clean samples inside the current epoch
   size_t last_target_ = 0;        // recovery reference, and the slow-start bound
+  // Delivery rate (bytes/s) at the last probe growth. The next growth has to
+  // beat it by 5%: that is what makes the probe stop at the path's knee.
+  uint64_t probe_rate_bps_ = 0;
   int64_t win_epoch_ms_ = 0;
   uint64_t epoch_acked_ = 0;
   bool loss_epoch_ = false;
+  // True when this epoch's loss evidence was a dup-ACK hole (the peer is still
+  // acknowledging, so data is flowing), as opposed to an RTO blackout. The
+  // rate probe only trusts the former: a timeout is congestion/blackout
+  // evidence and keeps the AIMD cut.
+  bool loss_epoch_dup_ = false;
   // Which loss evidence showed up, counted separately because the two have
   // different remedies and a WAN log line cannot tell them apart afterwards:
   // `dup_loss_events` is a second duplicate-ACK burst with the first repair
@@ -362,15 +507,31 @@ class Stream {
   uint32_t dup_acks_ = 0;
   bool have_cum_ = false;
 
+  // BBR (auto mode when cfg_.bbr): the model, the round boundary used to tell
+  // "a new RTT has started" on a cumulative ACK, and the pacing token bucket.
+  Bbr bbr_;
+  uint32_t bbr_round_end_ = 0;
+  double pace_tokens_ = 0.0;
+  int64_t pace_ms_ = 0;
+
   uint64_t bytes_queued_ = 0;
   uint64_t bytes_acked_ = 0;
   uint64_t bytes_delivered_ = 0;
   uint64_t retransmits_ = 0;
+  // Split for teardown forensics: which path re-sent the bytes.
+  uint64_t retx_fast_ = 0;
+  uint64_t retx_fill_ = 0;
+  uint64_t retx_rto_ = 0;
+  uint64_t fill_passes_ = 0;
   uint64_t dup_bytes_ = 0;
   uint64_t segs_sent_ = 0;
   uint64_t probes_sent_ = 0;
   uint64_t segs_rx_ = 0;
   uint64_t bad_segs_ = 0;
+  // Segments dropped because the out-of-order buffer was at its chunk ceiling.
+  // The sender recovers them by retransmission; the counter makes the path
+  // visible instead of looking like random loss.
+  uint64_t oob_drops_ = 0;
 };
 
 }  // namespace fcp

@@ -63,6 +63,12 @@ struct SessionConfig {
   uint8_t p_max = kDefaultPmax;
   uint16_t mtu = kDefaultMtu;
   size_t ip_hdr_len = kDefaultIpHeaderLen;
+  // PMTUD (pmtu.h): probe upward from `mtu` to at most pmtu_max_mtu. Off by
+  // default at the library level -- tests and embedders get exactly the wire
+  // they asked for -- while the proxy engine turns it on. The capability is
+  // negotiated, so a peer that did not advertise kCapPmtud is never probed.
+  bool pmtud = false;
+  uint16_t pmtu_max_mtu = kDefaultPmtuMaxMtu;
   int pinned_k = -1;  // --fec-parity-pinned; >= 0 bypasses the strategy
   // Link warm-up (M2代理设计.md §5), both optional and both defaulting to
   // the cold M1 behaviour. initial_srtt_ms == 0 keeps the internal 200ms, so
@@ -131,7 +137,9 @@ class Session {
   // Timer pump: handshake retries, T_flush, settlement, FECSTAT cadence.
   void on_tick(int64_t now_ms);
 
-  void on_rtt_sample(int64_t srtt_ms);
+  // `now_ms` drives the expiry of min_srtt_ms_ (0 = caller has no clock, in
+  // which case the baseline simply stays put -- tests only).
+  void on_rtt_sample(int64_t srtt_ms, int64_t now_ms = 0);
 
   // §14.6 (#30): emit the interval's FECSTAT now if it holds anything.
   // Called once at teardown so the peer's controller sees the final stretch
@@ -163,6 +171,19 @@ class Session {
   const MtuLimits& mtu_limits() const { return limits_; }
   bool config_valid() const { return limits_.valid; }
 
+  // PMTUD: the proven send MTU (starts at the configured value, grows when an
+  // ack comes back) and the payload size the stream layer must arm itself
+  // with. The host polls payload_max() and raises the stream when it moves.
+  uint16_t path_mtu() const { return pmtu_mtu_; }
+  size_t payload_max() const { return limits_.payload_max; }
+  // Largest symbol the receive side has proven (the peer's probes, capped by
+  // our own ceiling). Diagnostics and tests: the host never polls this for
+  // sizing, because only the sender learns the bound from the peer's ack.
+  size_t recv_symbol_max() const { return recv_symbol_max_; }
+  uint32_t pmtu_probes_sent() const { return pmtu_probes_sent_; }
+  uint32_t pmtu_probes_acked() const { return pmtu_probes_acked_; }
+  uint32_t pmtu_probes_lost() const { return pmtu_probes_lost_; }
+
   size_t cached_segments() const { return hs_.cached_segments(); }
   int64_t srtt_ms() const { return srtt_ms_; }
 
@@ -181,6 +202,11 @@ class Session {
   uint32_t fecstat_rx() const { return fecstat_rx_; }
   uint32_t last_pre_ppm() const { return last_pre_ppm_; }
   uint32_t last_usable_ppm() const { return last_usable_ppm_; }
+  // Raw loss of our outbound direction as the peer reported it in its last
+  // FECSTAT (expected data symbols and those that never arrived, before FEC
+  // recovery). The proxy aggregates these into loss_out_* on the stats line.
+  uint32_t last_peer_expected() const { return last_peer_expected_; }
+  uint32_t last_peer_lost() const { return last_peer_lost_; }
   // Cumulative received data-symbol payload bytes (wire length minus the
   // envelope/FEC header and the 2-byte symbol length). Benchmarks need this to
   // separate real payload from parity: both datagram types share one wire
@@ -211,6 +237,16 @@ class Session {
   bool on_wire_bootstrap(const std::vector<uint8_t>& plain, int64_t now_ms);
   bool on_wire_data(const std::vector<uint8_t>& plain, size_t wire_len, int64_t now_ms);
 
+  // PMTUD (pmtu.h): the ladder, the probe/ack codec, and the two bounds it
+  // moves. All of it is inert until configure() sees the peer's capability.
+  void pmtu_tick(int64_t now_ms);
+  void pmtu_send(uint8_t type, uint16_t mtu, uint32_t token);
+  bool pmtu_handle(const std::vector<uint8_t>& plain, size_t wire_len, int64_t now_ms);
+  bool is_pmtu_frame(const std::vector<uint8_t>& plain) const;
+  uint16_t pmtu_next_candidate() const;
+  void pmtu_raise_recv(uint16_t mtu);
+  void pmtu_raise_send(uint16_t mtu);
+
   void emit_symbol(const TxSymbol& symbol, bool bootstrap = false);
   // `bootstrap` routes the frame through the handshake envelope instead of the
   // data envelope (HELLO/HELLO_ACK only).
@@ -238,6 +274,13 @@ class Session {
   // R3-1: init_bootstrap_nonce() result. A session whose handshake counter
   // start could not be drawn must not run — see Session::start().
   bool bootstrap_seed_ok_ = false;
+  // Budget for AEAD attempts on the bootstrap envelope after negotiation. That
+  // key can then only carry a retried HELLO/ACK, which the handshake sends at
+  // >=300ms intervals, so a handful per second is plenty. Without the budget
+  // every forged datagram that failed the data envelope bought a second
+  // decrypt; the window caps that at kBootstrapProbesPerSecond per session.
+  int64_t bootstrap_window_ms_ = -1;
+  uint32_t bootstrap_probes_ = 0;
   SendFn send_;
   DeliverFn deliver_;
   LogFn log_;
@@ -250,7 +293,11 @@ class Session {
   int64_t srtt_ms_ = kDefaultSrttMs;
   // Minimum RTT observed via on_rtt_sample(); 0 = no sample yet, so the §8
   // queue guardrail stays inactive instead of firing on the default srtt.
+  // The baseline expires after kMinSrttExpiryMs so a route change to a slower
+  // path does not leave the guardrail permanently closed (srtt - min >= 40ms)
+  // and the FEC rate pinned at the ceiling.
   int64_t min_srtt_ms_ = 0;
+  int64_t min_srtt_stamp_ms_ = 0;
 
   std::unique_ptr<FrameTx> tx_;
   std::unique_ptr<FrameRx> rx_;
@@ -268,6 +315,8 @@ class Session {
   uint32_t fecstat_rx_ = 0;
   uint32_t last_pre_ppm_ = 0;
   uint32_t last_usable_ppm_ = 0;
+  uint32_t last_peer_expected_ = 0;
+  uint32_t last_peer_lost_ = 0;
   uint32_t data_tx_since_fecstat_ = 0;
   int64_t last_fecstat_ms_ = 0;
   bool fecstat_rx_pending_ = false;
@@ -275,6 +324,32 @@ class Session {
   uint32_t auth_fail_synced_ = 0;
   uint32_t struct_fail_synced_ = 0;
   bool nonce_exhausted_logged_ = false;
+
+  // PMTUD state. `pmtu_mtu_` is the largest size the *send* direction has
+  // proven (it starts at the configured MTU); `recv_symbol_max_` is the
+  // largest symbol the *receive* direction has proven. They are separate
+  // because a path can be asymmetric, and each side's probe proves only its
+  // own direction.
+  bool pmtud_on_ = false;        // capability negotiated (accept/answer probes)
+  uint16_t pmtu_mtu_ = 0;        // proven send MTU
+  uint16_t pmtu_max_mtu_ = 0;    // configured ceiling, clamped to the hard cap
+  uint16_t pmtu_probe_mtu_ = 0;  // outstanding probe size, 0 = none
+  // pmtu_next_ms_ < 0 means this side stopped probing (ceiling reached, or
+  // the size never answered). It is -1 rather than 0 because time 0 is a
+  // valid moment to start the ladder (the handshake may complete at t=0 in
+  // tests). It stays separate from pmtud_on_ because the peer may still be
+  // climbing its own ladder and must still get acks.
+  // Carried on the wire and echoed by the ack, but the ack is matched by size:
+  // the ladder is strictly increasing, so the outstanding size identifies the
+  // rung on its own, and requiring the token made an ack that arrived after the
+  // next retry (RTT above the retry interval) useless.
+  uint32_t pmtu_token_ = 0;
+  int pmtu_attempts_ = 0;
+  int64_t pmtu_next_ms_ = -1;
+  size_t recv_symbol_max_ = 0;
+  uint32_t pmtu_probes_sent_ = 0;
+  uint32_t pmtu_probes_acked_ = 0;
+  uint32_t pmtu_probes_lost_ = 0;
 };
 
 // Server-side salt lookup. Sessions are owned by the caller.

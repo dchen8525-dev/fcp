@@ -2,6 +2,8 @@
 
 #include <cstring>
 
+#include "fcp/random.h"  // secure_zero: the schedule is key material
+
 #if defined(_MSC_VER)
 #include <intrin.h>
 #elif defined(__x86_64__) || defined(__i386__)
@@ -142,6 +144,11 @@ void aes128_expand_key(const uint8_t key[kAesBlockLen], Aes128Key* out) {
   for (int i = 0; i < 44; ++i) {
     store_be(words[i], out->round_key + 4 * i);
   }
+  // The 176-byte schedule must not stay on the stack: every caller (session-key
+  // derivation, the CTR-based KDF, GCM key init) expands a real key and the
+  // expanded form is key material in its own right. Zeroed here rather than at
+  // each call site so a new caller cannot forget (spec §14.9, decision #40②).
+  secure_zero(words, sizeof(words));
 }
 
 void aes128_encrypt_block_ttable(const Aes128Key& key, const uint8_t in[kAesBlockLen],

@@ -84,6 +84,11 @@ class FrameTx {
 
   // Planned k for the next set that starts; a set locks the value at n == 0.
   void set_k(uint8_t k);
+  // PMTUD (pmtu.h): the path proved a larger symbol size. Growth only -- the
+  // symbols already queued (and the peer's receive bound) were sized for the
+  // old value, and the sets in flight are encoded at their own set-local
+  // symbol_max_, so raising this mid-set is safe.
+  void raise_limits(const MtuLimits& limits);
   // T_flush = clamp(srtt, 25ms, 200ms); default srtt is 200ms.
   void set_srtt_ms(int64_t srtt_ms);
 

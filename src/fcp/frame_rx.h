@@ -29,6 +29,13 @@
 namespace fcp {
 
 constexpr size_t kMaxActiveSets = 256;
+// Byte ceiling on the symbols all active sets hold together. kMaxActiveSets
+// alone bounds the count, not the memory: each set may carry D+P symbols of up
+// to one MTU, so an authenticated peer that leaves 256 sets incomplete could
+// hold ~256 * 255 * 1336 B (~85 MB) per session. Past this ceiling new symbols
+// are dropped instead of stored: ARQ recovers them, and a bounded buffer is the
+// better failure. Sized to cover a full 4 MiB window plus parity and slack.
+constexpr size_t kMaxRxSymbolBytes = 8u << 20;
 constexpr size_t kSnWindow = 4096;
 // Forward jumps larger than this are treated as a session discontinuity: no
 // placeholder sets are created for the skipped ids, and the first far-future
@@ -151,6 +158,9 @@ class FrameRx {
   // retransmission is worth building.
   uint32_t dup_after_recovered() const { return dup_after_recovered_; }
   uint32_t tail_dropped() const { return tail_dropped_; }
+  // Symbols refused because the session's symbol-byte ceiling is full. Not a
+  // protocol violation: the peer's ARQ retransmits and old sets retire.
+  uint32_t symbol_budget_drops() const { return symbol_budget_drops_; }
   // Fragments for an already-accounted, released set id (§5.3: settlement is
   // final; a late fragment must not open a second accounting unit).
   uint32_t retired_dropped() const { return retired_dropped_; }
@@ -184,6 +194,9 @@ class FrameRx {
   bool note_k(RxSet* set, uint8_t k);
   void prune_retired();
   void store_symbol(RxSet* set, uint8_t index, const uint8_t* symbol, size_t len);
+  // Bytes this set currently holds; subtracted from symbol_bytes_ when a set is
+  // erased (release_set, capacity eviction).
+  size_t symbols_bytes_of(const RxSet& set) const;
   void create_placeholders(uint32_t first, uint32_t last, int64_t now_ms);
   void deliver_payload(const uint8_t* payload, size_t len, bool recovered, bool late,
                        bool late_unexpected, int64_t now_ms, uint32_t repair_ms);
@@ -237,6 +250,18 @@ class FrameRx {
   uint32_t decode_attempts_ = 0;
   uint32_t tail_dropped_ = 0;
   uint32_t retired_dropped_ = 0;
+  uint32_t symbol_budget_drops_ = 0;
+  // Bytes held in RxSet::symbols across every active set. Maintained on store
+  // and on both erase paths so the ceiling in store_symbol is exact.
+  size_t symbol_bytes_ = 0;
+  // try_decode scratch, reused across attempts: each buffer is (n+k)*symbol_max
+  // (~350 KB at the codec ceiling) and the old code allocated two of them per
+  // attempt. A synchronous deliver_ callback can re-enter on_datagram, so
+  // decode_depth_ makes a nested attempt use its own locals instead of
+  // clobbering the outer one mid-iteration.
+  std::vector<std::vector<uint8_t>> decode_padded_;
+  std::vector<std::vector<uint8_t>> decode_recovered_;
+  int decode_depth_ = 0;
 };
 
 }  // namespace fcp

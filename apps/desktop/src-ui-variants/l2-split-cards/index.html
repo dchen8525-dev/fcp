@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>FCP · 浅色 2 分区卡片</title>
+<style>
+  :root{
+    --bg:#f4f5f8;
+    --surface:#ffffff;
+    --surface-2:#f6f7fa;
+    --line:#e6e9f0;
+    --line-2:#eef0f5;
+    --fg:#141a26;
+    --fg-2:#333c50;
+    --muted:#5b6475;
+    --muted-2:#8b93a3;
+    --accent:#2f6fed;
+    --accent-hover:#1f5fdc;
+    --accent-soft:#eaf1fe;
+    --ok:#12996f;
+    --ok-soft:#e6f6ef;
+    --err:#d92d20;
+    --warn:#a35a06;
+    --warn-soft:#fdf3e5;
+    --r:16px;
+    --shadow:0 1px 2px #1018280d, 0 10px 28px -18px #10182833;
+    --mono:ui-monospace,"Cascadia Mono","JetBrains Mono",Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    background:var(--bg);color:var(--fg);
+    font:14px/1.5 system-ui,-apple-system,"Segoe UI","Noto Sans SC","Microsoft YaHei UI",sans-serif;
+    display:flex;flex-direction:column;
+    user-select:none;-webkit-user-select:none;-webkit-font-smoothing:antialiased;
+  }
+
+  /* ---------- 顶栏（贴边，分区感） ---------- */
+  .bar{
+    flex:0 0 auto;height:60px;display:flex;align-items:center;gap:12px;
+    padding:0 24px;background:#fff;border-bottom:1px solid var(--line);
+  }
+  .brand{display:flex;align-items:center;gap:11px}
+  [data-mark]{width:32px;height:32px;display:block;flex:0 0 auto;border-radius:9px}
+  .mark-bg{fill:#141a26}
+  .mark-f{fill:#fff}
+  .mark-dot{fill:#5b8cff}
+  .brand b{font-size:15px;letter-spacing:.02em}
+  .brand small{font-size:11.5px;color:var(--muted);margin-left:8px}
+  .bar .spacer{flex:1}
+
+  .conn-pill{
+    display:flex;align-items:center;gap:8px;height:32px;padding:0 12px 0 10px;border-radius:8px;
+    background:var(--surface-2);border:1px solid var(--line);font-size:12.5px;color:var(--muted);
+    transition:.2s;
+  }
+  .conn-pill.on{background:var(--ok-soft);border-color:#c9ebdf;color:#0c7a58}
+  .conn-pill.on time{color:#0c7a58}
+  .conn-pill.bad{background:#fdeceb;border-color:#f6cdc9;color:#a82018}
+  .conn-pill time{font:12.5px var(--mono);font-variant-numeric:tabular-nums;color:var(--fg);font-weight:600}
+  .dot{width:7px;height:7px;border-radius:50%;background:#b8c0cd}
+  .dot.on{background:var(--ok);box-shadow:0 0 0 3px #12996f24}
+  .dot.bad{background:var(--err);box-shadow:0 0 0 3px #d92d2024}
+
+  /* ---------- 布局：左右两个独立分区，各自滚动 ---------- */
+  .workspace{flex:1;min-height:0;display:flex}
+  .pane{
+    min-width:0;min-height:0;display:flex;flex-direction:column;padding:20px 24px 22px;
+    overflow:auto;
+  }
+  .pane.config{flex:0 0 47%;max-width:640px}
+  .pane.output{flex:1;border-left:1px solid var(--line);background:#fbfbfd;gap:16px}
+  .pane::-webkit-scrollbar{width:10px}
+  .pane::-webkit-scrollbar-thumb{background:#d9dde6;border-radius:10px;border:3px solid var(--bg)}
+
+  .pane-head{display:flex;align-items:baseline;gap:10px;margin-bottom:16px}
+  .pane-head h2{margin:0;font-size:15px;font-weight:650}
+  .pane-head span{font-size:12px;color:var(--muted)}
+
+  /* ---------- 表单 ---------- */
+  .form{display:flex;flex-direction:column;gap:14px}
+  .field{display:flex;flex-direction:column;gap:6px;min-width:0}
+  .field > .lbl{font-size:12.5px;font-weight:550;color:var(--fg-2);display:flex;align-items:center;gap:6px}
+  .field > .lbl em{font-style:normal;font-weight:400;color:var(--muted-2);font-size:11px}
+  .duo{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+
+  .input-wrap{position:relative;display:flex;align-items:center}
+  input{
+    width:100%;height:42px;background:#fff;color:var(--fg);
+    border:1px solid #dfe3eb;border-radius:10px;padding:0 12px;
+    font:inherit;font-size:14px;outline:none;transition:.15s;
+    user-select:text;-webkit-user-select:text;
+  }
+  input:hover:not(:disabled){border-color:#c7ceda}
+  input:focus{border-color:var(--accent);box-shadow:0 0 0 3px #2f6fed1f}
+  input:disabled{background:var(--surface-2);color:#3a4356;border-color:var(--line);cursor:default}
+  input::placeholder{color:#a2aab8}
+  .input-wrap input.has-trail{padding-right:88px}
+  .trail{position:absolute;right:5px;display:flex;align-items:center;gap:2px}
+  .key-state{font-size:11px;color:var(--muted-2);font-variant-numeric:tabular-nums;padding:0 4px}
+  .key-state.ok{color:var(--ok)}
+  .key-state.bad{color:var(--err)}
+
+  button{font:inherit;cursor:pointer;border-radius:10px;transition:.15s;border:1px solid #dfe3eb;background:#fff;color:var(--fg-2);height:40px;padding:0 16px;font-size:13.5px;font-weight:550}
+  button:hover:not(:disabled){border-color:#c3cad6;background:#fafbfc}
+  button:disabled{opacity:.5;cursor:default}
+  button.icon{height:30px;width:30px;padding:0;border:0;background:transparent;color:var(--muted);display:grid;place-items:center;border-radius:8px;font-size:14px}
+  button.icon:hover:not(:disabled){background:var(--surface-2);color:var(--fg)}
+  #start{
+    height:44px;padding:0 24px;color:#fff;font-weight:600;
+    background:var(--accent);border-color:transparent;box-shadow:0 6px 14px -8px #2f6fedb3;
+  }
+  #start:hover:not(:disabled){background:var(--accent-hover);border-color:transparent}
+  body.is-running #start{display:none}
+  body.is-running #stop{
+    height:44px;padding:0 24px;font-weight:600;color:#a82018;background:#fdeceb;border-color:#f4cac6;
+  }
+  body.is-running #stop:hover{background:#fbe0de;border-color:#eeb6b1;color:#8e1a13}
+
+  .check{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--muted);margin-top:2px}
+  .check input{width:15px;height:15px;padding:0;accent-color:var(--accent)}
+
+  .adv-toggle{
+    height:auto;width:100%;display:flex;align-items:center;gap:8px;justify-content:flex-start;
+    padding:10px 12px;background:var(--surface-2);border:1px solid var(--line);border-radius:10px;
+    font-size:12.5px;font-weight:500;color:var(--fg-2);
+  }
+  .adv-toggle:hover:not(:disabled){background:#f1f3f7;border-color:#dfe3eb}
+  .adv-toggle .chev{font-size:9px;color:var(--muted);transition:transform .2s}
+  .adv-toggle[aria-expanded="true"] .chev{transform:rotate(90deg)}
+  .adv-toggle .defaults{margin-left:auto;font-size:11.5px;font-weight:400;color:var(--muted-2);font-variant-numeric:tabular-nums}
+  .adv-body{
+    display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:14px;
+    background:var(--surface-2);border:1px solid var(--line);border-radius:10px;margin-top:-8px;
+  }
+  .adv-body[hidden]{display:none}
+  .adv-body input{height:36px;font-size:13px}
+  .adv-body .lbl{font-size:11.5px}
+  .adv-note{grid-column:1/-1;margin:0;font-size:11px;color:var(--muted-2)}
+
+  .actions{display:flex;align-items:center;gap:10px;margin-top:6px;padding-top:16px;border-top:1px solid var(--line-2)}
+  .actions #hint{font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+  .footer-note{margin-top:auto;padding-top:22px}
+  .footer-note b{font-size:12px;font-weight:600;color:var(--fg-2);display:block;margin-bottom:5px}
+  .footer-note p{margin:0;font-size:12px;color:var(--muted);line-height:1.65}
+  .footer-note code{
+    font:12px var(--mono);background:var(--accent-soft);color:#1f4bb8;
+    padding:1px 6px;border-radius:5px;
+  }
+
+  /* ---------- 右侧：指标条 + 日志 ---------- */
+  .metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;flex:0 0 auto}
+  .metric{background:#fff;border:1px solid var(--line);border-radius:12px;padding:10px 12px;display:flex;flex-direction:column;gap:2px;min-width:0}
+  .metric .cap{font-size:11.5px;color:var(--muted);white-space:nowrap}
+  .metric b{font-size:18px;font-weight:650;letter-spacing:-.01em;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .metric.hero{grid-column:span 2;background:linear-gradient(135deg,#f2f6ff,#fbfcff);border-color:#dbe6fb}
+  .metric.hero b{font-size:26px;color:var(--accent);line-height:1.15}
+  .metric.hero .foot{font-size:11px;color:var(--muted-2);font-variant-numeric:tabular-nums;margin-top:2px}
+  #diag{display:flex;flex-wrap:wrap;gap:6px;flex:0 0 auto}
+  #diag[hidden]{display:none}
+  #diag .metric{flex-direction:row;align-items:baseline;gap:6px;padding:4px 10px;border-radius:8px;background:var(--warn-soft);border-color:#f2e0c6;color:var(--warn)}
+  #diag .metric b{font-size:12px}
+  #diag .metric .cap{font-size:11.5px;color:var(--warn)}
+
+  .logbox{
+    flex:1 1 auto;min-height:160px;display:flex;flex-direction:column;
+    background:#fff;border:1px solid var(--line);border-radius:12px;overflow:hidden;
+  }
+  .logbox .head{
+    flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:8px 10px 8px 14px;
+    border-bottom:1px solid var(--line-2);font-size:12px;color:var(--muted);
+  }
+  .logbox .head b{color:var(--fg-2);font-weight:550;font-size:12.5px}
+  .logbox .head button{margin-left:auto;height:26px;padding:0 10px;font-size:11.5px;border-radius:7px}
+  #log{
+    flex:1;min-height:0;margin:0;overflow:auto;padding:10px 14px;
+    font:11.8px/1.65 var(--mono);white-space:pre-wrap;word-break:break-all;color:#465063;
+    user-select:text;-webkit-user-select:text;
+  }
+  #log .err{color:var(--warn)}
+  #log .out{color:#5d6779}
+
+  @media (max-width:980px){
+    .workspace{flex-direction:column;overflow:auto}
+    .pane{flex:none;overflow:visible}
+    .pane.config{flex:none;max-width:none}
+    .pane.output{border-left:0;border-top:1px solid var(--line)}
+    .logbox{height:220px}
+  }
+  @media (max-height:700px){
+    .pane{padding-top:14px}
+    .form{gap:11px}
+    input{height:38px}
+    .metric.hero b{font-size:22px}
+  }
+</style>
+</head>
+<body>
+<header class="bar">
+  <div class="brand">
+    <span data-mark></span>
+    <b>FCP</b><small>可靠传输客户端</small>
+  </div>
+  <div class="spacer"></div>
+  <div class="conn-pill" id="statusPill">
+    <span class="dot" id="dot"></span>
+    <span id="state-text">未连接</span>
+    <time id="uptime">--</time>
+  </div>
+</header>
+
+<div class="workspace">
+  <!-- 左：配置 -->
+  <section class="pane config">
+    <div class="pane-head"><h2>连接配置</h2><span>修改后重新启动生效</span></div>
+
+    <div class="form">
+      <div class="field">
+        <span class="lbl">服务器地址</span>
+        <div class="input-wrap"><input id="host" placeholder="1.2.3.4 或 vpn.example.com" autocomplete="off" spellcheck="false" /></div>
+      </div>
+
+      <div class="duo">
+        <div class="field">
+          <span class="lbl">UDP 端口</span>
+          <input id="port" type="number" min="1" max="65535" value="4460" />
+        </div>
+        <div class="field">
+          <span class="lbl">本地代理端口 <em>SOCKS5 / HTTP</em></span>
+          <input id="listenPort" type="number" min="1" max="65535" value="1080" />
+        </div>
+      </div>
+
+      <div class="field">
+        <span class="lbl">预共享密钥 <em>32 位十六进制</em></span>
+        <div class="input-wrap">
+          <input id="key" class="has-trail" type="password" maxlength="32" spellcheck="false" placeholder="与服务端一致" autocomplete="off" />
+          <span class="trail">
+            <span class="key-state" id="keyState"></span>
+            <button class="icon" id="keyToggle" type="button" title="显示 / 隐藏">👁</button>
+          </span>
+        </div>
+      </div>
+
+      <label class="check"><input id="remember" type="checkbox" checked /> 记住设置</label>
+
+      <button class="adv-toggle" id="advToggle" type="button" aria-expanded="false" aria-controls="advBody">
+        <span class="chev">▶</span><span data-label>高级设置</span>
+        <span class="defaults">MTU 1400 · FEC 0.5 · k 自适应 · 127.0.0.1</span>
+      </button>
+      <div class="adv-body" id="advBody" hidden>
+        <div class="field"><span class="lbl">本地监听地址</span><input id="listen" value="127.0.0.1" /></div>
+        <div class="field"><span class="lbl">MTU</span><input id="mtu" type="number" min="576" max="9000" value="1400" /></div>
+        <div class="field"><span class="lbl">FEC 冗余上限 <em>0–1</em></span><input id="budget" type="number" step="0.05" min="0" max="1" value="0.5" /></div>
+        <div class="field"><span class="lbl">固定 k <em>-1 为自适应</em></span><input id="k" type="number" min="-1" max="7" value="-1" /></div>
+        <p class="adv-note">不展开时按左侧默认值提交，与显式填写效果相同。</p>
+      </div>
+
+      <div class="actions">
+        <button id="start" type="button">启动代理</button>
+        <button id="stop" type="button" disabled>停止</button>
+        <span id="hint"></span>
+      </div>
+    </div>
+
+    <div class="footer-note">
+      <b>启动后怎么用</b>
+      <p>把浏览器或系统的 SOCKS5 / HTTP 代理指向
+        <code id="localAddr">127.0.0.1:1080</code>，流量就走这条隧道。</p>
+    </div>
+  </section>
+
+  <!-- 右：运行 -->
+  <section class="pane output">
+    <div class="pane-head"><h2>运行</h2><span>每 2 秒采样一次</span></div>
+
+    <div class="metrics">
+      <div class="metric hero">
+        <span class="cap">活动会话</span>
+        <b id="m-live">0</b>
+        <span class="foot">采样 <span id="m-t">--</span></span>
+      </div>
+      <div class="metric"><span class="cap">上行</span><b id="m-tx">0 B</b></div>
+      <div class="metric"><span class="cap">下行</span><b id="m-rx">0 B</b></div>
+      <div class="metric"><span class="cap">已建立</span><b id="m-est">0</b></div>
+      <div class="metric"><span class="cap">隧道</span><b id="m-tun">0</b></div>
+      <div class="metric hero" style="grid-column:span 2;background:var(--surface-2);border-color:var(--line)">
+        <span class="cap">传输</span>
+        <b style="font-size:16px;color:var(--fg);line-height:1.6">UDP · FEC 纠删码</b>
+      </div>
+    </div>
+
+    <div id="diag" hidden></div>
+
+    <div class="logbox">
+      <div class="head"><b>日志</b><span>stdout / stderr</span><button id="clear" type="button">清空</button></div>
+      <pre id="log"></pre>
+    </div>
+  </section>
+</div>
+
+<script src="tokens.js"></script>
+<script src="app-light.js"></script>
+<script>
+  document.addEventListener("fcp:state", (e) => {
+    const on = e.detail.running;
+    const t = document.getElementById("state-text");
+    if (t) t.textContent = on ? "已连接" : "未连接";
+    const p = document.getElementById("statusPill");
+    if (p) p.className = "conn-pill" + (on ? " on" : "");
+  });
+
+  // 代理地址跟随本地端口输入实时变化。
+  const syncAddr = () => {
+    const addr = document.getElementById("localAddr");
+    const lp = document.getElementById("listenPort");
+    if (addr && lp) addr.textContent = "127.0.0.1:" + (lp.value || "1080");
+  };
+  document.getElementById("listenPort").addEventListener("input", syncAddr);
+  syncAddr();
+</script>
+</body>
+</html>

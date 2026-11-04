@@ -43,6 +43,13 @@ struct PeerProfile {
   // configuration choice, not a measurement of the link. It seeds the next
   // session's start value, which the closed loop is then free to move.
   size_t window_bytes = 0;
+  // BBR's view of the link at the end of the previous session: the delivery
+  // rate it measured and the minimum RTT it saw. Seeding both lets the next
+  // session start in PROBE_BW at the proven operating point instead of running
+  // STARTUP from the default window once per connection. Written only when the
+  // controller actually measured something (0 = unknown).
+  uint64_t bw_bps = 0;
+  int64_t min_rtt_ms = 0;
 };
 
 // Cache key "host:port". A bare IPv6 literal is bracketed first so the key

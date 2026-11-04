@@ -2,6 +2,8 @@
 
 #include <cstring>
 
+#include "fcp/settle.h"  // k_unknown_untrusted: the shared sample gate
+
 #include "test_util.h"
 
 namespace {
@@ -223,6 +225,29 @@ void TestUntrustedSample() {
   st2.on_report(Report(++id, 1000, 800, 0, 1), false);
   CHECK(st2.state() == fcp::FecState::kOff);
   CHECK_EQ(st2.untrusted_reports(), 1u);
+}
+
+// The gate is one predicate (settle.h k_unknown_untrusted), so its widening
+// must not depend on which of the three call sites reads it. 0x80000000 sets at
+// 10% lands exactly on the boundary; a 32-bit right-hand side wrapped it to 0
+// and turned a trusted report into an untrusted one (session.cc had that
+// spelling while settle/strategy promoted both sides).
+void TestUntrustedGateDoesNotWrapAt2Pow31() {
+  const uint32_t huge = 0x80000000u;  // *10 = 2^31+ : wraps a uint32 product
+  fcp::FecStrategy st;
+  uint32_t id = 0;
+  // 10% exactly: not over the gate.
+  st.on_report(Report(++id, 1000, 800, huge, huge / 10), false);
+  CHECK_EQ(st.untrusted_reports(), 0u);
+  CHECK(st.state() == fcp::FecState::kOn);
+  // One past 10%: over the gate.
+  st.on_report(Report(++id, 1000, 800, huge, huge / 10 + 1), false);
+  CHECK_EQ(st.untrusted_reports(), 1u);
+  // The predicate itself, at the widest values that used to wrap.
+  CHECK(!fcp::k_unknown_untrusted(huge, huge / 10));
+  CHECK(fcp::k_unknown_untrusted(huge, huge / 10 + 1));
+  CHECK(fcp::k_unknown_untrusted(0xFFFFFFFFu, 0xFFFFFFFFu / 10 + 1));
+  CHECK(!fcp::k_unknown_untrusted(0, 0));
 }
 
 void TestSmallSample() {
@@ -681,6 +706,7 @@ int main() {
   TestCleanStreak();
   TestCooldown();
   TestUntrustedSample();
+  TestUntrustedGateDoesNotWrapAt2Pow31();
   TestSmallSample();
   TestStaleReport();
   TestPinned();

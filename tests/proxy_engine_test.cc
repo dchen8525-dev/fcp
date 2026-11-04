@@ -58,6 +58,9 @@ struct Options {
   // Off by default here: these tests pin the legacy fixed-window backpressure
   // invariants. The autotune has its own test below.
   bool auto_window = false;
+  // The window tests below pin the epoch controller; BBR (the shipping
+  // default) has its own stream-level tests.
+  bool bbr = false;
   size_t window_min_bytes = 64 * 1024;
   size_t window_max_bytes = 1024 * 1024;
   // --window was given explicitly, so the prewarm prior must not replace the
@@ -91,6 +94,7 @@ class Harness {
     base.send_window_bytes = opt.send_window_bytes;
     base.rcv_buf_bytes = opt.rcv_buf_bytes;
     base.auto_window = opt.auto_window;
+    base.bbr = opt.bbr;
     base.window_min_bytes = opt.window_min_bytes;
     base.window_max_bytes = opt.window_max_bytes;
     base.window_explicit = opt.window_explicit;
@@ -126,6 +130,17 @@ class Harness {
       server->on_tick(now_ms);
       if (to_client.empty() && to_server.empty()) {
         break;
+      }
+    }
+    // A real target that sees EOF on its write half finishes the exchange and
+    // closes. The harness models that unless a test wants the target to answer
+    // after the half-close. This is a host action, so it runs between engine
+    // calls, never from inside the app_shutdown callback.
+    if (auto_close_target_on_shutdown) {
+      for (const uint64_t conn : server_side.shut_down) {
+        if (target_closed_.insert(conn).second) {
+          server->on_target_closed(conn, now_ms);
+        }
       }
     }
   }
@@ -183,6 +198,10 @@ class Harness {
   }
   bool app_closed(uint64_t conn) const { return client_side.closed.count(conn) != 0; }
   bool target_closed(uint64_t conn) const { return server_side.closed.count(conn) != 0; }
+  bool target_shut_down(uint64_t conn) const {
+    return server_side.shut_down.count(conn) != 0;
+  }
+  size_t server_shutdown_count() const { return server_side.shut_down.size(); }
 
   std::unique_ptr<ProxyEngine> client, server;
   // Every dial request the server asked for, kept for inspection; `dials` is a
@@ -199,6 +218,8 @@ class Harness {
   size_t client_accept_limit = kNoLimit;  // 0 = the socket will not take anything
   size_t server_accept_limit = kNoLimit;
   bool mute_server = false;  // the peer vanished: client datagrams go nowhere
+  // Model a target that closes as soon as it sees EOF on its write half.
+  bool auto_close_target_on_shutdown = true;
   int64_t now_ms = 1000;
 
   uint64_t first_dial_conn() const { return dials.empty() ? 0 : dials.front().conn; }
@@ -208,7 +229,9 @@ class Harness {
   struct Side {
     std::map<uint64_t, std::vector<uint8_t>> written;
     std::set<uint64_t> closed;
+    std::set<uint64_t> shut_down;  // write half closed (peer fin arrived)
   };
+  std::set<uint64_t> target_closed_;  // half-closed targets already closed by step()
 
   struct Delayed {
     size_t due_step = 0;
@@ -223,6 +246,9 @@ class Harness {
     };
     h.app_close = [this, is_client](uint64_t conn) {
       (is_client ? client_side : server_side).closed.insert(conn);
+    };
+    h.app_shutdown = [this, is_client](uint64_t conn) {
+      (is_client ? client_side : server_side).shut_down.insert(conn);
     };
     h.wire_send = [this, is_client](uint64_t peer, const uint8_t* wire, size_t len) {
       std::vector<uint8_t> d(wire, wire + len);
@@ -419,6 +445,44 @@ void socks5_round_trip() {
   CHECK(h.app_closed(kLocalConn));
   CHECK(h.target_closed(target_conn));
   CHECK_EQ(h.client->counters().idle_closed, 0u);
+}
+
+// A client that half-closes after its request is the normal shape of a
+// request/response session. The peer's fin must shut the target's write half and
+// keep the tunnel's send side open: the response still has to come back. The old
+// code answered the fin with its own fin, ending the exchange and dropping every
+// byte the target had not written yet.
+void half_close_keeps_the_response_flowing() {
+  Harness h{Options()};
+  h.auto_close_target_on_shutdown = false;  // the target answers, then closes
+  post_socks5_entry(h);
+  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, kTunnelSteps));
+  const uint64_t target_conn = h.first_dial_conn();
+
+  h.local_send(kLocalConn, "GET");
+  CHECK(h.run_until([&] { return h.target_bytes(target_conn).size() == 3; }, 20));
+
+  h.local_close(kLocalConn);  // the app shut its write half
+  CHECK(h.run_until([&] { return h.target_shut_down(target_conn); }, 60));
+  CHECK(!h.target_closed(target_conn));     // half-closed, not closed
+  CHECK(!h.app_closed(kLocalConn));         // the app can still read
+  CHECK_EQ(h.client->counters().live, 1u);  // the tunnel is still up
+  CHECK_EQ(h.server->counters().live, 1u);
+
+  // The response the target had not produced when the request ended still
+  // crosses the tunnel.
+  h.target_send(target_conn, std::vector<uint8_t>{'2', '0', '0'});
+  CHECK(h.run_until([&] {
+    return h.app_bytes(kLocalConn).size() == kEntryReplyBytes + 3;
+  }, 40));
+  CHECK_EQ(text_of(h.app_bytes(kLocalConn)).substr(kEntryReplyBytes), std::string("200"));
+
+  // Only the target's own close ends it.
+  h.target_close(target_conn);
+  CHECK(h.run_until([&] {
+    return h.client->counters().live == 0 && h.server->counters().live == 0;
+  }, 80));
+  CHECK(h.app_closed(kLocalConn));
 }
 
 // §4.2 with a domain target: the name crosses the wire unresolved (§14 remote
@@ -1219,6 +1283,7 @@ void prewarm_seeds_the_next_stream_window() {
 
 int main() {
   socks5_round_trip();
+  half_close_keeps_the_response_flowing();
   socks5_request_corked_with_greeting();
   socks5_greeting_without_request_waits();
   bad_mtu_refusal_closes_the_local_socket();

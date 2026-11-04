@@ -456,6 +456,21 @@ void ProxyEngine::on_app_writable(uint64_t conn, int64_t now_ms) {
   reap(now_ms);
 }
 
+int64_t ProxyEngine::next_wake_ms(int64_t now_ms) const {
+  int64_t next = 0;
+  for (const auto& entry : by_conn_) {
+    const Conn* c = entry.second.get();
+    if (c == nullptr || !c->stream || c->phase == Phase::kDone) {
+      continue;
+    }
+    const int64_t due = c->stream->next_wake_ms(now_ms);
+    if (due > 0 && (next == 0 || due < next)) {
+      next = due;
+    }
+  }
+  return next;
+}
+
 void ProxyEngine::on_tick(int64_t now_ms) {
   now_ms_ = now_ms;
   // #29a: expired tombstones whose salts never see another datagram would
@@ -485,6 +500,13 @@ void ProxyEngine::on_tick(int64_t now_ms) {
     }
     if (c->session) {
       c->session->on_tick(now_ms);
+      // PMTUD may have raised the proven payload size during that tick; the
+      // stream must adopt it before its next pump(), or the larger MTU would
+      // only ever benefit the next connection. set_max_segment() ignores a
+      // size that did not grow.
+      if (c->stream) {
+        c->stream->set_max_segment(c->session->payload_max());
+      }
     }
     session_events(*c, now_ms);
     if (c->phase == Phase::kDone) {
@@ -571,6 +593,23 @@ uint32_t ProxyEngine::dup_after_recovered() const {
   return total;
 }
 
+ProxyEngine::LossSample ProxyEngine::loss_sample() const {
+  LossSample total;
+  for (const auto& entry : by_conn_) {
+    const Conn& c = *entry.second;
+    if (!c.session) {
+      continue;
+    }
+    if (const FcpReporter* reporter = c.session->reporter()) {
+      total.in_expected += reporter->last_expected();
+      total.in_lost += reporter->last_lost();
+    }
+    total.out_expected += c.session->last_peer_expected();
+    total.out_lost += c.session->last_peer_lost();
+  }
+  return total;
+}
+
 size_t ProxyEngine::pending_app_bytes(uint64_t conn) const {
   const Conn* c = find(conn);
   return c == nullptr ? 0 : c->app_in.size();
@@ -598,6 +637,8 @@ void ProxyEngine::fill_session_config(SessionConfig* sc, uint64_t conn_id) const
   sc->p_max = cfg_.p_max;
   sc->mtu = cfg_.mtu;
   sc->ip_hdr_len = cfg_.ip_hdr_len;
+  sc->pmtud = cfg_.pmtud;
+  sc->pmtu_max_mtu = cfg_.pmtu_max_mtu;
   sc->pinned_k = cfg_.pinned_k;
   sc->fec_budget = cfg_.fec_budget;
   sc->trace = make_trace_sink(cfg_.trace_prefix, conn_id,
@@ -622,8 +663,13 @@ void ProxyEngine::fill_stream_config(StreamConfig* sc) const {
   sc->send_window_explicit = cfg_.window_explicit;
   sc->rcv_buf_bytes = cfg_.rcv_buf_bytes;
   sc->auto_window = cfg_.auto_window;
+  sc->bbr = cfg_.bbr;
+  sc->bbr_version = cfg_.bbr_version;
+  sc->window_probe = cfg_.window_probe;
   sc->window_min_bytes = cfg_.window_min_bytes;
   sc->window_max_bytes = cfg_.window_max_bytes;
+  sc->window_ceiling_bytes = cfg_.window_ceiling_bytes;
+  sc->ack_every = cfg_.ack_every;
   sc->idle_timeout_ms = cfg_.idle_timeout_ms;
 }
 
@@ -846,15 +892,24 @@ void ProxyEngine::attach_stream(Conn& conn) {
         if (p == nullptr || p->phase == Phase::kDone) {
           return;
         }
-        // The far side is done sending. In a proxy that ends the exchange: hand
-        // over what is left, then send our own fin (§2.3 has no shutdown()).
-        p->want_fin = true;
-        maybe_fin(*p);
+        // The far side is done sending. That is a half-close, not the end of the
+        // exchange: shutdown the local socket's write half (the app/target sees
+        // EOF) and keep the tunnel's send side open for whatever the local side
+        // still produces -- a response the target has not written yet, request
+        // bytes queued after the app's shutdown. Sending our own fin here, as
+        // the symmetric counterpart of on_local_closed(), used to end the
+        // tunnel the moment the peer stopped talking and drop that traffic.
+        if (host_.app_shutdown) {
+          host_.app_shutdown(id);
+        } else {
+          p->want_fin = true;
+          maybe_fin(*p);
+        }
       },
       [this, id](int64_t srtt_ms) {
         Conn* p = find(id);
         if (p != nullptr && p->session) {
-          p->session->on_rtt_sample(srtt_ms);
+          p->session->on_rtt_sample(srtt_ms, now_ms_);
         }
       },
       [this](const std::string& line) { log(line); });
@@ -1305,10 +1360,27 @@ void ProxyEngine::finish_conn(Conn& conn, int64_t now_ms, const char* why) {
   // ended exactly at its prior has not "moved" relative to it.
   const bool tuned = conn.stream != nullptr && cfg_.auto_window &&
                      conn.stream->send_window() != conn.stream_cfg.send_window_bytes;
-  if (stuck || tuned) {
+  // A stall verdict is reported from whichever side stopped moving. The receive
+  // side has no "stuck" send counter, so its oob/pending numbers only exist in
+  // this line — print them for a stall even when this side's send is clean.
+  const bool stalled = std::strcmp(why, "the peer stopped acknowledging") == 0;
+  if (stuck || tuned || stalled) {
+    char bbr[160] = "";
+    if (conn.stream->using_bbr()) {
+      std::snprintf(bbr, sizeof(bbr),
+                    " bbr=%s bw=%llu gain=%.2f eff=%.2f hi=%zu lo=%zu",
+                    Bbr::mode_name(conn.stream->bbr_mode()),
+                    static_cast<unsigned long long>(conn.stream->bbr_bandwidth_bps()),
+                    conn.stream->bbr_pacing_gain(), conn.stream->bbr_efficiency(),
+                    conn.stream->bbr_inflight_hi(), conn.stream->bbr_inflight_lo());
+    } else {
+      std::snprintf(bbr, sizeof(bbr), " bbr=off");
+    }
     std::snprintf(diag_, sizeof(diag_),
                   "stream queued=%llu acked=%llu delivered=%llu unacked=%zu in_flight=%zu "
-                  "rwnd=%zu cwnd=%zu rto=%lld loss_rto=%llu loss_dup=%llu probes=%llu",
+                  "rwnd=%zu cwnd=%zu rto=%lld loss_rto=%llu loss_dup=%llu probes=%llu "
+                  "retx=%llu (fast=%llu fill=%llu rto=%llu passes=%llu) "
+                  "oob=%zu pending=%zu%s",
                   static_cast<unsigned long long>(conn.stream->bytes_queued()),
                   static_cast<unsigned long long>(conn.stream->bytes_acked()),
                   static_cast<unsigned long long>(conn.stream->bytes_delivered()),
@@ -1317,7 +1389,13 @@ void ProxyEngine::finish_conn(Conn& conn, int64_t now_ms, const char* why) {
                   static_cast<long long>(conn.stream->rto_ms()),
                   static_cast<unsigned long long>(conn.stream->rto_loss_events()),
                   static_cast<unsigned long long>(conn.stream->dup_loss_events()),
-                  static_cast<unsigned long long>(conn.stream->probes_sent()));
+                  static_cast<unsigned long long>(conn.stream->probes_sent()),
+                  static_cast<unsigned long long>(conn.stream->retransmits()),
+                  static_cast<unsigned long long>(conn.stream->retx_fast()),
+                  static_cast<unsigned long long>(conn.stream->retx_fill()),
+                  static_cast<unsigned long long>(conn.stream->retx_rto()),
+                  static_cast<unsigned long long>(conn.stream->fill_passes()),
+                  conn.stream->oob_bytes(), conn.stream->delivery_pending(), bbr);
     log(label(conn) + " closed: " + why + " [" + diag_ + "]");
   } else {
     log(label(conn) + " closed: " + why);
@@ -1368,7 +1446,17 @@ void ProxyEngine::reap(int64_t now_ms) {
           // 8-byte forgery would buy a five-minute table entry. 伪造盐不同：
           // 它不进墓碑——否则攻击者可用猜测的盐把墓碑表顶满。
           if (salt_tombstones_.size() >= kSaltTombstoneMax) {
-            salt_tombstones_.erase(salt_tombstones_.begin());
+            // Evict the entry closest to its deadline rather than whatever the
+            // hash bucket order puts first: every eviction re-opens that salt
+            // to a phantom session, so the entry that was about to expire
+            // anyway is the cheapest one to lose.
+            auto soonest = salt_tombstones_.begin();
+            for (auto it = salt_tombstones_.begin(); it != salt_tombstones_.end(); ++it) {
+              if (it->second < soonest->second) {
+                soonest = it;
+              }
+            }
+            salt_tombstones_.erase(soonest);
           }
           salt_tombstones_[conn.salt_key] = now_ms + kSaltTombstoneMs;
         }
@@ -1377,7 +1465,16 @@ void ProxyEngine::reap(int64_t now_ms) {
       // the release has to wait until the connection is really gone -- and the
       // id is copied out first, because erase() destroys the Conn.
       const uint64_t conn_peer = conn.peer;
-      by_conn_.erase(it);
+      // `it` was taken before the host callbacks above. A host that re-enters
+      // through wire_send (in-process loopback, test hosts) can create a
+      // connection, insert into by_conn_ and rehash it -- after which `it` is
+      // dangling and erase(it) frees the wrong node. Resolve again; the extra
+      // lookup is O(1) on a table we are deleting from anyway.
+      const auto again = by_conn_.find(id);
+      if (again == by_conn_.end()) {
+        continue;  // a re-entrant path already released it; nothing left to do
+      }
+      by_conn_.erase(again);
       --counters_.live;
       if (cfg_.role == EngineRole::kServer && host_.peer_retired) {
         host_.peer_retired(conn_peer);
@@ -1409,6 +1506,13 @@ void ProxyEngine::save_profile(Conn& conn, int64_t now_ms) {
   // adaptive session.
   if (conn.stream_cfg.auto_window) {
     profile.window_bytes = conn.stream->send_window();
+  }
+  // BBR's model as a prior for the next connection to this peer. Both are kept
+  // apart from the epoch controller's window above: the bandwidth is what
+  // STARTUP would have spent a page of connections re-learning.
+  if (conn.stream->using_bbr()) {
+    profile.bw_bps = conn.stream->bbr_bandwidth_bps();
+    profile.min_rtt_ms = conn.stream->min_rtt_ms();
   }
   prewarm_.put(key, profile, now_ms);
 }

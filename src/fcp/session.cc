@@ -6,6 +6,7 @@
 #include <utility>
 #include <vector>
 
+#include "fcp/pmtu.h"
 #include "fcp/random.h"
 #include "fcp/session_log.h"
 #include "fcp/wire.h"
@@ -46,6 +47,17 @@ bool mtu_fits_largest_oob(const SessionConfig& cfg) {
 // invocation count far below the 2^32 bound.
 constexpr uint32_t kHandshakeSendBudget = 1u << 16;
 
+// After negotiation, the bootstrap envelope is only worth trying for a retried
+// HELLO/HELLO_ACK. The handshake retries at 300/600/1200ms, so this ceiling is
+// far above what a real peer needs; it only stops an unauthenticated flood
+// from making every failing datagram cost a second AEAD attempt.
+constexpr uint32_t kBootstrapProbesPerSecond = 64;
+
+// How long the §8 queue guardrail's min-RTT baseline stays valid. Mirrors Bbr's
+// min_rtt_expiry_ms; both controllers read the same "is this a standing queue"
+// question and must not disagree for long.
+constexpr int64_t kMinSrttExpiryMs = 10000;
+
 // R3-1: an all-zero configured nonce means "let the handshake draw one". The
 // distinction only exists so a test can pin the value.
 const uint8_t* nonce_or_null(const uint8_t nonce[16]) {
@@ -54,6 +66,26 @@ const uint8_t* nonce_or_null(const uint8_t nonce[16]) {
     acc |= nonce[i];
   }
   return acc == 0 ? nullptr : nonce;
+}
+
+// PMTUD (pmtu.h): how long one probe may stay unanswered before it is retried,
+// and how many attempts a size gets before the ladder stops. A size that is
+// one step too large is a black hole -- the datagram is dropped by the path,
+// never by the peer -- so the only signal is the missing ack.
+constexpr int64_t kPmtuRetryMs = 1000;
+constexpr int kPmtuAttempts = 3;
+
+uint8_t handshake_flags(const SessionConfig& cfg) {
+  return static_cast<uint8_t>(kLocalFlagsM1 | (cfg.pmtud ? kCapPmtud : 0));
+}
+
+// The ceiling from configuration, floored at the configured MTU (nothing to
+// probe upward to) and capped at the hard jumbo bound.
+uint16_t pmtu_ceiling(const SessionConfig& cfg) {
+  if (cfg.pmtu_max_mtu <= cfg.mtu) {
+    return cfg.mtu;
+  }
+  return std::min<uint16_t>(cfg.pmtu_max_mtu, kPmtuAbsoluteMaxMtu);
 }
 
 }  // namespace
@@ -79,9 +111,12 @@ Session::Session(const SessionConfig& config, SendFn send, DeliverFn deliver, Lo
           [this](const uint8_t* data, size_t len) { send_oob(data, len, true); },
           config.send_direction == Direction::kC2S ? HandshakeRole::kClient
                                                    : HandshakeRole::kServer,
-          nonce_or_null(config.handshake_nonce), kLocalFlagsM1,
+          nonce_or_null(config.handshake_nonce), handshake_flags(config),
           config.handshake_cache_segments, config.handshake_cache_bytes),
-      srtt_ms_(config.initial_srtt_ms > 0 ? config.initial_srtt_ms : kDefaultSrttMs) {
+      srtt_ms_(config.initial_srtt_ms > 0 ? config.initial_srtt_ms : kDefaultSrttMs),
+      pmtu_mtu_(config.mtu),
+      pmtu_max_mtu_(pmtu_ceiling(config)),
+      recv_symbol_max_(limits_.symbol_max) {
   // R3-1: the handshake envelope keeps the (PSK, salt) key for the whole life
   // of the session, so its counter must not restart at 0. A replayed HELLO
   // makes a *new* session seal a fresh ACK under that same key; with a fixed
@@ -130,19 +165,43 @@ bool Session::on_wire(const uint8_t* wire, size_t len, int64_t now_ms) {
   // is authenticated exactly once.
   std::vector<uint8_t> plain;
   bool bootstrap = false;
-  if (!env_.open(wire, len, &plain)) {
-    if (!hs_env_.open(wire, len, &plain)) {
-      ++auth_fail_;
-      sync_report_counters();
-      return false;
+  bool opened = env_.open(wire, len, &plain);
+  if (!opened) {
+    // Past negotiation the bootstrap key can only carry a retried
+    // HELLO/HELLO_ACK (its ACK was lost). Probing it is budgeted because any
+    // unauthenticated datagram that fails the data envelope otherwise bought a
+    // second AEAD attempt: an attacker set the decrypt budget for free. Before
+    // negotiation the session lives for a handshake, so every datagram is tried
+    // against the bootstrap epoch too -- that is the path that reaches
+    // on_oob().
+    bool may_probe = true;
+    if (hs_.established()) {
+      if (bootstrap_window_ms_ < 0 || now_ms - bootstrap_window_ms_ >= 1000) {
+        bootstrap_window_ms_ = now_ms;
+        bootstrap_probes_ = 0;
+      }
+      may_probe = bootstrap_probes_ < kBootstrapProbesPerSecond;
+      if (may_probe) {
+        ++bootstrap_probes_;
+      }
     }
-    bootstrap = true;
+    opened = may_probe && hs_env_.open(wire, len, &plain);
+    bootstrap = opened;
+  }
+  if (!opened) {
+    ++auth_fail_;
+    sync_report_counters();
+    return false;
   }
 
   // Authenticated but outside the MTU budget every conforming peer obeys
   // (§4.5): reject before it can inflate a set's symbol_max, the decode
-  // buffers, or the pre-negotiation data cache.
-  if (limits_.valid && plain.size() > kFecHdrLen + limits_.symbol_max) {
+  // buffers, or the pre-negotiation data cache. A PMTUD probe is the single
+  // exception -- being larger than the current bound is its whole job -- and
+  // pmtu_handle() re-checks it against the size the receiver actually got, so
+  // an oversized frame that merely claims to be a probe cannot move anything.
+  const bool pmtu_frame = is_pmtu_frame(plain);
+  if (limits_.valid && plain.size() > kFecHdrLen + recv_symbol_max_ && !pmtu_frame) {
     ++pre_struct_fail_;
     sync_report_counters();
     return true;
@@ -150,6 +209,13 @@ bool Session::on_wire(const uint8_t* wire, size_t len, int64_t now_ms) {
 
   if (bootstrap) {
     return on_wire_bootstrap(plain, now_ms);
+  }
+
+  // Handled before the frame layer: a probe that is within the current bound
+  // would otherwise reach FECSTAT validation and be counted as a drop.
+  if (pmtu_frame) {
+    pmtu_handle(plain, len, now_ms);
+    return true;
   }
 
   if (rx_) {
@@ -288,6 +354,7 @@ void Session::on_tick(int64_t now_ms) {
     return;
   }
   tx_->on_tick(now_ms);
+  pmtu_tick(now_ms);
   settle_->tick(now_ms, srtt_ms_);
   reporter_->on_tick(now_ms);
   sync_report_counters();
@@ -330,7 +397,7 @@ void Session::flush_report(int64_t now_ms) {
   }
 }
 
-void Session::on_rtt_sample(int64_t srtt_ms) {
+void Session::on_rtt_sample(int64_t srtt_ms, int64_t now_ms) {
   if (srtt_ms <= 0) {
     return;
   }
@@ -338,8 +405,16 @@ void Session::on_rtt_sample(int64_t srtt_ms) {
   // Baseline for the §8 queue guardrail is the minimum *observed* RTT. A fixed
   // initial value would make srtt - min_rtt >= 40ms permanent on any link
   // whose RTT exceeds it (satellite/cross-continental), silently pinning k.
-  if (min_srtt_ms_ <= 0 || srtt_ms < min_srtt_ms_) {
+  // A route change has the same effect from the other side: a floor from a
+  // faster path keeps the guardrail closed forever, so it expires after
+  // kMinSrttExpiryMs and follows the current path again.
+  const bool expired =
+      min_srtt_ms_ > 0 && now_ms > 0 && now_ms - min_srtt_stamp_ms_ >= kMinSrttExpiryMs;
+  if (min_srtt_ms_ <= 0 || srtt_ms < min_srtt_ms_ || expired) {
     min_srtt_ms_ = srtt_ms;
+    if (now_ms > 0) {
+      min_srtt_stamp_ms_ = now_ms;
+    }
   }
   if (tx_) {
     tx_->set_srtt_ms(srtt_ms);
@@ -424,6 +499,14 @@ void Session::configure(int64_t now_ms) {
                                    strategy_->target_recovery(), cfg_.fec_budget,
                                    cfg_.initial_k, pinned};
 
+  // PMTUD: only when both ends advertised the capability and there is room
+  // above the configured MTU. The first tick (not now) starts the ladder --
+  // probing from inside configure() would race the peer's own setup.
+  pmtud_on_ = cfg_.pmtud && (np.flags & kCapPmtud) != 0 && pmtu_max_mtu_ > cfg_.mtu;
+  if (pmtud_on_) {
+    pmtu_next_ms_ = now_ms;
+  }
+
   sync_report_counters();
 
   char line[192];
@@ -502,6 +585,13 @@ void Session::handle_fecstat(const uint8_t* payload, size_t len, int64_t now_ms)
   if (tx_) {
     tx_->set_k(strategy_->k());
   }
+  // Keep the raw numbers behind loss_out_* even when the sample gates below
+  // suppress the log line: the desktop speed test samples this between stats
+  // ticks and a small but valid report is still better than a stale zero.
+  last_peer_expected_ = stat.data_expected;
+  last_peer_lost_ = stat.data_expected > stat.data_rx_orig
+                        ? stat.data_expected - stat.data_rx_orig
+                        : 0;
   if (cfg_.trace) {
     TraceEntry entry;
     entry.now_ms = now_ms;
@@ -523,8 +613,7 @@ void Session::handle_fecstat(const uint8_t* payload, size_t len, int64_t now_ms)
   // that is too lossy to trust still moves the machine off the raw numbers,
   // and only the *log* line is suppressed. 同 strategy 样本门一阈值：
   // kUntrustedKUnknownPct 是唯一定义。
-  if (static_cast<uint64_t>(stat.sets_k_unknown) * 100 >
-      std::max<uint32_t>(1, stat.sets_expected) * kUntrustedKUnknownPct) {
+  if (k_unknown_untrusted(stat.sets_expected, stat.sets_k_unknown)) {
     log_fecstat_untrusted(log_, stat);
     return;
   }
@@ -540,10 +629,15 @@ void Session::handle_fecstat(const uint8_t* payload, size_t len, int64_t now_ms)
                                   ? stat.data_expected - stat.data_rx_orig
                                   : 0,
                               stat.data_expected);
+  // Sum in 64 bits: both fields are peer-supplied and the 32-bit sum wraps.
+  // With data_rx_orig = 0x80000000 and data_recovered_dl = 0x80000001 the sum
+  // is 1, so the old test claimed 299 usable bytes out of 300 while the peer
+  // had in fact delivered nothing -- a self-contradicting `pre=0ppm
+  // usable=996666ppm` log line and a poisoned last_usable_ppm_.
+  const uint64_t rx_total =
+      static_cast<uint64_t>(stat.data_rx_orig) + stat.data_recovered_dl;
   const uint32_t usable_part =
-      stat.data_expected > stat.data_rx_orig + stat.data_recovered_dl
-          ? stat.data_expected - stat.data_rx_orig - stat.data_recovered_dl
-          : 0;
+      stat.data_expected > rx_total ? stat.data_expected - static_cast<uint32_t>(rx_total) : 0;
   FecSampleRates rates;
   rates.lost = lost_signed > 0 ? static_cast<uint32_t>(lost_signed) : 0;
   rates.pre_ppm = pre;
@@ -568,6 +662,157 @@ void Session::handle_fecstat(const uint8_t* payload, size_t len, int64_t now_ms)
   // M3 byte budget transitions (§2), greppable for WAN calibration.
   log_fec_budget_transitions(log_, before, strategy_->state(), ratio, cfg_.fec_budget,
                              strategy_->k(), strategy_->last_loss());
+}
+
+// ---- PMTUD (pmtu.h) ----
+
+bool Session::is_pmtu_frame(const std::vector<uint8_t>& plain) const {
+  if (!pmtud_on_ || plain.size() < kFecHdrLen + kPmtuHeaderLen) {
+    return false;
+  }
+  FecHdr hdr{};
+  if (!parse_hdr(plain.data(), plain.size(), &hdr) ||
+      hdr_type(hdr.type_k) != SymbolType::kOob) {
+    return false;
+  }
+  PmtuMessage msg;
+  return pmtu_parse(plain.data() + kFecHdrLen, plain.size() - kFecHdrLen, &msg);
+}
+
+uint16_t Session::pmtu_next_candidate() const {
+  if (pmtu_mtu_ >= pmtu_max_mtu_) {
+    return 0;
+  }
+  // Two rungs cover the useful cases without spending RTTs on sizes nothing
+  // uses: the standard Ethernet size first, then the configured ceiling
+  // (jumbo is a LAN property and has to be asked for).
+  if (pmtu_mtu_ < 1500 && pmtu_max_mtu_ >= 1500) {
+    return 1500;
+  }
+  return pmtu_max_mtu_;
+}
+
+void Session::pmtu_tick(int64_t now_ms) {
+  if (!pmtud_on_ || pmtu_next_ms_ < 0 || now_ms < pmtu_next_ms_) {
+    return;
+  }
+  if (pmtu_probe_mtu_ != 0) {
+    pmtu_probe_mtu_ = 0;
+    if (++pmtu_attempts_ >= kPmtuAttempts) {
+      ++pmtu_probes_lost_;
+      pmtu_next_ms_ = -1;
+      char line[112];
+      std::snprintf(line, sizeof(line),
+                    "FCP PMTUD: %u-byte path did not answer, staying at %u",
+                    static_cast<unsigned>(pmtu_max_mtu_),
+                    static_cast<unsigned>(pmtu_mtu_));
+      log(line);
+      return;
+    }
+  }
+  const uint16_t candidate = pmtu_next_candidate();
+  if (candidate == 0) {
+    pmtu_next_ms_ = -1;
+    return;
+  }
+  // The token ties the ack to this probe. The ack itself is authenticated, so
+  // the token's job is to reject a late ack from an earlier rung and any
+  // reordering inside the session, not an off-path attacker.
+  uint8_t token_bytes[4] = {};
+  if (!random_bytes(token_bytes, sizeof(token_bytes))) {
+    pmtu_next_ms_ = -1;
+    return;
+  }
+  pmtu_token_ = get_le32(token_bytes);
+  pmtu_probe_mtu_ = candidate;
+  pmtu_send(kPmtuProbe, candidate, pmtu_token_);
+  ++pmtu_probes_sent_;
+  pmtu_next_ms_ = now_ms + kPmtuRetryMs;
+}
+
+void Session::pmtu_send(uint8_t type, uint16_t mtu, uint32_t token) {
+  const size_t len =
+      type == kPmtuProbe ? pmtu_probe_len(mtu, cfg_.ip_hdr_len) : kPmtuHeaderLen;
+  if (len == 0) {
+    return;
+  }
+  std::vector<uint8_t> msg(len, 0);
+  pmtu_build(PmtuMessage{type, token, mtu}, msg.data(), msg.size());
+  send_oob(msg.data(), msg.size());
+}
+
+bool Session::pmtu_handle(const std::vector<uint8_t>& plain, size_t wire_len,
+                          int64_t now_ms) {
+  PmtuMessage msg;
+  if (!pmtu_parse(plain.data() + kFecHdrLen, plain.size() - kFecHdrLen, &msg)) {
+    return false;
+  }
+  // Above the configured base and below the local ceiling is the only range
+  // that can move anything; everything else is a stale or misconfigured probe
+  // and is consumed silently. The ceiling is ours, not the peer's: a peer
+  // running --pmtu-max=9000 against a receiver configured for 1500 must not be
+  // able to inflate our receive bound (an 8 KB symbol times D per set times 256
+  // sets is real memory, and the probe may simply have crossed a path that
+  // accepts jumbo in one direction).
+  if (msg.mtu <= cfg_.mtu || msg.mtu > pmtu_max_mtu_) {
+    return true;
+  }
+  if (msg.type == kPmtuProbe) {
+    // The ack exists to say "this datagram arrived at the size it aimed for".
+    // The IP length is the outer bound on the way in, so a probe cannot be
+    // padded up by the path -- only truncated or dropped. Compare the envelope
+    // length actually received, not the message's own claim. (The ack itself
+    // is deliberately small, so only probes are size-checked.)
+    const size_t expect_wire = pmtu_udp_payload(msg.mtu, cfg_.ip_hdr_len);
+    if (wire_len != expect_wire) {
+      ++pre_struct_fail_;
+      sync_report_counters();
+      return true;
+    }
+    // Raise the receive bound first: the ack below is what authorizes the peer
+    // to send symbols this large.
+    pmtu_raise_recv(msg.mtu);
+    pmtu_send(kPmtuAck, msg.mtu, msg.token);
+  } else if (pmtu_probe_mtu_ == msg.mtu) {
+    // The rung is identified by its size, not the token: the ladder is strictly
+    // increasing, so an ack carrying the outstanding size can only belong to
+    // it. Requiring the token as well broke exactly the slow paths PMTUD is
+    // meant to help -- with a 1.2 s RTT the first ack arrives after the next
+    // retry already replaced the token, so every ack was ignored and the rung
+    // gave up after three tries even though the path had answered each probe.
+    pmtu_probe_mtu_ = 0;
+    pmtu_attempts_ = 0;
+    ++pmtu_probes_acked_;
+    pmtu_raise_send(msg.mtu);
+    pmtu_next_ms_ = pmtu_next_candidate() == 0 ? -1 : now_ms + kPmtuRetryMs;
+  }
+  return true;
+}
+
+void Session::pmtu_raise_recv(uint16_t mtu) {
+  const size_t wire = pmtu_udp_payload(mtu, cfg_.ip_hdr_len);
+  if (wire <= Envelope::kOverhead + kFecHdrLen) {
+    return;
+  }
+  const size_t symbol = wire - Envelope::kOverhead - kFecHdrLen;
+  recv_symbol_max_ = std::max(recv_symbol_max_, symbol);
+}
+
+void Session::pmtu_raise_send(uint16_t mtu) {
+  const MtuLimits next = compute_mtu_limits(mtu, cfg_.ip_hdr_len);
+  if (!next.valid || next.payload_max <= limits_.payload_max) {
+    return;
+  }
+  const uint16_t before = pmtu_mtu_;
+  limits_ = next;
+  pmtu_mtu_ = mtu;
+  if (tx_) {
+    tx_->raise_limits(next);
+  }
+  char line[96];
+  std::snprintf(line, sizeof(line), "FCP PMTUD: path MTU %u -> %u",
+                static_cast<unsigned>(before), static_cast<unsigned>(mtu));
+  log(line);
 }
 
 void Session::sync_report_counters() {

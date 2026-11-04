@@ -1,4 +1,4 @@
-﻿# Windows 一键构建：sidecar 准备 → tauri build（--no-bundle）→ 7zSD 便携单文件。
+﻿# Windows 一键构建：sidecar 准备 → tauri build（--no-bundle）→ 单文件引导器封装。
 #
 # 用法（在 VS 开发者命令行或已装好 Rust/Node 的环境里）：
 #   pwsh -File apps/desktop/scripts/build_windows.ps1 `

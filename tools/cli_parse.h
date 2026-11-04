@@ -140,7 +140,7 @@ struct Match {
   bool has_value = false;
 };
 
-// Longest-prefix matching, so `--window-cap` is never reported as `--window`.
+// Longest-prefix matching, so `--key-env` is never reported as `--key`.
 // A registered value-option given bare is an error rather than an empty value:
 // `--window` with no `=` would otherwise mean 0 KiB. `arg` must start with
 // "--"; the caller rewrites the short spellings (-h/-V/-v) first.

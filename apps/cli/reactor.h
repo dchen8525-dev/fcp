@@ -69,6 +69,8 @@
 
 namespace fcp {
 
+class BenchServer;
+
 // select() wakes at least this often, so the engine's tick and the DNS results
 // land on a predictable cadence.
 constexpr int kReactorTickMs = 25;  // matches kSessionTickMs
@@ -104,6 +106,10 @@ struct ReactorOptions {
   // Server: the UDP port to bind.
   std::string bind_addr = "0.0.0.0";
   int bind_port = 4460;
+  // Server: answer the desktop speed test's frame-layer bench on the FCP UDP
+  // port (bench.h). Off by default: the responder creates an authenticated
+  // session from an unauthenticated rendezvous, so exposing it is opt-in.
+  bool speedtest = false;
   // TCP connect budget for one resolved address. A name with several records
   // may spend this per record; the engine's own dial_timeout_ms still bounds
   // resolution plus all attempts from above.
@@ -188,8 +194,12 @@ class Reactor {
 
   // Engine host callbacks.
   size_t app_send(uint64_t conn, const uint8_t* data, size_t len);
+  void app_shutdown(uint64_t conn);
   void app_close(uint64_t conn);
   size_t wire_send(uint64_t peer, const uint8_t* wire, size_t len);
+  // Count a permanent UDP send error and explain the first one per second on
+  // stderr (EMSGSIZE is the "MTU larger than the path" case and names --mtu).
+  void note_udp_send_error(int err, size_t len);
   // Connections whose application socket hit a fatal send error. The engine
   // must not be re-entered from a host callback, so they are queued and the
   // loop tells it once the call stack has unwound (M-05).
@@ -226,7 +236,10 @@ class Reactor {
                  std::unordered_map<Sock, uint64_t>* connect_conn,
                  std::unordered_map<Sock, uint64_t>* write_conn,
                  std::unordered_map<Sock, uint64_t>* except_conn);
-  int64_t wait_ms(int64_t now_ms) const;
+  // select() timeout: the next engine tick, the earliest stream wake
+  // (ProxyEngine::next_wake_ms) and any pending connect deadline, whichever
+  // comes first, clamped to one reactor tick.
+  int64_t wait_ms(int64_t now_ms, int64_t wake_ms) const;
   void print_stats(int64_t now_ms);
 
   static std::string addr_key(const sockaddr* sa);
@@ -234,7 +247,12 @@ class Reactor {
   static Sock first_sock_of(const std::unordered_map<uint64_t, Sock>& m, uint64_t conn);
 
   ReactorOptions opt_;
+  // Snapshot of the engine config for the bench responder (key and FEC
+  // geometry); the engine owns its own copy.
+  EngineConfig base_config_;
   ProxyEngine engine_;
+  // Created in start() when opt_.speedtest is set (server role only).
+  std::unique_ptr<BenchServer> bench_;
   Sock udp_ = kBadSock;
   Sock listener_ = kBadSock;
   // The client has exactly one peer (id 0); the server assigns an id per
@@ -271,6 +289,8 @@ class Reactor {
   std::vector<uint64_t> unmonitored_;
   size_t skipped_this_pass_ = 0;
   uint64_t skipped_total_ = 0;
+  uint64_t udp_send_errors_ = 0;          // permanent send failures (stats/debug)
+  int64_t last_udp_send_error_ms_ = 0;    // rate limit for the log line above
   int64_t next_skip_log_ms_ = 0;
   size_t max_sessions_ = 0;
   using SignalHandler = void (*)(int);

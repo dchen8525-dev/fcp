@@ -96,6 +96,16 @@ void apply_prewarm(const PeerProfile& profile, SessionConfig* session, StreamCon
         !stream->send_window_explicit) {
       stream->send_window_bytes = profile.window_bytes;
     }
+    // The controller priors are only meaningful for the controller they came
+    // from, and only when the operator did not pin the start.
+    if (stream->auto_window && stream->bbr && !stream->send_window_explicit) {
+      if (profile.bw_bps > 0) {
+        stream->initial_bw_bps = profile.bw_bps;
+      }
+      if (profile.min_rtt_ms > 0) {
+        stream->initial_min_rtt_ms = profile.min_rtt_ms;
+      }
+    }
   }
 }
 

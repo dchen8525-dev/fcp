@@ -64,6 +64,7 @@ add_library(fcp STATIC
   src/fcp/envelope.cc
   src/fcp/random.cc
   src/fcp/hdr.cc
+  src/fcp/pmtu.cc
   src/fcp/fecstat.cc
   src/fcp/frame_tx.cc
   src/fcp/frame_rx.cc
@@ -74,6 +75,7 @@ add_library(fcp STATIC
   src/fcp/handshake.cc
   src/fcp/session.cc
   src/fcp/session_log.cc
+  src/fcp/bbr.cc
   src/fcp/stream.cc
   src/fcp/stream_recv.cc
   src/fcp/stream_send.cc

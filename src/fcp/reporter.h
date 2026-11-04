@@ -61,6 +61,12 @@ class FcpReporter {
   bool last_forced() const { return last_forced_; }
   uint32_t reports() const { return reports_; }
   int64_t last_report_ms() const { return last_report_ms_; }
+  // Raw inbound loss of the last emitted interval (expected data symbols and
+  // the ones that never arrived, before FEC recovery). The settle counters are
+  // cleared by reset_interval(), so the reporter caches the pair for hosts that
+  // want a live loss reading (the CLI stats line and the desktop speed test).
+  uint32_t last_expected() const { return last_expected_; }
+  uint32_t last_lost() const { return last_lost_; }
 
  private:
   bool has_content() const;
@@ -78,6 +84,8 @@ class FcpReporter {
   std::vector<uint16_t> repair_lat_;
 
   int64_t last_report_ms_ = 0;
+  uint32_t last_expected_ = 0;
+  uint32_t last_lost_ = 0;
   bool have_last_ = false;
   bool last_forced_ = false;
   uint32_t reports_ = 0;

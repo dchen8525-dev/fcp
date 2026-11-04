@@ -63,6 +63,12 @@ struct EngineConfig {
   uint8_t p_max = kDefaultPmax;
   uint16_t mtu = kDefaultMtu;
   size_t ip_hdr_len = kDefaultIpHeaderLen;
+  // PMTUD (pmtu.h): probe upward from `mtu` to at most pmtu_max_mtu once the
+  // peer advertises the capability. Product default on; the session-level
+  // default stays off so library tests see exactly the wire they configure.
+  // The reactor clears this if the socket could not be put in DF mode.
+  bool pmtud = true;
+  uint16_t pmtu_max_mtu = kDefaultPmtuMaxMtu;
   int pinned_k = -1;  // >= 0 bypasses the adaptive strategy (measurements)
   // M3 byte budget (M3控制设计.md §2), passed to SessionConfig verbatim.
   double fec_budget = kDefaultFecBudget;
@@ -81,8 +87,25 @@ struct EngineConfig {
   // its own queue shows up in the RTT. Not a BDP tracker: the measured BDP is
   // only the recovery reference after a loss.
   bool auto_window = true;
+  // Congestion controller for the adaptive window: BBR (delivery-rate model +
+  // pacing) is the default; false selects the epoch controller
+  // (StreamConfig::bbr).
+  bool bbr = true;
+  // 1 = BBRv1, 2 = BBRv2 (default).
+  int bbr_version = 2;
+  // Loss-epoch rate probe: grow instead of cutting when a lossy epoch still
+  // delivered data and shows no standing queue (epoch controller only).
+  bool window_probe = true;
   size_t window_min_bytes = kDefaultWindowMinBytes;
   size_t window_max_bytes = kDefaultWindowMaxBytes;
+  // Auto window + BBR: the send ceiling may follow the measured BDP up to this
+  // many bytes, with window_max_bytes as its floor. 0 keeps the ceiling fixed
+  // (the CLI raises it; a Stream configured directly keeps the old behaviour).
+  size_t window_ceiling_bytes = 0;
+  // One ACK per this many in-order data segments (StreamConfig::ack_every).
+  // 1 = per segment, which is what the unit tests want; the CLI and the desktop
+  // turn coalescing on for the wire.
+  uint8_t ack_every = 1;
   // Teardown of a tunnel that stopped speaking (§7: dead peer detection).
   int64_t idle_timeout_ms = kDefaultIdleTimeoutMs;
   // Remote resolution plus dial (§4.3).
@@ -108,6 +131,13 @@ struct EngineHost {
   std::function<size_t(uint64_t conn, const uint8_t* data, size_t len)> app_send;
   // Done with this connection's application socket: close it and forget it.
   std::function<void(uint64_t conn)> app_close;
+  // The other end of the tunnel will send nothing more: half-close this
+  // connection's application socket (shutdown write, keep reading). The local
+  // side then finishes in its own time and its close drives the teardown, so a
+  // target that answers after the request is complete is still relayed.
+  // Optional: a host without half-close support leaves it unset and the engine
+  // falls back to closing the tunnel here.
+  std::function<void(uint64_t conn)> app_shutdown;
   // One sealed datagram for `peer`. On the client there is a single peer (the
   // server); on the server `peer` is the client address the reactor saw first.
   // Returns the bytes the transport accepted (0 = dropped/would-block). The
@@ -158,6 +188,20 @@ class ProxyEngine {
   // Timer pump: handshake retries, stream retransmission, dial and flush
   // deadlines, idle reaping. 25ms (kSessionTickMs) is the intended period.
   void on_tick(int64_t now_ms);
+  // PMTUD is only sound with DF set on the UDP socket (reactor.cc): without
+  // it a router fragments an oversized probe instead of dropping it, and the
+  // session would raise its MTU to a size the path cannot carry whole. The
+  // host calls this when the setsockopt failed; sessions created afterwards
+  // stop advertising the capability.
+  void set_pmtud(bool enabled) { cfg_.pmtud = enabled; }
+
+  // Earliest time any stream wants the host to tick again before the regular
+  // 25 ms cadence: a coalesced ACK's deadline, or the pacer releasing the next
+  // segment. 0 = nothing is waiting on a sub-tick wake. The reactor folds this
+  // into its select() timeout, which is what gives the pacer a granularity
+  // finer than the tick (and keeps ACK coalescing from adding a tick of
+  // latency to short exchanges).
+  int64_t next_wake_ms(int64_t now_ms) const;
 
   // The application socket took more bytes: retry the flush. Called when select
   // reports the socket writable, and again on every tick, because a window that
@@ -214,6 +258,18 @@ class ProxyEngine {
   // #31 (M4 trigger metric): live sum of every session's FEC/ARQ waste
   // counter — retransmissions that lost the race to parity.
   uint32_t dup_after_recovered() const;
+  // Raw loss of the most recent FECSTAT interval, summed over live sessions.
+  // `in_*` is this end's inbound direction (what we failed to receive, from
+  // FcpReporter); `out_*` is the peer's view of our outbound direction (from
+  // the last report the peer sent us). Counts are data symbols, pre-FEC.
+  // A zero `expected` means no report has arrived for that direction yet.
+  struct LossSample {
+    uint64_t in_expected = 0;
+    uint64_t in_lost = 0;
+    uint64_t out_expected = 0;
+    uint64_t out_lost = 0;
+  };
+  LossSample loss_sample() const;
   const PrewarmCache& prewarm_cache() const { return prewarm_; }
   // Bytes the engine is holding for `conn`'s application socket.
   size_t pending_app_bytes(uint64_t conn) const;
@@ -366,7 +422,7 @@ class ProxyEngine {
   PeerProfile profile_for(uint64_t peer, int64_t now_ms) const;
   std::string label(const Conn& conn) const;
   std::string label(uint64_t conn) const;
-  char diag_[256] = {};  // #33③: teardown forensics scratch
+  char diag_[512] = {};  // #33③: teardown forensics scratch
   void log(const std::string& line) const;
 
   EngineConfig cfg_;

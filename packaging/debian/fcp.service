@@ -30,9 +30,9 @@ LogsDirectoryMode=0750
 StateDirectory=fcp
 StateDirectoryMode=0750
 
-# 每连接最坏 2 × --window-cap 内存（部署运维指南.md §5.1）：自适应默认
+# 每连接最坏 2 × --window MAX 内存（部署运维指南.md §5.1）：自适应默认
 # 1024 KiB × 256 会话 ≈ 512 MiB，再加上 FEC/流缓冲。这里刻意不设 MemoryMax
-# （默认即无限制）——真正的内存上限由 --max-sessions 和 --window-cap 决定，
+# （默认即无限制）——真正的内存上限由 --max-sessions 和 --window MAX 决定，
 # 写 MemoryMax=infinity 只是重复默认值，看不出任何意图。
 LimitNOFILE=65536
 

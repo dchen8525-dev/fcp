@@ -16,12 +16,14 @@ set(FCP_TEST_NAMES
   kfor_test
   strategy_test
   handshake_test
+  pmtu_test
   frame_tx_test
   frame_rx_test
   settle_test
   reporter_test
   session_test
   replay_test
+  bbr_test
   stream_test
   stream_e2e_test
   prewarm_test
@@ -57,7 +59,8 @@ target_link_libraries(fcp_proxy_proto_test PRIVATE fcp_proxy_core)
 # d+p pair limit) under the default test gate.
 add_executable(fcp_cli_test cli_test.cc
                ${CMAKE_CURRENT_SOURCE_DIR}/../apps/cli/cli.cc
-               ${CMAKE_CURRENT_SOURCE_DIR}/../apps/cli/reactor.cc)
+               ${CMAKE_CURRENT_SOURCE_DIR}/../apps/cli/reactor.cc
+               ${CMAKE_CURRENT_SOURCE_DIR}/../apps/cli/bench.cc)
 target_include_directories(fcp_cli_test PRIVATE
                ${CMAKE_CURRENT_SOURCE_DIR}/../apps/cli
                ${CMAKE_CURRENT_SOURCE_DIR}/../tools)
@@ -72,7 +75,7 @@ set_tests_properties(cli_test PROPERTIES TIMEOUT 300)
 # simulated time in the default configuration; the C3 acceptance run uses
 # FCP_SOAK_MS=600000 FCP_SOAK_REALTIME=1 (see M1验收记录.md).
 if(WIN32)
-  foreach(name e2e_test soak_test adv_test stream_e2e_test prewarm_test)
+  foreach(name e2e_test soak_test adv_test stream_e2e_test prewarm_test pmtu_test)
     if(TARGET fcp_${name})
       target_link_libraries(fcp_${name} PRIVATE ws2_32)
     endif()

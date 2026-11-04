@@ -546,10 +546,11 @@ void TestOutOfOrderHeldAndSackBlock() {
 }
 
 // A hole in front of a SACK block is retransmitted on the spot, before any RTO.
-// #27: the dup-ACK burst that follows the loss also triggers one forced copy
-// of the hole (kDupAckThresh duplicates arrive while the SACK repair is still
-// in flight), so the wire carries original + fill + fast retransmit, and the
-// receiver trims the redundant one.
+// The dup-ACK burst that follows must NOT add a second copy while the SACK
+// repair is still in flight (2026-11-03): the peer ACKs every received set, so
+// on a real 205ms path the unthrottled burst re-fired this repair every few
+// milliseconds (26k copies per 50 MB, observed live). One repair per RTT is
+// enough and is what keeps the ACK path from being drowned.
 void TestSackFillsHoleWithoutTimeout() {
   Fixture f;
   int copies = 0;
@@ -566,9 +567,9 @@ void TestSackFillsHoleWithoutTimeout() {
   f.drain();
 
   CHECK(f.b().delivered == src);
-  CHECK_EQ(copies, 3);  // original + SACK repair + fast retransmit
-  CHECK_EQ(f.sa().retransmits(), 2u);
-  CHECK_EQ(f.sb().dup_bytes(), f.payload());
+  CHECK_EQ(copies, 2);  // original + the SACK repair only
+  CHECK_EQ(f.sa().retransmits(), 1u);
+  CHECK_EQ(f.sb().dup_bytes(), 0u);  // no redundant forced copy
   // No RTO can have elapsed: rto is 400ms at the seeded srtt, and the repair
   // came back inside a couple of 25ms ticks.
   CHECK(f.now() - t0 < f.sa().rto_ms());
@@ -869,8 +870,8 @@ void TestKarnDropsAmbiguousSamples() {
   f.drain();
 
   CHECK(f.b().delivered == src);
-  CHECK_EQ(copies, 3);  // original + SACK repair + fast retransmit (#27)
-  CHECK_EQ(f.sa().retransmits(), 2u);
+  CHECK_EQ(copies, 2);  // original + SACK repair (the dup burst is throttled)
+  CHECK_EQ(f.sa().retransmits(), 1u);
   CHECK(f.a().rtts.empty());  // Karn: every copy of seg 0 was a retransmission
   CHECK_EQ(f.sa().srtt_ms(), f.cfg().initial_srtt_ms);
   CHECK_EQ(f.sa().bytes_acked(), src.size());
@@ -903,6 +904,44 @@ void TestRtoFiresWhenPeerStopsAcking() {
   f.drain();
   CHECK(f.b().delivered == src);
   CHECK(!f.sa().closed());
+}
+
+// A SACK cannot be retracted: the receiver's out-of-order tail can be dropped
+// under buffer pressure (or a forged block can arrive), and the sender has no
+// way to learn that the range is gone. If the mark were permanent the hole would
+// never be filled again -- the RTO pass and fill_holes both skip sacked
+// segments -- and the stream would freeze with no way out. The mark therefore
+// expires, after which the normal repair paths pick the bytes back up.
+void TestStaleSackExpiresAndRecovers() {
+  Fixture f;
+  f.cut_all();
+  const std::vector<uint8_t> src = MakeBytes(400, 42);  // 4 segments
+  CHECK_EQ(f.push(kA, src), src.size());
+  CHECK_EQ(f.data_of(kA).size(), 4u);
+
+  const auto copies_of = [&f](uint32_t offset) {
+    size_t n = 0;
+    for (const std::vector<uint8_t>& seg : f.data_of(kA)) {
+      if (IsData(seg) && rd32(seg.data() + 1) == offset) {
+        ++n;
+      }
+    }
+    return n;
+  };
+
+  // The peer claims the whole tail past the first segment is buffered. That
+  // fills segment 0 only; the rest must stay put while the mark is fresh.
+  f.feed(kA, MakeAck(0, 4096, 100, 400));
+  CHECK_EQ(copies_of(100), 1u);
+  f.tick(500);  // longer than the RTO, still inside the trust window
+  CHECK_EQ(copies_of(100), 1u);
+
+  // Once the mark is stale, a timeout has to be able to repair the range.
+  for (int i = 0; i < 60; ++i) {
+    f.tick(100);
+  }
+  CHECK(copies_of(100) >= 2u);
+  CHECK(copies_of(300) >= 2u);
 }
 
 void TestHalfCloseThenPeerClose() {
@@ -1110,10 +1149,10 @@ void TestSackRotationReportsAllHoles() {
   CHECK_EQ(f.now(), t_pushed);
 }
 
-// The dup-ACK path: the first SACK sighting repairs the hole via fill_holes,
-// and the third duplicate ACK adds exactly one forced copy of the first
-// unacked segment (once per batch — more duplicates need another kDupAckThresh
-// to fire again). No time passes, so nothing here can be an RTO.
+// The dup-ACK path: the first SACK sighting repairs the hole via fill_holes.
+// A forced copy of the first unacked segment happens only when that repair has
+// had a full RTT to land: one repair per RTT, not one per three ACKs. No RTO
+// is involved in any of these steps.
 void TestDupAckForceRefill() {
   Fixture f;
   f.cut_all();
@@ -1133,18 +1172,25 @@ void TestDupAckForceRefill() {
   for (const auto& ack : acks2) {
     f.feed(kA, ack);
   }
-  // ACK 1: fill_holes repairs the hole. ACKs 2..4: dups 1..3, the third
-  // forces one extra copy of the first unacked segment.
-  CHECK_EQ(f.sa().retransmits(), 2u);
-  CHECK_EQ(f.data_with_offset(kA, 0), 3u);  // original + fill + forced copy
+  // ACK 1 repairs the hole via fill_holes. ACKs 2..4 are the dup burst; it
+  // would force a copy, but the repair is still inside its RTT and a second
+  // copy would only compete with the first one for the same loss.
+  CHECK_EQ(f.sa().retransmits(), 1u);
+  CHECK_EQ(f.data_with_offset(kA, 0), 2u);  // original + fill
   CHECK_EQ(f.now(), t_pushed);              // no timeout was involved
 
-  // Replaying the same four ACKs restarts the counter: dup 3 fires once more
-  // (fill stays blocked by sack_filled_up_to_), proving the per-batch rule.
+  // After a full RTT with cum still stuck, the next burst is real loss
+  // evidence and fires exactly one forced copy.
+  f.tick(f.sa().srtt_ms() + 50);
   for (const auto& ack : acks2) {
     f.feed(kA, ack);
   }
-  CHECK_EQ(f.sa().retransmits(), 3u);
+  CHECK_EQ(f.sa().retransmits(), 2u);
+  // A third burst inside the same RTT is suppressed again.
+  for (const auto& ack : acks2) {
+    f.feed(kA, ack);
+  }
+  CHECK_EQ(f.sa().retransmits(), 2u);
 }
 
 // In-order ACKs never arm the fast-retransmit path.
@@ -1243,6 +1289,66 @@ void TestDeepReorderStaysUnderCap() {
   // The final (offset 0) segment completes the prefix: everything delivers.
   CHECK(f.b().delivered == src);
   CHECK_EQ(f.sb().oob_bytes(), 0u);
+}
+
+// A segment that lands on two buffered runs at once has to join them into one:
+// the receiver keeps its runs sorted and disjoint, and a detour through an
+// intermediate iterator invalidated by the erase used to corrupt that invariant.
+void TestOverlappingSegmentJoinsBothNeighbours() {
+  Fixture f;
+  f.cut_all();
+
+  f.feed(kB, MakeData(200, MakeBytes(100, 1), false));  // [200, 300)
+  f.feed(kB, MakeData(400, MakeBytes(100, 2), false));  // [400, 500)
+  CHECK_EQ(f.sb().oob_chunks(), 2u);
+
+  // [150, 480) starts before the first run and ends inside the second: both
+  // are absorbed, and the pieces must be in byte order.
+  std::vector<uint8_t> bridge = MakeBytes(100, 1);  // [200, 300) content
+  bridge = Concat(MakeBytes(50, 9), bridge);        // [150, 200) new
+  bridge = Concat(bridge, MakeBytes(80, 3));        // [300, 380) new
+  bridge = Concat(bridge, MakeBytes(20, 2));        // [380, 400) redundant? no: [380,400) new
+  CHECK_EQ(bridge.size(), 250u);
+  f.feed(kB, MakeData(150, bridge, false));
+  CHECK_EQ(f.sb().oob_chunks(), 1u);
+  CHECK_EQ(f.sb().oob_bytes(), 350u);  // [150, 500)
+
+  // Also the left-only case: a segment that starts inside the run below it.
+  f.feed(kB, MakeData(100, MakeBytes(100, 7), false));  // [100, 200) overlaps
+  CHECK_EQ(f.sb().oob_chunks(), 1u);
+  CHECK_EQ(f.sb().oob_bytes(), 400u);  // [100, 500)
+
+  // Filling the hole at 0 delivers every byte in order. The later segment's
+  // copy wins for the [150, 200) overlap, so the seed-9 run is gone.
+  std::vector<uint8_t> src = MakeBytes(100, 7);
+  src = Concat(src, MakeBytes(100, 1));
+  src = Concat(src, MakeBytes(80, 3));
+  src = Concat(src, MakeBytes(20, 2));
+  src = Concat(src, MakeBytes(100, 2));
+  CHECK_EQ(src.size(), 400u);
+  f.feed(kB, MakeData(0, MakeBytes(100, 0), false));
+  CHECK_EQ(f.sb().oob_bytes(), 0u);
+  CHECK(f.b().delivered == Concat(MakeBytes(100, 0), src));
+}
+
+// A peer that fills the receive buffer with one-byte chunks must not be able to
+// turn the out-of-order deque into an unbounded allocation: the byte cap alone
+// does not bound the number of entries, so there is a chunk ceiling too.
+void TestOobChunkCeilingBoundsTinySegments() {
+  StreamConfig cfg = DefaultCfg();
+  cfg.rcv_buf_bytes = 32768;  // chunk ceiling still floors at kMinOobChunks
+  Fixture f(cfg);
+  f.cut_all();
+
+  constexpr size_t kFeeds = 2000;
+  for (size_t i = 0; i < kFeeds; ++i) {
+    // Every other byte: each arrival is its own run, one byte long.
+    f.feed(kB, MakeData(static_cast<uint32_t>(2 * i + 2), MakeBytes(1, static_cast<uint8_t>(i)),
+                        false));
+  }
+  CHECK_EQ(f.sb().oob_chunks(), fcp::kMinOobChunks);
+  CHECK_EQ(f.sb().oob_bytes(), fcp::kMinOobChunks);
+  CHECK_EQ(f.sb().oob_drops(), kFeeds - fcp::kMinOobChunks);
 }
 
 // M2 §2.3: the close completes when OUR fin is acknowledged (cum >= fin_seq+1)
@@ -1428,6 +1534,9 @@ constexpr size_t kAutoCeil = 256 * 1024;
 StreamConfig AutoCfg() {
   StreamConfig c = DefaultCfg();
   c.auto_window = true;
+  // These tests pin the epoch controller (slow start / AIMD / loss probe).
+  // BBR is the shipping default and has its own tests below.
+  c.bbr = false;
   c.send_window_bytes = kAutoFloor;
   c.window_min_bytes = kAutoFloor;
   c.window_max_bytes = kAutoCeil;
@@ -1569,6 +1678,58 @@ void TestAutoWindowHoldsAtTheStartWindow() {
   CHECK(f.b().delivered == src);
 }
 
+// 2026-11-03: a dup-ACK hole is not congestion evidence on a FEC-protected
+// path -- the peer is still acknowledging, so data is flowing. With the probe
+// the window grows instead of taking the 30% AIMD cut; an RTO blackout still
+// cuts (TestAutoWindowCutsOnLoss) and the queue brake still owns shrinking.
+void TestAutoWindowProbesOnDupAckLoss() {
+  StreamConfig c = AutoCfg();
+  c.initial_srtt_ms = 4000;   // -> epoch 4s, rto clamped to 5s: no timeout in view
+  c.window_min_bytes = 4096;  // below the start, so a cut would be visible
+  Fixture f(c);               // window_probe defaults to true
+  f.cut_all();
+
+  const std::vector<uint8_t> src = MakeBytes(4u * 1024 * 1024, 62);
+  Applier w(f.sa(), src);
+  w.push();
+  f.tick(1);
+  const size_t start = f.sa().send_window();
+  CHECK_EQ(start, c.send_window_bytes);
+
+  // Take the window above the start first: full ACKs with the window binding.
+  for (int r = 0; r < 8 && f.sa().send_window() == start; ++r) {
+    f.feed(kA, MakeAck(static_cast<uint32_t>(f.sa().bytes_acked() + f.sa().in_flight()),
+                       64 * 1024, 0, 0));
+    f.tick(4100);  // epoch boundary
+    w.push();
+    f.tick(1);
+  }
+  const size_t w0 = f.sa().send_window();
+  CHECK(w0 > start);
+
+  const uint32_t hole = 100;  // max_segment 106 -> 100 byte payloads
+  const uint32_t base = static_cast<uint32_t>(f.sa().bytes_acked());
+  const std::vector<uint8_t> dup =
+      MakeAck(base, 64 * 1024, base + hole, base + 2 * hole);
+  for (int i = 0; i < 4; ++i) {
+    f.feed(kA, dup);  // the 4th is the third duplicate: repair, do not cut
+  }
+  CHECK_EQ(f.sa().dup_loss_events(), 0u);
+  // Past one RTT: the repair has had its chance, so the next burst is evidence,
+  // not the same burst arriving twice inside a repair's flight time.
+  f.tick(f.sa().srtt_ms() + 500);
+  CHECK_EQ(f.sa().send_window(), w0);  // one burst is not loss evidence
+
+  for (int i = 0; i < 4; ++i) {
+    f.feed(kA, dup);  // still stuck behind the same hole: this is a hole
+  }
+  CHECK(f.sa().dup_loss_events() > 0u);
+  f.tick(4100);
+  // The probe grows 25% (capped by the ceiling) instead of cutting.
+  CHECK_EQ(f.sa().send_window(), std::min(w0 + w0 / 4, kAutoCeil));
+  CHECK(f.sa().send_window() > w0);
+}
+
 // The prewarm prior raises the start window above the operator's --window; the
 // loss floor must stay at the operator's value (StreamConfig::loss_floor_bytes),
 // otherwise a warm connection that hits loss freezes at the prior instead of
@@ -1660,6 +1821,40 @@ void TestFixedWindowUnchanged() {
   f.drain();
   CHECK(f.b().delivered == src);
   CHECK_EQ(f.sa().send_window(), f.cfg().send_window_bytes);
+}
+
+// A fixed window below one segment never lets a segment leave: pump() admits a
+// segment only while in_flight + wire_len fits, so the stream accepted the
+// app's bytes and stalled with an empty in-flight (`--no-auto-window
+// --window=1`). The constructor floors the window at two segments.
+void TestFixedWindowCannotGoBelowTwoSegments() {
+  StreamConfig cfg = DefaultCfg();
+  cfg.auto_window = false;
+  cfg.send_window_bytes = 1;
+  Fixture f(cfg);
+  const std::vector<uint8_t> src = MakeBytes(150, 5);
+  CHECK_EQ(f.push(kA, src), src.size());
+  f.drain();
+  CHECK(f.b().delivered == src);
+  CHECK_EQ(f.sa().send_window(), 2 * f.cfg().max_segment);
+}
+
+// The historical min RTT is the reference the delay brake measures queueing
+// against. It has to expire: after a route change to a slower path a floor that
+// never rises makes every epoch look like a standing queue, so the window brakes
+// forever (and the §8 FEC guardrail stays closed for the same reason).
+void TestMinRttExpiresOntoASlowerPath() {
+  Fixture f;
+  Stream& s = f.sa();
+  s.test_update_rtt(200, 1000);
+  CHECK_EQ(s.min_rtt_ms(), 200);
+  s.test_update_rtt(500, 9500);  // inside the window: the floor holds
+  CHECK_EQ(s.min_rtt_ms(), 200);
+  s.test_update_rtt(520, 11500);  // expired: it follows the current path
+  CHECK_EQ(s.min_rtt_ms(), 520);
+  // A genuinely faster sample still lowers the floor immediately.
+  s.test_update_rtt(180, 11600);
+  CHECK_EQ(s.min_rtt_ms(), 180);
 }
 
 // The advertised window is backed by the receive buffer, so auto mode has to
@@ -1800,6 +1995,7 @@ void TestDupAckCutWaitsForSecondBurst() {
   StreamConfig c = AutoCfg();
   c.initial_srtt_ms = 4000;  // -> epoch 4s, rto clamped to 5s: no timeout in view
   c.window_min_bytes = 4096;  // below the start, so a 30% cut is visible
+  c.window_probe = false;     // this test pins the AIMD fallback
   Fixture f(c);
   f.cut_all();  // B receives nothing; the ACKs below are hand-made
   const std::vector<uint8_t> src = MakeBytes(4u * 1024 * 1024, 5);
@@ -1831,7 +2027,8 @@ void TestDupAckCutWaitsForSecondBurst() {
   }
   CHECK(f.sa().retransmits() >= 1u);
   CHECK_EQ(f.sa().dup_loss_events(), 0u);
-  f.tick(4100);
+  // Past one RTT: only a burst after the repair's own flight time is loss.
+  f.tick(f.sa().srtt_ms() + 500);
   CHECK_EQ(f.sa().send_window(), w0);  // one burst is still compatible with a hole
 
   for (int i = 0; i < 4; ++i) {
@@ -1890,6 +2087,122 @@ void TestStalledAppDoesNotBufferProbes() {
   CHECK(f.b().delivered == src);
 }
 
+// ACK coalescing (StreamConfig::ack_every). A clean in-order stream used to
+// emit one 81-byte ACK packet per data segment; batching two halves that on the
+// reverse path. A hole must still be reported at once (the sender is waiting on
+// it), and a pending ACK has to go out on its own deadline rather than waiting
+// for the next segment or the tick.
+void TestAckCoalescingHalvesCleanPathAcks() {
+  StreamConfig cfg = DefaultCfg();
+  cfg.ack_every = 2;
+  Fixture f(cfg);
+  const std::vector<uint8_t> seg = MakeBytes(100, 1);
+  f.feed(kB, MakeData(0, seg, false));
+  CHECK_EQ(f.acks_of(kB).size(), 0u);  // owed, not sent yet
+  f.feed(kB, MakeData(100, seg, false));
+  CHECK_EQ(f.acks_of(kB).size(), 1u);  // the second segment flushes it
+
+  // One more segment is owed; the host is told when it has to come back for it.
+  f.feed(kB, MakeData(200, seg, false));
+  CHECK_EQ(f.acks_of(kB).size(), 1u);
+  const int64_t wake = f.sb().next_wake_ms(f.now());
+  CHECK(wake > f.now());
+  f.tick(fcp::kAckDelayMs);
+  CHECK_EQ(f.acks_of(kB).size(), 2u);
+
+  // Out of order is urgent: 300..499 is missing, so the peer needs the SACK
+  // now, not after another arrival.
+  f.feed(kB, MakeData(500, seg, false));
+  CHECK_EQ(f.acks_of(kB).size(), 3u);
+}
+
+// Every ACK settles the delayed-ACK debt, not only the coalescing decision in
+// maybe_ack(). A duplicate segment is answered at once (the sender's RTO would
+// otherwise keep firing); if that immediate ACK left the debt standing, the
+// tick would send a second copy kAckDelayMs later -- the per-segment pair the
+// coalescing exists to remove, one delayed.
+void TestAnyAckSettlesTheCoalescingDebt() {
+  StreamConfig cfg = DefaultCfg();
+  cfg.ack_every = 2;
+  Fixture f(cfg);
+  const std::vector<uint8_t> seg = MakeBytes(100, 1);
+  f.feed(kB, MakeData(0, seg, false));
+  CHECK_EQ(f.acks_of(kB).size(), 0u);  // owed, not sent yet
+  f.feed(kB, MakeData(0, seg, false));
+  CHECK_EQ(f.acks_of(kB).size(), 1u);  // duplicate: answered immediately
+  f.tick(fcp::kAckDelayMs);
+  CHECK_EQ(f.acks_of(kB).size(), 1u);  // and no delayed copy follows it
+}
+
+// Upward PMTUD raises the session's payload size on a live stream. A raise the
+// send window cannot carry would send nothing at all (pump() admits on
+// in_flight + wire_len <= window, and the zero-window probe covers the peer's
+// window, not ours), so it is refused and the old segment size is kept.
+void TestSetMaxSegmentRefusesAStallingRaise() {
+  StreamConfig cfg = DefaultCfg();  // 106-byte segment, 100 payload bytes
+  cfg.auto_window = false;
+  cfg.send_window_bytes = 4096;
+  Fixture f(cfg);
+  f.sa().set_max_segment(9000);  // larger than the whole window: refused
+  f.sa().set_max_segment(200);   // fits: accepted, so 194 payload bytes
+  const std::vector<uint8_t> src = MakeBytes(1000, 7);
+  CHECK_EQ(f.push(kA, src), src.size());
+  f.drain();
+  CHECK(f.b().delivered == src);
+  // Cut at 194 bytes: six segments. A 9000-byte segment would have emitted none.
+  CHECK_EQ(f.a().sent.size(), 6u);
+}
+
+// The send ceiling is the operator's MAX only when they pinned one. Otherwise a
+// session that keeps proving a larger BDP may grow past it, up to the ceiling
+// bound -- a 1 MiB ceiling is 40 Mbps at 200 ms however good the controller is.
+void TestWindowCeilingFollowsMeasuredBdp() {
+  StreamConfig cfg = DefaultCfg();
+  cfg.auto_window = true;
+  cfg.bbr = true;
+  cfg.send_window_bytes = 256 * 1024;
+  cfg.window_min_bytes = 64 * 1024;
+  cfg.window_max_bytes = 256 * 1024;
+  cfg.window_ceiling_bytes = 4 * 1024 * 1024;
+  // A prewarm prior makes the BDP deterministic: 20 MB/s x 100 ms = 2 MiB.
+  cfg.initial_bw_bps = 20u * 1000u * 1000u;
+  cfg.initial_min_rtt_ms = 100;
+  Fixture f(cfg);
+  f.sa().on_tick(f.now());
+  CHECK(f.sa().send_window() > cfg.window_max_bytes);
+  CHECK(f.sa().send_window() <= cfg.window_ceiling_bytes);
+
+  // Without a ceiling bound the configured MAX is the last word.
+  StreamConfig pinned = cfg;
+  pinned.window_ceiling_bytes = 0;
+  Fixture g(pinned);
+  g.sa().on_tick(g.now());
+  CHECK(g.sa().send_window() <= pinned.window_max_bytes);
+}
+
+// The pacer must say *when* it can release the next segment. Relying on the
+// 25 ms reactor tick is what turned BBR pacing into a burst emitter.
+void TestPacerReportsItsNextWake() {
+  StreamConfig cfg = DefaultCfg();
+  cfg.auto_window = true;
+  cfg.bbr = true;
+  cfg.send_window_bytes = 256 * 1024;
+  cfg.window_min_bytes = 64 * 1024;
+  cfg.window_max_bytes = 1024 * 1024;
+  cfg.rcv_buf_bytes = 1024 * 1024;
+  cfg.initial_srtt_ms = 100;
+  Fixture f(cfg);
+  f.feed(kA, MakeAck(0, 1024 * 1024, 0, 0));  // the peer advertises room
+  const std::vector<uint8_t> blob = MakeBytes(200000, 7);
+  (void)f.sa().write(blob.data(), blob.size());
+  f.sa().on_tick(f.now());
+  CHECK(!f.data_of(kA).empty());
+  const int64_t now = f.now();
+  // The bucket was charged by the burst just emitted; the next segment has to
+  // wait a fraction of the tick, and the host is told exactly when.
+  CHECK(f.sa().next_wake_ms(now) > now);
+}
+
 int main() {
   TestOrderedFlow();
   TestBidirectional();
@@ -1907,6 +2220,7 @@ int main() {
   TestStalledReaderBoundsTheSendQueue();
   TestKarnDropsAmbiguousSamples();
   TestRtoFiresWhenPeerStopsAcking();
+  TestStaleSackExpiresAndRecovers();
   TestHalfCloseThenPeerClose();
   TestCloseWithNothingQueued();
   TestRstAborts();
@@ -1919,20 +2233,30 @@ int main() {
   TestInvalidSackBlockIgnored();
   TestPeerFinDoesNotDropUnackedData();
   TestDeepReorderStaysUnderCap();
+  TestOverlappingSegmentJoinsBothNeighbours();
+  TestOobChunkCeilingBoundsTinySegments();
   TestFinOffsetRewriteRejected();
   TestMalformedSegments();
   TestRandomLossEndToEnd();
   TestAutoWindowGrowsToCeiling();
   TestAutoWindowCutsOnLoss();
   TestAutoWindowHoldsAtTheStartWindow();
+  TestAutoWindowProbesOnDupAckLoss();
   TestAutoWindowLossFloorFollowsConfiguredStart();
   TestSynchronousAckDuringPumpKeepsQueueConsistent();
   TestFixedWindowUnchanged();
+  TestFixedWindowCannotGoBelowTwoSegments();
+  TestMinRttExpiresOntoASlowerPath();
   TestAutoWindowRaisesRcvCap();
   TestAutoWindowGrowsPastInflatedTarget();
   TestAutoWindowBrakesOnStandingQueue();
   TestAutoWindowStaysPutWhenPeerLimited();
   TestDupAckCutWaitsForSecondBurst();
   TestStalledAppDoesNotBufferProbes();
+  TestAckCoalescingHalvesCleanPathAcks();
+  TestAnyAckSettlesTheCoalescingDebt();
+  TestSetMaxSegmentRefusesAStallingRaise();
+  TestWindowCeilingFollowsMeasuredBdp();
+  TestPacerReportsItsNextWake();
   return fcp_test::finish();
 }

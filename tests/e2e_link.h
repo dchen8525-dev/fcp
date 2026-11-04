@@ -274,6 +274,11 @@ struct Harness {
   uint32_t loss_percent = 20;
   uint32_t rng = 0x9E3779B9u;
   bool drop_next_data_a = false;
+  // Simulated path MTU in UDP-payload bytes: a datagram larger than this is
+  // dropped by the "network". 0 = no limit. This is what upward PMTUD has to
+  // discover -- the probe is the only packet large enough to be affected, so
+  // the rest of the session keeps working while the ladder fails.
+  size_t path_max_wire = 0;
 
   // Deterministic burst injection (task E2, spec #27②): every `burst_period`
   // outgoing data symbols from A, the first `burst_len` are dropped — e.g.
@@ -349,7 +354,7 @@ struct Harness {
       drop_next_data_a = false;
       return;
     }
-    if (drop(type)) {
+    if (drop(type) || (path_max_wire != 0 && len > path_max_wire)) {
       return;
     }
     sock_a.Send(wire, len);
@@ -365,7 +370,7 @@ struct Harness {
     } else {
       ++b_control;
     }
-    if (drop(type)) {
+    if (drop(type) || (path_max_wire != 0 && len > path_max_wire)) {
       return;
     }
     sock_b.Send(wire, len);

@@ -40,6 +40,17 @@ constexpr int64_t kTombstoneMaxMs = 1400;
 // 静默只改到其中一处）。
 constexpr uint32_t kUntrustedKUnknownPct = 10;
 
+// 判据本身也只有这一处实现。原先三个调用点（settle / strategy / session）
+// 各写一遍 `k_unknown * 100 > max(1, expected) * pct`，其中 session 那处把
+// 右侧留在了 uint32：对端给 sets_expected = 0x80000000 时该乘积在 2^32 上
+// 回绕成 0，于是一份合法的 k-unknown 报告被判成不可信、日志行被静默顶掉。
+// 两侧都提升到 uint64 后宽度漂移不再可能，因为宽度只在这一行决定。
+constexpr bool k_unknown_untrusted(uint32_t sets_expected, uint32_t sets_k_unknown) {
+  const uint64_t denom = sets_expected != 0 ? sets_expected : 1;
+  return static_cast<uint64_t>(sets_k_unknown) * 100 >
+         denom * static_cast<uint64_t>(kUntrustedKUnknownPct);
+}
+
 // Burst detection (M3控制设计.md §3, #26). The reference is the exact
 // i.i.d. law of the max raw-loss run M over one full-size group of `d` slots
 // at per-slot loss `p`: out[l] = P(M = l) for l = 0..7, out[8] = P(M >= 8).

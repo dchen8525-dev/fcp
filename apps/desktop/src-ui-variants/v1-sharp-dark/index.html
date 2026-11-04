@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>FCP · 方案 1 精修深色</title>
+<style>
+  :root{
+    --bg:#0b0e14; --panel:#12161f; --panel-2:#0d1117; --line:#1f2632; --line-soft:#181e28;
+    --fg:#e9eef5; --fg-dim:#a8b3c4; --muted:#6d7a8c;
+    --accent:#3b82f6; --accent-2:#2563eb; --ok:#34d399; --warn:#fbbf24; --err:#f87171;
+    --r:14px;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    background:
+      radial-gradient(1200px 600px at 12% -10%, #16203010, transparent 60%),
+      radial-gradient(600px 400px at 100% 0%, #1b2a4515, transparent 55%),
+      var(--bg);
+    color:var(--fg);
+    font:14px/1.55 system-ui,-apple-system,"Segoe UI","Noto Sans SC","Microsoft YaHei UI",sans-serif;
+    -webkit-font-smoothing:antialiased;
+    display:flex;flex-direction:column;padding:0 20px 20px;gap:14px;
+    user-select:none;-webkit-user-select:none;
+  }
+
+  /* ---------- 顶栏 ---------- */
+  .bar{display:flex;align-items:center;gap:12px;height:60px;flex:0 0 auto}
+  .brand{display:flex;align-items:center;gap:10px}
+  [data-mark]{width:26px;height:26px;display:block;flex:0 0 auto}
+  .mark-bg{fill:#151b26}
+  .mark-f{fill:#ecf2f8}
+  .mark-dot{fill:#3aa0ff}
+  .brand b{font-size:15px;letter-spacing:.14em;font-weight:650}
+  .brand span{font-size:12px;color:var(--muted);letter-spacing:.06em}
+  .bar .spacer{flex:1}
+
+  .status-pill{
+    display:flex;align-items:center;gap:9px;
+    background:var(--panel);border:1px solid var(--line);border-radius:999px;
+    padding:7px 14px 7px 12px;font-size:12px;color:var(--fg-dim);
+    box-shadow:inset 0 1px 0 #ffffff08;
+  }
+  .dot{width:8px;height:8px;border-radius:50%;background:#475569;transition:.25s}
+  .dot.on{background:var(--ok);box-shadow:0 0 0 3px #34d3991f,0 0 12px #34d39999}
+  .dot.bad{background:var(--err);box-shadow:0 0 0 3px #f871711f}
+  .status-pill time{font-variant-numeric:tabular-nums;color:var(--fg);letter-spacing:.02em}
+
+  /* ---------- 布局 ---------- */
+  main{
+    flex:1;min-height:0;display:grid;gap:14px;
+    grid-template-columns:minmax(0,1.32fr) minmax(300px,.9fr);
+    grid-template-rows:auto minmax(160px,1fr);
+    grid-template-areas:"conn status" "log log";
+  }
+  .card{
+    background:linear-gradient(180deg,#141a24,#10151d 45%,var(--panel));
+    border:1px solid var(--line);border-radius:var(--r);
+    box-shadow:inset 0 1px 0 #ffffff0a,0 8px 28px -18px #000;
+    padding:16px 18px;min-height:0;display:flex;flex-direction:column;
+  }
+  .card.conn{grid-area:conn} .card.status{grid-area:status} .card.log{grid-area:log}
+
+  h2{
+    margin:0 0 14px;font-size:11px;font-weight:650;color:var(--muted);
+    letter-spacing:.16em;text-transform:uppercase;display:flex;align-items:center;gap:8px;
+  }
+  h2::after{content:"";flex:1;height:1px;background:linear-gradient(90deg,var(--line),transparent)}
+
+  /* ---------- 表单 ---------- */
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(196px,1fr));gap:14px 16px}
+  label{display:flex;flex-direction:column;gap:6px;font-size:11.5px;color:var(--fg-dim);letter-spacing:.02em}
+  input{
+    background:var(--panel-2);color:var(--fg);border:1px solid var(--line-soft);
+    border-radius:10px;padding:9px 11px;font:inherit;font-size:13px;outline:none;
+    user-select:text;-webkit-user-select:text;transition:border-color .15s,box-shadow .15s;
+  }
+  input:hover:not(:disabled){border-color:#2a3444}
+  input:focus{border-color:var(--accent);box-shadow:0 0 0 3px #3b82f626}
+  input:disabled{opacity:.55}
+  .row{display:flex;gap:6px}
+  .row input{flex:1;min-width:0}
+
+  .check{flex-direction:row;align-items:center;gap:9px;margin-top:16px;font-size:12px;color:var(--muted);letter-spacing:0}
+  .check input{width:15px;height:15px;padding:0;accent-color:var(--accent)}
+
+  .actions{display:flex;align-items:center;gap:10px;margin-top:16px;padding-top:14px;border-top:1px solid var(--line-soft)}
+  button{
+    background:#1a2130;color:var(--fg);border:1px solid #2a3444;border-radius:10px;
+    padding:9px 18px;font:inherit;font-size:13px;font-weight:550;cursor:pointer;
+    transition:.15s;white-space:nowrap;
+  }
+  button:hover:not(:disabled){background:#212a3a;border-color:#3a4759}
+  button:disabled{opacity:.4;cursor:default}
+  button.primary{
+    background:linear-gradient(180deg,#4c8dff,var(--accent-2));border-color:#3b7ef0;color:#fff;
+    box-shadow:0 1px 0 #ffffff26 inset,0 6px 18px -8px #2563ebe6;
+  }
+  button.primary:hover:not(:disabled){background:linear-gradient(180deg,#5f9bff,#2f6ff0)}
+  button.ghost{background:transparent;border-color:var(--line);color:var(--fg-dim);padding:7px 11px;font-size:12px}
+  button.ghost:hover:not(:disabled){color:var(--fg);border-color:#3a4759}
+  button.right{margin-left:auto}
+  #hint{font-size:12px;color:var(--muted);margin-left:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+  /* ---------- 指标 ---------- */
+  .metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(104px,1fr));gap:9px}
+  .metric{
+    background:var(--panel-2);border:1px solid var(--line-soft);border-radius:11px;
+    padding:10px 12px;display:flex;flex-direction:column;gap:3px;
+  }
+  .metric .cap{font-size:10.5px;color:var(--muted);letter-spacing:.07em}
+  .metric b{font-size:19px;font-weight:600;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+  .metrics.diag{margin-top:10px}
+  .metrics.diag .metric{padding:7px 10px;border-style:dashed;border-color:#2a2233}
+  .metrics.diag .metric b{font-size:14px;color:var(--warn)}
+  .metrics.diag .metric .cap{font-size:10px}
+
+  /* ---------- 日志 ---------- */
+  .log pre{
+    flex:1;min-height:90px;margin:0;overflow:auto;background:#070a0f;
+    border:1px solid var(--line-soft);border-radius:11px;padding:10px 12px;
+    font:12px/1.6 ui-monospace,"Cascadia Mono","JetBrains Mono",Consolas,monospace;
+    white-space:pre-wrap;word-break:break-all;color:#adbacb;
+    user-select:text;-webkit-user-select:text;
+  }
+  .log pre::-webkit-scrollbar{width:9px;height:9px}
+  .log pre::-webkit-scrollbar-thumb{background:#2a3342;border-radius:9px}
+  .log .err{color:var(--warn)}
+  .log .out{color:#8b98ab}
+
+  @media (max-width:900px){
+    main{grid-template-columns:1fr;grid-template-areas:"conn" "status" "log"}
+  }
+</style>
+</head>
+<body>
+<header class="bar">
+  <div class="brand">
+    <span data-mark></span>
+    <b>FCP</b><span>可靠传输客户端</span>
+  </div>
+  <div class="spacer"></div>
+  <div class="status-pill">
+    <span class="dot" id="dot"></span>
+    <time id="uptime">--</time>
+  </div>
+</header>
+
+<main>
+  <section class="card conn">
+    <h2>连接参数</h2>
+    <div class="grid">
+      <label>服务器地址<input id="host" placeholder="1.2.3.4 或 vpn.example.com" /></label>
+      <label>UDP 端口<input id="port" type="number" min="1" max="65535" value="4460" /></label>
+      <label>预共享密钥
+        <span class="row">
+          <input id="key" type="password" maxlength="32" spellcheck="false" placeholder="32 位十六进制" autocomplete="off" />
+          <button class="ghost" id="keyToggle" type="button" title="显示/隐藏">显示</button>
+        </span>
+      </label>
+      <label>本地监听地址<input id="listen" value="127.0.0.1" /></label>
+      <label>本地代理端口<input id="listenPort" type="number" min="1" max="65535" value="1080" /></label>
+      <label>MTU<input id="mtu" type="number" min="576" max="9000" value="1400" /></label>
+      <label>FEC 冗余上限<input id="budget" type="number" step="0.05" min="0" max="1" value="0.5" /></label>
+      <label>固定 k（-1 = 自适应）<input id="k" type="number" min="-1" max="7" value="-1" /></label>
+    </div>
+    <label class="check"><input id="remember" type="checkbox" checked /> 记住设置（密钥以明文保存在本机，按需勾选）</label>
+    <div class="actions">
+      <button id="start" class="primary" type="button">启动代理</button>
+      <button id="stop" type="button" disabled>停止</button>
+      <span id="hint"></span>
+    </div>
+  </section>
+
+  <section class="card status">
+    <h2>运行状态</h2>
+    <div class="metrics">
+      <div class="metric"><span class="cap">运行时长</span><b id="m-t">--</b></div>
+      <div class="metric"><span class="cap">活动会话</span><b id="m-live">0</b></div>
+      <div class="metric"><span class="cap">已建立</span><b id="m-est">0</b></div>
+      <div class="metric"><span class="cap">隧道</span><b id="m-tun">0</b></div>
+      <div class="metric"><span class="cap">上行</span><b id="m-tx">0 B</b></div>
+      <div class="metric"><span class="cap">下行</span><b id="m-rx">0 B</b></div>
+    </div>
+    <div class="metrics diag" id="diag"></div>
+  </section>
+
+  <section class="card log">
+    <h2>日志 <button class="ghost right" id="clear" type="button">清空</button></h2>
+    <pre id="log"></pre>
+  </section>
+</main>
+
+<script src="tokens.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

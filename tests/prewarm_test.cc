@@ -286,6 +286,31 @@ void TestApplyPrewarm() {
   unknown.auto_window = true;
   fcp::apply_prewarm(fcp::PeerProfile{0, -1, 0}, nullptr, &unknown);
   CHECK_EQ(unknown.send_window_bytes, fcp::kDefaultSendWindowBytes);
+
+  // The controller priors ride along: the previous session's measured rate and
+  // minimum RTT let the next connection start in PROBE_BW instead of slow
+  // starting a page of short-lived flows one at a time.
+  fcp::StreamConfig ctrl;
+  ctrl.auto_window = true;  // BBR is the StreamConfig default
+  fcp::apply_prewarm(fcp::PeerProfile{0, -1, 0, 20u * 1000u * 1000u, 100}, nullptr,
+                     &ctrl);
+  CHECK_EQ(ctrl.initial_bw_bps, 20u * 1000u * 1000u);
+  CHECK_EQ(ctrl.initial_min_rtt_ms, 100);
+  // An explicit --window start is the operator's operating point: no prior.
+  fcp::StreamConfig pinned;
+  pinned.auto_window = true;
+  pinned.send_window_explicit = true;
+  fcp::apply_prewarm(fcp::PeerProfile{0, -1, 0, 20u * 1000u * 1000u, 100}, nullptr,
+                     &pinned);
+  CHECK_EQ(pinned.initial_bw_bps, 0u);
+  CHECK_EQ(pinned.initial_min_rtt_ms, 0);
+  // The epoch controller has no rate model to seed.
+  fcp::StreamConfig epoch;
+  epoch.auto_window = true;
+  epoch.bbr = false;
+  fcp::apply_prewarm(fcp::PeerProfile{0, -1, 0, 20u * 1000u * 1000u, 100}, nullptr,
+                     &epoch);
+  CHECK_EQ(epoch.initial_bw_bps, 0u);
 }
 
 // The point of the whole exercise: the first set of a brand-new session

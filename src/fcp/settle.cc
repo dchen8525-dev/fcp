@@ -221,10 +221,7 @@ void FcpSettle::on_event(RxEvent event, uint32_t value) {
 void FcpSettle::reset_interval() { counters_ = SettleCounters{}; }
 
 bool FcpSettle::untrusted() const {
-  const uint32_t denom = std::max<uint32_t>(1, counters_.sets_expected);
-  // 同 strategy 样本门的整数形态（*100 / *pct），避免浮点比较的边界。
-  return static_cast<uint64_t>(counters_.sets_k_unknown) * 100 >
-         static_cast<uint64_t>(denom) * kUntrustedKUnknownPct;
+  return k_unknown_untrusted(counters_.sets_expected, counters_.sets_k_unknown);
 }
 
 uint32_t FcpSettle::data_lost() const {

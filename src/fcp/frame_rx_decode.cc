@@ -44,15 +44,35 @@ void FrameRx::try_decode(RxSet* set, int64_t now_ms) {
   }
   const size_t symbol_max = set->symbol_max;
 
-  std::vector<std::vector<uint8_t>> padded(n + k, std::vector<uint8_t>(symbol_max, 0));
+  // Reuse the scratch buffers across attempts; a nested attempt (a synchronous
+  // host re-entering on_datagram from the deliver callback below) uses locals,
+  // because it would otherwise overwrite rows the outer loop is still reading.
+  std::vector<std::vector<uint8_t>> local_padded;
+  std::vector<std::vector<uint8_t>> local_recovered;
+  const bool nested = decode_depth_ > 0;
+  std::vector<std::vector<uint8_t>>& padded = nested ? local_padded : decode_padded_;
+  std::vector<std::vector<uint8_t>>& recovered = nested ? local_recovered : decode_recovered_;
+  ++decode_depth_;
+  struct DepthGuard {
+    int& depth;
+    ~DepthGuard() { --depth; }
+  } guard{decode_depth_};
+
+  padded.resize(n + k);
   std::vector<const uint8_t*> symbols(n + k, nullptr);
+  // Missing indices stay nullptr (erasures), so their padded rows are never
+  // read and do not need clearing -- only the tail past a short symbol does.
   for (size_t i = 0; i < n; ++i) {
     if (!set->orig_mask.test(i)) {
       continue;
     }
     const std::vector<uint8_t>& s = set->symbols[i];
-    std::memcpy(padded[i].data(), s.data(), std::min(s.size(), symbol_max));
-    symbols[i] = padded[i].data();
+    std::vector<uint8_t>& row = padded[i];
+    row.resize(symbol_max);
+    const size_t n_copy = std::min(s.size(), symbol_max);
+    std::memcpy(row.data(), s.data(), n_copy);
+    std::fill(row.begin() + static_cast<std::ptrdiff_t>(n_copy), row.end(), 0);
+    symbols[i] = row.data();
   }
   // No parity for j in [k_eff, k): those rows are ghost erasures.
   for (size_t r = 0; r < k; ++r) {
@@ -61,11 +81,14 @@ void FrameRx::try_decode(RxSet* set, int64_t now_ms) {
       continue;
     }
     const std::vector<uint8_t>& s = set->symbols[idx];
-    std::memcpy(padded[idx].data(), s.data(), std::min(s.size(), symbol_max));
-    symbols[idx] = padded[idx].data();
+    std::vector<uint8_t>& row = padded[idx];
+    row.resize(symbol_max);
+    const size_t n_copy = std::min(s.size(), symbol_max);
+    std::memcpy(row.data(), s.data(), n_copy);
+    std::fill(row.begin() + static_cast<std::ptrdiff_t>(n_copy), row.end(), 0);
+    symbols[idx] = row.data();
   }
 
-  std::vector<std::vector<uint8_t>> recovered;
   ++set->decode_attempts;
   ++decode_attempts_;
   if (!decode(symbols.data(), n, k, symbol_max, &recovered)) {

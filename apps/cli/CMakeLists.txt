@@ -8,10 +8,13 @@
 
 find_package(Threads REQUIRED)
 
-add_executable(fcp-client main_client.cc cli.cc reactor.cc)
+# cli.cc is shared, and both roles can reach the bench unit: the server hosts
+# the frame-layer responder in its reactor, the client runs one bench in
+# --speedtest mode.
+add_executable(fcp-client main_client.cc cli.cc reactor.cc bench.cc)
 target_link_libraries(fcp-client PRIVATE fcp_proxy_core Threads::Threads)
 
-add_executable(fcp-server main_server.cc cli.cc reactor.cc)
+add_executable(fcp-server main_server.cc cli.cc reactor.cc bench.cc)
 target_link_libraries(fcp-server PRIVATE fcp_proxy_core Threads::Threads)
 
 # tools/cli_parse.h: the argv splitting and range checks shared with the tools.

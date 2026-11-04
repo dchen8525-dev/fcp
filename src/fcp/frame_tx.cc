@@ -21,6 +21,13 @@ void FrameTx::set_k(uint8_t k) {
   next_k_ = std::min(k, static_cast<uint8_t>(kRsMaxParity));
 }
 
+void FrameTx::raise_limits(const MtuLimits& limits) {
+  if (!limits.valid || limits.payload_max <= limits_.payload_max) {
+    return;
+  }
+  limits_ = limits;
+}
+
 void FrameTx::set_srtt_ms(int64_t srtt_ms) {
   flush_ms_ = std::clamp<int64_t>(srtt_ms, kMinFlushMs, kMaxFlushMs);
 }

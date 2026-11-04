@@ -4,6 +4,7 @@
 
 #include "fcp/aes.h"
 #include "fcp/ghash.h"
+#include "fcp/random.h"
 
 namespace fcp {
 namespace {
@@ -39,16 +40,20 @@ void compute_tag(const GcmKey& key, const uint8_t j0[16], const uint8_t* aad,
   for (int i = 0; i < 16; ++i) {
     tag[i] = static_cast<uint8_t>(s[i] ^ ek[i]);
   }
+  // GHASH output and E_K(J0) are both key-dependent; leaving either on the
+  // stack leaks a block of the same material the CTR path protects.
+  secure_zero(s, sizeof(s));
+  secure_zero(ek, sizeof(ek));
 }
 
 void ctr_xor(const Aes128Key& key, const uint8_t j0[16], const uint8_t* in, size_t len,
              uint8_t* out) {
   uint8_t counter[16];
+  uint8_t stream[16];
   std::memcpy(counter, j0, 16);
   size_t off = 0;
   while (off < len) {
     increment_counter(counter);
-    uint8_t stream[16];
     aes128_encrypt_block(key, counter, stream);
     const size_t take = (len - off < 16) ? len - off : 16;
     for (size_t i = 0; i < take; ++i) {
@@ -56,6 +61,12 @@ void ctr_xor(const Aes128Key& key, const uint8_t j0[16], const uint8_t* in, size
     }
     off += take;
   }
+  // The last keystream block (and the counter that produced it) is as sensitive
+  // as the key: ciphertext XOR keystream is the plaintext, so a residual block
+  // on the stack decrypts whatever was sealed in the same frame. Zeroed once
+  // after the loop instead of per block -- the loop is the hot path.
+  secure_zero(stream, sizeof(stream));
+  secure_zero(counter, sizeof(counter));
 }
 
 }  // namespace
@@ -107,7 +118,9 @@ bool gcm_seal(const uint8_t key[16], const uint8_t iv[kGcmIvLen], const uint8_t*
               uint8_t tag[kGcmTagLen]) {
   GcmKey expanded;
   gcm_key_init(key, &expanded);
-  return gcm_seal_keyed(expanded, iv, aad, aad_len, plain, len, cipher, tag);
+  const bool ok = gcm_seal_keyed(expanded, iv, aad, aad_len, plain, len, cipher, tag);
+  secure_zero(&expanded, sizeof(expanded));
+  return ok;
 }
 
 bool gcm_open(const uint8_t key[16], const uint8_t iv[kGcmIvLen], const uint8_t* aad,
@@ -115,7 +128,9 @@ bool gcm_open(const uint8_t key[16], const uint8_t iv[kGcmIvLen], const uint8_t*
               const uint8_t tag[kGcmTagLen], uint8_t* plain) {
   GcmKey expanded;
   gcm_key_init(key, &expanded);
-  return gcm_open_keyed(expanded, iv, aad, aad_len, cipher, len, tag, plain);
+  const bool ok = gcm_open_keyed(expanded, iv, aad, aad_len, cipher, len, tag, plain);
+  secure_zero(&expanded, sizeof(expanded));
+  return ok;
 }
 
 }  // namespace fcp

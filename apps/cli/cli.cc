@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -29,7 +30,9 @@
 #include <unistd.h>
 #endif
 
+#include "bench.h"
 #include "cli_parse.h"
+#include "fcp/frame_rx.h"
 #include "fcp/frame_tx.h"
 #include "fcp/session.h"
 #include "fcp/version.h"
@@ -109,12 +112,35 @@ bool ParseKeyFile(const std::string& path, uint8_t out[16], std::string* error) 
   return true;
 }
 
+// Short spellings. Every one is rewritten to its long form before matching, so
+// there is still exactly one code path per option. The list is deliberately
+// small: the flags a startup command cannot avoid (key, address, port, MTU),
+// not a second alphabet to learn. -h/-V/-v predate it and keep their meaning.
+struct ShortOption {
+  char flag;
+  const char* long_name;
+  bool takes_value;
+};
+
+constexpr ShortOption kShortOptions[] = {
+    {'h', "--help", false},     {'V', "--version", false}, {'v', "--log=verbose", false},
+    {'k', "--key-file", true},  {'H', "--host", true},     {'p', "--port", true},
+    {'b', "--bind", true},      {'l', "--listen", true},    {'m', "--mtu", true},
+};
+
+const ShortOption* FindShortOption(char flag) {
+  for (const ShortOption& option : kShortOptions) {
+    if (option.flag == flag) {
+      return &option;
+    }
+  }
+  return nullptr;
+}
+
 // The accepted spellings of every option, in the order --help lists them.
-// Compound forms (--window=START:MAX, --fec=D:P) and their legacy single-value
-// aliases are separate entries that land in the same EngineConfig fields, so a
-// deployment written against the old names keeps its meaning. Matching is
-// longest-prefix, so --window-cap and --key-file never collapse to their
-// shorter siblings.
+// Compound forms (--window=START[:MAX], --fec=D:P) land in the EngineConfig
+// fields their halves name. Matching is longest-prefix, so --key-env never
+// collapses into --key, and --speedtest-seconds never into --speedtest.
 const std::vector<tools::Alias>& OptionAliases() {
   static const std::vector<tools::Alias> kAliases = {
       {"--key", true},
@@ -126,26 +152,27 @@ const std::vector<tools::Alias>& OptionAliases() {
       {"--listen", true},
       {"--local-port", true},
       {"--mtu", true},
-      {"--d", true},
-      {"--p", true},
+      {"--pmtu-max", true},
       {"--fec", true},
       {"--p-max", true},
       {"--k", true},
       {"--fec-budget", true},
       {"--trace", true},
       {"--window", true},
-      {"--window-cap", true},
       {"--rcv-buf", true},
-      {"--auto-window", false},
       {"--no-auto-window", false},
+      {"--no-pmtud", false},
+      {"--no-window-probe", false},
+      {"--no-bbr", false},
+      {"--bbr-version", true},
       {"--idle", true},
       {"--dial-timeout", true},
       {"--connect-timeout", true},
       {"--max-sessions", true},
+      {"--speedtest", false},
+      {"--speedtest-seconds", true},
       {"--no-prewarm", false},
-      {"--stats", true},
       {"--log", true},
-      {"--verbose", false},
       {"--help", false},
       {"--version", false},
   };
@@ -156,38 +183,66 @@ void Usage(EngineRole role, const char* argv0) {
   const bool client = role == EngineRole::kClient;
   std::printf(
       "usage: %s %s\n"
+      "  -k, --key-file=FILE  PSK file (recommended: keeps the key out of `ps`)\n"
       "  --key=HEX32          16-byte pre-shared key (one of --key/--key-file/\n"
       "                       --key-env; both ends equal)\n"
-      "  --key-file=FILE      read the key from FILE instead (keeps it out of `ps`)\n"
       "  --key-env=VAR        read the key from environment variable VAR (for the\n"
       "                       packaged unit: a DynamicUser cannot read a 0600\n"
-      "                       file, but systemd hands the service its env)\n",
-      argv0, client ? "[--host=IP --port=P] [--listen=IP --local-port=P] [options]"
-                    : "[--bind=IP --port=P] [options]");
+      "                       file, but systemd hands the service its env)\n"
+      "  Addresses also take ADDR:PORT, so one argument replaces the pair:\n"
+      "  -H 203.0.113.7:40000 is --host=203.0.113.7 --port=40000.\n",
+      argv0, client ? "[-H IP[:P]] [-l IP[:P]] [options]"
+                    : "[-b IP[:P]] [options]");
   if (client) {
-    std::printf("  --host=IP            FCP server address (required)\n"
-                "  --port=N             FCP server UDP port (default 4460)\n"
-                "  --listen=IP          local proxy bind (default 127.0.0.1)\n"
-                "  --local-port=N       local proxy port (default 1080)\n");
+    std::printf("  -H, --host=IP[:P]    FCP server address (required); :P sets --port\n"
+                "  -p, --port=N         FCP server UDP port (default 4460)\n"
+                "  -l, --listen=IP[:P]  local proxy bind (default 127.0.0.1:1080);\n"
+                "                       :P sets --local-port\n"
+                "  --local-port=N       local proxy port (default 1080)\n"
+                "  --speedtest          run one raw FCP link speed test against\n"
+                "                       --host/--port and exit (no local proxy)\n"
+                "  --speedtest-seconds=N  seconds per direction, 3..30 (default 8)\n");
   } else {
-    std::printf("  --bind=IP            UDP bind address (default 0.0.0.0)\n"
-                "  --port=N             UDP listen port (default 4460)\n");
+    std::printf("  -b, --bind=IP[:P]    UDP bind address (default 0.0.0.0):P sets\n"
+                "                       --port; -b :40000 keeps 0.0.0.0:40000\n"
+                "  -p, --port=N         UDP listen port (default 4460)\n"
+                "  --speedtest          answer the desktop link speed test on the\n"
+                "                       same UDP port (off by default; the test is\n"
+                "                       PSK-authenticated like a tunnel)\n");
   }
   std::printf(
-      "  --mtu=N              IP packet budget incl. IP+UDP headers (default 1400;\n"
+      "  -m, --mtu=N          IP packet budget incl. IP+UDP headers (default 1400;\n"
       "                       lowered to fit the largest local interface MTU)\n"
-      "  --fec=D:P            frame geometry (default 10:3; --d/--p still work)\n"
+      "  --no-pmtud           do not probe upward past --mtu (PMTUD is on by\n"
+      "                       default; both ends must support it)\n"
+      "  --pmtu-max=N         largest IP packet PMTUD may prove, 1280..9000\n"
+      "                       (default 1500; jumbo is a LAN property, ask for it)\n"
+      "  --fec=D:P            frame geometry (default 10:3)\n"
       "  --p-max=N            controller parity ceiling 0..7 (default 4; the\n"
       "                       documented 5..7 range needs this raised)\n"
       "  --k=N                pinned parity per set, -1 = adaptive (default -1;\n"
-      "                       must not exceed min(--p, --p-max))\n"
+      "                       must not exceed min(--fec P, --p-max))\n"
       "  --fec-budget=R       redundancy ceiling parity/data per report, 0 = off (default 0.5)\n"
       "  --trace=PREFIX       per-session controller trace JSONL (calibration)\n"
-      "  --window=START:MAX   send window KiB; autotune start + ceiling\n"
-      "                       (default 256:1024; START 64..4096 in autotune,\n"
-      "                       1..1048576 fixed; --window-cap still works)\n"
+      "  --window=START[:MAX] send window KiB; autotune start + ceiling\n"
+      "                       (default 256:1024; START 64..4096 in autotune --\n"
+      "                       the floor rises with --mtu above ~2 KiB, and the\n"
+      "                       error names the value -- 1..1048576 fixed, but\n"
+      "                       not below two segments at this --mtu). An empty\n"
+      "                       START keeps the default start and the prewarm\n"
+      "                       prior: --window=:4096 pins only the ceiling\n"
+      "                       (default: the adaptive ceiling follows the\n"
+      "                       measured BDP up to 4096 KiB -- a 1 MiB cap holds\n"
+      "                       a 200 ms path to ~40 Mbps)\n"
       "  --no-auto-window     fixed --window instead of autotune (autotune is\n"
-      "                       the default; --auto-window still accepted)\n"
+      "                       the default)\n"
+      "  --no-bbr             use the epoch controller (slow start/AIMD) instead\n"
+      "                       of BBR; BBR is the default\n"
+      "  --bbr-version=N      1 = BBRv1 (loss is not congestion evidence),\n"
+      "                       2 = BBRv2 (default: learns inflight_hi/lo from\n"
+      "                       stream loss on top of v1; see #51)\n"
+      "  --no-window-probe    disable the loss-epoch growth probe (epoch\n"
+      "                       controller only; the probe is on by default)\n"
       "  --rcv-buf=KiB        fixed-mode receive buffer (default: the fixed\n"
       "                       --window, at least 256; --no-auto-window only)\n"
       "  --idle=ms            tunnel idle teardown (default 300000)\n"
@@ -199,20 +254,16 @@ void Usage(EngineRole role, const char* argv0) {
       "  --no-prewarm         start every session cold (default: reuse RTT/k/window priors)\n"
       "  --log=LEVEL          off (default; exit summary only) |\n"
       "                       stats[:ms] (periodic line) | verbose\n"
-      "  -v                   alias of --log=verbose; --stats=ms still works\n"
-      "  --version            print the release version and exit\n");
+      "  -v                   shorthand for --log=verbose\n"
+      "  -h, --help           this text; -V, --version prints the build and exits\n");
 }
 
-// Values shared by the compound (--window=START:MAX) and legacy
-// (--window / --window-cap) spellings. 0 = not given; the parsers never
-// accept a 0, so it is unambiguous. The two source flags say which spelling
-// supplied the ceiling, so mixing spellings can be rejected instead of one
-// silently replacing the other.
+// --window=START[:MAX]. 0 in either field means "not given" (the parsers never
+// accept a 0), which is also how an empty START is expressed: ":4096" pins the
+// ceiling and leaves the start to the default/prewarm prior.
 struct ParsedWindows {
   size_t start = 0;
   size_t ceiling = 0;
-  bool max_from_window = false;  // --window=START:MAX
-  bool max_from_cap = false;     // --window-cap=MAX
 };
 
 // START and MAX have different domains: MAX is autotune-only and bounded to
@@ -222,36 +273,33 @@ struct ParsedWindows {
 // 64..4096 autotune range is enforced later, once --no-auto-window is known.
 bool ParseWindowValue(const std::string& flag, const std::string& value, ParsedWindows* w,
                       std::string* error) {
-  const std::string what = "--" + flag + " must be START or START:MAX, START 1..1048576 "
+  const std::string what = "--" + flag + " must be START, START:MAX or :MAX; START 1..1048576 "
                                         "KiB and MAX 64..4096 KiB (got '" + value + "')";
   const std::vector<std::string> parts = tools::SplitFields(value);
-  if (parts.size() > 2) {
+  if (parts.size() > 2 || (parts.size() == 2 && parts[1].empty())) {
     *error = what;
     return false;
   }
-  long start = 0;
-  long ceiling = 0;
-  const std::string flag_start = "--" + flag;
-  const std::string flag_max = "--" + flag + " (MAX)";
-  if (parts[0].empty() ||
-      !tools::ParseLong(flag_start.c_str(), parts[0].c_str(), 1, 1048576, &start, error)) {
-    if (error->empty()) {
-      *error = what;
+  if (!parts[0].empty()) {
+    long start = 0;
+    const std::string flag_start = "--" + flag;
+    if (!tools::ParseLong(flag_start.c_str(), parts[0].c_str(), 1, 1048576, &start, error)) {
+      return false;
     }
-    return false;
+    w->start = static_cast<size_t>(start);
   }
   if (parts.size() == 2) {
-    if (parts[1].empty() ||
-        !tools::ParseLong(flag_max.c_str(), parts[1].c_str(), 64, 4096, &ceiling, error)) {
-      if (error->empty()) {
-        *error = what;
-      }
+    long ceiling = 0;
+    const std::string flag_max = "--" + flag + " (MAX)";
+    if (!tools::ParseLong(flag_max.c_str(), parts[1].c_str(), 64, 4096, &ceiling, error)) {
       return false;
     }
     w->ceiling = static_cast<size_t>(ceiling);
-    w->max_from_window = true;
   }
-  w->start = static_cast<size_t>(start);
+  if (w->start == 0 && w->ceiling == 0) {
+    *error = what;  // "--window=" or "--window=:"
+    return false;
+  }
   return true;
 }
 
@@ -278,17 +326,21 @@ struct ProxyFlags {
   SeenValue dial_timeout;
   SeenValue connect_timeout;
   SeenValue max_sessions;
+  bool speedtest = false;
+  SeenValue speedtest_seconds;
   SeenValue log;
-  SeenValue stats;
   SeenValue rcv_buf;
   SeenValue fec_budget;
   SeenValue p_max;
   SeenValue k;
   SeenValue mtu;
+  SeenValue pmtu_max;
+  bool pmtud_off = false;
   bool prewarm_off = false;
-  bool auto_window = false;
   bool no_auto_window = false;
-  bool verbose = false;
+  bool no_window_probe = false;
+  bool no_bbr = false;
+  SeenValue bbr_version;
 };
 
 // Applies one matched argument's value. Numbers whose range is a property of
@@ -326,10 +378,12 @@ bool ApplyValue(const tools::Match& m, ProxyFlags* f, ParsedWindows* windows, Pr
     f->connect_timeout = {true, v};
   } else if (name == "--max-sessions") {
     f->max_sessions = {true, v};
+  } else if (name == "--speedtest") {
+    f->speedtest = true;
+  } else if (name == "--speedtest-seconds") {
+    f->speedtest_seconds = {true, v};
   } else if (name == "--log") {
     f->log = {true, v};
-  } else if (name == "--stats") {
-    f->stats = {true, v};
   } else if (name == "--rcv-buf") {
     f->rcv_buf = {true, v};
   } else if (name == "--fec-budget") {
@@ -340,31 +394,21 @@ bool ApplyValue(const tools::Match& m, ProxyFlags* f, ParsedWindows* windows, Pr
     f->k = {true, v};
   } else if (name == "--mtu") {
     f->mtu = {true, v};
+  } else if (name == "--pmtu-max") {
+    f->pmtu_max = {true, v};
+  } else if (name == "--no-pmtud") {
+    f->pmtud_off = true;
   } else if (name == "--no-prewarm") {
     f->prewarm_off = true;
-  } else if (name == "--auto-window") {
-    f->auto_window = true;
   } else if (name == "--no-auto-window") {
     f->no_auto_window = true;
-  } else if (name == "--verbose") {
-    f->verbose = true;
-  } else if (name == "--fec" || name == "--d" || name == "--p") {
-    // --fec=D:P is the pair, --d/--p set one half; the pair limit (D+P <= 256)
-    // is checked once both halves are known.
-    if (name == "--p") {
-      if (!tools::ParseLong("--p", v.c_str(), 0, 7, &n, error)) {
-        return false;
-      }
-      out->ec.p = static_cast<uint8_t>(n);
-      return true;
-    }
-    if (name == "--d") {
-      if (!tools::ParseLong("--d", v.c_str(), 1, 255, &n, error)) {
-        return false;
-      }
-      out->ec.d = static_cast<uint8_t>(n);
-      return true;
-    }
+  } else if (name == "--no-window-probe") {
+    f->no_window_probe = true;
+  } else if (name == "--no-bbr") {
+    f->no_bbr = true;
+  } else if (name == "--bbr-version") {
+    f->bbr_version = {true, v};
+  } else if (name == "--fec") {
     const std::vector<std::string> parts = tools::SplitFields(v);
     if (parts.size() > 2) {
       *error = "--fec takes D or D:P (got '" + v + "')";
@@ -384,28 +428,8 @@ bool ApplyValue(const tools::Match& m, ProxyFlags* f, ParsedWindows* windows, Pr
       }
       out->ec.p = static_cast<uint8_t>(n);
     }
-  } else if (name == "--window" || name == "--window-cap") {
-    const std::string flag = name.substr(2);
-    if (name == "--window-cap") {
-      // Legacy spelling: the ceiling alone, always a single number. It may be
-      // combined with a single-valued --window (the docs' old incantation), but
-      // not with the compound, which already carries a MAX.
-      if (windows->max_from_window) {
-        *error = "--window=START:MAX already sets the ceiling; drop --window-cap";
-        return false;
-      }
-      if (!tools::ParseLong(name.c_str(), v.c_str(), 64, 4096, &n, error)) {
-        return false;
-      }
-      windows->ceiling = static_cast<size_t>(n);
-      windows->max_from_cap = true;
-      return true;
-    }
-    if (!ParseWindowValue(flag, v, windows, error)) {
-      return false;
-    }
-    if (windows->max_from_window && windows->max_from_cap) {
-      *error = "--window=START:MAX already sets the ceiling; drop --window-cap";
+  } else if (name == "--window") {
+    if (!ParseWindowValue(name.substr(2), v, windows, error)) {
       return false;
     }
   } else {
@@ -415,11 +439,59 @@ bool ApplyValue(const tools::Match& m, ProxyFlags* f, ParsedWindows* windows, Pr
   return true;
 }
 
+// "ADDR:PORT" -> address + port, so one argument replaces the pair. The tunnel
+// socket is AF_INET, so an address with several colons is an IPv6 literal (or a
+// typo) and is left as the whole address; a non-numeric tail is equally not a
+// port. An empty address ("--bind=:40000") means "keep the default address".
+bool SplitAddressPort(const std::string& text, std::string* address, std::string* port) {
+  // Exactly one colon: an IPv6 literal ("::1", "[::1]:4000") has more than one
+  // and must stay a single address, or it would be split into a nonsense host
+  // plus a bogus port and reported as "port given twice".
+  const size_t colon = text.find(':');
+  if (colon == std::string::npos || colon != text.rfind(':') || colon + 1 == text.size()) {
+    return false;
+  }
+  const std::string tail = text.substr(colon + 1);
+  for (const char c : tail) {
+    if (c < '0' || c > '9') {
+      return false;
+    }
+  }
+  *address = text.substr(0, colon);
+  *port = tail;
+  return true;
+}
+
 bool ApplyHostPort(EngineRole role, const ProxyFlags& f, ProxyArgs* out, std::string* error) {
   const bool client = role == EngineRole::kClient;
   long n = 0;
+  // The address options carry an optional :PORT. Resolving it here (rather
+  // than each option on its own) keeps one rule: a port may come from --port
+  // or from an address, and two sources are an ambiguity, not an override.
+  std::string host = f.host.given ? f.host.value : std::string();
+  std::string host_port;
+  const bool host_has_port = f.host.given && SplitAddressPort(f.host.value, &host, &host_port);
+  std::string bind = f.bind.given ? f.bind.value : std::string();
+  std::string bind_port;
+  const bool bind_has_port = f.bind.given && SplitAddressPort(f.bind.value, &bind, &bind_port);
+  const std::string* compound_port = host_has_port ? &host_port : (bind_has_port ? &bind_port : nullptr);
   if (f.port.given) {
+    if (compound_port != nullptr) {
+      *error = "the port is given twice: --port and the address suffix; drop one";
+      return false;
+    }
     if (!tools::ParseLong("--port", f.port.value.c_str(), 1, 65535, &n, error)) {
+      return false;
+    }
+    if (client) {
+      out->ro.remote_port = static_cast<int>(n);
+    } else {
+      out->ro.bind_port = static_cast<int>(n);
+    }
+  } else if (compound_port != nullptr) {
+    // Name the option the operator typed, not the port half of it.
+    const char* flag = host_has_port ? "--host" : "--bind";
+    if (!tools::ParseLong(flag, compound_port->c_str(), 1, 65535, &n, error)) {
       return false;
     }
     if (client) {
@@ -429,11 +501,11 @@ bool ApplyHostPort(EngineRole role, const ProxyFlags& f, ProxyArgs* out, std::st
     }
   }
   if (client) {
-    if (!f.host.given || f.host.value.empty()) {
-      *error = "--host=IP is required on the client";
+    if (!f.host.given || host.empty()) {
+      *error = "--host=IP[:PORT] is required on the client";
       return false;
     }
-    out->ro.remote_host = f.host.value;
+    out->ro.remote_host = host;
     if (f.bind.given) {
       *error = "--bind is a server option; the client listens with --listen";
       return false;
@@ -452,11 +524,13 @@ bool ApplyHostPort(EngineRole role, const ProxyFlags& f, ProxyArgs* out, std::st
       return false;
     }
     if (f.bind.given) {
-      if (f.bind.value.empty()) {
+      if (!bind_has_port && bind.empty()) {
         *error = "--bind needs an address (default 0.0.0.0)";
         return false;
       }
-      out->ro.bind_addr = f.bind.value;
+      if (!bind.empty()) {
+        out->ro.bind_addr = bind;
+      }
     }
   }
   return true;
@@ -580,20 +654,96 @@ size_t InterfaceMtu() {
 }
 
 void ApplyEnvironmentDefaults(ProxyArgs* args) {
-  if (!args->mtu_explicit) {
-    const size_t if_mtu = InterfaceMtu();
-    const uint16_t adjusted = MtuForInterface(args->ec.mtu, if_mtu);
-    if (adjusted < args->ec.mtu) {
-      args->notes.push_back("[fcp] note: MTU lowered to " + std::to_string(adjusted) +
-                            " bytes (default " + std::to_string(args->ec.mtu) +
-                            ") to fit the largest local interface MTU " +
-                            std::to_string(if_mtu) + " (IP+UDP headers included)");
-      args->ec.mtu = adjusted;
-    }
-  }
+  // Always: even with an explicit --mtu this has to look at the interface, to
+  // turn PMTUD (and with it DF) off when the explicit size cannot leave the
+  // host at all.
+  ApplyInterfaceMtu(InterfaceMtu(), args);
   const ResourceLimits limits = CurrentResourceLimits();
   const std::vector<std::string> notes = ResourceNotes(args->ec.role, args->ec, limits);
   args->notes.insert(args->notes.end(), notes.begin(), notes.end());
+}
+
+std::string JsonEscape(const std::string& in) {
+  std::string out;
+  out.reserve(in.size() + 8);
+  for (unsigned char c : in) {
+    switch (c) {
+      case '"':
+        out += "\\\"";
+        break;
+      case '\\':
+        out += "\\\\";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        if (c < 0x20) {
+          char buf[8];
+          std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+          out += buf;
+        } else {
+          out += static_cast<char>(c);
+        }
+    }
+  }
+  return out;
+}
+
+std::string BenchSampleJson(const bench::Sample& s) {
+  char buf[256];
+  std::snprintf(buf, sizeof(buf),
+                "{\"mbps\":%.2f,\"bytes\":%llu,\"seconds\":%.2f,\"acked\":%s,"
+                "\"lossPpm\":%u,\"lossN\":%u}",
+                s.mbps, static_cast<unsigned long long>(s.bytes), s.seconds,
+                s.acked ? "true" : "false", s.loss_ppm, s.loss_n);
+  return buf;
+}
+
+// One-shot client bench. Everything the desktop reads is one JSON object per
+// line prefixed with "@speedtest"; regular diagnostics stay on stderr so the
+// stdout reader never has to guess.
+int RunBench(const ProxyArgs& args) {
+  bench::ClientOptions opt;
+  opt.host = args.ro.remote_host;
+  opt.port = static_cast<uint16_t>(args.ro.remote_port);
+  std::memcpy(opt.key, args.ec.key, sizeof(opt.key));
+  opt.seconds = static_cast<uint16_t>(args.speedtest_seconds);
+  opt.mtu = args.ec.mtu;
+  opt.ip_hdr_len = args.ec.ip_hdr_len;
+
+  auto progress = [](const char* direction, uint64_t bytes, int64_t elapsed_ms) {
+    std::printf(
+        "@speedtest {\"event\":\"progress\",\"direction\":\"%s\",\"bytes\":%llu,"
+        "\"elapsedMs\":%lld}\n",
+        direction, static_cast<unsigned long long>(bytes),
+        static_cast<long long>(elapsed_ms));
+    std::fflush(stdout);
+  };
+
+  bench::Result result;
+  bench::RunClient(opt, progress, &result);
+  std::string json = "{\"event\":\"done\",\"seconds\":";
+  json += std::to_string(args.speedtest_seconds);
+  json += ",\"download\":";
+  json += result.have_download ? BenchSampleJson(result.download) : "null";
+  json += ",\"upload\":";
+  json += result.have_upload ? BenchSampleJson(result.upload) : "null";
+  json += ",\"error\":";
+  json += result.error.empty() ? "null" : "\"" + JsonEscape(result.error) + "\"";
+  json += "}";
+  std::printf("@speedtest %s\n", json.c_str());
+  std::fflush(stdout);
+  if (!result.error.empty()) {
+    std::fprintf(stderr, "speedtest: %s\n", result.error.c_str());
+  }
+  return result.have_download ? 0 : 2;
 }
 
 }  // namespace
@@ -610,6 +760,43 @@ uint16_t MtuForInterface(uint16_t configured, size_t interface_mtu) {
     return configured;
   }
   return static_cast<uint16_t>(interface_mtu);
+}
+
+void ApplyInterfaceMtu(size_t interface_mtu, ProxyArgs* args) {
+  const uint16_t adjusted = MtuForInterface(args->ec.mtu, interface_mtu);
+  if (adjusted >= args->ec.mtu) {
+    // A larger (or unqueryable) interface leaves both values alone: probing
+    // from the configured MTU up to --pmtu-max is exactly the point.
+    return;
+  }
+  if (args->mtu_explicit) {
+    // The operator asked for more than this host's largest interface can carry.
+    // That used to still work -- without DF the kernel fragments the datagram
+    // -- but PMTUD now sets DF on the whole tunnel socket, and with DF every
+    // send of that size comes back EMSGSIZE: handshake and data both black-hole.
+    // Keep the explicit MTU (the operator may know the path better than the
+    // interface table) and give up PMTUD instead, which also leaves DF off, so
+    // the kernel fragments exactly as it did before.
+    if (args->ec.pmtud) {
+      args->ec.pmtud = false;
+      args->notes.push_back(
+          "[fcp] note: --mtu " + std::to_string(args->ec.mtu) +
+          " exceeds the largest local interface MTU " + std::to_string(interface_mtu) +
+          "; PMTUD disabled (DF would make every datagram EMSGSIZE), "
+          "the kernel will fragment instead");
+    }
+    return;
+  }
+  args->notes.push_back("[fcp] note: MTU lowered to " + std::to_string(adjusted) +
+                        " bytes (default " + std::to_string(args->ec.mtu) +
+                        ") to fit the largest local interface MTU " +
+                        std::to_string(interface_mtu) + " (IP+UDP headers included)");
+  args->ec.mtu = adjusted;
+  // A probe above the local interface can only produce EMSGSIZE: the kernel
+  // refuses to hand the datagram to the interface at all.
+  if (args->ec.pmtu_max_mtu > adjusted) {
+    args->ec.pmtu_max_mtu = adjusted;
+  }
 }
 
 std::vector<std::string> ResourceNotes(EngineRole role, const EngineConfig& ec,
@@ -629,13 +816,25 @@ std::vector<std::string> ResourceNotes(EngineRole role, const EngineConfig& ec,
   }
   // Worst-case buffers, not reserved up front: the receive capacity the window
   // promises plus the window the sender may grow into.
-  const size_t rcv_cap =
-      ec.auto_window ? (ec.rcv_buf_bytes > ec.window_max_bytes ? ec.rcv_buf_bytes
-                                                               : ec.window_max_bytes)
-                     : ec.rcv_buf_bytes;
-  const size_t send_cap = ec.auto_window ? ec.window_max_bytes : ec.send_window_bytes;
+  // The auto ceiling (window_ceiling_bytes) is a per-session possibility, so
+  // the worst case has to use it, not the configured MAX.
+  const size_t win_ceiling =
+      std::max(ec.window_max_bytes, ec.window_ceiling_bytes);
+  const size_t rcv_cap = ec.auto_window ? (ec.rcv_buf_bytes > win_ceiling ? ec.rcv_buf_bytes
+                                                                          : win_ceiling)
+                                        : ec.rcv_buf_bytes;
+  const size_t send_cap = ec.auto_window ? win_ceiling : ec.send_window_bytes;
+  // FrameRx holds the symbols of the sets it has not decoded yet. A working
+  // session's symbol buffer tracks the data in flight, so it is estimated at
+  // rcv+send window; the hard ceiling kMaxRxSymbolBytes (which an adversarial
+  // peer can reach with 256 incomplete sets) is the bound the kernel enforces,
+  // not what every healthy session costs. Leaving both out understated a wide
+  // window by an order of magnitude.
+  const size_t rx_symbols =
+      std::min<size_t>(kMaxRxSymbolBytes, rcv_cap + send_cap);
   const uint64_t per_session = static_cast<uint64_t>(rcv_cap) +
                                static_cast<uint64_t>(send_cap) +
+                               static_cast<uint64_t>(rx_symbols) +
                                static_cast<uint64_t>(kPerSessionBookkeepingBytes);
   const uint64_t total = per_session * static_cast<uint64_t>(ec.max_sessions);
   if (limits.address_space > 0) {
@@ -681,21 +880,42 @@ bool parse_proxy_args(EngineRole role, int argc, char** argv, ProxyArgs* out,
   std::vector<std::string> seen;
   std::string key_spelling;
   matched.reserve(static_cast<size_t>(argc));
-  bool fec_form = false;
-  bool d_form = false;
-  bool p_form = false;
-  bool log_form = false;
-  bool verbose_form = false;
-  bool stats_form = false;
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
-    // Short spellings are rewritten to their long form: one code path per option.
-    if (arg == "-h") {
-      arg = "--help";
-    } else if (arg == "-V") {
-      arg = "--version";
-    } else if (arg == "-v") {
-      arg = "--verbose";
+    // Short spellings are rewritten to their long form: one code path per
+    // option. A value option takes the next argument ("-k psk") or an attached
+    // one ("-k=psk", "-kpsk"), so a short command stays short.
+    if (arg.size() >= 2 && arg[0] == '-' && arg[1] != '-') {
+      const ShortOption* option = FindShortOption(arg[1]);
+      if (option == nullptr) {
+        *error = "unknown argument: " + arg;
+        return false;
+      }
+      std::string rest = arg.substr(2);
+      if (!option->takes_value) {
+        if (!rest.empty()) {
+          *error = std::string("-") + option->flag + " takes no value; got '" + arg + "'";
+          return false;
+        }
+        arg = option->long_name;
+      } else {
+        std::string value;
+        if (!rest.empty()) {
+          value = rest[0] == '=' ? rest.substr(1) : rest;
+        } else if (i + 1 < argc) {
+          value = argv[++i];
+        } else {
+          *error = std::string("-") + option->flag + " (" + option->long_name +
+                   ") requires a value";
+          return false;
+        }
+        if (value.empty()) {
+          *error = std::string("-") + option->flag + " (" + option->long_name +
+                   ") requires a value";
+          return false;
+        }
+        arg = std::string(option->long_name) + "=" + value;
+      }
     }
     if (arg.rfind("--", 0) != 0) {
       *error = "unknown argument: " + arg;
@@ -712,9 +932,8 @@ bool parse_proxy_args(EngineRole role, int argc, char** argv, ProxyArgs* out,
       continue;
     }
     // Duplicate detection is per option group, not per spelling: --key,
-    // --key-file and --key-env are one setting, as are --window/--window-cap.
-    // -v and --stats stay independent of each other (the deploy docs use them
-    // together) but cannot be mixed with --log, which is checked after the loop.
+    // --key-file and --key-env are one setting. -v is rewritten to
+    // --log=verbose, so it shares that group too.
     const char* group = name.c_str() + 2;
     const bool key_option =
         name == "--key" || name == "--key-file" || name == "--key-env";
@@ -733,35 +952,10 @@ bool parse_proxy_args(EngineRole role, int argc, char** argv, ProxyArgs* out,
     if (key_option) {
       key_spelling = name;
     }
-    if (name == "--fec") {
-      fec_form = true;
-    } else if (name == "--d") {
-      d_form = true;
-    } else if (name == "--p") {
-      p_form = true;
-    } else if (name == "--log") {
-      log_form = true;
-    } else if (name == "--verbose") {
-      verbose_form = true;
-    } else if (name == "--stats") {
-      stats_form = true;
-    }
     matched.push_back(std::move(m));
   }
   if (out->help || out->version) {
     return true;
-  }
-  // --fec=D:P is one option for the pair; --d/--p are the pair split over two
-  // options. Mixing the forms is the same setting given twice.
-  if (fec_form && (d_form || p_form)) {
-    *error = "--fec and --d/--p are two spellings of the geometry; give one form";
-    return false;
-  }
-  // --log already says both things, so it cannot be combined with either
-  // spelling it replaces.
-  if (log_form && (verbose_form || stats_form)) {
-    *error = "--log already selects the logging; drop -v/--stats";
-    return false;
   }
 
   // Pass 2: apply the values, in command-line order.
@@ -841,6 +1035,19 @@ bool parse_proxy_args(EngineRole role, int argc, char** argv, ProxyArgs* out,
     out->ec.mtu = static_cast<uint16_t>(n);
     out->mtu_explicit = true;
   }
+  if (given.pmtu_max.given) {
+    long n = 0;
+    if (!tools::ParseLong("--pmtu-max", given.pmtu_max.value.c_str(), 1280, 9000, &n,
+                          error)) {
+      return false;
+    }
+    out->ec.pmtu_max_mtu = static_cast<uint16_t>(n);
+  }
+  // A ceiling below the starting MTU means "never probe upward": the ladder
+  // only climbs. This also covers --mtu 9000 with the default 1500 ceiling.
+  if (out->ec.pmtu_max_mtu < out->ec.mtu) {
+    out->ec.pmtu_max_mtu = out->ec.mtu;
+  }
   if (given.p_max.given) {
     long n = 0;
     if (!tools::ParseLong("--p-max", given.p_max.value.c_str(), 0, 7, &n, error)) {
@@ -894,6 +1101,9 @@ bool parse_proxy_args(EngineRole role, int argc, char** argv, ProxyArgs* out,
   if (given.prewarm_off) {
     out->ec.prewarm = false;
   }
+  if (given.pmtud_off) {
+    out->ec.pmtud = false;
+  }
 
   // P8-4: D + P <= 256 is a protocol hard limit (the symbol table index is
   // u8); each flag is in range above, but the pair can still be illegal. Fail
@@ -920,15 +1130,38 @@ bool parse_proxy_args(EngineRole role, int argc, char** argv, ProxyArgs* out,
     }
   }
 
-  if (given.auto_window && given.no_auto_window) {
-    *error = "--auto-window and --no-auto-window are mutually exclusive";
-    return false;
-  }
   if (given.no_auto_window) {
     out->ec.auto_window = false;
   }
-  // --auto-window has nothing to set: autotune is the default and is the only
-  // way the window grows, so the flag is accepted for scripts and ignored.
+  out->ec.window_probe = !given.no_window_probe;
+  // BBR is the default congestion controller for the adaptive window. The
+  // epoch controller (--no-bbr) is kept for comparison and for reproducing
+  // pre-#51 behaviour; a fixed window ignores either.
+  out->ec.bbr = !given.no_bbr;
+  if (given.bbr_version.given) {
+    if (!out->ec.bbr) {
+      *error = "--bbr-version only applies while BBR is enabled (drop --no-bbr)";
+      return false;
+    }
+    long version = 0;
+    if (!tools::ParseLong("--bbr-version", given.bbr_version.value.c_str(), 1, 2, &version,
+                          error)) {
+      return false;
+    }
+    out->ec.bbr_version = static_cast<int>(version);
+    if (!out->ec.auto_window) {
+      out->notes.push_back(
+          "[fcp] note: --bbr-version only applies to the adaptive window; "
+          "the fixed window has no congestion controller (drop --no-auto-window)");
+    }
+  }
+  if (out->ec.bbr && given.no_window_probe) {
+    out->notes.push_back(
+        "[fcp] note: --no-window-probe only affects the epoch controller; "
+        "BBR is on (add --no-bbr to use the epoch controller)");
+  }
+  // windows.start == 0 means ":MAX" was used: the ceiling is pinned and the
+  // start stays at the default, which the prewarm prior may still replace.
   const bool start_given = windows.start > 0;
   if (windows.start > 0) {
     if (out->ec.auto_window) {
@@ -952,6 +1185,24 @@ bool parse_proxy_args(EngineRole role, int argc, char** argv, ProxyArgs* out,
     out->ec.send_window_bytes = windows.start * 1024u;
     // Explicit beats the prewarm prior (see StreamConfig::send_window_explicit).
     out->ec.window_explicit = true;
+    if (!out->ec.auto_window) {
+      // A fixed window below two segments cannot make progress: pump() admits a
+      // segment only while in_flight + wire_len fits, so a smaller window
+      // accepts the app's bytes and never puts one on the wire (the live
+      // `--no-auto-window --window=1` freeze). Stream floors it as well; the
+      // CLI refuses instead of silently using a different number.
+      // Only the segment size matters here: window_min_bytes is an autotune
+      // concept, and the fixed window has always accepted values well below it.
+      const MtuLimits limits = compute_mtu_limits(out->ec.mtu, out->ec.ip_hdr_len);
+      const size_t floor_bytes =
+          limits.valid ? 2 * limits.payload_max : static_cast<size_t>(0);
+      if (out->ec.send_window_bytes < floor_bytes) {
+        *error = "--window START under --no-auto-window must be at least " +
+                 std::to_string((floor_bytes + 1023u) / 1024u) +
+                 " KiB (two segments at this --mtu)";
+        return false;
+      }
+    }
   }
   if (windows.ceiling > 0) {
     if (!out->ec.auto_window) {
@@ -965,16 +1216,40 @@ bool parse_proxy_args(EngineRole role, int argc, char** argv, ProxyArgs* out,
   }
   if (!start_given && out->ec.auto_window && windows.ceiling > 0 &&
       out->ec.send_window_bytes > out->ec.window_max_bytes) {
-    // A lone legacy --window-cap below the 256 KiB default start used to clamp
-    // the start to the cap; failing such a command line would break exactly the
-    // memory-constrained deployments the flag exists for. No START was named,
-    // so lowering the default to the operator's own ceiling is not a silent
-    // override of a choice. (An explicit START above MAX is still an error.)
+    // A ceiling-only "--window=:MAX" below the 256 KiB default start: closing
+    // the range would fail exactly the memory-constrained deployments the form
+    // exists for. No START was named, so lowering the default to the
+    // operator's own ceiling is not a silent override of a choice. (An
+    // explicit START above MAX is still an error.)
     out->ec.send_window_bytes = out->ec.window_max_bytes;
     out->notes.push_back(
-        "[fcp] note: --window-cap lowered the default adaptive start from " +
+        "[fcp] note: --window=:MAX lowered the default adaptive start from " +
         std::to_string(kDefaultSendWindowBytes / 1024) + " KiB to " +
         std::to_string(out->ec.window_max_bytes / 1024) + " KiB");
+  }
+  // Wire-side defaults that do not need an operator decision:
+  //   * the adaptive ceiling follows the measured BDP up to 4 MiB unless a MAX
+  //     was pinned (an explicit MAX is a decision, and the prewarm prior must
+  //     keep applying to the start);
+  //   * ACKs are coalesced two per ACK on the wire. The unit tests keep
+  //     per-segment ACKs (EngineConfig::ack_every stays 1); production is what
+  //     pays the 81-byte ACK packet per segment.
+  out->ec.ack_every = 2;
+  if (out->ec.auto_window && out->ec.bbr && windows.ceiling == 0 &&
+      !out->ec.window_explicit) {
+    // The ceiling may follow the measured BDP, but the deployment guide's
+    // worst-case memory promise (2 x window x sessions ~= 512 MiB) must hold:
+    // one session's share shrinks as --max-sessions grows. The 256-session
+    // default therefore keeps today's 1 MiB ceiling; the high-throughput
+    // server recipe (--max-sessions=64) gets the full 4 MiB.
+    constexpr size_t kWindowBudgetBytes = 512u * 1024u * 1024u;
+    const size_t share = out->ec.max_sessions > 0
+                             ? kWindowBudgetBytes / out->ec.max_sessions / 2
+                             : kDefaultWindowCeilingBytes;
+    const size_t ceiling = std::min(kDefaultWindowCeilingBytes, share);
+    if (ceiling > out->ec.window_max_bytes) {
+      out->ec.window_ceiling_bytes = ceiling;
+    }
   }
   if (out->ec.auto_window && out->ec.send_window_bytes > out->ec.window_max_bytes) {
     // A range whose explicit START is above its own MAX is a mistake, and
@@ -1018,12 +1293,27 @@ bool parse_proxy_args(EngineRole role, int argc, char** argv, ProxyArgs* out,
   if (!ApplyHostPort(role, given, out, error)) {
     return false;
   }
-  if (given.listen.given) {
-    out->ro.listen_addr = given.listen.value;
+  std::string listen_addr = given.listen.given ? given.listen.value : std::string();
+  std::string listen_port;
+  const bool listen_has_port =
+      given.listen.given && SplitAddressPort(given.listen.value, &listen_addr, &listen_port);
+  if (given.listen.given && !listen_addr.empty()) {
+    out->ro.listen_addr = listen_addr;
   }
   if (given.local_port.given) {
+    if (listen_has_port) {
+      *error = "the local proxy port is given twice: --local-port and the address "
+               "suffix; drop one";
+      return false;
+    }
     long n = 0;
     if (!tools::ParseLong("--local-port", given.local_port.value.c_str(), 1, 65535, &n, error)) {
+      return false;
+    }
+    out->ro.listen_port = static_cast<int>(n);
+  } else if (listen_has_port) {
+    long n = 0;
+    if (!tools::ParseLong("--listen", listen_port.c_str(), 1, 65535, &n, error)) {
       return false;
     }
     out->ro.listen_port = static_cast<int>(n);
@@ -1033,15 +1323,30 @@ bool parse_proxy_args(EngineRole role, int argc, char** argv, ProxyArgs* out,
       return false;
     }
   }
-  if (given.stats.given) {
-    long n = 0;
-    if (!tools::ParseLong("--stats", given.stats.value.c_str(), 0, 86400000, &n, error)) {
+  if (given.log.given && given.log.value == "verbose") {
+    out->ro.verbose = true;
+  }
+  // --speedtest means different things by role: the server turns on the
+  // frame-layer responder on its UDP port, the client runs one bench and
+  // exits. --speedtest-seconds only belongs to the client's one-shot mode.
+  if (given.speedtest) {
+    if (role == EngineRole::kServer) {
+      out->ro.speedtest = true;
+    } else {
+      out->speedtest = true;
+    }
+  }
+  if (given.speedtest_seconds.given) {
+    if (role != EngineRole::kClient || !given.speedtest) {
+      *error = "--speedtest-seconds only applies to the client's --speedtest run";
       return false;
     }
-    out->ro.stats_ms = static_cast<int64_t>(n);
-  }
-  if (given.verbose || (given.log.given && given.log.value == "verbose")) {
-    out->ro.verbose = true;
+    long n = 0;
+    if (!tools::ParseLong("--speedtest-seconds", given.speedtest_seconds.value.c_str(),
+                          bench::kMinSeconds, bench::kMaxSeconds, &n, error)) {
+      return false;
+    }
+    out->speedtest_seconds = static_cast<int>(n);
   }
   return true;
 }
@@ -1076,6 +1381,9 @@ int run_proxy(EngineRole role, int argc, char** argv) {
   }
   for (const std::string& note : args.notes) {
     std::fprintf(stderr, "%s\n", note.c_str());
+  }
+  if (role == EngineRole::kClient && args.speedtest) {
+    return RunBench(args);
   }
 
   Reactor reactor(args.ec, args.ro);

@@ -140,10 +140,14 @@ inline uint8_t random_byte() {
     }                                                          \
   } while (0)
 
+// 两侧都按值保存：`std::min/max` 返回的是实参的**引用**，而 `w0 + w0 / 4`
+// 这类实参是临时量。先前的 `const auto&` 绑定只把临时量活到本语句结束，
+// 下一句比较读到的是已析构的栈槽（Linux 上实测把 40960 读成 106，Windows
+// 恰好还是旧值，所以只在 CI 红）。测试里拷贝几个 size_t/枚举可以忽略。
 #define CHECK_EQ(actual, expected)                                                 \
   do {                                                                             \
-    const auto& check_eq_a = (actual);                                             \
-    const auto& check_eq_e = (expected);                                           \
+    const auto check_eq_a = (actual);                                              \
+    const auto check_eq_e = (expected);                                            \
     ::fcp_test::check_eq(__FILE__, __LINE__, #actual " == " #expected, check_eq_a, \
                          check_eq_e);                                              \
   } while (0)

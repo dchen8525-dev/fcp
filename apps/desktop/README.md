@@ -67,7 +67,7 @@ pwsh -File apps/desktop/scripts/build_windows.ps1 `
   -ProxyBin build\release-win\apps\cli\Release\fcp-client.exe
 ```
 
-产物：`dist/fcp-client-<版本>-windows-x64.exe`。首次双击时引导器把 `FCP.exe` +
+产物：`dist/fcp-client-<版本>-windows-amd64.exe`。首次双击时引导器把 `FCP.exe` +
 `fcp-client.exe` 解到 `%LOCALAPPDATA%\FCP\bin\<载荷哈希>\`，之后直接启动缓存；
 换新版本会解到新目录，旧目录 7 天未用后清理。不写系统目录、不建卸载项、
 不需要管理员权限。删除 exe 即卸载（缓存目录可手动删除）。

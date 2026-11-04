@@ -20,7 +20,7 @@
 | 平台 | 文件 | 用法 |
 |---|---|---|
 | Ubuntu 服务端 | `fcp-server-<版本>-linux-amd64.deb` | `sudo dpkg -i …`；同包带 `fcp-client` |
-| Windows 客户端 | `fcp-client-<版本>-windows-x64.exe` | 双击运行，无需安装 |
+| Windows 客户端 | `fcp-client-<版本>-windows-amd64.exe` | 双击运行，无需安装 |
 | Linux 客户端 | `fcp-client-<版本>-linux-amd64.AppImage` | `chmod +x` 后双击 |
 
 见 [Releases](https://github.com/dchen8525-dev/fcp/releases)。

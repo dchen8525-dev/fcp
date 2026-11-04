@@ -3,7 +3,7 @@
 | 平台 | 文件 | 用法 |
 |---|---|---|
 | Ubuntu 服务端 | `fcp-server-VERSION-linux-ARCH.deb` | `sudo dpkg -i` 安装（见下）；同包带命令行客户端 |
-| Windows 客户端 | `fcp-client-VERSION-windows-x64.exe` | 单文件，双击即运行；**无需安装** |
+| Windows 客户端 | `fcp-client-VERSION-windows-amd64.exe` | 单文件，双击即运行；**无需安装** |
 | Linux 客户端 | `fcp-client-VERSION-linux-amd64.AppImage` | `chmod +x` 后双击；**无需安装** |
 
 Windows 客户端是单文件便携版：首次双击时解压到

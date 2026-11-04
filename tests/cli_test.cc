@@ -782,6 +782,12 @@ void TestBenchCodec() {
   CHECK(IsMagic(kMagic, kMagicLen));
   CHECK(!IsMagic(rendezvous, sizeof(rendezvous)));
   CHECK(!IsMagic(rendezvous, kMagicLen - 1));
+  // The server tells complete from truncated rendezvous apart with the prefix
+  // test; IsMagic must not blur the two.
+  CHECK(IsMagicPrefix(rendezvous, sizeof(rendezvous)));
+  CHECK(IsMagicPrefix(rendezvous, kMagicLen + 3));
+  CHECK(!IsMagicPrefix(rendezvous, kMagicLen - 1));
+  CHECK(!IsMagicPrefix(nullptr, kMagicLen));
 
   const uint64_t user = UserBytes(kDataPayloadLen);
   CHECK_EQ(user, static_cast<uint64_t>(kDataPayloadLen - kHeaderLen));
@@ -830,6 +836,24 @@ void TestBenchCodec() {
   RateWindow burst;
   burst.Add(0, 100000);
   CHECK_EQ(burst.best_bps(), 0ull);
+  // A gap only narrows the span over slots that still hold data, so a
+  // stalled-then-resumed receiver is not credited with a rate it never ran.
+  RateWindow gap;
+  for (int i = 0; i < 10; ++i) {
+    gap.Add(i * 100, 1000);
+  }
+  gap.Add(5000, 1000);  // 4s of silence, then a lone slot
+  CHECK_EQ(gap.best_bps(), 80000ull);
+  CHECK_EQ(gap.total_bytes(), 11000ull);
+
+  // The bench gate admits exactly one run at a time in a process.
+  std::string gate_error;
+  CHECK(BenchGate(&gate_error));
+  CHECK(!BenchGate(&gate_error));
+  CHECK(!gate_error.empty());
+  BenchRelease();
+  CHECK(BenchGate(&gate_error));
+  BenchRelease();
 }
 
 void TestEnvironmentDefaults() {

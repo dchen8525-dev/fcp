@@ -1,6 +1,7 @@
 #include "bench.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -47,10 +48,6 @@ void SleepMs(int64_t ms) {
   }
 }
 
-bool HasMagicPrefix(const uint8_t* data, size_t len) {
-  return data != nullptr && len >= kMagicLen && std::memcmp(data, kMagic, kMagicLen) == 0;
-}
-
 double WireBytesPerSegment() {
   // Data symbol on the wire = envelope/FEC overhead + payload (frame_tx.h).
   return static_cast<double>(kDataPayloadLen + kDataWireOverhead);
@@ -72,7 +69,7 @@ bool EncodeRendezvous(const uint8_t salt[kSaltLen], uint16_t seconds,
 
 bool DecodeRendezvous(const uint8_t* data, size_t len, uint8_t salt[kSaltLen],
                       uint16_t* seconds) {
-  if (!HasMagicPrefix(data, len) || len != kRendezvousLen ||
+  if (!IsMagicPrefix(data, len) || len != kRendezvousLen ||
       get_le16(data + kMagicLen) != kVersion || salt == nullptr || seconds == nullptr) {
     return false;
   }
@@ -81,8 +78,12 @@ bool DecodeRendezvous(const uint8_t* data, size_t len, uint8_t salt[kSaltLen],
   return true;
 }
 
+bool IsMagicPrefix(const uint8_t* data, size_t len) {
+  return data != nullptr && len >= kMagicLen && std::memcmp(data, kMagic, kMagicLen) == 0;
+}
+
 bool IsMagic(const uint8_t* data, size_t len) {
-  return len == kMagicLen && HasMagicPrefix(data, len);
+  return len == kMagicLen && IsMagicPrefix(data, len);
 }
 
 void EncodeData(uint32_t sn, uint8_t* out, size_t len) {
@@ -109,7 +110,7 @@ void EncodeReport(uint32_t sn, uint64_t delivered, uint64_t best_bps, uint8_t* o
 }
 
 bool DecodePayload(const uint8_t* payload, size_t len, DecodedPayload* out) {
-  if (out == nullptr || !HasMagicPrefix(payload, len) || len < kHeaderLen) {
+  if (out == nullptr || !IsMagicPrefix(payload, len) || len < kHeaderLen) {
     return false;
   }
   if (get_le16(payload + kMagicLen) != kVersion) {
@@ -137,6 +138,25 @@ bool DecodePayload(const uint8_t* payload, size_t len, DecodedPayload* out) {
 void Ramp::Advance() {
   bps_ = std::min(kMaxBps, bps_ * 1.5);
 }
+
+// One bench at a time per process: two sessions would interleave on the same
+// UDP socket, and the reactor's UDP receive buffer is shared with the proxy.
+std::atomic<int>& BenchOwner() {
+  static std::atomic<int> owner{0};
+  return owner;
+}
+
+bool BenchGate(std::string* error) {
+  if (BenchOwner().exchange(1) == 0) {
+    return true;
+  }
+  if (error != nullptr) {
+    *error = "已有测速会话在进行（同一进程同一时间只跑一个）";
+  }
+  return false;
+}
+
+void BenchRelease() { BenchOwner().store(0); }
 
 void RateWindow::Add(int64_t now_ms, uint64_t bytes) {
   const int64_t index = now_ms / kSlotMs;
@@ -266,6 +286,21 @@ bool RunClient(const ClientOptions& opt, const ProgressFn& progress, Result* out
     out->error = "测速时长必须在 3..30 秒";
     return false;
   }
+  std::string gate_error;
+  if (!BenchGate(&gate_error)) {
+    out->error = gate_error;
+    return false;
+  }
+  // RAII so every early return below releases the gate; hand it over as the
+  // last thing the function does.
+  struct GateGuard {
+    ~GateGuard() {
+      if (held) {
+        BenchRelease();
+      }
+    }
+    bool held = true;
+  } gate;
 #ifdef _WIN32
   WSADATA wsa{};
   const bool wsa_owned = WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
@@ -387,7 +422,9 @@ bool RunClient(const ClientOptions& opt, const ProgressFn& progress, Result* out
             first_down_ms = now;
           }
           last_down_ms = now;
-        } else {
+        } else if (decoded.delivered >= up_reported) {
+          // Reports are cumulative and can arrive late; never let a stale one
+          // walk the upload count back (that would look like lost data).
           up_reported = decoded.delivered;
           up_best_bps = decoded.best_bps;
           have_report = true;
@@ -493,6 +530,9 @@ bool RunClient(const ClientOptions& opt, const ProgressFn& progress, Result* out
           ++burst;
         }
         if (now - phase_start >= static_cast<int64_t>(opt.seconds) * 1000) {
+          // The timer stops the offered load; leftover tokens must not turn
+          // into one final burst after the measurement window closed.
+          tokens = 0.0;
           phase = Phase::kDrain;
           phase_start = now;
         }
@@ -554,14 +594,23 @@ bool RunClient(const ClientOptions& opt, const ProgressFn& progress, Result* out
     result.upload.mbps = static_cast<double>(up_best_bps) / 1e6;
     result.upload.seconds = static_cast<double>(opt.seconds);
     result.upload.acked = true;
-    const uint32_t expected = session.last_peer_expected();
-    const uint32_t lost = session.last_peer_lost();
-    result.upload.loss_n = expected;
-    result.upload.loss_ppm =
-        expected > 0
-            ? static_cast<uint32_t>(
-                  (static_cast<uint64_t>(lost) * 1000000ull + expected / 2) / expected)
-            : 0;
+    // The server counts what arrived, not what we handed to the framer. It
+    // can only report at least as much as we sent (we stop sending first and
+    // wait out the drain), so a smaller number is FEC/ARQ loss the upload
+    // could not recover -- never report that as confirmed.
+    if (up_reported < up_sent) {
+      result.upload.acked = false;
+      result.upload.lost_bytes = up_sent - up_reported;
+      if (result.error.empty()) {
+        const double pct = up_sent > 0
+                               ? 100.0 * static_cast<double>(result.upload.lost_bytes) /
+                                     static_cast<double>(up_sent)
+                               : 0.0;
+        char line[96];
+        std::snprintf(line, sizeof(line), "上行有 %.1f%% 未到达服务端", pct);
+        result.error = line;
+      }
+    }
     result.have_upload = true;
   } else if (result.error.empty()) {
     result.error = "没有收到服务端的上传确认";
@@ -570,6 +619,8 @@ bool RunClient(const ClientOptions& opt, const ProgressFn& progress, Result* out
   *out = result;
   CloseSock(sock);
   cleanup();
+  gate.held = false;
+  bench::BenchRelease();
   return result.have_download;
 }
 
@@ -591,14 +642,21 @@ void BenchServer::Reset() {
   // Destroy the session first: its destructor flushes the last FECSTAT through
   // send_, which still needs peer_ to be valid.
   session_.reset();
+  bench::BenchRelease();
+  // sn_ deliberately survives: the frame layer's cross-set dedup remembers
+  // the last kSnWindow sequence numbers, so restarting at 1 would make the next
+  // client's first payloads collide with the previous session's and vanish.
   have_peer_ = false;
   phase_ = Phase::kWaitEstablished;
+  outcome_logged_ = false;
   std::memset(salt_, 0, sizeof(salt_));
   upload_bytes_ = 0;
   upload_window_.Reset();
   tokens_ = 0.0;
   token_ms_ = 0;
   last_ramp_ms_ = 0;
+  // last_echo_ms_ is not reset: it throttles the "busy slot" echo path too,
+  // and StartSession replies to its own rendezvous explicitly.
 }
 
 void BenchServer::StartSession(const Peer& from, const uint8_t salt[bench::kSaltLen],
@@ -610,6 +668,14 @@ void BenchServer::StartSession(const Peer& from, const uint8_t salt[bench::kSalt
   seconds_ = static_cast<uint16_t>(
       std::min<int>(bench::kMaxSeconds, std::max<int>(bench::kMinSeconds, seconds)));
   created_ms_ = now_ms;
+  if (!bench::BenchGate(nullptr)) {
+    // A previous session's tick never released the gate; the slot has to be
+    // reclaimable or the responder locks up on a stale claim.
+    bench::BenchRelease();
+    if (!bench::BenchGate(nullptr)) {
+      return;
+    }
+  }
 
   SessionConfig cfg;
   std::memcpy(cfg.key, opt_.key, sizeof(cfg.key));
@@ -646,7 +712,11 @@ void BenchServer::StartSession(const Peer& from, const uint8_t salt[bench::kSalt
   }
   session_->on_tick(now_ms);
   phase_ = Phase::kWaitEstablished;
-  SendRendezvousEcho(now_ms);
+  // Reply unconditionally: last_echo_ms_ deliberately survives a Reset (it is
+  // shared with the busy-slot path) and would otherwise swallow the echo for a
+  // client that arrives inside the previous session's echo window.
+  last_echo_ms_ = now_ms;
+  send_(peer_, bench::kMagic, bench::kMagicLen);
   if (log_) {
     log_("[bench] session started, " + std::to_string(seconds_) + "s per direction");
   }
@@ -677,14 +747,30 @@ bool BenchServer::OnDatagram(const Peer& from, const uint8_t* data, size_t len,
       return true;
     }
     if (session_ != nullptr) {
-      session_->on_wire(data, len, now_ms);
+      // Session's return value is the auth/parse verdict. False is expected for
+      // a duplicate or corrupt datagram; it must not be retried, and it must
+      // not fall through as "not ours" either -- every datagram from the peer
+      // belongs to the bench session while the slot is held.
+      (void)session_->on_wire(data, len, now_ms);
     }
     return true;
   }
-  // Not the bench peer: a rendezvous from somebody else while the single slot
-  // is busy is consumed rather than handed to the proxy engine, which would
-  // count it as an unknown salt.
-  if (len >= bench::kMagicLen && std::memcmp(data, bench::kMagic, bench::kMagicLen) == 0) {
+  // Not the bench peer. A datagram that merely *starts* with the magic is not
+  // necessarily ours: the tunnel envelope header is arbitrary ciphertext
+  // bytes, so a real proxy datagram draws the 8-byte magic with probability
+  // 2^-64. Among ~500k datagrams per second that is once in 40 years, but a
+  // bug that writes the magic at offset 0 (the old bench code did) would turn
+  // every such datagram into one here -- so only full bench shapes are
+  // consumed, and an incomplete rendezvous still gets the echo (the client
+  // may be retrying after a lost echo) instead of being parsed or forwarded.
+  if (bench::IsMagic(data, len)) {
+    return true;
+  }
+  uint8_t salt[bench::kSaltLen];
+  uint16_t seconds = 0;
+  if (bench::DecodeRendezvous(data, len, salt, &seconds) ||
+      (bench::IsMagicPrefix(data, len) && len < bench::kRendezvousLen)) {
+    SendRendezvousEcho(now_ms);
     return true;
   }
   return false;
@@ -723,8 +809,14 @@ void BenchServer::SendReport(int64_t now_ms, bool final) {
                       sizeof(report));
   session_->on_kcp_output(report, sizeof(report), now_ms);
   last_report_ms_ = now_ms;
-  if (final && log_ && upload_bytes_ > 0) {
-    log_("[bench] upload delivered " + std::to_string(upload_bytes_) + " bytes");
+  // final is true for every repeat of the final report; log the outcome once.
+  if (final && log_ && upload_bytes_ > 0 && !outcome_logged_) {
+    outcome_logged_ = true;
+    char line[160];
+    std::snprintf(line, sizeof(line), "[bench] upload %llu bytes delivered, best %.1f Mbps",
+                  static_cast<unsigned long long>(upload_bytes_),
+                  static_cast<double>(upload_window_.best_bps()) / 1e6);
+    log_(line);
   }
 }
 
@@ -816,7 +908,8 @@ void BenchServer::OnTick(int64_t now_ms) {
       }
       break;
     case Phase::kDraining:
-      if (now_ms - phase_start_ms_ < 600 && now_ms - last_report_ms_ >= 150) {
+      if (now_ms - phase_start_ms_ < bench::kFinalReportsMs &&
+          now_ms - last_report_ms_ >= 150) {
         SendReport(now_ms, true);  // repeat the final report; payloads can drop
       }
       if (now_ms >= drain_end_ms_) {

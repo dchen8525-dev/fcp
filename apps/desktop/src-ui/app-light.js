@@ -405,6 +405,7 @@ function boot() {
     speedRunning = false;
     if ($("speedStart")) $("speedStart").disabled = false;
     const fill = (sample, id, subId) => {
+      if ($(subId)) $(subId).classList.remove("bad");
       if (!sample) {
         if ($(id)) $(id).textContent = "--";
         if ($(subId)) $(subId).textContent = "未完成";
@@ -412,9 +413,13 @@ function boot() {
       }
       if ($(id)) $(id).textContent = Number(sample.mbps || 0).toFixed(2);
       const secs = Number(sample.seconds || 0);
-      const ack = sample.acked === false ? "（未确认）" : "";
+      const lossy = sample.acked === false;
+      const ack = lossy
+        ? `（${fmtBytes(Number(sample.lostBytes || 0))} 未到达）`
+        : "";
       if ($(subId)) {
         $(subId).textContent = `${fmtBytes(Number(sample.bytes || 0))} / ${secs.toFixed(1)}s${ack}`;
+        $(subId).classList.toggle("bad", lossy);
       }
     };
     fill(r.download, "sp-down", "sp-down-sub");

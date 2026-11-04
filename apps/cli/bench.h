@@ -81,9 +81,16 @@ constexpr int64_t kRampMs = 500;
 constexpr int64_t kWindowMs = 1000;
 constexpr int64_t kSilenceMs = 700;   // no data for this long = direction done
 constexpr int64_t kReportMs = 250;    // server -> client upload progress
-constexpr int64_t kDrainMs = 1500;    // client waits this long for reports
+// The server goes silent once the upload stops, so the client has to outlast
+// the server's own silence detector (kSilenceMs) before it can judge the
+// result, on top of the last report still being in flight.
+constexpr int64_t kDrainMs = kSilenceMs + 1500;
 constexpr int64_t kSetupTimeoutMs = 6000;
 constexpr int64_t kSettleBeforePhaseMs = 300;
+// The server flushes every set within flush_ms_ (25..200ms), but a control
+// report goes out on its own when the set queue is idle, and both run on the
+// reactor's 25ms tick. Two seconds is far beyond any of those.
+constexpr int64_t kFinalReportsMs = 2000;
 
 enum class PayloadType : uint8_t { kData = 0, kReport = 1 };
 
@@ -95,7 +102,11 @@ bool EncodeRendezvous(const uint8_t salt[kSaltLen], uint16_t seconds,
                       uint8_t out[kRendezvousLen]);
 bool DecodeRendezvous(const uint8_t* data, size_t len, uint8_t salt[kSaltLen],
                       uint16_t* seconds);
+// IsMagic is the exact 8-byte echo. IsMagicPrefix only asks whether the
+// datagram starts with the magic, which the server uses to classify stray
+// datagrams without trusting them as bench traffic.
 bool IsMagic(const uint8_t* data, size_t len);
+bool IsMagicPrefix(const uint8_t* data, size_t len);
 
 // Fills exactly `len` bytes (len >= kHeaderLen) with a data payload; the body
 // is zero. A unique `sn` per payload keeps the frame layer's dedup honest.
@@ -177,6 +188,10 @@ struct Sample {
   uint64_t bytes = 0;
   double seconds = 0.0;
   bool acked = false;
+  // Upload only: bytes the framer accepted that the server never counted
+  // (upload.loss_n is the server's symbol-level loss; this one only moves
+  // when something was actually lost). acked is false whenever it is > 0.
+  uint64_t lost_bytes = 0;
   // Pre-FEC raw loss of this direction's receive side, as last reported.
   uint32_t loss_ppm = 0;
   uint32_t loss_n = 0;
@@ -193,6 +208,12 @@ struct Result {
 // direction is "down" or "up"; bytes are delivered (down) or sent (up).
 using ProgressFn = std::function<void(const char* direction, uint64_t bytes,
                                       int64_t elapsed_ms)>;
+
+// Process-wide single-bench gate. RunClient takes it and releases it on every
+// exit path; the server's BenchServer takes it per session. A second bench in
+// the same process is refused instead of interleaving on the shared socket.
+bool BenchGate(std::string* error);
+void BenchRelease();
 
 // Blocking; returns false only when no measurement could be made at all
 // (socket, rendezvous, handshake). A run whose upload report never arrived
@@ -269,6 +290,7 @@ class BenchServer {
 
   uint64_t upload_bytes_ = 0;
   bench::RateWindow upload_window_;
+  bool outcome_logged_ = false;
   uint8_t payload_[bench::kDataPayloadLen] = {};
 };
 

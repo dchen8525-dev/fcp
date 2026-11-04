@@ -16,9 +16,9 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -261,7 +261,6 @@ fn assign_to_reaper(_child: &Child) {}
 fn kill_child(child: &mut Child) {
     #[cfg(unix)]
     {
-        use std::time::Instant;
         let pid = child.id() as i32;
         unsafe {
             libc::kill(pid, libc::SIGTERM);
@@ -576,7 +575,27 @@ fn start_speedtest(
         // reached the server still has to produce a done event so the UI does
         // not stay in "测速中".
         let mut done = false;
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        // Bounded: the child must produce its done line (success or its own
+        // error) well inside its own timeouts. An unbounded reader would
+        // leave `running` stuck if the sidecar ever wedged.
+        let (tx, rx) = mpsc::channel::<String>();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(cfg.seconds as u64 * 2 + 60);
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let line = match rx.recv_timeout(deadline - now) {
+                Ok(line) => line,
+                Err(_) => break,
+            };
             let Some(rest) = line.strip_prefix("@speedtest ") else {
                 let _ = app_out.emit("proxy-log", json!({ "stream": "out", "line": line }));
                 continue;
@@ -610,22 +629,37 @@ fn start_speedtest(
                 _ => {}
             }
         }
+        // Reap first: a done line and exit race, and a hung reader must not
+        // leave the process behind.
+        let killed = child_arc
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
+            .map(|mut child| {
+                if child.try_wait().ok().flatten().is_none() {
+                    kill_child(&mut child);
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false);
         if !done {
+            let error = if killed {
+                "测速进程超时退出"
+            } else {
+                "测速进程异常退出（确认服务端以 --speedtest 启动）"
+            };
             let _ = app_out.emit(
                 "speedtest-done",
                 json!({
                     "download": Value::Null,
                     "upload": Value::Null,
-                    "error": "测速进程异常退出（确认服务端以 --speedtest 启动）",
+                    "error": error,
                 }),
             );
         }
         running.store(false, Ordering::SeqCst);
-        if let Ok(mut guard) = child_arc.lock() {
-            if let Some(mut child) = guard.take() {
-                let _ = child.wait();
-            }
-        }
     });
 
     thread::spawn(move || {

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -696,12 +697,20 @@ std::string JsonEscape(const std::string& in) {
   return out;
 }
 
-std::string BenchSampleJson(const bench::Sample& s) {
-  char buf[256];
+std::string BenchSampleJson(const bench::Sample& s, double user_bytes_per_sec) {
+  // "wireMbps" is the offered load at the framer (user bytes plus the 16-byte
+  // bench header); "mbps" is what the receiver counted, post-FEC and
+  // post-dedup. The gap between them is FEC redundancy plus whatever the
+  // direction lost.
+  const double wire_mbps = user_bytes_per_sec * 8.0 / 1e6;
+  char buf[320];
   std::snprintf(buf, sizeof(buf),
-                "{\"mbps\":%.2f,\"bytes\":%llu,\"seconds\":%.2f,\"acked\":%s,"
-                "\"lossPpm\":%u,\"lossN\":%u}",
-                s.mbps, static_cast<unsigned long long>(s.bytes), s.seconds,
+                "{\"mbps\":%.2f,\"wireMbps\":%.2f,\"bytes\":%llu,\"lostBytes\":%llu,"
+                "\"seconds\":%.2f,\"acked\":%s,\"lossPpm\":%u,\"lossN\":%u}",
+                std::isfinite(s.mbps) ? s.mbps : 0.0,
+                std::isfinite(wire_mbps) ? wire_mbps : 0.0,
+                static_cast<unsigned long long>(s.bytes),
+                static_cast<unsigned long long>(s.lost_bytes), s.seconds,
                 s.acked ? "true" : "false", s.loss_ppm, s.loss_n);
   return buf;
 }
@@ -732,9 +741,17 @@ int RunBench(const ProxyArgs& args) {
   std::string json = "{\"event\":\"done\",\"seconds\":";
   json += std::to_string(args.speedtest_seconds);
   json += ",\"download\":";
-  json += result.have_download ? BenchSampleJson(result.download) : "null";
+  // The download's offered rate is not known to this process (the server
+  // sends it), so only the upload side carries wireMbps.
+  json += result.have_download ? BenchSampleJson(result.download, 0.0) : "null";
   json += ",\"upload\":";
-  json += result.have_upload ? BenchSampleJson(result.upload) : "null";
+  json += result.have_upload
+              ? BenchSampleJson(result.upload,
+                                result.upload.seconds > 0
+                                    ? static_cast<double>(result.upload.bytes) /
+                                          result.upload.seconds
+                                    : 0.0)
+              : "null";
   json += ",\"error\":";
   json += result.error.empty() ? "null" : "\"" + JsonEscape(result.error) + "\"";
   json += "}";

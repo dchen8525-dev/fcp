@@ -10,7 +10,7 @@
 #   scripts/build_deb.sh --stage DIR [--out-dir DIR] [--version V] [--arch A]
 #
 #   DIR        已按 FHS 装好的树（DESTDIR 前缀），含 usr/bin、etc、usr/share/doc。
-#   产出       <out-dir>/fcp-server_<version>_<arch>.deb
+#   产出       <out-dir>/fcp-server-<version>-linux-<arch>.deb
 #              默认 out-dir = <stage>/../packages
 #
 # 需要：dpkg-deb（dpkg 自带），以及构建机上已生成的 Linux 可执行文件。
@@ -147,7 +147,7 @@ for s in preinst postinst prerm postrm; do
 done
 
 # ---- 出包 ------------------------------------------------------------------
-DEB="$OUT_DIR/${PACKAGE}_${VERSION}_${ARCH}.deb"
+DEB="$OUT_DIR/${PACKAGE}-${VERSION}-linux-${ARCH}.deb"
 rm -f "$DEB"
 # 固定时间戳，同一输入两次打包一致（便于 diff 与复现）。
 SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-0}" \

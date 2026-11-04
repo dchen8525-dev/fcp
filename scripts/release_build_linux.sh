@@ -10,7 +10,7 @@
 #   version 缺省取仓库根 VERSION 文件；CI 传 tag 去掉前导 v 的版本号，
 #   CMake 侧会再次校验格式（顶层 CMakeLists 的 FCP_RELEASE_VERSION）。
 #
-# 产出：<build>/packages/fcp-server_<version>_<arch>.deb
+# 产出：<build>/packages/fcp-server-<version>-linux-<arch>.deb
 #
 # 需要：build-essential cmake ninja-build dpkg（dpkg-deb 打在 dpkg 里）。
 # 打 deb 只用 dpkg-deb，不依赖 debhelper / fakeroot / cpack / python。
@@ -87,7 +87,7 @@ bash "$ROOT/scripts/build_deb.sh" \
   --arch "$DEB_ARCH"
 
 echo "== 产出"
-deb="$BUILD_DIR/packages/fcp-server_${VERSION}_${DEB_ARCH}.deb"
+deb="$BUILD_DIR/packages/fcp-server-${VERSION}-linux-${DEB_ARCH}.deb"
 if command -v dpkg-deb >/dev/null; then
   dpkg-deb --info "$deb"
 fi

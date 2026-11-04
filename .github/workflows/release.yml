@@ -3,9 +3,9 @@ name: release
 # 打 tag 即发布：`git tag v0.0.1 && git push origin v0.0.1`
 #
 # 产出三件发布物，挂在同一条 GitHub Release 上：
-#   * fcp_<版本>_<arch>.deb         Ubuntu 服务端（同包带 CLI client、systemd unit、conffile）
-#   * fcp-client_<版本>_amd64.exe          Windows 客户端（单文件，双击运行，免安装）
-#   * fcp-client_<版本>_amd64.AppImage         Linux 客户端（双击运行，免安装）
+#   * fcp-server-<版本>-linux-<arch>.deb  Ubuntu 服务端（同包带 CLI client、systemd unit、conffile）
+#   * fcp-client-<版本>-windows-x64.exe Windows 客户端（单文件，双击运行，免安装）
+#   * fcp-client-<版本>-linux-amd64.AppImage  Linux 客户端（双击运行，免安装）
 #
 # 客户端是 Tauri 2 壳 + fcp-client sidecar（apps/desktop）。隧道仍由 CLI
 # 承载，所以两个客户端 job 先构建 FCP_BUILD_PROXY=ON 的 CLI。
@@ -321,7 +321,7 @@ jobs:
       - name: 冒烟（引导器自检 + sidecar --version）
         shell: pwsh
         run: |
-          $exe = Get-ChildItem dist\fcp-client_*_amd64.exe | Select-Object -First 1
+          $exe = Get-ChildItem dist\fcp-client-*-windows-x64.exe | Select-Object -First 1
           if (!$exe) { throw "没找到单文件便携 exe" }
           Write-Host "产物：$($exe.FullName) ($([math]::Round($exe.Length / 1MB, 1)) MiB)"
           $proc = Start-Process -FilePath $exe.FullName `
@@ -339,7 +339,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: windows-portable
-          path: dist/fcp-client_*_amd64.exe
+          path: dist/fcp-client-*-windows-x64.exe
           if-no-files-found: error
           retention-days: 14
 

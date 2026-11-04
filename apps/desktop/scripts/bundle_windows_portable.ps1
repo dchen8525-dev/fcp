@@ -99,7 +99,7 @@ try {
   $hash.CopyTo($footer, 32)
 
   # 4) 拼接：引导器 + 载荷 + 尾部。
-  $out = Join-Path $OutDir "fcp-client_${Version}_amd64.exe"
+  $out = Join-Path $OutDir "fcp-client-${Version}-windows-x64.exe"
   $fs = [System.IO.File]::Create($out)
   try {
     foreach ($part in @($launcher, $payload)) {

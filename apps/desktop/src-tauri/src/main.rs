@@ -4,7 +4,7 @@
 // reactor CLI，M2 §6 的进程外宿主）。这里只做三件事：
 //   1. 用表单参数启动 sidecar，密钥走环境变量（不进 argv，`ps` 看不到）；
 //   2. 逐行读 stdout：`stats ...` 解析成计数/速率事件，其余原样进日志面板；
-//   3. 关窗/停止时收掉子进程。
+//   3. 关窗/最小化只收进托盘（隧道继续跑），真正退出（托盘菜单"退出"）时收掉子进程。
 //
 // sidecar 解析顺序：FCP_PROXY_BIN（开发期覆盖）→ 资源目录（AppImage/安装布局）
 // → 主程序同目录（Windows 便携包）。找不到就明确报错，不回落到 PATH 上的同名
@@ -22,7 +22,9 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 
 struct ProxyProc {
     child: Arc<Mutex<Option<Child>>>,
@@ -804,6 +806,55 @@ fn speedtest_selftest() -> i32 {
     i32::from(!text.contains("\"mbps\""))
 }
 
+// 托盘是否建起来了：关窗时据此决定"收进托盘"还是"按老路退出"。
+// Linux 上 tray-icon 依赖 libayatana-appindicator，缺库时构建失败；此时若仍
+// 阻止关窗，窗口会消失且没有入口把它叫回来，所以只有建成功才改变关闭语义。
+static TRAY_READY: AtomicBool = AtomicBool::new(false);
+
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
+    let show = MenuItem::with_id(app, "show", "显示主界面", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+    let mut builder = TrayIconBuilder::new()
+        .tooltip("FCP 客户端")
+        .menu(&menu)
+        // 左键单击直接还原窗口，菜单走右键（Windows 的常规习惯）。
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => show_main_window(app),
+            // app.exit() 走 RunEvent::ExitRequested，子进程由 main 里的
+            // 退出处理收掉，别在这里自己 kill。
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| match event {
+            TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            }
+            | TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            } => show_main_window(tray.app_handle()),
+            _ => {}
+        });
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(icon.clone());
+    }
+    builder.build(app)?;
+    TRAY_READY.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
 fn main() {
     if std::env::args().any(|a| a == "--fcp-speedtest-selftest") {
         std::process::exit(speedtest_selftest());
@@ -823,6 +874,29 @@ fn main() {
     let app = tauri::Builder::default()
         .manage(proc_state)
         .manage(speed_state)
+        .setup(|app| {
+            if let Err(err) = setup_tray(app.handle()) {
+                // 托盘失败不阻断启动：只是关窗/最小化仍按老行为走。
+                eprintln!("托盘图标不可用，关闭窗口将直接退出：{err}");
+            }
+            Ok(())
+        })
+        // 关闭和最小化都只收进托盘：隧道（sidecar）继续跑，这是代理客户端的
+        // 核心用途；真正退出走托盘菜单的"退出"。
+        .on_window_event(|window, event| match event {
+            WindowEvent::CloseRequested { api, .. } => {
+                if TRAY_READY.load(Ordering::SeqCst) {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+            WindowEvent::Resized(_) => {
+                if TRAY_READY.load(Ordering::SeqCst) && window.is_minimized().unwrap_or(false) {
+                    let _ = window.hide();
+                }
+            }
+            _ => {}
+        })
         .invoke_handler(tauri::generate_handler![
             start_proxy,
             stop_proxy,

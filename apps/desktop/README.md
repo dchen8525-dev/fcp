@@ -45,6 +45,11 @@ apps/desktop/
 `--window=START:MAX` 并加 `--no-auto-window`，要对照 BBRv1 或旧 epoch 控制器需用 CLI
 （`--bbr-version=1` / `--no-bbr`）。
 
+**托盘**：关闭窗口或最小化只把窗口收进托盘，sidecar（隧道）继续运行；托盘图标
+左键单击还原窗口，右键菜单是「显示主界面 / 退出」，只有「退出」会停掉隧道并结束
+进程。托盘建不起来时（Linux 缺 `libayatana-appindicator3`）退回旧行为：关窗直接
+退出，不会留下看不见的进程。
+
 设置保存在 WebView 的 localStorage；"记住设置"关闭时不落盘。`?panel=conn|status|speed|log`
 可直接打开某一页（排障/截图用）。
 
@@ -129,5 +134,6 @@ FCP_PROXY_BIN=/path/to/fcp-client npm run dev   # 开发模式
 
 ## 图标
 
-`npm run icons` 重新生成 `src-tauri/icons/`（纯 Node，无图形库依赖）：深色圆角
-底 + 冰白 F + 右下角品牌蓝圆点。
+`npm run icons` 重新生成 `src-tauri/icons/`（纯 Node，无图形库依赖）：绿底
+（`#0f9d76`，与界面 accent 同色）白字 F + 白点，ICO 带 16/32/48/64/128/256 六个
+尺寸（小图标视图不会回退成默认 exe 图标）。

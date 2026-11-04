@@ -202,6 +202,14 @@ void Stream::on_tick(int64_t now_ms) {
   // contract (stream.h, ClosedFn) is that closed_ may mark the stream finished
   // but must not destroy it, so the members stay readable -- but nothing after
   // a reset belongs on the wire.
+  //
+  // The tail probe runs before the RTO: when both are due in the same tick the
+  // probe wins, which is the whole point (one RTT instead of two, and no
+  // congestion signal for what may be a single lost segment).
+  tail_loss_probe(now_ms);
+  if (state_ == StreamState::kClosed) {
+    return;
+  }
   retransmit_timeouts(now_ms);
   if (state_ == StreamState::kClosed) {
     return;
@@ -310,6 +318,11 @@ void Stream::pump(int64_t now_ms) {
   bool forced = probe_credit_;
   probe_credit_ = false;
   bool held = false;
+  // The tail-loss clock is armed when data starts flowing from an idle pipe:
+  // from then on it measures "no cumulative progress", not "the app has been
+  // quiet". A stream that goes idle after a fully acked transfer therefore does
+  // not inherit an old deadline for its next segment.
+  bool arm_progress = in_flight_ == 0;
   // Bookkeeping is applied before handing the bytes to the host: a host that
   // delivers synchronously (in-process loopback) can reach handle_ack() from
   // inside send_, and that pops segments out of tx_. Indexing freshly each round
@@ -343,6 +356,11 @@ void Stream::pump(int64_t now_ms) {
     seg.sent = true;
     seg.sent_ms = now_ms;
     in_flight_ += seg.wire_len();
+    if (arm_progress) {
+      arm_progress = false;
+      progress_ms_ = now_ms;
+      tlp_probes_ = 0;
+    }
     // A reentrant pump may already have put a later segment on the wire, so
     // the bound only moves forward -- and "forward" is measured modularly
     // (seq.h): the byte offsets wrap at 4 GiB by design (~27 min at 20 Mbps),

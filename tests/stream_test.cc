@@ -468,6 +468,7 @@ void TestOrderedFlow() {
   CHECK_EQ(f.sa().in_flight(), 0u);
   CHECK_EQ(f.sa().queued_bytes(), 0u);
   CHECK_EQ(f.sa().retransmits(), 0u);
+  CHECK_EQ(f.sa().retx_tlp(), 0u);  // ACKs flowing: the tail probe stays off
   CHECK_EQ(f.sb().dup_bytes(), 0u);
   CHECK_EQ(f.sb().bad_segs(), 0u);
   CHECK_EQ(f.sb().state(), StreamState::kOpen);
@@ -1191,6 +1192,135 @@ void TestDupAckForceRefill() {
     f.feed(kA, ack);
   }
   CHECK_EQ(f.sa().retransmits(), 2u);
+}
+
+// Tail loss probe: the newest segment on the wire is lost and no later data
+// exists, so there is neither a duplicate ACK nor a SACK block to reveal it.
+// The old path could only wait for the RTO; the probe resends the tail after
+// about one RTT, and the ACK it provokes completes the transfer without a
+// timeout episode (no backoff, no BBR loss signal).
+void TestTailLossProbeRepairsLostTail() {
+  Fixture f;
+  const size_t cap = f.payload();
+  const uint32_t tail_off = 4u * static_cast<uint32_t>(cap);
+  int copies = 0;
+  f.killer = [&copies, tail_off](const Packet& p) {
+    if (p.from != kA || !IsData(p.seg) || rd32(p.seg.data() + 1) != tail_off) {
+      return false;
+    }
+    return ++copies == 1;  // lose the original tail, let the probe through
+  };
+  const std::vector<uint8_t> src = MakeBytes(5 * cap, 91);
+  CHECK_EQ(f.push(kA, src), src.size());
+  CHECK_EQ(copies, 1);
+  CHECK_EQ(f.sa().retx_fill(), 0u);  // the tail is above every SACK block
+  CHECK_EQ(f.sa().retx_tlp(), 0u);
+  CHECK_EQ(f.sa().rto_loss_events(), 0u);
+  const int64_t t0 = f.now();
+
+  // Shorter than the probe interval: nothing may go out. The previous ACKs
+  // already moved cum to the tail, so this is not a progress question.
+  f.tick(10);
+  CHECK_EQ(f.sa().retx_tlp(), 0u);
+
+  // The probe has to fire within one RTO and repair the tail; if it needed the
+  // timeout this loop would see rto_loss_events first.
+  for (int i = 0; i < 100 && f.sa().retx_tlp() == 0; ++i) {
+    f.tick(10);
+  }
+  CHECK_EQ(f.sa().retx_tlp(), 1u);
+  CHECK_EQ(f.sa().rto_loss_events(), 0u);
+  CHECK_EQ(f.sa().retx_rto(), 0u);
+  CHECK(f.now() - t0 < f.sa().rto_ms());
+  CHECK_EQ(f.data_with_offset(kA, tail_off), 2u);
+  CHECK_EQ(copies, 2);
+
+  f.drain();
+  CHECK(f.b().delivered == src);
+  CHECK_EQ(f.sa().retx_tlp(), 1u);  // one probe per stall, no storm
+}
+
+// A fill that is itself lost must not wait for the RTO. The watermark used to
+// make the range "owned" and the peer keeps reporting the same block above it,
+// so the hole sat there for 2 RTTs plus backoff. One retry per RTT, driven by
+// that same SACK evidence, is enough.
+void TestLostSackFillRetriedAfterOneRtt() {
+  Fixture f;
+  f.cut_all();
+  const std::vector<uint8_t> src = MakeBytes(4 * f.payload(), 12);
+  const size_t cap = f.payload();
+  CHECK_EQ(f.push(kA, src), src.size());
+  const std::vector<uint8_t> ack =
+      MakeAck(0, f.cfg().rcv_buf_bytes, static_cast<uint32_t>(cap),
+              2u * static_cast<uint32_t>(cap));
+  f.feed(kA, ack);  // hole at offset 0, the peer holds everything above it
+  CHECK_EQ(f.sa().retx_fill(), 1u);
+  CHECK_EQ(f.sa().retransmits(), 1u);
+  CHECK_EQ(f.sa().fill_passes(), 1u);
+
+  // The same block inside one RTT: the first repair is still in flight.
+  f.tick(50);
+  f.feed(kA, ack);
+  CHECK_EQ(f.sa().retransmits(), 1u);
+  CHECK_EQ(f.sa().retx_fill(), 1u);
+
+  // A round trip later the cumulative point is still below the block, so the
+  // repair is retried -- without any timeout.
+  f.tick(200);
+  f.feed(kA, ack);
+  CHECK_EQ(f.sa().retx_fill(), 2u);
+  CHECK_EQ(f.sa().retransmits(), 2u);
+  CHECK_EQ(f.sa().fill_passes(), 1u);  // no new range was revealed
+  CHECK_EQ(f.sa().rto_loss_events(), 0u);
+  CHECK_EQ(f.sa().retx_rto(), 0u);
+}
+
+// A burst hole is one recovery event. With BBR pacing the whole revealed range
+// goes out in a single pass; the old 32-segment budget needed another ACK (and
+// on a stalled receiver, another ACK interval) before the hole was complete.
+void TestSackFillsWholeHoleInOnePass() {
+  StreamConfig c;
+  c.max_segment = 106;  // 100-byte payload per segment
+  c.send_window_bytes = 128 * 1024;
+  c.rcv_buf_bytes = 128 * 1024;
+  c.auto_window = true;
+  c.window_min_bytes = 8 * 1024;
+  c.window_max_bytes = 256 * 1024;
+  c.initial_srtt_ms = 200;
+  c.rto_min_ms = 100;
+  c.rto_max_ms = 5000;
+  c.idle_timeout_ms = 300000;
+  Fixture f(c);
+  f.cut_all();
+  const size_t cap = f.payload();
+  const size_t count = 60;
+  const std::vector<uint8_t> src = MakeBytes(count * cap, 33);
+  CHECK_EQ(f.push(kA, src), src.size());
+  // push() only guarantees the bytes were accepted; the pacer releases them a
+  // bucket at a time.
+  for (int i = 0; i < 10 && f.data_of(kA).size() < count; ++i) {
+    f.tick(25);
+  }
+  CHECK_EQ(f.data_of(kA).size(), count);
+
+  // Let the token bucket bank one burst's worth (it is capped at 6 ms of the
+  // pacing rate, ~11 KB here) without reaching any timer.
+  f.tick(50);
+  const std::vector<std::vector<uint8_t>> segs = f.data_of(kA);
+  f.feed(kB, segs.back());  // the peer holds only the last segment
+  const std::vector<uint8_t> ack = f.last_ack(kB);
+  CHECK_EQ(rd32(ack.data() + 1), 0u);  // cum: everything below is a hole
+  CHECK_EQ(rd32(ack.data() + 9), static_cast<uint32_t>((count - 1) * cap));
+  f.feed(kA, ack);
+
+  // 59 missing segments, above the old 32-segment cap, all in this one pass.
+  CHECK_EQ(f.sa().retx_fill(), static_cast<uint64_t>(count - 1));
+  CHECK_EQ(f.sa().fill_passes(), 1u);
+  CHECK_EQ(f.data_with_offset(kA, 0), 2u);
+  CHECK_EQ(f.data_with_offset(kA, static_cast<uint32_t>((count / 2) * cap)), 2u);
+  CHECK_EQ(f.data_with_offset(kA, static_cast<uint32_t>((count - 2) * cap)), 2u);
+  CHECK_EQ(f.data_with_offset(kA, static_cast<uint32_t>((count - 1) * cap)), 1u);
+  CHECK_EQ(f.sa().rto_loss_events(), 0u);
 }
 
 // In-order ACKs never arm the fast-retransmit path.
@@ -1964,6 +2094,7 @@ void TestAutoWindowBrakesOnStandingQueue() {
   CHECK(window > kAutoFloor);        // it did grow: the link has headroom
   CHECK(window < 96u * 1024);        // ... and stopped far below the cap
   CHECK_EQ(f.sa().retransmits(), 0u);  // no loss: the brake, not the RTO
+  CHECK_EQ(f.sa().retx_tlp(), 0u);     // ACKs flow even when the queue is deep
   CHECK(f.sa().min_rtt_ms() <= 45);
   CHECK(std::equal(f.b().delivered.begin(), f.b().delivered.end(), src.begin()));
 }
@@ -2210,6 +2341,9 @@ int main() {
   TestSackFillsHoleWithoutTimeout();
   TestSackRotationReportsAllHoles();
   TestDupAckForceRefill();
+  TestTailLossProbeRepairsLostTail();
+  TestLostSackFillRetriedAfterOneRtt();
+  TestSackFillsWholeHoleInOnePass();
   TestNoSpuriousFastRetransmit();
   TestDupAndOverlapTrimming();
   TestReceiverBufferCapAndRwnd();

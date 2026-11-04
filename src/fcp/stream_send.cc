@@ -164,6 +164,10 @@ void Stream::ack_advance_cum(uint32_t cum, int64_t now_ms) {
     tx_.pop_front();
   }
   snd_una_ = cum;
+  // The peer confirmed progress: the tail-loss clock restarts and the probe
+  // budget for the previous stall is spent.
+  progress_ms_ = now_ms;
+  tlp_probes_ = 0;
   // fill_holes only fills the range each SACK block newly reveals. Once cum
   // moves, the next hole is above the new cumulative point, so the watermark
   // has to follow it; leaving it ahead would ignore blocks between the two.
@@ -226,67 +230,106 @@ void Stream::fill_holes(uint32_t sack_start, int64_t now_ms) {
   // A SACK block past snd_una_ means the sender's next bytes are the hole, so
   // retransmit them now instead of waiting a full RTO. Measured burst loss
   // (spec §14.10) makes RTO-only recovery stall a 20 Mbps stream.
-  //
-  // Only the range this block newly reveals is filled, not every unsacked byte
-  // below it. With the rotating block, each new start used to re-walk the whole
-  // prefix: on a 4 MiB window with a few hundred holes that is quadratic, and
-  // it showed up as ~22k retransmissions for a 50 MB transfer whose real loss
-  // was ~2%. Older repairs that are lost are still recovered by the RTO and by
-  // the front-of-window fast retransmit.
-  if (!seq_after(sack_start, snd_una_) || !seq_after(sack_start, sack_filled_up_to_)) {
+  if (!seq_after(sack_start, snd_una_)) {
     return;
   }
-  const uint32_t from = sack_filled_up_to_;
-  sack_filled_up_to_ = sack_start;
-  ++fill_passes_;
-  // A SACK block can reveal a hole of the whole window (the first block after a
-  // burst loss), and the old loop emitted every segment in it in one call: up to
-  // a window of back-to-back packets with no pacing, which is exactly the burst
-  // the path just dropped. Charge the pass like the RTO pass (one window or 32
-  // segments) and let BBR's token bucket gate it; the rest is filled by the next
-  // ACK, which is cheap because the receiver keeps re-advertising.
   const size_t seg_cap = cfg_.max_segment > 0 ? cfg_.max_segment : 1;
-  size_t budget = std::min(send_window_, 32 * seg_cap);
+  // A SACK block can reveal a hole of the whole window (the first block after a
+  // burst loss). With BBR the token bucket is the burst limiter, so the whole
+  // hole goes out in this one pass; without a pacer the old 32-segment cap still
+  // keeps the repair from arriving as one back-to-back micro-burst.
+  size_t budget = using_bbr() ? send_window_ : std::min(send_window_, 32 * seg_cap);
+  // One repair per RTT. The gate used to be rto_ms_, which left a lost repair
+  // to the RTO even though the peer keeps re-advertising the same hole; a round
+  // trip is the earliest a second copy can do any good.
+  const int64_t rtt = std::max<int64_t>(std::max(min_rtt_ms_, srtt_ms_), 1);
   bool sent_any = false;
+
+  // First pass: the range this block newly reveals, from the watermark up to
+  // the block start. Every eligible segment goes out, not one per ACK/RTT: a
+  // burst hole is one recovery event.
+  if (seq_after(sack_start, sack_filled_up_to_)) {
+    const uint32_t from = sack_filled_up_to_;
+    ++fill_passes_;
+    sack_filled_up_to_ = sack_start;
+    for (size_t i = 0; i < tx_.size(); ++i) {
+      PendingSeg& seg = tx_[i];
+      const uint32_t seg_end = seg.offset + static_cast<uint32_t>(seg.wire_len());
+      if (!seq_after(seg_end, snd_una_) || !seg.sent || sack_fresh(seg, now_ms)) {
+        continue;  // acked, not on the wire (pump handles those), or not a hole
+      }
+      if (seq_dist(seg.offset, sack_start) >= 0) {
+        break;  // at or past the hole
+      }
+      if (seq_dist(seg.offset, from) < 0) {
+        continue;  // an earlier block already owned this range
+      }
+      if (seg.retrans && now_ms - seg.sent_ms < rtt) {
+        continue;  // already re-filling this one
+      }
+      if ((sent_any && seg.wire_len() > budget) ||
+          !pace_allow(seg.wire_len(), now_ms)) {
+        // The rest waits for the next ACK. Leave the watermark at this segment:
+        // it was not sent, so a later block with a higher start has to be able
+        // to fill it (advancing past it here would hand the range to nobody and
+        // leave the hole to the RTO).
+        sack_filled_up_to_ = seg.offset;
+        return;
+      }
+      budget = budget >= seg.wire_len() ? budget - seg.wire_len() : 0;
+      seg.sent_ms = now_ms;
+      seg.retrans = true;
+      // A fill is a repair too: if the peer is still stuck behind the same hole
+      // a full RTT later, the next duplicate burst is loss evidence and not just
+      // the fill arriving late (ack_dup_burst gates on the RTT).
+      fast_retx_armed_ = true;
+      ++retransmits_;
+      ++retx_fill_;
+      if (using_bbr()) {
+        // A SACK fill is a speculative repair: the SACK block says where the
+        // peer's buffer resumes, not that these bytes were lost. Counting every
+        // fill as loss made a 2%-loss transfer look 60% lossy to BBRv2, whose
+        // inflight_hi then ratcheted down to the 64 KiB floor for the whole
+        // connection (0.16 MB/s). Only dup-ACK evidence and RTOs count.
+        bbr_.on_sent(now_ms, seg.wire_len(), in_flight_);
+      }
+      emit_seg(seg);
+      sent_any = true;
+    }
+  }
+
+  // Second pass: repairs below the watermark that the peer's cumulative point
+  // still has not passed. A lost fill used to be invisible: the watermark made
+  // the range "owned", the SACK block keeps starting above it, and only the RTO
+  // (two RTTs, then backoff) could send it again -- the multi-RTT tail of a
+  // burst loss. One copy per RTT recovers it in a round trip. Original sends
+  // are deliberately excluded: a segment below a reported block may simply sit
+  // in a chunk this single-block ACK has not rotated to yet, and re-sending
+  // those was the quadratic ~22k-retransmission storm.
   for (size_t i = 0; i < tx_.size(); ++i) {
     PendingSeg& seg = tx_[i];
     const uint32_t seg_end = seg.offset + static_cast<uint32_t>(seg.wire_len());
     if (!seq_after(seg_end, snd_una_) || !seg.sent || sack_fresh(seg, now_ms)) {
-      continue;  // acked, not on the wire (pump handles those), or not a hole
+      continue;
     }
     if (seq_dist(seg.offset, sack_start) >= 0) {
-      break;  // at or past the hole
+      break;
     }
-    if (seq_dist(seg.offset, from) < 0) {
-      continue;  // an earlier block already owned this range
+    if (seq_at_or_after(seg.offset, sack_filled_up_to_)) {
+      continue;  // the first pass owns this range
     }
-    if (seg.retrans && now_ms - seg.sent_ms < rto_ms_) {
-      continue;  // already re-filling this one
+    if (!seg.retrans || now_ms - seg.sent_ms < rtt) {
+      continue;  // never filled, or a repair is still in flight
     }
     if ((sent_any && seg.wire_len() > budget) ||
         !pace_allow(seg.wire_len(), now_ms)) {
-      // The rest waits for the next ACK. Leave the watermark at this segment:
-      // it was not "owned" by this block, so a later block with a higher start
-      // has to be able to fill it (advancing past it here would hand the range
-      // to nobody and leave the hole to the RTO).
-      sack_filled_up_to_ = seg.offset;
-      break;
+      return;  // the next ACK continues; the watermark is untouched
     }
     budget = budget >= seg.wire_len() ? budget - seg.wire_len() : 0;
     seg.sent_ms = now_ms;
-    seg.retrans = true;
-    // A fill is a repair too: if the peer is still stuck behind the same hole
-    // a full RTT later, the next duplicate burst is loss evidence and not just
-    // the fill arriving late (ack_dup_burst gates on the RTT).
-    fast_retx_armed_ = true;
     ++retransmits_;
     ++retx_fill_;
     if (using_bbr()) {
-      // A SACK fill is a speculative repair: the SACK block says where the
-      // peer's buffer resumes, not that these bytes were lost. Counting every
-      // fill as loss made a 2%-loss transfer look 60% lossy to BBRv2, whose
-      // inflight_hi then ratcheted down to the 64 KiB floor for the whole
-      // connection (0.16 MB/s). Only dup-ACK evidence and RTOs count.
       bbr_.on_sent(now_ms, seg.wire_len(), in_flight_);
     }
     emit_seg(seg);
@@ -354,6 +397,72 @@ void Stream::retransmit_timeouts(int64_t now_ms) {
     ++rto_loss_events_;  // one timeout episode, however many segments it resent
     rto_backoff_ = std::min<int64_t>(rto_backoff_ * 2, 16);
   }
+}
+
+int64_t Stream::tlp_pto_ms() const {
+  const int64_t rtt = std::max<int64_t>(srtt_ms_, 1);
+  // ~1.5 RTT plus a little slack, floored above the host's 25 ms tick (delivery
+  // is quantized to it, so a lossless round trip can look like a tick and a
+  // half) and capped just below the base RTO, which takes over when the probe
+  // itself is lost.
+  const int64_t pto =
+      std::max<int64_t>(kTlpMinPtoMs, rtt + std::max<int64_t>(kTlpSlackMs, rtt / 2));
+  return std::min<int64_t>(pto, std::max<int64_t>(rto_ms_ - 1, 1));
+}
+
+int64_t Stream::tlp_due_ms(int64_t now_ms) const {
+  if (state_ == StreamState::kClosed || in_flight_ == 0 || tlp_probes_ >= kTlpMaxProbes) {
+    return 0;
+  }
+  // The newest segment on the wire is the tail. Segments pump() has built but
+  // the window still holds back are not "lost": the window will release them.
+  const PendingSeg* tail = nullptr;
+  for (auto it = tx_.rbegin(); it != tx_.rend(); ++it) {
+    if (it->sent) {
+      tail = &*it;
+      break;
+    }
+  }
+  // A SACK block proves the peer holds this segment; any loss is below it,
+  // where fill_holes() lives. A repair already in flight gets its own RTT, and
+  // after that the RTO is the backstop.
+  if (tail == nullptr || tail->retrans || sack_fresh(*tail, now_ms)) {
+    return 0;
+  }
+  // Both clocks have to be quiet: no cumulative progress and the tail itself
+  // outstanding for the probe interval. The pair keeps a busy stream (ACKs
+  // flowing, tail freshly sent) and an app-limited tail wait -- where the only
+  // thing outstanding is the ACK of the last segment -- off the probe.
+  const int64_t since = std::max(progress_ms_, tail->sent_ms);
+  return since + tlp_pto_ms();
+}
+
+void Stream::tail_loss_probe(int64_t now_ms) {
+  const int64_t due = tlp_due_ms(now_ms);
+  if (due == 0 || now_ms < due) {
+    return;
+  }
+  PendingSeg* tail = nullptr;
+  for (auto it = tx_.rbegin(); it != tx_.rend(); ++it) {
+    if (it->sent) {
+      tail = &*it;
+      break;
+    }
+  }
+  if (tail == nullptr) {
+    return;
+  }
+  tail->sent_ms = now_ms;
+  tail->retrans = true;
+  ++tlp_probes_;
+  ++retransmits_;
+  ++retx_tlp_;
+  if (using_bbr()) {
+    // On the wire like any other repair, but not loss evidence: a delayed ACK
+    // or a one-off tail drop must not move BBR's model.
+    bbr_.on_sent(now_ms, tail->wire_len(), in_flight_);
+  }
+  emit_seg(*tail);
 }
 
 void Stream::probe_zero_window(int64_t now_ms) {

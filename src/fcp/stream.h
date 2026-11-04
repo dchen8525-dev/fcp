@@ -77,6 +77,24 @@ constexpr int64_t kAckDelayMs = 4;
 // only has to cover scheduling jitter, not a whole tick.
 constexpr double kPaceBurstMs = 6.0;
 
+// Tail loss probe (RFC 8985 in shape, simplified here). With data outstanding
+// and neither cumulative progress nor a probe for about one and a half RTTs,
+// resend the newest segment the peer has not SACKed. The ACK it provokes either
+// repairs the lost tail itself or tells us the tail arrived and only its ACK
+// was lost, so a tail loss costs one RTT instead of the RTO's two (plus the
+// exponential backoff the RTO would arm). It is a probe, not congestion
+// evidence: BBR hears about the send, never about a loss. Two probes per stall
+// at most -- after that the RTO is the backstop.
+//
+// The floor keeps the probe off the host's tick grid: delivery is quantized to
+// the 25 ms tick, so a lossless round trip can look like a tick and a half, and
+// probing every tick would turn the feature into a retransmission storm on fast
+// paths. The ceiling keeps it strictly before the base RTO, which owns the case
+// where the probe itself is lost.
+constexpr int64_t kTlpMinPtoMs = 60;
+constexpr int64_t kTlpSlackMs = 10;
+constexpr uint32_t kTlpMaxProbes = 2;
+
 constexpr uint8_t kStreamRstAbort = 1;
 
 enum class StreamState : uint8_t {
@@ -278,6 +296,8 @@ class Stream {
   uint64_t retx_fast() const { return retx_fast_; }
   uint64_t retx_fill() const { return retx_fill_; }
   uint64_t retx_rto() const { return retx_rto_; }
+  // Probes sent by the tail-loss timer, apart from RTO repairs and fills.
+  uint64_t retx_tlp() const { return retx_tlp_; }
   uint64_t fill_passes() const { return fill_passes_; }
   uint64_t dup_bytes() const { return dup_bytes_; }
   uint64_t segs_sent() const { return segs_sent_; }
@@ -375,6 +395,12 @@ class Stream {
   // repair paths. See PendingSeg::sacked_ms for why it cannot be permanent.
   bool sack_fresh(const PendingSeg& seg, int64_t now_ms) const;
   void retransmit_timeouts(int64_t now_ms);
+  // Tail loss probe: resend the newest un-SACKed segment when nothing has
+  // progressed for roughly one RTT. tlp_due_ms() is the shared predicate, so
+  // next_wake_ms() can schedule the tick that fires it.
+  void tail_loss_probe(int64_t now_ms);
+  int64_t tlp_due_ms(int64_t now_ms) const;
+  int64_t tlp_pto_ms() const;
   void probe_zero_window(int64_t now_ms);
   void update_srtt(int64_t sample_ms, int64_t now_ms);
   void update_window(int64_t now_ms);
@@ -421,7 +447,11 @@ class Stream {
   uint32_t rcv_nxt_ = 0;             // bytes delivered to the app
   bool peer_fin_ = false;
   uint32_t peer_fin_at_ = 0;         // offset where the peer's data ends
-  uint32_t sack_filled_up_to_ = 0;   // never re-fill a hole below this
+  // New holes are filled from here up to the SACK block start. Bytes below the
+  // mark are not re-walked as first-time holes (a rotating single-block ACK
+  // would otherwise keep re-sending ranges it has not reported yet), but a
+  // repair below it is retried once per RTT -- see fill_holes().
+  uint32_t sack_filled_up_to_ = 0;
   int64_t last_ack_ms_ = 0;          // last ACK emitted (out-of-order tick ACK)
   // #27: on repeated ACKs of the same cumulative point (the peer has data we
   // do not), rotate which oob chunk the single SACK block reports, so the
@@ -497,6 +527,11 @@ class Stream {
   bool fast_retx_armed_ = false;
   int64_t last_activity_ms_ = 0;
   int64_t last_probe_ms_ = 0;
+  // Tail loss probe state: when the peer last confirmed progress (cum moved, or
+  // data went out after an idle period) and how many probes this stall has
+  // already spent. Both reset on the next cumulative advance.
+  int64_t progress_ms_ = 0;
+  uint32_t tlp_probes_ = 0;
   bool eof_delivered_ = false;
   bool notified_ = false;            // ClosedFn fires at most once per stream
   // #27: duplicate-ACK tracking on the send side (same cumulative point as
@@ -522,6 +557,7 @@ class Stream {
   uint64_t retx_fast_ = 0;
   uint64_t retx_fill_ = 0;
   uint64_t retx_rto_ = 0;
+  uint64_t retx_tlp_ = 0;
   uint64_t fill_passes_ = 0;
   uint64_t dup_bytes_ = 0;
   uint64_t segs_sent_ = 0;

@@ -209,6 +209,13 @@ int64_t Stream::next_wake_ms(int64_t now_ms) const {
   if (ack_pending_ && now_ms < last_ack_ms_ + kAckDelayMs) {
     next = last_ack_ms_ + kAckDelayMs;
   }
+  // The tail probe has its own deadline; without it the host only discovers
+  // the probe on its next 25 ms tick, which is fine on a WAN but eats most of
+  // the gain on a short path.
+  const int64_t tlp_due = tlp_due_ms(now_ms);
+  if (tlp_due > now_ms) {
+    next = next == 0 ? tlp_due : std::min(next, tlp_due);
+  }
   // The pacer only matters when it -- not the window -- is what holds the next
   // segment back: if the window admits nothing, waiting for tokens is useless
   // and the ACK that opens the window will wake us anyway.

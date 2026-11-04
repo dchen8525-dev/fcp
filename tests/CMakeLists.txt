@@ -62,8 +62,7 @@ add_executable(fcp_cli_test cli_test.cc
                ${CMAKE_CURRENT_SOURCE_DIR}/../apps/cli/reactor.cc
                ${CMAKE_CURRENT_SOURCE_DIR}/../apps/cli/bench.cc)
 target_include_directories(fcp_cli_test PRIVATE
-               ${CMAKE_CURRENT_SOURCE_DIR}/../apps/cli
-               ${CMAKE_CURRENT_SOURCE_DIR}/../tools)
+               ${CMAKE_CURRENT_SOURCE_DIR}/../apps/cli)
 target_link_libraries(fcp_cli_test PRIVATE fcp_proxy_core)
 if(WIN32)
   target_link_libraries(fcp_cli_test PRIVATE ws2_32 iphlpapi)
@@ -82,7 +81,7 @@ if(WIN32)
   endforeach()
 endif()
 
-# fcp-replay smoke (tools/, #28): replay the checked-in golden trace and make
+# fcp-replay smoke (apps/cli/, #28): replay the checked-in golden trace and make
 # sure the tool loads it and prints its summary. --dump exercises the bare-flag
 # path (it used to be documented but rejected as "bad argument"), and
 # --require-exact turns the golden into a real determinism guard: a controller

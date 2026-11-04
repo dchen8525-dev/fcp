@@ -1,0 +1,1301 @@
+#include "mainwindow.h"
+
+#include <QAction>
+#include <QApplication>
+#include <QButtonGroup>
+#include <QCheckBox>
+#include <QCloseEvent>
+#include <QComboBox>
+#include <QDir>
+#include <QFrame>
+#include <QGraphicsDropShadowEffect>
+#include <QGridLayout>
+#include <QHBoxLayout>
+#include <QIcon>
+#include <QJsonValue>
+#include <QLabel>
+#include <QLineEdit>
+#include <QMenu>
+#include <QPainter>
+#include <QPainterPath>
+#include <QPlainTextEdit>
+#include <QProgressBar>
+#include <QPushButton>
+#include <QRegularExpression>
+#include <QScrollBar>
+#include <QSettings>
+#include <QStackedWidget>
+#include <QSystemTrayIcon>
+#include <QTextDocument>
+#include <QTimer>
+#include <QToolButton>
+#include <QVBoxLayout>
+
+#include <cmath>
+
+#include "sparkline.h"
+
+namespace fcp {
+namespace {
+
+constexpr const char* kAccent = "#0f9d76";
+constexpr const char* kAccentDark = "#0b8563";
+constexpr const char* kMuted = "#5b6b63";
+constexpr const char* kMuted2 = "#8a9a91";
+constexpr const char* kErr = "#c2410c";
+constexpr const char* kLogOut = "#5b6b63";
+constexpr const char* kLogErr = "#a56a12";
+
+QLabel* makeLabel(const QString& text, const char* role = nullptr) {
+  auto* label = new QLabel(text);
+  if (role) {
+    label->setProperty("role", role);
+  }
+  return label;
+}
+
+QLabel* makeRichLabel(const QString& text, const char* role = nullptr) {
+  QLabel* label = makeLabel(text, role);
+  label->setTextFormat(Qt::RichText);
+  return label;
+}
+
+void repolish(QWidget* widget) {
+  widget->style()->unpolish(widget);
+  widget->style()->polish(widget);
+  widget->update();
+}
+
+// 24x24 viewBox 的线性图标，用 QPainter 画，不额外依赖 QtSvg。
+QIcon makeNavIcon(int kind, const QColor& color) {
+  QPixmap pixmap(32, 32);
+  pixmap.setDevicePixelRatio(2.0);
+  pixmap.fill(Qt::transparent);
+  QPainter painter(&pixmap);
+  painter.setRenderHint(QPainter::Antialiasing, true);
+  painter.scale(16.0 / 24.0, 16.0 / 24.0);
+  painter.setPen(QPen(color, 1.8, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+  painter.setBrush(Qt::NoBrush);
+
+  switch (kind) {
+    case 0:  // 连接
+      painter.drawLine(QPointF(12, 3), QPointF(12, 9));
+      painter.drawPolyline(QPolygonF({QPointF(8, 6.5), QPointF(12, 10), QPointF(16, 6.5)}));
+      painter.drawRoundedRect(QRectF(4, 12, 16, 8), 3, 3);
+      painter.setBrush(color);
+      for (double x : {8.0, 12.0, 16.0}) {
+        painter.drawEllipse(QPointF(x, 16), 0.8, 0.8);
+      }
+      break;
+    case 1:  // 运行状态
+      painter.drawPolyline(QPolygonF({QPointF(3, 13), QPointF(7, 13), QPointF(9.5, 7),
+                                      QPointF(13.5, 19), QPointF(16, 13), QPointF(21, 13)}));
+      break;
+    case 2:  // 链路测速
+      painter.drawArc(QRectF(4.2, 5.2, 15.6, 15.6), 200 * 16, 140 * 16);
+      painter.drawLine(QPointF(12, 14), QPointF(15, 10));
+      painter.drawEllipse(QPointF(12, 14), 1.8, 1.8);
+      break;
+    case 3:  // 日志
+      painter.drawLine(QPointF(4, 5), QPointF(20, 5));
+      painter.drawLine(QPointF(4, 10), QPointF(20, 10));
+      painter.drawLine(QPointF(4, 15), QPointF(14, 15));
+      painter.drawLine(QPointF(4, 20), QPointF(11, 20));
+      break;
+    default:
+      break;
+  }
+  painter.end();
+
+  QIcon icon;
+  icon.addPixmap(pixmap, QIcon::Normal, QIcon::Off);
+  // 选中态换成品牌绿。
+  if (!color.isValid() || color != QColor(kAccent)) {
+    QIcon active = makeNavIcon(kind, QColor(kAccent));
+    icon.addPixmap(active.pixmap(QSize(16, 16), QIcon::Normal, QIcon::On), QIcon::Normal,
+                   QIcon::On);
+  } else {
+    icon.addPixmap(pixmap, QIcon::Normal, QIcon::On);
+  }
+  return icon;
+}
+
+QPixmap pulsePixmap() {
+  QPixmap pixmap(40, 40);
+  pixmap.setDevicePixelRatio(2.0);
+  pixmap.fill(Qt::transparent);
+  QPainter painter(&pixmap);
+  painter.setRenderHint(QPainter::Antialiasing, true);
+  painter.scale(20.0 / 24.0, 20.0 / 24.0);
+  painter.setPen(QPen(QColor(kAccent), 2.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+  painter.drawPolyline(QPolygonF({QPointF(3, 13), QPointF(7, 13), QPointF(9.5, 7),
+                                  QPointF(13.5, 19), QPointF(16, 13), QPointF(21, 13)}));
+  painter.end();
+  return pixmap;
+}
+
+QWidget* makeField(const QString& text, QWidget* input, const QString& note = {}) {
+  auto* holder = new QWidget;
+  auto* layout = new QVBoxLayout(holder);
+  layout->setContentsMargins(0, 0, 0, 0);
+  layout->setSpacing(5);
+
+  auto* head = new QHBoxLayout;
+  head->setContentsMargins(0, 0, 0, 0);
+  head->setSpacing(6);
+  head->addWidget(makeLabel(text, "fieldLabel"));
+  if (!note.isEmpty()) {
+    head->addWidget(makeLabel(note, "fieldNote"));
+  }
+  head->addStretch();
+  layout->addLayout(head);
+  layout->addWidget(input);
+  return holder;
+}
+
+void addCardShadow(QFrame* card) {
+  auto* shadow = new QGraphicsDropShadowEffect(card);
+  shadow->setBlurRadius(34);
+  shadow->setOffset(0, 14);
+  shadow->setColor(QColor(20, 80, 60, 40));
+  card->setGraphicsEffect(shadow);
+}
+
+}  // namespace
+
+MainWindow::MainWindow(Sidecar* sidecar, QWidget* parent)
+    : QMainWindow(parent), sidecar_(sidecar) {
+  setWindowTitle(QStringLiteral("FCP"));
+  setWindowIcon(QIcon(QStringLiteral(":/assets/fcp.png")));
+  resize(960, 680);
+  setMinimumSize(760, 560);
+
+  auto* central = new QWidget;
+  central->setObjectName(QStringLiteral("central"));
+  auto* root = new QHBoxLayout(central);
+  root->setContentsMargins(0, 0, 0, 0);
+  root->setSpacing(0);
+
+  stack_ = new QStackedWidget;
+  root->addWidget(buildRail());
+
+  auto* stage = new QWidget;
+  auto* stage_layout = new QVBoxLayout(stage);
+  stage_layout->setContentsMargins(18, 20, 20, 20);
+  stage_layout->setSpacing(0);
+  stage_layout->addWidget(stack_);
+  root->addWidget(stage, 1);
+  setCentralWidget(central);
+
+  stack_->addWidget(buildConnPage());
+  stack_->addWidget(buildStatusPage());
+  stack_->addWidget(buildSpeedPage());
+  stack_->addWidget(buildLogPage());
+
+  connect(sidecar_, &Sidecar::proxyStats, this, &MainWindow::onStats);
+  connect(sidecar_, &Sidecar::proxyLog, this, &MainWindow::appendLog);
+  connect(sidecar_, &Sidecar::proxyStateChanged, this,
+          [this](bool running, int exit_code, bool abnormal) {
+            if (running) {
+              setRunning(true);
+              return;
+            }
+            const QString hint = abnormal
+                                     ? QStringLiteral("代理异常退出（code %1）").arg(exit_code)
+                                     : QStringLiteral("已断开");
+            setRunning(false, hint);
+            dot_->setStyleSheet(
+                QStringLiteral("background:%1;border-radius:4px;").arg(abnormal ? kErr : "#c6d3cc"));
+          });
+  connect(sidecar_, &Sidecar::speedProgress, this, &MainWindow::onSpeedProgress);
+  connect(sidecar_, &Sidecar::speedDone, this, &MainWindow::onSpeedDone);
+  connect(sidecar_, &Sidecar::speedStateChanged, this, [this](bool running) {
+    speed_running_ = running;
+    speed_start_->setEnabled(!running);
+    // 单程时长一旦被中途改掉，进度条的 2×时长估算就对不上了。
+    speed_seconds_->setEnabled(!running);
+  });
+
+  setupTray();
+  loadSettings();
+  setRunning(false, QString());
+  syncAddr();
+  updateKeyState();
+}
+
+MainWindow::~MainWindow() = default;
+
+QFrame* MainWindow::makeCard() {
+  auto* card = new QFrame;
+  card->setProperty("role", "card");
+  addCardShadow(card);
+  return card;
+}
+
+QWidget* MainWindow::buildRail() {
+  auto* rail = new QWidget;
+  rail->setObjectName(QStringLiteral("rail"));
+  rail->setFixedWidth(208);
+
+  auto* layout = new QVBoxLayout(rail);
+  layout->setContentsMargins(14, 18, 14, 16);
+  layout->setSpacing(6);
+
+  auto* brand = new QHBoxLayout;
+  brand->setContentsMargins(6, 4, 6, 16);
+  brand->setSpacing(10);
+  auto* mark = new QLabel;
+  mark->setPixmap(QIcon(QStringLiteral(":/assets/fcp.png")).pixmap(32, 32));
+  mark->setFixedSize(32, 32);
+  brand->addWidget(mark);
+
+  auto* brand_text = new QVBoxLayout;
+  brand_text->setContentsMargins(0, 0, 0, 0);
+  brand_text->setSpacing(0);
+  auto* name = makeLabel(QStringLiteral("FCP"));
+  name->setObjectName(QStringLiteral("brandName"));
+  auto* sub = makeLabel(QStringLiteral("可靠传输客户端"));
+  sub->setObjectName(QStringLiteral("brandSub"));
+  brand_text->addWidget(name);
+  brand_text->addWidget(sub);
+  brand->addLayout(brand_text);
+  brand->addStretch();
+  layout->addLayout(brand);
+
+  auto* group = new QButtonGroup(this);
+  group->setExclusive(true);
+  const QStringList titles{QStringLiteral("连接"), QStringLiteral("运行状态"),
+                           QStringLiteral("链路测速"), QStringLiteral("日志")};
+  for (int i = 0; i < titles.size(); ++i) {
+    auto* button = new QPushButton(titles.at(i));
+    button->setObjectName(QStringLiteral("nav"));
+    button->setCheckable(true);
+    button->setCursor(Qt::PointingHandCursor);
+    button->setIcon(makeNavIcon(i, QColor(kMuted)));
+    button->setIconSize(QSize(16, 16));
+    group->addButton(button, i);
+    connect(button, &QPushButton::clicked, this, [this, i] { stack_->setCurrentIndex(i); });
+    nav_.append(button);
+    layout->addWidget(button);
+  }
+  nav_.first()->setChecked(true);
+  layout->addStretch();
+
+  auto* foot = new QFrame;
+  foot->setProperty("role", "railFoot");
+  auto* foot_layout = new QVBoxLayout(foot);
+  foot_layout->setContentsMargins(10, 9, 10, 9);
+  foot_layout->setSpacing(5);
+
+  auto* state_row = new QHBoxLayout;
+  state_row->setContentsMargins(0, 0, 0, 0);
+  state_row->setSpacing(8);
+  dot_ = new QLabel;
+  dot_->setFixedSize(8, 8);
+  dot_->setStyleSheet(QStringLiteral("background:#c6d3cc;border-radius:4px;"));
+  state_text_ = makeLabel(QStringLiteral("未连接"), "muted");
+  state_row->addWidget(dot_, 0, Qt::AlignVCenter);
+  state_row->addWidget(state_text_);
+  state_row->addStretch();
+  foot_layout->addLayout(state_row);
+
+  auto* addr_row = new QHBoxLayout;
+  addr_row->setContentsMargins(0, 0, 0, 0);
+  addr_row->setSpacing(8);
+  rail_addr_ = makeLabel(QStringLiteral("127.0.0.1:1080"), "mono");
+  rail_addr_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+  uptime_ = makeLabel(QStringLiteral("--"), "monoStrong");
+  addr_row->addWidget(rail_addr_);
+  addr_row->addStretch();
+  addr_row->addWidget(uptime_);
+  foot_layout->addLayout(addr_row);
+
+  layout->addWidget(foot);
+  return rail;
+}
+
+QWidget* MainWindow::buildConnPage() {
+  auto* card = makeCard();
+  auto* layout = new QVBoxLayout(card);
+  layout->setContentsMargins(24, 20, 24, 20);
+  layout->setSpacing(12);
+
+  auto* head = new QHBoxLayout;
+  head->setContentsMargins(0, 0, 0, 2);
+  head->setSpacing(10);
+  head->addWidget(makeLabel(QStringLiteral("连接"), "h2"));
+  head->addWidget(makeLabel(QStringLiteral("修改后需重新启动生效"), "headSub"));
+  head->addStretch();
+  layout->addLayout(head);
+
+  auto* form = new QWidget;
+  form->setMaximumWidth(640);
+  auto* form_layout = new QVBoxLayout(form);
+  form_layout->setContentsMargins(0, 0, 0, 0);
+  form_layout->setSpacing(12);
+
+  host_ = new QLineEdit;
+  host_->setPlaceholderText(QStringLiteral("1.2.3.4 或 vpn.example.com"));
+  host_->setClearButtonEnabled(false);
+  form_layout->addWidget(makeField(QStringLiteral("服务器地址"), host_));
+
+  auto* row = new QHBoxLayout;
+  row->setContentsMargins(0, 0, 0, 0);
+  row->setSpacing(12);
+  port_ = new QLineEdit(QStringLiteral("4460"));
+  listen_port_ = new QLineEdit(QStringLiteral("1080"));
+  row->addWidget(makeField(QStringLiteral("UDP 端口"), port_));
+  row->addWidget(makeField(QStringLiteral("本地代理端口"), listen_port_,
+                           QStringLiteral("SOCKS5 / HTTP")));
+  form_layout->addLayout(row);
+
+  auto* key_row = new QWidget;
+  auto* key_layout = new QVBoxLayout(key_row);
+  key_layout->setContentsMargins(0, 0, 0, 0);
+  key_layout->setSpacing(5);
+  auto* key_head = new QHBoxLayout;
+  key_head->setContentsMargins(0, 0, 0, 0);
+  key_head->setSpacing(6);
+  key_head->addWidget(makeLabel(QStringLiteral("预共享密钥"), "fieldLabel"));
+  key_head->addWidget(makeLabel(QStringLiteral("32 位十六进制"), "fieldNote"));
+  key_head->addStretch();
+  key_layout->addLayout(key_head);
+
+  auto* key_input_row = new QHBoxLayout;
+  key_input_row->setContentsMargins(0, 0, 0, 0);
+  key_input_row->setSpacing(6);
+  key_ = new QLineEdit;
+  key_->setEchoMode(QLineEdit::Password);
+  key_->setMaxLength(32);
+  key_->setPlaceholderText(QStringLiteral("与服务端一致"));
+  key_input_row->addWidget(key_, 1);
+  key_state_ = makeLabel(QString(), "fieldNote");
+  key_input_row->addWidget(key_state_);
+  key_toggle_ = new QToolButton;
+  key_toggle_->setObjectName(QStringLiteral("eye"));
+  key_toggle_->setText(QStringLiteral("👁"));
+  key_toggle_->setToolTip(QStringLiteral("显示 / 隐藏"));
+  key_toggle_->setCursor(Qt::PointingHandCursor);
+  key_input_row->addWidget(key_toggle_);
+  key_layout->addLayout(key_input_row);
+  form_layout->addWidget(key_row);
+
+  remember_ = new QCheckBox(QStringLiteral("记住设置"));
+  remember_->setChecked(true);
+  form_layout->addWidget(remember_);
+
+  adv_toggle_ = new QPushButton;
+  adv_toggle_->setObjectName(QStringLiteral("link"));
+  adv_toggle_->setCursor(Qt::PointingHandCursor);
+  adv_toggle_->setText(QStringLiteral("▸  高级设置    MTU 1400 · FEC 0.5 · k 自适应 · 127.0.0.1"));
+  form_layout->addWidget(adv_toggle_);
+
+  adv_body_ = new QFrame;
+  adv_body_->setProperty("role", "adv");
+  auto* adv_layout = new QGridLayout(adv_body_);
+  adv_layout->setContentsMargins(14, 12, 14, 12);
+  adv_layout->setHorizontalSpacing(14);
+  adv_layout->setVerticalSpacing(10);
+  listen_ = new QLineEdit(QStringLiteral("127.0.0.1"));
+  mtu_ = new QLineEdit(QStringLiteral("1400"));
+  budget_ = new QLineEdit(QStringLiteral("0.5"));
+  k_ = new QLineEdit(QStringLiteral("-1"));
+  adv_layout->addWidget(makeField(QStringLiteral("本地监听地址"), listen_), 0, 0);
+  adv_layout->addWidget(makeField(QStringLiteral("MTU"), mtu_), 0, 1);
+  adv_layout->addWidget(
+      makeField(QStringLiteral("FEC 冗余上限"), budget_, QStringLiteral("0–1")), 1, 0);
+  adv_layout->addWidget(
+      makeField(QStringLiteral("固定 k"), k_, QStringLiteral("-1 为自适应")), 1, 1);
+  auto* adv_note = makeLabel(QStringLiteral("不展开时按默认值提交，与显式填写效果相同。"),
+                             "fieldNote");
+  adv_layout->addWidget(adv_note, 2, 0, 1, 2);
+  adv_body_->setVisible(false);
+  form_layout->addWidget(adv_body_);
+
+  auto* actions = new QHBoxLayout;
+  actions->setContentsMargins(0, 8, 0, 0);
+  actions->setSpacing(10);
+  start_ = new QPushButton(QStringLiteral("启动代理"));
+  start_->setObjectName(QStringLiteral("primary"));
+  start_->setCursor(Qt::PointingHandCursor);
+  stop_ = new QPushButton(QStringLiteral("停止"));
+  stop_->setObjectName(QStringLiteral("danger"));
+  stop_->setCursor(Qt::PointingHandCursor);
+  stop_->setEnabled(false);
+  hint_ = makeLabel(QString(), "hint");
+  hint_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+  actions->addWidget(start_);
+  actions->addWidget(stop_);
+  actions->addWidget(hint_, 1);
+  form_layout->addLayout(actions);
+
+  layout->addWidget(form);
+  layout->addStretch();
+
+  auto* tip = new QFrame;
+  tip->setProperty("role", "tip");
+  auto* tip_layout = new QVBoxLayout(tip);
+  tip_layout->setContentsMargins(14, 11, 14, 11);
+  conn_addr_ = makeRichLabel(QString(), "muted");
+  conn_addr_->setWordWrap(true);
+  tip_layout->addWidget(conn_addr_);
+  layout->addWidget(tip);
+
+  connect(start_, &QPushButton::clicked, this, &MainWindow::onStart);
+  connect(stop_, &QPushButton::clicked, this, &MainWindow::onStop);
+  connect(adv_toggle_, &QPushButton::clicked, this, [this] { setAdvanced(!advanced_); });
+  connect(key_toggle_, &QToolButton::clicked, this, [this] {
+    const bool hidden = key_->echoMode() == QLineEdit::Password;
+    key_->setEchoMode(hidden ? QLineEdit::Normal : QLineEdit::Password);
+    key_toggle_->setText(hidden ? QStringLiteral("隐藏") : QStringLiteral("👁"));
+  });
+  connect(key_, &QLineEdit::textChanged, this, [this] {
+    updateKeyState();
+    saveSettings();
+  });
+  connect(host_, &QLineEdit::textChanged, this, [this] { saveSettings(); });
+  connect(port_, &QLineEdit::textChanged, this, [this] { saveSettings(); });
+  connect(listen_port_, &QLineEdit::textChanged, this, [this] {
+    syncAddr();
+    saveSettings();
+  });
+  connect(listen_, &QLineEdit::textChanged, this, [this] {
+    syncAddr();
+    saveSettings();
+  });
+  connect(mtu_, &QLineEdit::textChanged, this, [this] { saveSettings(); });
+  connect(budget_, &QLineEdit::textChanged, this, [this] { saveSettings(); });
+  connect(k_, &QLineEdit::textChanged, this, [this] { saveSettings(); });
+  connect(remember_, &QCheckBox::toggled, this, [this] { saveSettings(); });
+  return card;
+}
+
+QWidget* MainWindow::buildStatusPage() {
+  auto* card = makeCard();
+  auto* layout = new QVBoxLayout(card);
+  layout->setContentsMargins(24, 20, 24, 20);
+  layout->setSpacing(12);
+
+  auto* head = new QHBoxLayout;
+  head->setContentsMargins(0, 0, 0, 2);
+  head->setSpacing(10);
+  head->addWidget(makeLabel(QStringLiteral("运行状态"), "h2"));
+  head->addWidget(makeLabel(QStringLiteral("每 0.5 秒采样"), "headSub"));
+  head->addStretch();
+  layout->addLayout(head);
+
+  auto* brief = new QFrame;
+  brief->setProperty("role", "brief");
+  auto* brief_layout = new QHBoxLayout(brief);
+  brief_layout->setContentsMargins(14, 14, 16, 14);
+  brief_layout->setSpacing(14);
+  auto* pulse = new QLabel;
+  pulse->setPixmap(pulsePixmap());
+  pulse->setFixedSize(38, 38);
+  pulse->setAlignment(Qt::AlignCenter);
+  pulse->setStyleSheet(QStringLiteral("background:#ffffff;border-radius:11px;"));
+  brief_layout->addWidget(pulse);
+  auto* live_box = new QVBoxLayout;
+  live_box->setContentsMargins(0, 0, 0, 0);
+  live_box->setSpacing(1);
+  live_box->addWidget(makeLabel(QStringLiteral("活动会话"), "metricCap"));
+  m_live_ = makeLabel(QStringLiteral("0"), "bigValue");
+  live_box->addWidget(m_live_);
+  brief_layout->addLayout(live_box);
+  brief_layout->addStretch();
+  auto* chips = new QHBoxLayout;
+  chips->setContentsMargins(0, 0, 0, 0);
+  chips->setSpacing(6);
+  chips->addWidget(makeLabel(QStringLiteral("UDP / FEC"), "chip"), 0, Qt::AlignVCenter);
+  sample_chip_ = makeRichLabel(QStringLiteral("采样 --"), "chip");
+  chips->addWidget(sample_chip_, 0, Qt::AlignVCenter);
+  brief_layout->addLayout(chips);
+  layout->addWidget(brief);
+
+  auto* metrics = new QHBoxLayout;
+  metrics->setContentsMargins(0, 0, 0, 0);
+  metrics->setSpacing(10);
+  const auto add_metric = [&](const QString& cap, QLabel** value, const char* role) {
+    auto* frame = new QFrame;
+    frame->setProperty("role", "metric");
+    auto* box = new QVBoxLayout(frame);
+    box->setContentsMargins(11, 11, 11, 11);
+    box->setSpacing(2);
+    box->addWidget(makeLabel(cap, "metricCap"));
+    *value = makeLabel(QStringLiteral("0"), role);
+    box->addWidget(*value);
+    metrics->addWidget(frame, 1);
+  };
+  add_metric(QStringLiteral("下行"), &m_rx_, "metricValueRx");
+  add_metric(QStringLiteral("上行"), &m_tx_, "metricValueTx");
+  add_metric(QStringLiteral("已建立会话"), &m_est_, "metricValue");
+  add_metric(QStringLiteral("累计隧道"), &m_tun_, "metricValue");
+  layout->addLayout(metrics);
+
+  auto* chart_frame = new QFrame;
+  chart_frame->setProperty("role", "chart");
+  auto* chart_layout = new QVBoxLayout(chart_frame);
+  chart_layout->setContentsMargins(12, 10, 12, 8);
+  chart_layout->setSpacing(6);
+  auto* chart_head = new QHBoxLayout;
+  chart_head->setContentsMargins(0, 0, 0, 0);
+  chart_head->setSpacing(6);
+  chart_head->addWidget(makeLabel(QStringLiteral("下行"), "legendRx"));
+  rate_rx_ = makeLabel(QStringLiteral("0 B/s"), "monoStrong");
+  chart_head->addWidget(rate_rx_);
+  chart_head->addSpacing(10);
+  chart_head->addWidget(makeLabel(QStringLiteral("上行"), "legendTx"));
+  rate_tx_ = makeLabel(QStringLiteral("0 B/s"), "monoStrong");
+  chart_head->addWidget(rate_tx_);
+  chart_head->addStretch();
+  chart_head->addWidget(makeLabel(QStringLiteral("最近 60 秒"), "fieldNote"));
+  chart_layout->addLayout(chart_head);
+  chart_ = new Sparkline;
+  chart_layout->addWidget(chart_, 1);
+  layout->addWidget(chart_frame, 1);
+
+  diag_host_ = new QWidget;
+  diag_layout_ = new QHBoxLayout(diag_host_);
+  diag_layout_->setContentsMargins(0, 0, 0, 0);
+  diag_layout_->setSpacing(6);
+  diag_layout_->addStretch();
+  diag_host_->setVisible(false);
+  layout->addWidget(diag_host_);
+
+  status_note_ = makeRichLabel(QString(), "muted");
+  status_note_->setWordWrap(true);
+  layout->addWidget(status_note_);
+  return card;
+}
+
+QWidget* MainWindow::buildSpeedPage() {
+  auto* card = makeCard();
+  auto* layout = new QVBoxLayout(card);
+  layout->setContentsMargins(24, 20, 24, 20);
+  layout->setSpacing(12);
+
+  auto* head = new QHBoxLayout;
+  head->setContentsMargins(0, 0, 0, 2);
+  head->setSpacing(10);
+  head->addWidget(makeLabel(QStringLiteral("链路测速"), "h2"));
+  head->addWidget(makeLabel(QStringLiteral("FCP 帧层裸吞吐，上下行各跑一次"), "headSub"));
+  head->addStretch();
+  layout->addLayout(head);
+
+  auto* controls = new QHBoxLayout;
+  controls->setContentsMargins(0, 0, 0, 0);
+  controls->setSpacing(12);
+  speed_seconds_ = new QComboBox;
+  speed_seconds_->setFixedWidth(170);
+  speed_seconds_->addItem(QStringLiteral("5 秒"), 5);
+  speed_seconds_->addItem(QStringLiteral("8 秒"), 8);
+  speed_seconds_->addItem(QStringLiteral("12 秒"), 12);
+  speed_seconds_->addItem(QStringLiteral("20 秒"), 20);
+  speed_seconds_->setCurrentIndex(1);
+  controls->addWidget(makeField(QStringLiteral("单程时长"), speed_seconds_));
+  speed_start_ = new QPushButton(QStringLiteral("开始测速"));
+  speed_start_->setObjectName(QStringLiteral("primary"));
+  speed_start_->setCursor(Qt::PointingHandCursor);
+  controls->addWidget(speed_start_, 0, Qt::AlignBottom);
+  speed_hint_ = makeLabel(QStringLiteral("服务端需以 --speedtest 启动"), "hint");
+  speed_hint_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+  controls->addWidget(speed_hint_, 1);
+  layout->addLayout(controls);
+
+  auto* results = new QHBoxLayout;
+  results->setContentsMargins(0, 4, 0, 0);
+  results->setSpacing(12);
+  const auto add_tile = [&](const QString& cap, QLabel** value, QLabel** sub,
+                            const QString& note) {
+    auto* tile = new QFrame;
+    tile->setProperty("role", "tile");
+    auto* box = new QVBoxLayout(tile);
+    box->setContentsMargins(16, 14, 16, 14);
+    box->setSpacing(4);
+    auto* cap_row = new QHBoxLayout;
+    cap_row->setContentsMargins(0, 0, 0, 0);
+    cap_row->setSpacing(5);
+    cap_row->addWidget(makeLabel(cap, "tileCap"));
+    if (!note.isEmpty()) {
+      cap_row->addWidget(makeLabel(note, "fieldNote"));
+    }
+    cap_row->addStretch();
+    box->addLayout(cap_row);
+    auto* big = new QHBoxLayout;
+    big->setContentsMargins(0, 0, 0, 0);
+    big->setSpacing(6);
+    *value = makeLabel(QStringLiteral("--"), "tileBig");
+    auto* unit = makeLabel(QStringLiteral("Mbps"), "tileUnit");
+    big->addWidget(*value, 0, Qt::AlignBottom);
+    big->addWidget(unit, 0, Qt::AlignBottom);
+    big->addStretch();
+    box->addLayout(big);
+    *sub = makeLabel(QStringLiteral("等待测速"), "tileSub");
+    box->addWidget(*sub);
+    results->addWidget(tile, 1);
+  };
+  add_tile(QStringLiteral("下行"), &sp_down_, &sp_down_sub_, QString());
+  add_tile(QStringLiteral("上行"), &sp_up_, &sp_up_sub_, QString());
+
+  auto* loss_tile = new QFrame;
+  loss_tile->setProperty("role", "tile");
+  auto* loss_box = new QVBoxLayout(loss_tile);
+  loss_box->setContentsMargins(16, 14, 16, 14);
+  loss_box->setSpacing(4);
+  auto* loss_cap = new QHBoxLayout;
+  loss_cap->setContentsMargins(0, 0, 0, 0);
+  loss_cap->setSpacing(5);
+  loss_cap->addWidget(makeLabel(QStringLiteral("链路丢包"), "tileCap"));
+  loss_cap->addWidget(makeLabel(QStringLiteral("FEC 恢复前"), "fieldNote"));
+  loss_cap->addStretch();
+  loss_box->addLayout(loss_cap);
+  const auto add_loss_row = [&](const QString& name, QLabel** value, QLabel** note) {
+    auto* row = new QHBoxLayout;
+    row->setContentsMargins(0, 2, 0, 0);
+    row->setSpacing(8);
+    row->addWidget(makeLabel(name, "muted"));
+    *value = makeLabel(QStringLiteral("--"), "lossValue");
+    row->addWidget(*value);
+    row->addStretch();
+    *note = makeLabel(QString(), "tileSub");
+    row->addWidget(*note);
+    loss_box->addLayout(row);
+  };
+  add_loss_row(QStringLiteral("下行"), &sp_loss_in_, &sp_loss_in_n_);
+  add_loss_row(QStringLiteral("上行"), &sp_loss_out_, &sp_loss_out_n_);
+  results->addWidget(loss_tile, 1);
+  layout->addLayout(results);
+
+  sp_progress_ = new QProgressBar;
+  sp_progress_->setRange(0, 100);
+  sp_progress_->setValue(0);
+  sp_progress_->setTextVisible(false);
+  sp_progress_->setFixedHeight(6);
+  layout->addWidget(sp_progress_);
+  layout->addStretch();
+
+  auto* tip = new QFrame;
+  tip->setProperty("role", "tip");
+  auto* tip_layout = new QVBoxLayout(tip);
+  tip_layout->setContentsMargins(14, 11, 14, 11);
+  auto* tip_text = makeRichLabel(
+      QStringLiteral(
+          "服务端需以 <b>--speedtest</b> 启动。测速不复用代理会话：客户端另起一个 "
+          "fcp-client 直连服务端同一个 UDP 端口，两端直接向 FCP 帧/FEC 层灌数据符号，"
+          "绕开代理的 TCP 流窗口和 HTTP 靶子，量到的是隧道本身能承载的裸吞吐。发送速率"
+          "从 20 Mbps 起每 0.5 秒 ×1.5 自动爬升，面板取接收端最好的一秒窗口。丢包取"
+          "测速期间最后一个 FEC 统计窗口（约 2 秒）的原始丢包率，即 FEC 恢复前就丢掉"
+          "的比例，后续被补齐也不会减少；下行由本端统计，上行随服务端回报带回。"),
+      "muted");
+  tip_text->setWordWrap(true);
+  tip_layout->addWidget(tip_text);
+  layout->addWidget(tip);
+
+  connect(speed_start_, &QPushButton::clicked, this, &MainWindow::onSpeedStart);
+  connect(speed_seconds_, &QComboBox::currentIndexChanged, this, [this] { saveSettings(); });
+  return card;
+}
+
+QWidget* MainWindow::buildLogPage() {
+  auto* card = makeCard();
+  auto* layout = new QVBoxLayout(card);
+  layout->setContentsMargins(24, 20, 24, 20);
+  layout->setSpacing(12);
+
+  auto* head = new QHBoxLayout;
+  head->setContentsMargins(0, 0, 0, 2);
+  head->setSpacing(10);
+  head->addWidget(makeLabel(QStringLiteral("日志"), "h2"));
+  head->addWidget(makeLabel(QStringLiteral("stdout / stderr"), "headSub"));
+  head->addStretch();
+  log_count_ = makeLabel(QString(), "mono");
+  head->addWidget(log_count_);
+  auto* clear = new QPushButton(QStringLiteral("清空"));
+  clear->setObjectName(QStringLiteral("ghost"));
+  clear->setCursor(Qt::PointingHandCursor);
+  head->addWidget(clear);
+  layout->addLayout(head);
+
+  log_ = new QPlainTextEdit;
+  log_->setObjectName(QStringLiteral("log"));
+  log_->setReadOnly(true);
+  log_->setMaximumBlockCount(4000);
+  log_->setWordWrapMode(QTextOption::WrapAnywhere);
+  layout->addWidget(log_, 1);
+
+  connect(clear, &QPushButton::clicked, this, [this] {
+    log_->clear();
+    log_count_->clear();
+    log_lines_ = 0;
+  });
+  return card;
+}
+
+MainWindow::Collected MainWindow::collect() const {
+  Collected result;
+  const QString key = key_->text().trimmed();
+  static const QRegularExpression kHex32(QStringLiteral("^[0-9a-fA-F]{32}$"));
+  if (!kHex32.match(key).hasMatch()) {
+    result.error = QStringLiteral("预共享密钥要 32 位十六进制");
+    return result;
+  }
+
+  bool ok = false;
+  const uint port = port_->text().trimmed().toUInt(&ok);
+  if (!ok || port < 1 || port > 65535) {
+    result.error = QStringLiteral("UDP 端口无效");
+    return result;
+  }
+  const uint listen_port = listen_port_->text().trimmed().toUInt(&ok);
+  if (!ok || listen_port < 1 || listen_port > 65535) {
+    result.error = QStringLiteral("本地端口无效");
+    return result;
+  }
+
+  const bool open = advanced_;
+  const QString mtu_text = open ? mtu_->text().trimmed() : QStringLiteral("1400");
+  const QString k_text = open ? k_->text().trimmed() : QStringLiteral("-1");
+  const QString budget_text = open ? budget_->text().trimmed() : QStringLiteral("0.5");
+  const QString listen_text =
+      open ? listen_->text().trimmed() : QStringLiteral("127.0.0.1");
+
+  const int mtu = mtu_text.toInt(&ok);
+  if (!ok || mtu < 576 || mtu > 9000) {
+    result.error = QStringLiteral("MTU 应在 576..9000");
+    return result;
+  }
+  const int k = k_text.toInt(&ok);
+  if (!ok || k < -1 || k > 7) {
+    result.error = QStringLiteral("k 应在 -1..7");
+    return result;
+  }
+  const double budget = budget_text.toDouble(&ok);
+  if (!ok || !std::isfinite(budget) || budget < 0.0 || budget > 1.0) {
+    result.error = QStringLiteral("FEC 预算应在 0..1");
+    return result;
+  }
+  if (listen_text.isEmpty()) {
+    result.error = QStringLiteral("本地监听地址不能为空");
+    return result;
+  }
+
+  result.config.host = host_->text().trimmed();
+  result.config.port = static_cast<quint16>(port);
+  result.config.key_hex = key;
+  result.config.listen = listen_text;
+  result.config.listen_port = static_cast<quint16>(listen_port);
+  result.config.mtu = mtu;
+  result.config.k = k;
+  result.config.fec_budget = budget;
+  result.ok = true;
+  return result;
+}
+
+void MainWindow::setRunning(bool running, const QString& hint) {
+  running_ = running;
+  start_->setEnabled(!running);
+  stop_->setEnabled(running);
+  for (QWidget* widget :
+       {static_cast<QWidget*>(host_), static_cast<QWidget*>(port_),
+        static_cast<QWidget*>(listen_port_), static_cast<QWidget*>(key_),
+        static_cast<QWidget*>(remember_), static_cast<QWidget*>(listen_),
+        static_cast<QWidget*>(mtu_), static_cast<QWidget*>(budget_),
+        static_cast<QWidget*>(k_), static_cast<QWidget*>(adv_toggle_),
+        static_cast<QWidget*>(key_toggle_)}) {
+    widget->setEnabled(!running);
+  }
+  speed_start_->setEnabled(!speed_running_);
+  if (!speed_running_) {
+    speed_hint_->setText(running ? QStringLiteral("约 2 × 单程时长")
+                                 : QStringLiteral("服务端需以 --speedtest 启动"));
+    speed_hint_->setProperty("role", "hint");
+    repolish(speed_hint_);
+  }
+  dot_->setStyleSheet(QStringLiteral("background:%1;border-radius:4px;")
+                          .arg(running ? kAccent : "#c6d3cc"));
+  state_text_->setText(running ? QStringLiteral("已连接") : QStringLiteral("未连接"));
+  if (!running) {
+    uptime_->setText(QStringLiteral("--"));
+  }
+  if (!hint.isNull()) {
+    setHint(hint, false);
+  }
+  status_note_->setVisible(!running);
+  stack_->setCurrentIndex(running ? 1 : 0);
+  // 自动翻页时把左栏的选中态一起带过去，否则高亮还停在“连接”。
+  const int page = running ? 1 : 0;
+  if (page < nav_.size()) {
+    nav_.at(page)->setChecked(true);
+  }
+}
+
+void MainWindow::setHint(const QString& text, bool error) {
+  hint_->setText(text);
+  hint_->setProperty("role", error ? "hintError" : "hint");
+  repolish(hint_);
+}
+
+void MainWindow::setAdvanced(bool open) {
+  advanced_ = open;
+  adv_body_->setVisible(open);
+  adv_toggle_->setText(open
+                           ? QStringLiteral("▾  收起高级")
+                           : QStringLiteral(
+                                 "▸  高级设置    MTU 1400 · FEC 0.5 · k 自适应 · 127.0.0.1"));
+  syncAddr();
+  saveSettings();
+}
+
+void MainWindow::updateKeyState() {
+  const QString value = key_->text().trimmed();
+  static const QRegularExpression kHex32(QStringLiteral("^[0-9a-fA-F]{32}$"));
+  if (value.isEmpty()) {
+    key_state_->clear();
+    key_state_->setProperty("role", "fieldNote");
+  } else if (kHex32.match(value).hasMatch()) {
+    key_state_->setText(QStringLiteral("✓ 32 位"));
+    key_state_->setProperty("role", "keyOk");
+  } else {
+    key_state_->setText(QStringLiteral("%1/32").arg(value.size()));
+    key_state_->setProperty("role", "keyBad");
+  }
+  repolish(key_state_);
+}
+
+void MainWindow::syncAddr() {
+  QString host = advanced_ ? listen_->text().trimmed() : QString();
+  if (host.isEmpty()) {
+    host = QStringLiteral("127.0.0.1");
+  }
+  QString port = listen_port_->text().trimmed();
+  if (port.isEmpty()) {
+    port = QStringLiteral("1080");
+  }
+  const QString addr = QStringLiteral("%1:%2").arg(host, port);
+  // 这三处里 rail_addr_ 默认 AutoText、其余是 RichText：监听地址是用户输入，
+  // 不转义的话 `<x>:1080` 会被当 HTML 标签吞掉。
+  const QString addr_html = addr.toHtmlEscaped();
+  rail_addr_->setText(addr_html);
+  conn_addr_->setText(
+      QStringLiteral("启动后把浏览器或系统的 SOCKS5 / HTTP 代理指向 <b>%1</b>，"
+                     "流量即经隧道转发。密钥只保存在本机，不写入日志。")
+          .arg(addr_html));
+  status_note_->setText(
+      QStringLiteral("启动后这里显示实时吞吐与会话数；把系统的 SOCKS5 / HTTP 代理指向 "
+                     "<b>%1</b> 即可走隧道。")
+          .arg(addr_html));
+}
+
+void MainWindow::onStart() {
+  if (running_) {
+    return;
+  }
+  const Collected collected = collect();
+  if (!collected.ok) {
+    setHint(collected.error, true);
+    return;
+  }
+  if (collected.config.host.isEmpty()) {
+    setHint(QStringLiteral("服务器地址不能为空"), true);
+    return;
+  }
+  setHint(QStringLiteral("正在连接…"), false);
+  QString error;
+  if (!sidecar_->startProxy(collected.config, &error)) {
+    setHint(error, true);
+    appendLog(QStringLiteral("start failed: %1").arg(error), true);
+    setRunning(false, QString());
+    return;
+  }
+  saveSettings();
+  last_t_ = last_tx_ = last_rx_ = 0.0;
+  setHint(QStringLiteral("本地代理 %1:%2 → %3:%4")
+              .arg(collected.config.listen)
+              .arg(collected.config.listen_port)
+              .arg(collected.config.host)
+              .arg(collected.config.port),
+          false);
+  setRunning(true);
+}
+
+void MainWindow::onStop() {
+  sidecar_->stopProxy();
+  setRunning(false, QStringLiteral("已断开"));
+}
+
+void MainWindow::onSpeedStart() {
+  if (speed_running_) {
+    return;
+  }
+  const Collected collected = collect();
+  if (!collected.ok) {
+    speed_hint_->setText(collected.error);
+    speed_hint_->setProperty("role", "hintError");
+    repolish(speed_hint_);
+    return;
+  }
+  if (collected.config.host.isEmpty()) {
+    speed_hint_->setText(QStringLiteral("服务器地址不能为空"));
+    speed_hint_->setProperty("role", "hintError");
+    repolish(speed_hint_);
+    return;
+  }
+
+  const int seconds = speed_seconds_->currentData().toInt();
+  speed_running_ = true;
+  speed_start_->setEnabled(false);
+  sp_down_->setText(QStringLiteral("--"));
+  sp_up_->setText(QStringLiteral("--"));
+  sp_down_sub_->setText(QStringLiteral("下行…"));
+  sp_down_sub_->setProperty("role", "tileSub");
+  sp_up_sub_->setText(QStringLiteral("排队中"));
+  sp_up_sub_->setProperty("role", "tileSub");
+  sp_loss_in_->setText(QStringLiteral("--"));
+  sp_loss_in_n_->clear();
+  sp_loss_out_->setText(QStringLiteral("--"));
+  sp_loss_out_n_->clear();
+  sp_progress_->setValue(0);
+  speed_hint_->setText(QStringLiteral("测速中… 下行 %1s + 上行 %1s").arg(seconds));
+  speed_hint_->setProperty("role", "hint");
+  repolish(speed_hint_);
+
+  saveSettings();
+  SpeedTestConfig config;
+  config.host = collected.config.host;
+  config.port = collected.config.port;
+  config.key_hex = collected.config.key_hex;
+  config.seconds = seconds;
+  config.mtu = collected.config.mtu;
+  QString error;
+  if (!sidecar_->startSpeedTest(config, &error)) {
+    speed_running_ = false;
+    speed_start_->setEnabled(true);
+    speed_hint_->setText(error);
+    speed_hint_->setProperty("role", "hintError");
+    repolish(speed_hint_);
+    // 起不来就把两块瓦片也退回初始文案，别留着"下行…/排队中"。
+    sp_down_sub_->setText(QStringLiteral("等待测速"));
+    sp_up_sub_->setText(QStringLiteral("等待测速"));
+  }
+}
+
+void MainWindow::onStats(const QJsonObject& stats) {
+  const auto number = [&stats](const char* key) -> quint64 {
+    return static_cast<quint64>(stats.value(QLatin1String(key)).toDouble());
+  };
+  const double t = stats.value(QStringLiteral("t")).toDouble();
+  sample_chip_->setText(QStringLiteral("采样 <b>%1 s</b>").arg(t, 0, 'f', 1));
+  if (running_) {
+    uptime_->setText(fmtUptime(t));
+  }
+  m_live_->setText(QString::number(number("live")));
+  m_est_->setText(QString::number(number("up")));
+  m_tun_->setText(QString::number(number("tunnels")));
+  m_tx_->setText(fmtBytes(number("tx")));
+  m_rx_->setText(fmtBytes(number("rx")));
+
+  double tx_rate = 0.0;
+  double rx_rate = 0.0;
+  const double dt = t - last_t_;
+  if (dt > 0.2) {
+    tx_rate = (static_cast<double>(number("tx")) - last_tx_) / dt;
+    rx_rate = (static_cast<double>(number("rx")) - last_rx_) / dt;
+    last_t_ = t;
+    last_tx_ = static_cast<double>(number("tx"));
+    last_rx_ = static_cast<double>(number("rx"));
+  }
+  rate_tx_->setText(fmtRate(tx_rate));
+  rate_rx_->setText(fmtRate(rx_rate));
+  // dt <= 0.2 是重复/补发的采样，没有新的速率信息；塞 0 进图会把曲线砸平。
+  if (dt > 0.2) {
+    chart_->addSample(tx_rate, rx_rate);
+  }
+  rebuildDiag(stats);
+}
+
+void MainWindow::rebuildDiag(const QJsonObject& stats) {
+  struct Entry {
+    const char* key;
+    const char* name;
+  };
+  static const Entry kEntries[] = {
+      {"bad_entry", "坏入口"}, {"refused", "拒绝"},       {"hs_failed", "握手失败"},
+      {"reset", "重置"},       {"idle", "空闲回收"},      {"clash", "salt 冲突"},
+      {"over", "超会话"},      {"bad_cfg", "错配置"},     {"no_entropy", "无熵"},
+      {"budget", "限速建连"},  {"unknown", "未知 salt"},
+  };
+
+  QVector<quint64> values;
+  values.reserve(static_cast<int>(std::size(kEntries)));
+  for (const Entry& entry : kEntries) {
+    values.append(static_cast<quint64>(
+        stats.value(QLatin1String(entry.key)).toDouble()));
+  }
+  if (values == diag_values_) {
+    return;
+  }
+  diag_values_ = values;
+
+  while (QLayoutItem* item = diag_layout_->takeAt(0)) {
+    if (QWidget* widget = item->widget()) {
+      widget->deleteLater();
+    }
+    delete item;
+  }
+  bool any = false;
+  for (int i = 0; i < static_cast<int>(std::size(kEntries)); ++i) {
+    if (values.at(i) == 0) {
+      continue;
+    }
+    any = true;
+    auto* chip = makeRichLabel(QStringLiteral("%1 <b>%2</b>")
+                                   .arg(QString::fromUtf8(kEntries[i].name))
+                                   .arg(values.at(i)),
+                               "diag");
+    diag_layout_->addWidget(chip, 0, Qt::AlignVCenter);
+  }
+  diag_layout_->addStretch();
+  diag_host_->setVisible(any);
+}
+
+void MainWindow::onSpeedProgress(const QString& direction, quint64 bytes, double seconds) {
+  if (!speed_running_) {
+    return;
+  }
+  const bool up = direction == QLatin1String("up");
+  const int total = qMax(3, speed_seconds_->currentData().toInt());
+  const double base = up ? 50.0 : 0.0;
+  sp_progress_->setValue(
+      qMin(99, static_cast<int>(base + (seconds / total) * 50.0)));
+  QLabel* sub = up ? sp_up_sub_ : sp_down_sub_;
+  sub->setText(QStringLiteral("%1 / %2s").arg(fmtBytes(bytes)).arg(seconds, 0, 'f', 1));
+}
+
+void MainWindow::onSpeedDone(const QJsonObject& result) {
+  if (!speed_running_) {
+    return;
+  }
+  speed_running_ = false;
+  speed_start_->setEnabled(true);
+
+  const auto fill = [](const QJsonObject& sample, QLabel* value, QLabel* sub) {
+    sub->setProperty("role", "tileSub");
+    if (sample.isEmpty()) {
+      value->setText(QStringLiteral("--"));
+      sub->setText(QStringLiteral("未完成"));
+      repolish(sub);
+      return;
+    }
+    const double mbps = sample.value(QStringLiteral("mbps")).toDouble();
+    const quint64 bytes =
+        static_cast<quint64>(sample.value(QStringLiteral("bytes")).toDouble());
+    const double seconds = sample.value(QStringLiteral("seconds")).toDouble();
+    const bool acked =
+        sample.value(QStringLiteral("acked")).isBool()
+            ? sample.value(QStringLiteral("acked")).toBool()
+            : true;
+    value->setText(QString::number(mbps, 'f', 2));
+    QString text = QStringLiteral("%1 / %2s").arg(fmtBytes(bytes)).arg(seconds, 0, 'f', 1);
+    if (!acked) {
+      const quint64 lost = static_cast<quint64>(
+          sample.value(QStringLiteral("lostBytes")).toDouble());
+      text += QStringLiteral("（%1 未到达）").arg(fmtBytes(lost));
+      sub->setProperty("role", "tileSubBad");
+    }
+    sub->setText(text);
+    repolish(sub);
+  };
+  fill(result.value(QStringLiteral("download")).toObject(), sp_down_, sp_down_sub_);
+  fill(result.value(QStringLiteral("upload")).toObject(), sp_up_, sp_up_sub_);
+
+  const auto apply_loss = [](const QJsonObject& sample, QLabel* pct, QLabel* note) {
+    const quint64 n =
+        static_cast<quint64>(sample.value(QStringLiteral("lossN")).toDouble());
+    if (n == 0) {
+      pct->setText(QStringLiteral("--"));
+      note->clear();
+      return;
+    }
+    const double ppm = sample.value(QStringLiteral("lossPpm")).toDouble();
+    pct->setText(QStringLiteral("%1%").arg(ppm / 10000.0, 0, 'f', 2));
+    note->setText(QStringLiteral("n=%1").arg(n));
+  };
+  const QJsonObject download = result.value(QStringLiteral("download")).toObject();
+  const QJsonObject upload = result.value(QStringLiteral("upload")).toObject();
+  apply_loss(download, sp_loss_in_, sp_loss_in_n_);
+  apply_loss(upload, sp_loss_out_, sp_loss_out_n_);
+
+  const QString error = result.value(QStringLiteral("error")).toString();
+  // 失败就归零，别留一条满格绿条让人以为测完了。
+  sp_progress_->setValue(error.isEmpty() ? 100 : 0);
+  speed_hint_->setText(error.isEmpty() ? QStringLiteral("测速完成") : error);
+  speed_hint_->setProperty("role", error.isEmpty() ? "hint" : "hintError");
+  repolish(speed_hint_);
+}
+
+void MainWindow::appendLog(const QString& line, bool is_stderr) {
+  QScrollBar* bar = log_->verticalScrollBar();
+  const bool at_bottom = bar->value() >= bar->maximum() - 4;
+  log_->appendHtml(QStringLiteral("<span style=\"color:%1\">%2</span>")
+                       .arg(QLatin1String(is_stderr ? kLogErr : kLogOut),
+                            line.toHtmlEscaped()));
+  // 自己数，不用 blockCount()：空文档的首个空段落会让计数差一。
+  log_lines_ = qMin(log_lines_ + 1, 4000);
+  log_count_->setText(QStringLiteral("%1 行").arg(log_lines_));
+  if (at_bottom) {
+    bar->setValue(bar->maximum());
+  }
+}
+
+void MainWindow::loadSettings() {
+  loading_ = true;
+  QSettings settings;
+  const bool remember = settings.value(QStringLiteral("remember"), true).toBool();
+  remember_->setChecked(remember);
+
+  if (remember) {
+    host_->setText(settings.value(QStringLiteral("host")).toString());
+    port_->setText(settings.value(QStringLiteral("port"), QStringLiteral("4460")).toString());
+    listen_port_->setText(
+        settings.value(QStringLiteral("listenPort"), QStringLiteral("1080")).toString());
+    listen_->setText(
+        settings.value(QStringLiteral("listen"), QStringLiteral("127.0.0.1")).toString());
+    mtu_->setText(settings.value(QStringLiteral("mtu"), QStringLiteral("1400")).toString());
+    budget_->setText(
+        settings.value(QStringLiteral("budget"), QStringLiteral("0.5")).toString());
+    k_->setText(settings.value(QStringLiteral("k"), QStringLiteral("-1")).toString());
+    key_->setText(settings.value(QStringLiteral("key")).toString());
+    const int seconds = settings.value(QStringLiteral("speedSeconds"), 8).toInt();
+    for (int i = 0; i < speed_seconds_->count(); ++i) {
+      if (speed_seconds_->itemData(i).toInt() == seconds) {
+        speed_seconds_->setCurrentIndex(i);
+        break;
+      }
+    }
+  }
+
+  setAdvanced(settings.value(QStringLiteral("advanced"), false).toBool());
+  loading_ = false;
+}
+
+void MainWindow::saveSettings() {
+  if (loading_) {
+    return;
+  }
+  QSettings settings;
+  if (!remember_->isChecked()) {
+    // 把"不记住"本身也记下来，否则下次启动复选框又弹回勾选、字段却全空了。
+    settings.clear();
+    settings.setValue(QStringLiteral("remember"), false);
+    return;
+  }
+  settings.setValue(QStringLiteral("remember"), true);
+  settings.setValue(QStringLiteral("host"), host_->text());
+  settings.setValue(QStringLiteral("port"), port_->text());
+  settings.setValue(QStringLiteral("listenPort"), listen_port_->text());
+  settings.setValue(QStringLiteral("listen"), listen_->text());
+  settings.setValue(QStringLiteral("mtu"), mtu_->text());
+  settings.setValue(QStringLiteral("budget"), budget_->text());
+  settings.setValue(QStringLiteral("k"), k_->text());
+  settings.setValue(QStringLiteral("key"), key_->text());
+  settings.setValue(QStringLiteral("advanced"), advanced_);
+  settings.setValue(QStringLiteral("speedSeconds"), speed_seconds_->currentData().toInt());
+}
+
+void MainWindow::setupTray() {
+  if (!QSystemTrayIcon::isSystemTrayAvailable()) {
+    return;
+  }
+  tray_ = new QSystemTrayIcon(QIcon(QStringLiteral(":/assets/fcp.png")), this);
+  tray_->setToolTip(QStringLiteral("FCP 客户端"));
+  auto* menu = new QMenu(this);
+  QAction* show = menu->addAction(QStringLiteral("显示主界面"));
+  QAction* quit = menu->addAction(QStringLiteral("退出"));
+  connect(show, &QAction::triggered, this, [this] {
+    showNormal();
+    raise();
+    activateWindow();
+  });
+  connect(quit, &QAction::triggered, this, &MainWindow::quitApp);
+  tray_->setContextMenu(menu);
+  connect(tray_, &QSystemTrayIcon::activated, this,
+          [this](QSystemTrayIcon::ActivationReason reason) {
+            if (reason == QSystemTrayIcon::Trigger ||
+                reason == QSystemTrayIcon::DoubleClick) {
+              showNormal();
+              raise();
+              activateWindow();
+            }
+          });
+  tray_->show();
+}
+
+void MainWindow::quitApp() {
+  sidecar_->shutdown();
+  if (tray_) {
+    tray_->hide();
+  }
+  qApp->quit();
+}
+
+void MainWindow::closeEvent(QCloseEvent* event) {
+  if (tray_ && tray_->isVisible()) {
+    // 关窗只收进托盘，隧道（sidecar）继续跑；真正退出走托盘菜单。
+    event->ignore();
+    hide();
+    return;
+  }
+  // 没有托盘就只能按老行为退出；否则窗口关了但进程还在后台。
+  sidecar_->shutdown();
+  event->accept();
+  qApp->quit();
+}
+
+void MainWindow::changeEvent(QEvent* event) {
+  QMainWindow::changeEvent(event);
+  if (event->type() == QEvent::WindowStateChange && isMinimized() && tray_ &&
+      tray_->isVisible()) {
+    QTimer::singleShot(0, this, [this] { hide(); });
+  }
+}
+
+QString MainWindow::fmtBytes(quint64 bytes) {
+  if (bytes >= (1ULL << 30)) {
+    return QStringLiteral("%1 GiB").arg(bytes / static_cast<double>(1ULL << 30), 0, 'f', 2);
+  }
+  if (bytes >= (1ULL << 20)) {
+    return QStringLiteral("%1 MiB").arg(bytes / static_cast<double>(1ULL << 20), 0, 'f', 2);
+  }
+  if (bytes >= (1ULL << 10)) {
+    return QStringLiteral("%1 KiB").arg(bytes / static_cast<double>(1ULL << 10), 0, 'f', 1);
+  }
+  return QStringLiteral("%1 B").arg(bytes);
+}
+
+QString MainWindow::fmtRate(double bytes_per_second) {
+  if (bytes_per_second >= (1 << 20)) {
+    return QStringLiteral("%1 MiB/s").arg(bytes_per_second / (1 << 20), 0, 'f', 2);
+  }
+  if (bytes_per_second >= (1 << 10)) {
+    return QStringLiteral("%1 KiB/s").arg(bytes_per_second / (1 << 10), 0, 'f', 0);
+  }
+  return QStringLiteral("%1 B/s").arg(bytes_per_second, 0, 'f', 0);
+}
+
+QString MainWindow::fmtUptime(double seconds) {
+  const qint64 total = qMax<qint64>(0, static_cast<qint64>(seconds));
+  const qint64 h = total / 3600;
+  const qint64 m = (total % 3600) / 60;
+  const qint64 s = total % 60;
+  if (h > 0) {
+    return QStringLiteral("%1:%2:%3")
+        .arg(h)
+        .arg(m, 2, 10, QLatin1Char('0'))
+        .arg(s, 2, 10, QLatin1Char('0'));
+  }
+  return QStringLiteral("%1:%2")
+      .arg(m, 2, 10, QLatin1Char('0'))
+      .arg(s, 2, 10, QLatin1Char('0'));
+}
+
+}  // namespace fcp

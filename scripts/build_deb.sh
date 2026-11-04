@@ -2,7 +2,7 @@
 # 把 `cmake --install` 的 DESTDIR 安装树打成交付 .deb。
 #
 # 用 dpkg-deb（dpkg 自带，Ubuntu/Debian 构建机必有），不再自己拼 ar/tar：
-#   * 包内文件落点由 cmake/FCPPackaging.cmake 的 install() 唯一决定；
+#   * 包内文件落点由 packaging/FCPPackaging.cmake 的 install() 唯一决定；
 #   * 本脚本只补 DEBIAN/ 元数据（control、conffiles、维护者脚本）并交给 dpkg-deb。
 # 所以不存在"Python 落点表与 install() 漂移"这一类问题。
 #
@@ -69,7 +69,7 @@ for f in usr/bin/fcp-server usr/bin/fcp-client \
   }
 done
 [ -d "$STAGE/usr/share/doc/$PACKAGE" ] || {
-  echo "安装树缺少 /usr/share/doc/$PACKAGE；检查 cmake/FCPPackaging.cmake 的文档落点" >&2
+  echo "安装树缺少 /usr/share/doc/$PACKAGE；检查 packaging/FCPPackaging.cmake 的文档落点" >&2
   exit 1
 }
 

@@ -40,6 +40,7 @@ endif()
 option(FCP_BUILD_TESTS "Build FCP tests" ON)
 option(FCP_BUILD_TOOLS "Build FCP tools (benchmark harness)" ON)
 option(FCP_BUILD_PROXY "Build the FCP proxy CLI (client and server)" OFF)
+option(FCP_BUILD_GUI "Build the Qt desktop client (requires Qt 6 Widgets)" OFF)
 
 # 覆盖率门禁：line ≥ 90 / branch ≥ 80（gcc/clang；MSVC 用 OpenCPP 或单独跑）。
 # 部署级 flag：静态库自身没有链接步骤，PRIVATE link option 不会传给测试，
@@ -120,24 +121,26 @@ if(FCP_BUILD_TESTS)
   add_subdirectory(tests)
 endif()
 
-if(FCP_BUILD_TOOLS)
-  add_subdirectory(tools)
-endif()
-
-# The CLI host (select reactor, argv parsing, the two mains). The protocol half
-# it drives is fcp_proxy_core above; only these executables are gated by
-# FCP_BUILD_PROXY. tests/cli_test.cc compiles cli.cc and reactor.cc directly so
-# the argv guards stay under the default test gate.
-if(FCP_BUILD_PROXY)
+# The CLI host (select reactor, argv parsing, the two mains) and the tools
+# (fcp-bench, fcp-replay) share one directory. The protocol half the host drives
+# is fcp_proxy_core above; only those executables are gated by FCP_BUILD_PROXY,
+# the tools by FCP_BUILD_TOOLS. tests/cli_test.cc compiles cli.cc and reactor.cc
+# directly so the argv guards stay under the default test gate.
+if(FCP_BUILD_PROXY OR FCP_BUILD_TOOLS)
   add_subdirectory(apps/cli)
 endif()
 
-# 桌面客户端不走 CMake：apps/desktop 用 Tauri 2 打包，隧道由 CLI 的
-# fcp-client 以 sidecar 承载（见 apps/desktop/README.md）。
+# 桌面客户端是 Qt 6 Widgets 壳，默认不构建（Qt 不在 vcpkg manifest 里，装上
+# 会让默认的 CLI/测试构建变重）。单独构建也行：
+#   cmake -S apps/desktop -B build/gui -DCMAKE_PREFIX_PATH=<Qt6 前缀>
+# 隧道仍由 CLI 的 fcp-client 以 sidecar 承载（见 apps/desktop/README.md）。
+if(FCP_BUILD_GUI)
+  add_subdirectory(apps/desktop)
+endif()
 
 # 发布打包（Linux 服务端 deb）：只有同时构建代理 CLI 时才有意义。桌面客户端的
-# 单文件 exe / AppImage 由 apps/desktop/scripts 组装，不经过 CPack。该文件自身
+# 单文件 exe / AppImage 由 scripts/desktop 组装，不经过 CPack。该文件自身
 # 也会再判一次平台与开关，这里保留条件只为让"为什么没生成 deb"显式。
 if(FCP_BUILD_PROXY)
-  include(cmake/FCPPackaging.cmake)
+  include(packaging/FCPPackaging.cmake)
 endif()

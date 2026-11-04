@@ -19,8 +19,8 @@
 //!
 //! 首次运行把载荷解压到 `%LOCALAPPDATA%\FCP\bin\<SHA-256 前 8 字节>\`，
 //! 之后直接启动缓存里的 `FCP.exe`；不同版本按内容哈希分目录共存，
-//! 7 天未使用的旧版本目录会被清理。用户数据（WebView localStorage）由
-//! Tauri 按 `com.fcp.client` 单独保存，与本缓存无关，升级不丢配置。
+//! 7 天未使用的旧版本目录会被清理。用户配置由 Qt 的 QSettings 存在注册表
+//! （`HKCU\Software\FCP\FCP Client`），与本缓存无关，升级不丢配置。
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 

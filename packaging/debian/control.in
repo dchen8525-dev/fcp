@@ -4,7 +4,7 @@
 # 改另一边。长描述的唯一真源是 packaging/debian/description，主页与维护者的
 # 唯一真源是 packaging/debian/metadata.env。
 #
-# 已安装文件（6 类）的全部落点由 cmake/FCPPackaging.cmake 的 install() 决定，
+# 已安装文件（6 类）的全部落点由 packaging/FCPPackaging.cmake 的 install() 决定，
 # build_deb.sh 直接打包那棵 DESTDIR 树：
 #   /usr/bin/fcp-server
 #   /usr/bin/fcp-client

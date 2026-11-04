@@ -7,7 +7,7 @@ name: release
 #   * fcp-client-gui-<版本>-windows-amd64.exe Windows 客户端（单文件，双击运行，免安装）
 #   * fcp-client-gui-<版本>-linux-amd64.AppImage  Linux 客户端（双击运行，免安装）
 #
-# 客户端是 Tauri 2 壳 + fcp-client sidecar（apps/desktop）。隧道仍由 CLI
+# 客户端是 Qt 6 Widgets 壳 + fcp-client sidecar（apps/desktop）。隧道仍由 CLI
 # 承载，所以两个客户端 job 先构建 FCP_BUILD_PROXY=ON 的 CLI。
 #
 # 门禁顺序是"测试在前、打包在后"：linux-deb 跑完整 ctest（Linux Release），
@@ -212,13 +212,11 @@ jobs:
   linux-appimage:
     name: Linux 客户端 AppImage
     needs: prep
-    # 与 deb 同一个构建机下限：AppImage 里打包 webkit2gtk，但 glibc/libstdc++
+    # 与 deb 同一个构建机下限：AppImage 里打包 Qt 运行库，但 glibc/libstdc++
     # 仍来自构建机；22.04 构建可在 22.04/24.04 上运行。
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
 
       - uses: ./.github/actions/setup-vcpkg
 
@@ -227,38 +225,24 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build pkg-config libssl-dev file curl \
-            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
-            libayatana-appindicator3-dev libxdo-dev patchelf \
-            xvfb xauth
+            qt6-base-dev libgl1-mesa-dev patchelf xvfb xauth \
+            libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+            libxcb-render-util0 libxcb-xinerama0
+          # 24.04 的 Qt xcb 插件需要它；22.04 不一定有这个包。
+          sudo apt-get install -y --no-install-recommends libxcb-cursor0 || true
 
-      # tauri.conf.json / package.json 里的版本先对齐到 VERSION（唯一真源），
-      # 否则 AppImage 的文件名和包内元数据会停在旧版本。
-      - name: 同步版本
-        run: |
-          node -e '
-            const fs = require("fs");
-            const v = fs.readFileSync("VERSION", "utf8").trim();
-            for (const p of ["apps/desktop/package.json",
-                             "apps/desktop/src-tauri/tauri.conf.json"]) {
-              const j = JSON.parse(fs.readFileSync(p, "utf8"));
-              j.version = v;
-              fs.writeFileSync(p, JSON.stringify(j, null, 2) + "\n");
-            }
-          '
-
-      # CLI 构建 + sidecar + AppImage 都在脚本里；本地同一命令可复现。
+      # CLI 构建 + Qt GUI + linuxdeploy 都在脚本里；本地同一命令可复现。
       - name: 构建 + AppImage（发布门禁）
-        run: bash apps/desktop/scripts/build_linux.sh
+        run: bash scripts/desktop/build_linux.sh
 
-      # WebKit 在无显示环境下用 xvfb 起；6 秒后被 timeout 杀掉（rc=124）
+      # Qt 在无显示环境下用 xvfb 起；6 秒后被 timeout 杀掉（rc=124）
       # 说明它没有启动即崩。GUI 无法做更强的无头断言。
       - name: 启动冒烟（离屏存活 6 秒）
         run: |
           set +e
           appimage="$(ls dist/*.AppImage | head -1)"
           chmod +x "$appimage"
-          APPIMAGE_EXTRACT_AND_RUN=1 WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 \
-            timeout 6 xvfb-run -a "$appimage"
+          APPIMAGE_EXTRACT_AND_RUN=1 timeout 6 xvfb-run -a "$appimage"
           rc=$?
           if [ "$rc" -ne 124 ]; then
             echo "::error::AppImage 启动后提前退出（rc=$rc）"
@@ -282,9 +266,17 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # Qt 6 Widgets。install-qt-action 比在 CI 里用 vcpkg 现编 Qt 快得多；
+      # QT_ROOT_DIR 指到 kit 目录，脚本从这里找 Qt6Config.cmake 与 windeployqt。
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          arch: win64_msvc2022_64
+          cache: true
+
       - uses: ./.github/actions/setup-vcpkg
 
-      # sidecar：Tauri 壳不链接引擎，隧道跑在这两个 CLI 可执行文件里的 client。
+      # sidecar：GUI 壳不链接引擎，隧道跑在这两个 CLI 可执行文件里的 client。
       # 用默认的 Visual Studio 生成器（multi-config），runner 里不需要 vcvars。
       - name: 构建 CLI（sidecar）
         shell: pwsh
@@ -296,28 +288,17 @@ jobs:
           cmake --build build/release-win --config Release --parallel
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      # 版本真源是仓库根 VERSION；JS 侧的两处副本在这里对齐。
-      - name: 同步版本
-        shell: pwsh
-        run: |
-          $v = (Get-Content VERSION -Raw).Trim()
-          foreach ($p in @("apps/desktop/package.json",
-                           "apps/desktop/src-tauri/tauri.conf.json")) {
-            $j = Get-Content $p -Raw | ConvertFrom-Json
-            $j.version = $v
-            $j | ConvertTo-Json -Depth 20 | Set-Content $p -Encoding utf8
-          }
-
-      # sidecar 准备 + tauri build + 引导器单文件都在脚本里。
+      # Qt GUI + sidecar 收集 + windeployqt + 引导器单文件都在脚本里。
       - name: 构建 + 单文件便携 exe
         shell: pwsh
         run: |
-          pwsh -File apps/desktop/scripts/build_windows.ps1 `
-            -ProxyBin build\release-win\apps\cli\Release\fcp-client.exe
+          pwsh -File scripts/desktop/build_windows.ps1 `
+            -ProxyBin build\release-win\apps\cli\Release\fcp-client.exe `
+            -QtPrefix $env:QT_ROOT_DIR
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      # 无头环境无法启动 WebView GUI；这里验证引导器能把载荷解到缓存、
-      # sidecar 可执行、产物已生成。
+      # 无头环境无法做更强的 GUI 断言；这里验证引导器能把载荷解到缓存、
+      # Qt 运行库齐全、sidecar 可执行、产物已生成。
       - name: 冒烟（引导器自检 + sidecar --version）
         shell: pwsh
         run: |
@@ -333,6 +314,11 @@ jobs:
           $cached = Get-ChildItem (Join-Path $env:LOCALAPPDATA "FCP\bin") -Directory |
                     Where-Object { Test-Path (Join-Path $_.FullName "FCP.exe") }
           if (!$cached) { throw "缓存里没有 FCP.exe" }
+          foreach ($rel in @("Qt6Core.dll", "platforms\qwindows.dll", "fcp-client.exe")) {
+            if (!(Test-Path (Join-Path $cached[0].FullName $rel))) {
+              throw "缓存里缺少 $rel"
+            }
+          }
           & build\release-win\apps\cli\Release\fcp-client.exe --version
           if ($LASTEXITCODE -ne 0) { throw "sidecar --version 退出码 $LASTEXITCODE" }
 

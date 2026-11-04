@@ -1,139 +1,108 @@
-# Tauri 2 客户端（Windows / Linux 便携交付）
+# FCP 桌面客户端（Qt 6 Widgets）
 
-这是唯一的图形客户端：Tauri 2 壳（Rust + 系统 WebView），真正跑隧道的仍是
-`apps/cli` 的 `fcp-client`（以 sidecar 子进程方式启动，密钥走环境
-变量，不进 argv）。传输层、FEC、信封、策略一行未改。原 Qt 客户端
-（`apps/fcp-client`）已于 2026-11-03 移除，不再构建也不再发布。
+一个很薄的 GUI 壳：**协议和隧道都不在这里**。真正的代理进程是同一仓库
+`apps/cli` 的 `fcp-client`，GUI 只负责：
+
+* 按界面参数启动/停止 `fcp-client`（sidecar）；
+* 读它的 `stats` 行，画吞吐、会话数与诊断计数；
+* 另起一个 `fcp-client --speedtest` 进程跑链路测速；
+* 托盘、关窗/最小化只隐藏窗口（隧道继续跑）。
+
+Qt 只用到 **Widgets**（没有 WebView、没有 QML、没有 QtCharts）。图标、折线图
+和复选框的勾都是 `QPainter`/QSS 画的，运行库由 `windeployqt` 收集。
+
+## 为什么是 Qt
+
+旧版是 Tauri 2 + WebView：Windows 依赖系统 WebView2，Linux AppImage 得把
+WebKitGTK 整套打进去（77 MiB，其中 WebKit/JSC/ICU 约 160 MiB 解压后）。
+Qt Widgets 的 AppImage 只带 Qt 运行库，体积和启动都小一个量级，也没有
+"系统 WebView 版本不一致"这一类问题。决策记录见 `docs/决策记录.md` #73。
+
+## 目录
 
 ```
-apps/desktop/
-├── launcher/                # 单文件引导器（Rust）：解压载荷到本地缓存并启动 FCP.exe
-├── src-ui/                  # 静态前端（无打包器，Tauri 直接吃这个目录）
-├── src-tauri/               # Rust 壳
-│   ├── src/main.rs          # 启动/停止 sidecar、解析 stats、转发事件
-│   ├── tauri.conf.json      # externalBin、图标、窗口、CSP
-│   └── binaries/            # sidecar 输入（带目标三元组后缀，构建前放入）
-├── scripts/
-│   ├── build_windows.ps1    # Windows：CMake 构建 → tauri build → 单文件 exe
-│   ├── build_linux.sh       # Linux：同上，产出 AppImage
-│   ├── prepare_sidecar.ps1  # 单独把 fcp-client.exe 放进 binaries/
-│   └── bundle_windows_portable.ps1  # 引导器 + zip 载荷 + 尾部 → 单文件 exe
-└── icons/                   # 由 scripts/make_icons.mjs 生成（npm run icons）
+CMakeLists.txt        独立可构建的 Qt 项目（也可由根 CMake 的 FCP_BUILD_GUI=ON 引入）
+src/main.cpp          QApplication、样式表、--fcp-speedtest-selftest
+src/mainwindow.*      左栏 + 连接 / 运行状态 / 链路测速 / 日志 四页
+src/sidecar.*          fcp-client 子进程管理、stats / @speedtest 解析
+src/sparkline.*       最近 60 秒上下行折线（QPainter）
+assets/               fcp.png、fcp.ico、check.png、app.qss、fcp.desktop、fcp.rc
+launcher/             Windows 单文件引导器（Rust，仅打包用）
 ```
 
-## 界面与行为
+## 构建
 
-左栏四个菜单对应四块内容，同一时刻只显示一块（启动/停止会自动切到对应页）：
-
-- **连接**：只露 4 个参数——服务器地址、UDP 端口、本地代理端口、预共享密钥
-  （实时校验 32 位 hex，可显示/隐藏）。本地监听地址、MTU、FEC 预算、固定 k 收进
-  「高级设置」，不展开时按 sidecar 默认值（127.0.0.1 / 1400 / 0.5 / -1）提交。
-- **运行状态**：每 500ms 解析 sidecar 的 `stats` 行，展示活动会话、已建立、隧道
-  数、上下行字节，并把速率画成最近 60 秒折线；非零诊断计数单独列出（坏入口/
-  拒绝/握手失败/reset/空闲回收/salt 冲突/超会话/错配置/无熵/限速建连/未知 salt）。
-- **链路测速**：另起一个 `fcp-client --speedtest` 直连服务端同一个 UDP 端口，两端
-  直接向 FCP 帧/FEC 层灌数据符号，先下载后上传，显示两向 Mbps、传输字节数与测速
-  期间的原始丢包率。不经过代理的 TCP 流窗口，也不打 HTTP 靶子，所以结果是隧道本身
-  的裸吞吐；代理未启动也能测。单程默认 8 秒（5/8/12/20 秒可选）。服务端需以
-  `--speedtest` 启动，否则提示“服务端没有响应测速”。
-- **日志**：sidecar 的 stdout 非 stats 行与全部 stderr，带行数统计与清空。
-
-界面启动 sidecar 时固定带 `--window=:4096`（自适应上限 4 MiB，即向服务端通告
-4 MiB 接收容量）。空的 START 表示不显式设置起点：默认的 BBRv2 会把窗口和 pacing
-收敛到链路工作点（200 ms 级跨洲链路，50 MB 下载实测 2.15–2.21 MB/s，见部署运维指南
-§4）。服务端下载方向同样配 `--window=:4096` 即可；要固定窗口做对照才用
-`--window=START:MAX` 并加 `--no-auto-window`，要对照 BBRv1 或旧 epoch 控制器需用 CLI
-（`--bbr-version=1` / `--no-bbr`）。
-
-**托盘**：关闭窗口或最小化只把窗口收进托盘，sidecar（隧道）继续运行；托盘图标
-左键单击还原窗口，右键菜单是「显示主界面 / 退出」，只有「退出」会停掉隧道并结束
-进程。托盘建不起来时（Linux 缺 `libayatana-appindicator3`）退回旧行为：关窗直接
-退出，不会留下看不见的进程。
-
-设置保存在 WebView 的 localStorage；"记住设置"关闭时不落盘。`?panel=conn|status|speed|log`
-可直接打开某一页（排障/截图用）。
-
-## Windows 构建（便携单文件）
+需要 Qt 6.2+ 的 Widgets 开发包。Windows 上本仓库的习惯是用 vcpkg 的经典树
+（`D:\work\vcpkg\installed\x64-windows`，其中带 `tools/Qt6/bin/windeployqt.exe`）：
 
 ```powershell
-# 0) vcpkg 一次性准备（manifest 模式；之后新终端会继承 VCPKG_ROOT）
-git clone https://github.com/microsoft/vcpkg.git D:\vcpkg
-D:\vcpkg\bootstrap-vcpkg.bat
-setx VCPKG_ROOT D:\vcpkg
-
-# 1) 先构建 sidecar（build.bat 默认不开 FCP_BUILD_PROXY，必须显式打开）
-cmake -S . -B build/release-win `
-  -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
-  -DFCP_BUILD_PROXY=ON -DFCP_BUILD_TESTS=OFF -DFCP_BUILD_TOOLS=OFF
-cmake --build build/release-win --config Release --parallel
-
-# 2) 一键打包
-pwsh -File apps/desktop/scripts/build_windows.ps1 `
-  -ProxyBin build\release-win\apps\cli\Release\fcp-client.exe
+cmake -S apps/desktop -B build/gui -DCMAKE_PREFIX_PATH=D:\work\vcpkg\installed\x64-windows
+cmake --build build/gui --config Release
 ```
 
-产物：`dist/fcp-client-gui-<版本>-windows-amd64.exe`。首次双击时引导器把 `FCP.exe` +
-`fcp-client.exe` 解到 `%LOCALAPPDATA%\FCP\bin\<载荷哈希>\`，之后直接启动缓存；
-换新版本会解到新目录，旧目录 7 天未用后清理。不写系统目录、不建卸载项、
-不需要管理员权限。删除 exe 即卸载（缓存目录可手动删除）。
-
-配置存在 WebView 的 localStorage（按 `com.fcp.client` 标识），与版本缓存目录
-无关，升级不需要重输；前提是不要改 `src-tauri/tauri.conf.json` 的 `identifier`。
-
-依赖：Rust（`cargo` 在 PATH，构建 Tauri 壳与引导器）、Node/npm。
-Windows 10/11 自带 WebView2 运行时。排障：`--fcp-launcher-selftest`，
-失败日志在 `%LOCALAPPDATA%\FCP\launcher.log`。
-
-测速的无界面自检（服务端先以 `--speedtest` 启动；不需要本地代理）：
-
-```powershell
-$env:FCP_SPEEDTEST_HOST="198.51.100.7"   # 默认 127.0.0.1
-$env:FCP_SPEEDTEST_PORT="4460"           # 默认 4460
-$env:FCP_SPEEDTEST_SECONDS="5"           # 默认 8，范围 3..30
-$env:FCP_SPEEDTEST_KEY="<32 位 hex>"     # 或复用 FCP_PSK
-.\FCP.exe --fcp-speedtest-selftest   # 结果同时写到 %TEMP%\fcp-speedtest.txt
-```
-
-它直接拉起 `fcp-client --speedtest` sidecar，与界面走同一条命令；release 是
-GUI 子系统，所以别指望在控制台看到 JSON，读文件或看退出码（0 = 两向都完成）。
-
-## Linux 构建（AppImage）
-
-在 Linux（或 VPS）上：
+Linux（Ubuntu 22.04+）：
 
 ```bash
-bash apps/desktop/scripts/build_linux.sh
-# 产物：dist/fcp-client-gui-<版本>-linux-amd64.AppImage
-#      （tauri 原始产物留在 src-tauri/target/.../bundle/appimage/*.AppImage）
+sudo apt install qt6-base-dev cmake ninja-build
+cmake -S apps/desktop -B build/linux-gui -DCMAKE_BUILD_TYPE=Release
+cmake --build build/linux-gui --parallel
 ```
 
-依赖（Debian/Ubuntu）：
+`FCP.exe` / `FCP` 需要和 `fcp-client` 放在同一目录（开发时把构建出来的
+`fcp-client` 拷过去，或设 `FCP_PROXY_BIN` 指向它）。sidecar 解析顺序是
+**环境变量 → 主程序同目录**，从不回落到 `PATH`。
+
+Windows 上构建完就能直接双击：`FCP_GUI_AUTO_DEPLOY`（默认开）会在
+POST_BUILD 自动跑 `windeployqt` 并把 Qt bin 里剩余的第三方 DLL
+（zlib/pcre2/icu 等）收进输出目录。关掉用 `-DFCP_GUI_AUTO_DEPLOY=OFF`；
+关掉后需自行把 Qt bin 加入 `PATH` 才能运行。发布的完整打包（递归依赖
+清点 + 单文件封装）仍走 `scripts/desktop/build_windows.ps1`。
+
+也可以从仓库根一起构建：
 
 ```bash
-apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
-  libayatana-appindicator3-dev patchelf cmake build-essential pkg-config libssl-dev
-curl -sSf https://sh.rustup.rs | sh -s -- -y
-# 脚本里的 CMake 需要 vcpkg toolchain
-git clone https://github.com/microsoft/vcpkg.git ~/vcpkg
-~/vcpkg/bootstrap-vcpkg.sh -disableMetrics
-export VCPKG_ROOT=~/vcpkg
+cmake -S . -B build -DFCP_BUILD_PROXY=ON -DFCP_BUILD_GUI=ON \
+  -DCMAKE_PREFIX_PATH=<Qt6 前缀>
 ```
 
-AppImage 是单文件、`chmod +x` 后双击即用，不需要安装。运行时不需要用户系统预装
-WebKit（AppImage 内含 webkit2gtk 相关库）。
+## 行为约定
 
-## 调试
+* **参数**：`--host --port --listen --local-port --mtu --fec-budget --window=:4096
+  --key-env=FCP_PSK --log=stats:500`，`k >= 0` 时再加 `--k`。PSK 走环境变量
+  `FCP_PSK`，不出现在命令行。
+* **校验顺序**（与旧版一致）：密钥 32 位十六进制 → UDP 端口 → 本地端口 →
+  MTU 576..9000 → k -1..7 → FEC 0..1 → 监听地址非空 → 服务器地址非空。
+  高级设置折叠时按默认值提交（127.0.0.1 / 1400 / -1 / 0.5）。
+* **设置**：`QSettings`（Windows 注册表 `HKCU\Software\FCP\FCP Client`，
+  Linux `~/.config/FCP/FCP Client.conf`）。取消"记住设置"会清空已存配置。
+* **托盘**：关窗和最小化只 `hide()`，sidecar 继续跑；真正退出走托盘菜单。
+  没有系统托盘时关窗即退出。
+* **子进程随 GUI 一起死**：Windows 用 `KILL_ON_JOB_CLOSE` 的 Job Object，
+  Linux 用 `PR_SET_PDEATHSIG`。任务管理器强杀 GUI 后不会留下占着 1080 的
+  `fcp-client`。
+* **日志**：stdout 灰色、stderr 沙色，最多保留 4000 行；只有视图在底部时才
+  自动滚动。
+
+## 测速自检
+
+无界面跑一次测速（服务端需以 `--speedtest` 启动）：
 
 ```bash
-cd apps/desktop
-npm install
-FCP_PROXY_BIN=/path/to/fcp-client npm run dev   # 开发模式
+FCP_SPEEDTEST_HOST=127.0.0.1 FCP_SPEEDTEST_PORT=4460 \
+FCP_SPEEDTEST_KEY=<32 位十六进制> FCP_SPEEDTEST_SECONDS=8 \
+  ./FCP --fcp-speedtest-selftest
 ```
 
-`FCP_PROXY_BIN` 覆盖 sidecar 路径，便于在开发机上直接跑 dev 模式。
+结果 JSON 同时写到 `%TEMP%\fcp-speedtest.txt`（release 是 GUI 子系统，没有
+控制台）；含 `"mbps"` 时退出码为 0。
 
-## 图标
+## 打包
 
-`npm run icons` 重新生成 `src-tauri/icons/`（纯 Node，无图形库依赖）：绿底
-（`#0f9d76`，与界面 accent 同色）白字 F + 白点，ICO 带 16/32/48/64/128/256 六个
-尺寸（小图标视图不会回退成默认 exe 图标）。
+* Windows：`scripts/desktop/build_windows.ps1` 构建 GUI + 收集 Qt 运行库 +
+  `fcp-client`，`scripts/desktop/bundle_windows_portable.ps1` 用
+  `launcher/` 打成单文件便携 exe（载荷是整棵目录树）。
+* Linux：`scripts/desktop/build_linux.sh` 构造 AppDir，用 linuxdeploy 的 Qt
+  插件生成 AppImage。
+* 图标：`node scripts/desktop/make_icons.mjs`（产物进仓库）。
+
+发布流水线与排障见 `docs/发布流程.md`。

@@ -59,12 +59,20 @@ cmake --build build/rel -j"$(nproc)"
 ctest --test-dir build/rel --output-on-failure
 ```
 
-桌面客户端是 Tauri 2 壳 + WebView，隧道由 `fcp-client` 以 sidecar 承载（需要 Rust/Node）：
+桌面客户端是 Qt 6 Widgets 壳，隧道由 `fcp-client` 以 sidecar 承载。构建需要
+Qt 6.2+ Widgets 开发包（Windows 打包另需 Rust，用于单文件引导器）：
 
 ```bash
-bash apps/desktop/scripts/build_linux.sh
-pwsh -File apps/desktop/scripts/build_windows.ps1 -ProxyBin build\release-win\apps\cli\Release\fcp-client.exe
+# Linux（qt6-base-dev 即可；脚本同时构建 CLI 与 AppImage）
+bash scripts/desktop/build_linux.sh
+
+# Windows（Qt 6 前缀由 -QtPrefix 指定）
+pwsh -File scripts/desktop/build_windows.ps1 `
+  -ProxyBin build\release-win\apps\cli\Release\fcp-client.exe `
+  -QtPrefix D:\work\vcpkg\installed\x64-windows
 ```
+
+只想要 GUI 可执行文件时，可以单独构建 `apps/desktop`（见其 README）。
 
 ## 仓库结构
 
@@ -72,11 +80,11 @@ pwsh -File apps/desktop/scripts/build_windows.ps1 -ProxyBin build\release-win\ap
 |---|---|
 | `src/fcp` | 协议核心：信封、握手、FEC、流层与拥塞控制 |
 | `src/proxy` | 代理引擎（无 socket，宿主回调注入，可脱机测试） |
-| `apps/cli` | `fcp-server` / `fcp-client` 与 select 反应堆 |
-| `apps/desktop` | Tauri 2 桌面客户端 |
-| `tools` | `fcp-bench` 基准、`fcp-replay` 轨迹重放 |
+| `apps/cli` | `fcp-server` / `fcp-client`、select 反应堆、`fcp-bench` 基准、`fcp-replay` 轨迹重放 |
+| `apps/desktop` | Qt 6 桌面客户端（GUI 壳 + Windows 单文件引导器） |
+| `scripts` | 构建与打包脚本（`desktop/` 下是 Qt GUI / AppImage / 引导器流水线） |
 | `tests` | ctest 用例（含链路模拟与对抗用例） |
-| `packaging` | deb / systemd / Windows 打包输入 |
+| `packaging` | deb / systemd / Windows 打包输入与安装落点（`FCPPackaging.cmake`） |
 | `docs` | 规格、设计、决策与运维文档 |
 
 ## 文档

@@ -72,7 +72,7 @@ test -f "$STAGE_DIR/usr/lib/systemd/system/fcp.service"
 test -f "$STAGE_DIR/usr/share/doc/fcp-server/部署运维指南.md"
 
 # 打包：直接用 dpkg-deb 把上面造好的 DESTDIR 安装树打成 .deb（scripts/build_deb.sh）。
-# 包内落点由 cmake/FCPPackaging.cmake 的 install() 唯一决定，打包器不再维护第二份
+# 包内落点由 packaging/FCPPackaging.cmake 的 install() 唯一决定，打包器不再维护第二份
 # 文件表；出包后的 control/conffiles/落点校验也在那个脚本里做。
 echo "== build_deb"
 case "$(uname -m)" in

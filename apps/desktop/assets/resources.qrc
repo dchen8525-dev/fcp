@@ -1,0 +1,8 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+  <qresource prefix="/assets">
+    <file>fcp.png</file>
+    <file>check.png</file>
+    <file>app.qss</file>
+  </qresource>
+</RCC>

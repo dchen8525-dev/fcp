@@ -12,7 +12,7 @@ Windows 客户端是单文件便携版：首次双击时解压到
 设置会保留，升级不需要重输。首次运行可能被 SmartScreen
 提示"未知发布者"（本版本没有代码签名），点"更多信息 → 仍要运行"即可。
 
-Linux AppImage 自带 WebKitGTK 运行时。浏览器下载会丢掉可执行位，先
+Linux AppImage 自带 Qt 6 运行库与 xcb 平台插件。浏览器下载会丢掉可执行位，先
 `chmod +x fcp-client-gui-VERSION-linux-amd64.AppImage`，再在文件管理器里双击运行。
 如果系统提示缺 libfuse2：`sudo apt install libfuse2`，或设
 `APPIMAGE_EXTRACT_AND_RUN=1` 直接解包运行。不需要安装，删除这一个文件就是卸载。

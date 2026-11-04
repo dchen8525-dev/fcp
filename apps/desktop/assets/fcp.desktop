@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=FCP
+Name[zh_CN]=FCP 客户端
+Comment=Reliable transport client
+Comment[zh_CN]=可靠传输客户端
+Exec=FCP
+Icon=fcp
+Terminal=false
+Categories=Network;
+Keywords=fcp;proxy;tunnel;

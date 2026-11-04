@@ -1,6 +1,6 @@
 [Unit]
 Description=FCP server (UDP tunnel endpoint with FEC)
-Documentation=file:///usr/share/doc/fcp/部署运维指南.md
+Documentation=file:///usr/share/doc/fcp-server/部署运维指南.md
 After=network-online.target
 Wants=network-online.target
 

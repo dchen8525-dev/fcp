@@ -378,16 +378,16 @@
     </div>
 
     <div class="grid">
-      <div class="metric tx"><span class="cap">上行 OUT</span><b id="m-tx">0 B</b></div>
-      <div class="metric rx"><span class="cap">下行 IN</span><b id="m-rx">0 B</b></div>
+      <div class="metric rx"><span class="cap">下行</span><b id="m-rx">0 B</b></div>
+      <div class="metric tx"><span class="cap">上行</span><b id="m-tx">0 B</b></div>
       <div class="metric"><span class="cap">已建立会话</span><b id="m-est">0</b></div>
       <div class="metric"><span class="cap">累计隧道</span><b id="m-tun">0</b></div>
     </div>
 
     <div class="chart">
       <div class="chart-head">
-        <span class="lg tx">上行</span><b id="rate-tx">0 B/s</b>
         <span class="lg rx">下行</span><b id="rate-rx">0 B/s</b>
+        <span class="lg tx">上行</span><b id="rate-tx">0 B/s</b>
         <span class="sp">最近 60 秒</span>
       </div>
       <canvas id="spark"></canvas>
@@ -421,12 +421,12 @@
 
     <div class="speed-results">
       <div class="speed-tile">
-        <span class="cap">下行下载</span>
+        <span class="cap">下行</span>
         <div class="big"><b id="sp-down">--</b><em>Mbps</em></div>
         <span class="sub" id="sp-down-sub">等待测速</span>
       </div>
       <div class="speed-tile">
-        <span class="cap">上行上传</span>
+        <span class="cap">上行</span>
         <div class="big"><b id="sp-up">--</b><em>Mbps</em></div>
         <span class="sub" id="sp-up-sub">等待测速</span>
       </div>

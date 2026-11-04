@@ -15,7 +15,7 @@ project(fcp VERSION ${FCP_VERSION} LANGUAGES CXX)
 
 include(GNUInstallDirs)
 
-# 打包元数据：唯一真源是 packaging/debian/metadata.env（scripts/build_deb.py 也读它）。
+# 打包元数据：唯一真源是 packaging/debian/metadata.env（scripts/build_deb.sh 也读它）。
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/packaging/debian/metadata.env"
      FCP_METADATA_LINES REGEX "^FCP_")
 foreach(line IN LISTS FCP_METADATA_LINES)

@@ -1,23 +1,22 @@
 # 可读版 control（审包用，不是构建输入）。
 #
-# 真正的 control 由 scripts/build_deb.py 的 build_control() 生成；字段顺序与这里
-# 一致，改一边记得改另一边。长描述的唯一真源是 packaging/debian/description，
-# 主页与维护者的唯一真源是 packaging/debian/metadata.env。
+# 真正的 control 由 scripts/build_deb.sh 生成；字段顺序与这里一致，改一边记得
+# 改另一边。长描述的唯一真源是 packaging/debian/description，主页与维护者的
+# 唯一真源是 packaging/debian/metadata.env。
 #
-# 已安装文件（6 类，与 cmake/FCPPackaging.cmake 的 install() 和 build_deb.py 的
-# iter_package_files() 逐条对齐）：
+# 已安装文件（6 类）的全部落点由 cmake/FCPPackaging.cmake 的 install() 决定，
+# build_deb.sh 直接打包那棵 DESTDIR 树：
 #   /usr/bin/fcp-server
 #   /usr/bin/fcp-client
 #   /usr/lib/systemd/system/fcp.service
 #   /etc/fcp/fcp.env                (conffile)
-#   /usr/share/doc/fcp/*.md + VERSION
-#   /usr/share/doc/fcp/copyright
+#   /usr/share/doc/fcp-server/*.md + VERSION
+#   /usr/share/doc/fcp-server/copyright
 #
 # 结构铁律：control 是**单个段落**，字段之间不许有空行（dpkg 按空行分段，
 # 多一个空行就把后面的字段拆成第二个段落，`dpkg -i` 报 missing 'Package'
-# field）。build_deb.py 写完会自检这一点，release_build_linux.sh 再用 dpkg-deb
-# 复核一次。
-Package: fcp
+# field）。build_deb.sh 出包后会自检这一点。
+Package: fcp-server
 Version: @VERSION@
 Architecture: @ARCH@
 Maintainer: @MAINTAINER@

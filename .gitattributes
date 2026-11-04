@@ -10,14 +10,25 @@ packaging/debian/postinst text eol=lf
 packaging/debian/prerm    text eol=lf
 packaging/debian/postrm   text eol=lf
 
+# deb 打包输入：conffiles / control / description / 元数据 / unit / env 都会被
+# dpkg-deb 或 shell 按行读，行尾 CR 会变成字段值或路径的一部分（dpkg-deb
+# 报 conffile "... does not appear in package"）。仓库里统一存 LF。
+packaging/debian/conffiles   text eol=lf
+packaging/debian/description text eol=lf
+packaging/debian/control.in  text eol=lf
+packaging/debian/metadata.env text eol=lf
+packaging/debian/fcp.env     text eol=lf
+packaging/debian/fcp.service text eol=lf
+packaging/debian/copyright   text eol=lf
+
 # 可执行位记在 Git 索引里（100755），不依赖工作区的文件模式：
 # Git for Windows 的 core.filemode 默认是 false，新建脚本必须
 # `git update-index --chmod=+x <file>` 补这一步，否则 Linux runner 上
 # 直接 "Permission denied"（首跑实测）。
 #
-# .py 同理：scripts/build_deb.py 在 Linux runner 上被 python3 直接执行，CRLF 会让
-# `#!/usr/bin/env python3` 变成 "bad interpreter"（本地用 tar/scp 传代码时
-# 实测过，Git 索引里的 LF 才是准的）。
+# .sh 同理：scripts/build_deb.sh 在 Linux runner 上被 bash 执行，CRLF 会让
+# shebang 变成 "bad interpreter"（本地用 tar/scp 传代码时实测过，Git 索引里
+# 的 LF 才是准的）。
 *.sh    text eol=lf
 *.py    text eol=lf
 *.yml   text eol=lf

@@ -9,7 +9,7 @@
  The package ships a systemd unit for the server side; start-up arguments
  live in /etc/fcp/fcp.env (a dpkg conffile, so upgrades keep your
  edits). The service is not started on install: you must supply a
- pre-shared key first (see /usr/share/doc/fcp/部署运维指南.md).
+ pre-shared key first (see /usr/share/doc/fcp-server/部署运维指南.md).
  .
  FCP v7 does not interoperate with v6: both ends must run the same major
  wire version.

@@ -67,7 +67,7 @@ pwsh -File apps/desktop/scripts/build_windows.ps1 `
   -ProxyBin build\release-win\apps\cli\Release\fcp-client.exe
 ```
 
-产物：`dist/FCP-<版本>-win64.exe`。首次双击时引导器把 `FCP.exe` +
+产物：`dist/fcp-client-<版本>_amd64.exe`。首次双击时引导器把 `FCP.exe` +
 `fcp-client.exe` 解到 `%LOCALAPPDATA%\FCP\bin\<载荷哈希>\`，之后直接启动缓存；
 换新版本会解到新目录，旧目录 7 天未用后清理。不写系统目录、不建卸载项、
 不需要管理员权限。删除 exe 即卸载（缓存目录可手动删除）。
@@ -98,7 +98,8 @@ GUI 子系统，所以别指望在控制台看到 JSON，读文件或看退出�
 
 ```bash
 bash apps/desktop/scripts/build_linux.sh
-# 产物：apps/desktop/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
+# 产物：dist/fcp-client-<版本>_amd64.AppImage
+#      （tauri 原始产物留在 src-tauri/target/.../bundle/appimage/*.AppImage）
 ```
 
 依赖（Debian/Ubuntu）：

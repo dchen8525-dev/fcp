@@ -4,8 +4,8 @@ name: release
 #
 # 产出三件发布物，挂在同一条 GitHub Release 上：
 #   * fcp_<版本>_<arch>.deb         Ubuntu 服务端（同包带 CLI client、systemd unit、conffile）
-#   * FCP-<版本>-win64.exe          Windows 客户端（单文件，双击运行，免安装）
-#   * FCP-<版本>-linux-x86_64.AppImage  Linux 客户端（双击运行，免安装）
+#   * fcp-client-<版本>_amd64.exe          Windows 客户端（单文件，双击运行，免安装）
+#   * fcp-client-<版本>_amd64.AppImage         Linux 客户端（双击运行，免安装）
 #
 # 客户端是 Tauri 2 壳 + fcp-client sidecar（apps/desktop）。隧道仍由 CLI
 # 承载，所以两个客户端 job 先构建 FCP_BUILD_PROXY=ON 的 CLI。
@@ -44,7 +44,7 @@ permissions:
 
 jobs:
   # 版本号只有一个真源：仓库根 VERSION。tag 必须与它逐字符一致，
-  # 否则"v0.0.2 打了个 0.0.1 的包"这种事故没人会注意到。
+  # 否则"tag 与包内版本对不上"这种事故没人会注意到。
   prep:
     name: 版本与 tag 校验
     runs-on: ubuntu-latest
@@ -124,7 +124,7 @@ jobs:
 
       # 构建 / ctest / 打 deb 三步都在 scripts/release_build_linux.sh 里：
       # 本地复现同一条命令，CI 与手工构建不会漂（docs/发布流程.md §2）。
-      - name: 构建 + ctest + build_deb（发布门禁）
+      - name: 构建 + ctest + 打 deb（发布门禁）
         run: bash scripts/release_build_linux.sh build "${{ needs.prep.outputs.version }}"
 
       - name: 安装冒烟（dpkg -i → 自检 → 服务起停 → 卸载）
@@ -143,9 +143,9 @@ jobs:
           echo "== dpkg 记录的文件清单"
           # 先打清单再逐条检查：落点类失败（第五次跑挂在文档路径上）只有
           # 清单在手才能判断是"没装"还是"装到别的路径/别的文件名"。
-          dpkg -L fcp
-          echo "== /usr/share/doc/fcp 实际内容"
-          ls -la /usr/share/doc/fcp || true
+          dpkg -L fcp-server
+          echo "== /usr/share/doc/fcp-server 实际内容"
+          ls -la /usr/share/doc/fcp-server || true
 
           echo "== /etc/fcp 目录与 conffile 状态"
           # /etc/fcp 是 0750 root:root（env 里有 PSK，不能放宽），所以下面凡是
@@ -164,15 +164,15 @@ jobs:
           check "/usr/bin/fcp-server 可执行" test -x /usr/bin/fcp-server
           check "/usr/bin/fcp-client 可执行" test -x /usr/bin/fcp-client
           check "/etc/fcp/fcp.env 存在" sudo test -f /etc/fcp/fcp.env
-          check "文档已装" test -f "/usr/share/doc/fcp/部署运维指南.md"
+          check "文档已装" test -f "/usr/share/doc/fcp-server/部署运维指南.md"
           echo "  - systemd unit 已注册"
           systemctl cat fcp >/dev/null || {
             echo "::error::systemctl cat fcp 失败；包内 unit 落点："
-            dpkg -L fcp | grep -i systemd || echo "(包里没有 systemd 目录)"
+            dpkg -L fcp-server | grep -i systemd || echo "(包里没有 systemd 目录)"
             exit 1
           }
           echo "== conffile 登记（升级不覆盖运维配置的前提）"
-          dpkg-query -W -f='${Conffiles}\n' fcp | tee /tmp/conf.txt
+          dpkg-query -W -f='${Conffiles}\n' fcp-server | tee /tmp/conf.txt
           grep -q '/etc/fcp/fcp.env' /tmp/conf.txt
 
           echo "== 服务起停（systemd 可用时）"
@@ -321,7 +321,7 @@ jobs:
       - name: 冒烟（引导器自检 + sidecar --version）
         shell: pwsh
         run: |
-          $exe = Get-ChildItem dist\FCP-*-win64.exe | Select-Object -First 1
+          $exe = Get-ChildItem dist\fcp-client-*_amd64.exe | Select-Object -First 1
           if (!$exe) { throw "没找到单文件便携 exe" }
           Write-Host "产物：$($exe.FullName) ($([math]::Round($exe.Length / 1MB, 1)) MiB)"
           $proc = Start-Process -FilePath $exe.FullName `
@@ -339,7 +339,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: windows-portable
-          path: dist/FCP-*-win64.exe
+          path: dist/fcp-client-*_amd64.exe
           if-no-files-found: error
           retention-days: 14
 

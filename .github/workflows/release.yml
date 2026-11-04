@@ -198,7 +198,7 @@ jobs:
           fi
 
           echo "== 卸载"
-          sudo dpkg -r fcp
+          sudo dpkg -r fcp-server
           test ! -e /usr/bin/fcp-server
 
       - uses: actions/upload-artifact@v4

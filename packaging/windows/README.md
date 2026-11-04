@@ -41,10 +41,10 @@ Windows 客户端是**单文件免安装 exe**，由三部分拼接而成：
 - 自检（解压并确认 `FCP.exe` / `fcp-client.exe` 就位，不启动 GUI）：
 
   ```powershell
-  Start-Process -Wait -FilePath .\fcp-client-0.0.1-windows-amd64.exe `
+  Start-Process -Wait -FilePath .\fcp-client-gui-0.0.1-windows-amd64.exe `
     -ArgumentList "--fcp-launcher-selftest" -PassThru | Select-Object ExitCode
   ```
 
   结果同时写到 `%LOCALAPPDATA%\FCP\selftest.txt`。
 - 启动失败会弹消息框，并追加到 `%LOCALAPPDATA%\FCP\launcher.log`。
-- 手动查看载荷：`7z l fcp-client-<版本>-windows-amd64.exe`（载荷是标准 zip）。
+- 手动查看载荷：`7z l fcp-client-gui-<版本>-windows-amd64.exe`（载荷是标准 zip）。

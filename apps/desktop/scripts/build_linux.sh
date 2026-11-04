@@ -46,7 +46,7 @@ SRC="$(ls -1 "$TAURI_DIR"/src-tauri/target/"$TARGET"/release/bundle/appimage/*.A
 # 版本号的唯一真源是仓库根的 VERSION（tauri.conf.json 在发布流水线里先同步）。
 VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION")"
 mkdir -p "$ROOT/dist"
-OUT="$ROOT/dist/fcp-client-$VERSION-linux-amd64.AppImage"
+OUT="$ROOT/dist/fcp-client-gui-$VERSION-linux-amd64.AppImage"
 cp "$SRC" "$OUT"
 chmod +x "$OUT"
 

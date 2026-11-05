@@ -1,6 +1,6 @@
 #!/bin/bash
 # Linux 侧构建（在 VPS / CI 上跑）：CMake 出 fcp-client → CMake 出 Qt GUI
-# → linuxdeploy（Qt 插件）→ 裁掉无用插件 → appimagetool（xz）打成 .AppImage
+# → linuxdeploy（Qt 插件）→ 裁掉无用插件 → appimagetool（zstd -22）打成 .AppImage
 # （便携、双击运行，不需要安装）。
 #
 # 用法：在仓库根执行
@@ -79,7 +79,7 @@ fetch "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/l
   "$TOOLS/linuxdeploy"
 fetch "https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage" \
   "$TOOLS/linuxdeploy-plugin-qt"
-# linuxdeploy 自带的 appimagetool 只出 zstd；这里单独用它选 xz。
+# linuxdeploy 自带的 appimagetool 不能指定压缩参数；这里单独下一份。
 fetch "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage" \
   "$TOOLS/appimagetool"
 
@@ -112,8 +112,13 @@ rm -rf "$APPDIR/usr/plugins/imageformats" \
 
 mkdir -p "$ROOT/dist"
 OUT="$ROOT/dist/fcp-client-gui-$VERSION-linux-amd64.AppImage"
-echo "== appimagetool（xz）"
-ARCH=x86_64 "$TOOLS/appimagetool" --comp xz --no-appstream "$APPDIR" "$OUT"
+# continuous 版 appimagetool 内置的 mksquashfs 是只带 zstd 的静态构建，
+# --comp xz 会直接报 "Compressor xz is not supported"。zstd -22 与 xz 的
+# 体积差在个位数百分比，换来的是构建更快、不依赖发行版的 squashfs-tools。
+echo "== appimagetool（zstd -22）"
+ARCH=x86_64 "$TOOLS/appimagetool" --comp zstd \
+  --mksquashfs-opt -Xcompression-level --mksquashfs-opt 22 \
+  --no-appstream "$APPDIR" "$OUT"
 chmod +x "$OUT"
 
 echo "== 产物："

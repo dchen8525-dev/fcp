@@ -252,9 +252,9 @@ jobs:
       # AppImage 体积的大头是发行版 Qt 依赖的 ICU（解包后 ~35 MiB）。
       # 自编 qtbase 时关掉 ICU/OpenSSL/DBus，包体预计减半；Qt 编译约
       # 10 分钟，按版本+选项缓存，命中时直接复用前缀。
-      - name: Qt 无 ICU（缓存）
+      - name: 恢复 Qt 无 ICU（缓存）
         id: qt-noicu
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/qt-noicu-6.8.3
           key: qt-noicu-6.8.3-linux-${{ hashFiles('scripts/desktop/build_qt_noicu.sh') }}
@@ -262,6 +262,15 @@ jobs:
       - name: 构建 Qt（缓存未命中时）
         if: steps.qt-noicu.outputs.cache-hit != 'true'
         run: bash scripts/desktop/build_qt_noicu.sh "${{ runner.temp }}/qt-noicu-6.8.3"
+
+      # actions/cache 的保存挂在 job 收尾，job 一失败就跳过；显式 save 让
+      # 后面 AppImage 步骤再挂也不用重编 16 分钟 Qt。
+      - name: 保存 Qt 构建（缓存未命中时）
+        if: steps.qt-noicu.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/qt-noicu-6.8.3
+          key: qt-noicu-6.8.3-linux-${{ hashFiles('scripts/desktop/build_qt_noicu.sh') }}
 
       # CLI 构建 + Qt GUI + linuxdeploy 都在脚本里；本地同一命令可复现。
       - name: 构建 + AppImage（发布门禁）

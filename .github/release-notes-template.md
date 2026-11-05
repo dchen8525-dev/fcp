@@ -21,14 +21,18 @@ Linux AppImage 自带 Qt 6 运行库与 xcb 平台插件。浏览器下载会丢
 
 ```bash
 sudo dpkg -i fcp-server-VERSION-linux-ARCH.deb   # 依赖缺失时改用：sudo apt install ./fcp-server-VERSION-linux-ARCH.deb
-sudo editor /etc/fcp/fcp.env        # 填 FCP_ARGS，至少要有 --key=HEX32 或 --key-file=FILE
+# 首次安装已自动生成 /etc/fcp/fcp.env 里的 FCP_PSK（安装输出里打印一次）。
+# 想改端口/参数就编辑 FCP_ARGS；默认已带 --speedtest 与
+# --log-file=/var/log/fcp/server.log，日志级别默认 debug（--log=LEVEL 调整）。
+sudo editor /etc/fcp/fcp.env
 sudo systemctl enable --now fcp
 journalctl -u fcp -f
 ```
 
 装完自检：`fcp-server --version`。包里同时带客户端
-（`fcp-client -H <服务器>:<端口> -k <PSK文件>`，本地 SOCKS5/HTTP :1080）。
-服务**不会**在安装时自动启动——没有密钥的进程只会退出，这是有意的。
+（`FCP_PSK=<服务端那串十六进制> fcp-client -H <服务器>:<端口>`，本地
+SOCKS5/HTTP :1080；`-k <PSK文件>` 亦可）。服务**不会**在安装时自动启动，
+需要显式 `systemctl enable --now fcp`。
 
 - 部署与排障：[docs/部署运维指南.md](https://github.com/OWNER_REPO/blob/TAG/docs/部署运维指南.md)
 - 协议（v7 与 v6 不互通，升级必须两端同时替换）：[docs/协议规格.md](https://github.com/OWNER_REPO/blob/TAG/docs/协议规格.md)

@@ -26,7 +26,10 @@ if [ "$1" = "configure" ]; then
     cat <<'EOF'
 
 FCP 服务端已安装。下一步：
-  1. 编辑 /etc/fcp/fcp.env，填写 FCP_ARGS（至少要有 --key=HEX32 或 --key-file=FILE）
+  1. 编辑 /etc/fcp/fcp.env，设置 FCP_PSK=HEX32（openssl rand -hex 16）与
+     FCP_ARGS=--key-env=FCP_PSK —— 本 unit 是 DynamicUser，服务用户读不了
+     root 的 0600 文件，--key-file 在 systemd 下不工作；--key=HEX32 会把
+     PSK 暴露在 ps 的 argv 里，也不要用（fcp.env 顶部注释是权威说明）
   2. systemctl enable --now fcp
   3. journalctl -u fcp -f
 

@@ -92,6 +92,12 @@ elif [ -z "${QMAKE:-}" ]; then
   QMAKE="$(command -v qmake6 || command -v qmake || echo /usr/lib/qt6/bin/qmake)"
 fi
 export QMAKE
+# 自编 Qt 不在系统库路径里，linuxdeploy 用 ldd 解析 ELF 依赖时找不到
+# libQt6Widgets.so.6（CI 首次跑就失败在这里）。把前缀的 lib 加进搜索路径，
+# 也顺带保证 plugin-qt 找到的是同一份 Qt。
+if [ -n "${FCP_QT_PREFIX:-}" ]; then
+  export LD_LIBRARY_PATH="$FCP_QT_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
 
 echo "== linuxdeploy（Qt 插件）"
 cd "$WORK"

@@ -750,9 +750,11 @@ std::unique_ptr<Session> ProxyEngine::make_session(uint64_t cid, const SessionCo
         }
         p->stream->on_segment(payload, len, now_ms_);
       },
-      [this](const std::string& line) {
-        log(std::string(kTagInfo) + line);
-      });
+      // session.cc / session_log.cc 的每条日志都自带 [d]/[i]/[w]/[e] 标签，
+      // 汇集点（Reactor::log_line）只剥一层。这里再套一层 kTagInfo 会把所有
+      // 会话行都判成 info（--log=info 也压不住 [d] 行，--log=error 反而吞掉
+      // 会话错误），渲染时还会残留内层标签。原样透传。
+      [this](const std::string& line) { log(line); });
 }
 
 // 会话建立失败的两种本质上不同的原因。混淆它们会让运维把一条熵源故障
@@ -1072,7 +1074,7 @@ bool ProxyEngine::parse_entry(Conn& conn, int64_t now_ms) {
         conn.want_fin = true;
         arm_grace(conn, /*only_if_idle=*/true);
         maybe_fin(conn);
-        log(std::string(kTagWarn) + label(conn) + "no acceptable SOCKS5 method");
+        log(std::string(kTagWarn) + label(conn) + " no acceptable SOCKS5 method");
         return false;
       }
       conn.phase = Phase::kSocks5Request;
@@ -1147,7 +1149,7 @@ void ProxyEngine::refuse_local(Conn& conn, const char* why, Socks5Rep rep,
   conn.want_fin = true;
   arm_grace(conn, /*only_if_idle=*/true);
   maybe_fin(conn);
-  log(std::string(kTagWarn) + label(conn) + why);
+  log(std::string(kTagWarn) + label(conn) + " " + why);
 }
 
 void ProxyEngine::queue_local_reply(Conn& conn, Socks5Rep rep, HttpReply http) {

@@ -1751,6 +1751,15 @@ void Reactor::check_stall(int64_t now_ms) {
     return;
   }
   const ProxyEngine::Counters& c = engine_.counters();
+  if (c.live == 0 && stall_since_ms_ == 0) {
+    // 空闲隧道两个方向都冻结，这不是死路径。把基线刷到当下：否则空闲几分钟
+    // 后第一条新连接发出的 OPEN 会让 TX 看起来"还在动"，而 last_rx 还停在
+    // 上一段活跃期，看门狗就把整段空窗报成 half-open（0.0.6 实测：16:32 起
+    // 空闲 6 分钟，16:38 新连接一到就误报 371.8s，1.3s 后"恢复"）。
+    stall_last_rx_ms_ = now_ms;
+    stall_last_tx_ms_ = now_ms;
+    return;
+  }
   const bool rx_moved = c.bytes_rx != stall_seen_rx_bytes_;
   const bool tx_moved = c.bytes_tx != stall_seen_tx_bytes_;
   if (rx_moved) {

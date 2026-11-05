@@ -24,6 +24,7 @@ class QProgressBar;
 class QPushButton;
 class QStackedWidget;
 class QSystemTrayIcon;
+class QTimer;
 class QToolButton;
 
 namespace fcp {
@@ -40,6 +41,8 @@ class MainWindow : public QMainWindow {
  protected:
   void closeEvent(QCloseEvent* event) override;
   void changeEvent(QEvent* event) override;
+  // Windows 唤醒事件（WM_POWERBROADCAST）走这里；网络切换走定时轮询。
+  bool nativeEvent(const QByteArray& type, void* message, qint64* result) override;
 
  private:
   // 页面搭建。
@@ -78,6 +81,11 @@ class MainWindow : public QMainWindow {
   void setupTray();
   void quitApp();
 
+  // 唤醒/网络切换后的隧道重建（P-稳定性包 5）：检测到路径变化就整组重启，
+  // 比等 idle 超时或半开僵死快得多。限频见 restartTunnel。
+  void restartTunnel(const QString& reason);
+  void onNetWatchTick();
+
   static QString fmtBytes(quint64 bytes);
   static QString fmtRate(double bytes_per_second);
   static QString fmtUptime(double seconds);
@@ -108,6 +116,7 @@ class MainWindow : public QMainWindow {
   QLineEdit* mtu_ = nullptr;
   QLineEdit* budget_ = nullptr;
   QLineEdit* k_ = nullptr;
+  QLineEdit* rate_ = nullptr;
   QPushButton* start_ = nullptr;
   QPushButton* stop_ = nullptr;
   QLabel* hint_ = nullptr;
@@ -140,7 +149,11 @@ class MainWindow : public QMainWindow {
   QLabel* sp_loss_in_n_ = nullptr;
   QLabel* sp_loss_out_ = nullptr;
   QLabel* sp_loss_out_n_ = nullptr;
+  Sparkline* sp_chart_ = nullptr;
   QProgressBar* sp_progress_ = nullptr;
+  // 进度事件差分缓冲（下标 0=down 1=up），用于实时速率曲线。
+  quint64 sp_slope_bytes_[2] = {0, 0};
+  double sp_slope_secs_[2] = {0.0, 0.0};
 
   // 日志页。
   QPlainTextEdit* log_ = nullptr;
@@ -154,6 +167,13 @@ class MainWindow : public QMainWindow {
   double last_t_ = 0.0;
   double last_tx_ = 0.0;
   double last_rx_ = 0.0;
+
+  // 唤醒/网络切换检测（Qt <6.3 没有 QNetworkInformation，Windows 用 iphlpapi
+  // 5 秒轮询适配器快照）。
+  QTimer* net_watch_ = nullptr;
+  QByteArray net_digest_;
+  QByteArray net_pending_digest_;  // 待确认的变化（连续两次相同才重建）
+  qint64 tunnel_started_ms_ = 0;
 };
 
 }  // namespace fcp

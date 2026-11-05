@@ -19,7 +19,6 @@ TOOLS="$ROOT/build/appimage/tools"
 SKIP_FCP=0
 [ "${1:-}" = "--skip-fcp" ] && SKIP_FCP=1
 
-[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 mkdir -p "$WORK" "$TOOLS"
 
 if [ "$SKIP_FCP" = 0 ]; then

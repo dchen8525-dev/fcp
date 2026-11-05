@@ -74,18 +74,18 @@ void TestWireGolden() {
   CHECK_EQ(fcp::kHelloAckLen, 52u);
   CHECK_EQ(static_cast<int>(fcp::kLocalFlagsM1), 0x07);
 
-  // "FCP_HELLO_V4" + 4 NUL padding (16-byte oob magic, erratum #25) |
+  // "FCP_HELLO_V1" + 4 NUL padding (16-byte oob magic) |
   // sender nonce (16) | caps (4).
   const Bytes hello = MakeHello(Nonce(0x11));
   CHECK_EQ(fcp_test::hex(hello.data(), hello.size()),
-           "4643505f48454c4c4f5f563400000000"
+           "4643505f48454c4c4f5f563100000000"
            "11111111111111111111111111111111"
            "010a0307");
 
   // ... and the ACK repeats the client's draw before its own.
   const Bytes ack = MakeAck(Nonce(0x11), Nonce(0x22));
   CHECK_EQ(fcp_test::hex(ack.data(), ack.size()),
-           "4643505f48454c4c4f5f41434b5f5634"
+           "4643505f48454c4c4f5f41434b5f5631"
            "11111111111111111111111111111111"
            "22222222222222222222222222222222"
            "010a0307");
@@ -95,16 +95,18 @@ void TestWireGolden() {
   CHECK(fcp::is_hello_ack(ack.data(), ack.size()));
   CHECK(!fcp::is_hello(ack.data(), ack.size()));
 
-  // The magic doubles as the handshake version: a v3 message is not a v4
-  // HELLO, so a replayed v3 handshake cannot be replayed into the old key
-  // schedule.
-  Bytes v3(20);
-  std::memcpy(v3.data(), "FCP_HELLO_V3\0\0\0\0", 16);
-  v3[16] = 1;
-  v3[17] = 10;
-  v3[18] = 3;
-  v3[19] = 0x07;
-  CHECK(!fcp::is_hello(v3.data(), v3.size()));
+  // The magic doubles as the handshake version: a well-shaped 36-byte message
+  // whose magic differs by one character is not a HELLO, and anything that is
+  // not a HELLO cannot enter our key schedule.
+  Bytes stranger(36);
+  std::memcpy(stranger.data(), "FCP_HELLO_V2\0\0\0\0", 16);
+  stranger[16] = 1;
+  stranger[17] = 10;
+  stranger[18] = 3;
+  stranger[19] = 0x07;
+  std::memcpy(stranger.data() + 20, Nonce(0x11).data(), 16);
+  CHECK(!fcp::is_hello(stranger.data(), stranger.size()));
+  CHECK(stranger.size() == fcp::kHelloLen);
 
   CHECK(!fcp::is_hello(hello.data(), hello.size() - 1));
   CHECK(!fcp::is_hello_ack(ack.data(), ack.size() - 1));
@@ -413,7 +415,7 @@ void TestTimeout() {
   CHECK(p.hs.state() == fcp::HandshakeState::kFailed);
   CHECK(p.hs.error() == fcp::HandshakeError::kNoAck);
   CHECK_EQ(p.sent.size(), 3u);
-  CHECK(std::string(fcp::handshake_error_text(p.hs.error())) == "V4 no ACK after 3 tries");
+  CHECK(std::string(fcp::handshake_error_text(p.hs.error())) == "no ACK after 3 tries");
 
   // A late tick after failure stays quiet.
   p.hs.on_tick(5000);

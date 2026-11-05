@@ -45,6 +45,11 @@ endif()
 
 target_link_libraries(fcp_gui PRIVATE Qt6::Widgets)
 
+# 网络切换检测（GetAdaptersAddresses 快照轮询）。
+if(WIN32)
+  target_link_libraries(fcp_gui PRIVATE iphlpapi)
+endif()
+
 # 开发树里的 FCP.exe 直接双击能跑：POST_BUILD 把 sidecar 与 Qt 运行库收进
 # 输出目录。发布的完整打包（依赖清点 + 单文件封装）仍走
 # scripts/desktop/build_windows.ps1，这里只保证本地运行不缺 DLL。

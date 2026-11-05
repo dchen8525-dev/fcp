@@ -34,8 +34,9 @@ if(FCP_BUILD_PROXY)
 
   if(WIN32)
     # iphlpapi: the startup MTU default reads the local interface table.
-    target_link_libraries(fcp-client PRIVATE ws2_32 iphlpapi)
-    target_link_libraries(fcp-server PRIVATE ws2_32 iphlpapi)
+    # winmm: timeBeginPeriod/timeEndPeriod around the reactor loop (P1-1).
+    target_link_libraries(fcp-client PRIVATE ws2_32 iphlpapi winmm)
+    target_link_libraries(fcp-server PRIVATE ws2_32 iphlpapi winmm)
   endif()
 
   # deb 包里只有这两个可执行文件（packaging/debian 的 spec），别的一个都不装：

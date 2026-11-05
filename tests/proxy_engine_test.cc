@@ -55,7 +55,7 @@ struct Options {
   int64_t dial_timeout_ms = 5000;
   size_t send_window_bytes = 64 * 1024;
   size_t rcv_buf_bytes = 32 * 1024;
-  // Off by default here: these tests pin the legacy fixed-window backpressure
+  // Off by default here: these tests pin the fixed-window backpressure
   // invariants. The autotune has its own test below.
   bool auto_window = false;
   // The window tests below pin the epoch controller; BBR (the shipping
@@ -75,6 +75,10 @@ struct Options {
   // false). Only the misconfiguration test sets this.
   uint16_t mtu = 1400;
   std::string trace_prefix;  // #29a: per-session controller trace when set
+  // Cap for that trace file: 0 keeps EngineConfig's shipping default
+  // (kTraceRotateBytes); the rotation test shrinks it to something a unit test
+  // can actually cross.
+  size_t trace_rotate_bytes = 0;
 };
 
 struct DialRequest {
@@ -104,6 +108,8 @@ class Harness {
     cc.role = EngineRole::kClient;
     cc.max_sessions = opt.client_max_sessions;
     cc.trace_prefix = opt.trace_prefix;
+    cc.trace_rotate_bytes =
+        opt.trace_rotate_bytes != 0 ? opt.trace_rotate_bytes : kTraceRotateBytes;
     EngineConfig sc = base;
     sc.role = EngineRole::kServer;
     sc.max_sessions = opt.server_max_sessions;
@@ -385,6 +391,18 @@ bool logged(const std::vector<std::string>& lines, const std::string& needle) {
     }
   }
   return false;
+}
+
+// Byte size of a trace file, or -1 when it does not exist.
+long trace_file_size(const char* path) {
+  std::FILE* f = std::fopen(path, "rb");
+  if (f == nullptr) {
+    return -1;
+  }
+  std::fseek(f, 0, SEEK_END);
+  const long size = std::ftell(f);
+  std::fclose(f);
+  return size;
 }
 
 // Every step here is a virtual 25ms tick, so this is a generous ceiling rather
@@ -1007,6 +1025,74 @@ void trace_sink_writes_controller_trace() {
   CHECK(std::remove("replay_trace_test/deep/dir/trace.101.jsonl") == 0);
 }
 
+// The rotation half of #29a: a trace that runs long enough must not grow
+// without bound. The shipping cap is 64 MiB -- far past a unit test -- so this
+// scenario shrinks the cap through make_trace_sink's rotate_bytes hook (via
+// Options::trace_rotate_bytes) and drives bulk traffic until the sink has
+// crossed it once: the live file restarts empty and the previous generation
+// is left behind as ".1".
+void trace_sink_rotates_at_the_cap() {
+  Options opt;
+  opt.trace_prefix = "replay_trace_test/deep/dir/rotate";  // dirs auto-created
+  constexpr size_t kRotate = 2048;
+  opt.trace_rotate_bytes = kRotate;
+  Harness h{opt};
+  post_socks5_entry(h);
+  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, kTunnelSteps));
+
+  const std::string jsonl = "replay_trace_test/deep/dir/rotate.101.jsonl";
+  const std::string backup = jsonl + ".1";
+  // One bulk burst per cycle: 400 packets clears the kFecstatMinSamples gate
+  // of a report interval, so every cycle ends on exactly one accepted report
+  // and therefore one JSONL line. The idle tail rides the loop past the 2s
+  // cadence boundary, and the cycle stops as soon as ".1" is there.
+  const std::vector<uint8_t> bulk(400 * 1336, 0x5A);
+  size_t delivered = 0;
+  bool rotated = false;
+  for (int i = 0; i < 12 && !rotated; ++i) {
+    h.local_send(kLocalConn, bulk);
+    delivered += bulk.size();
+    CHECK(h.run_until([&] {
+      return h.target_bytes(h.last_dial_conn()).size() >= delivered;
+    }, 400));
+    h.run_until([] { return false; }, 96);
+    rotated = trace_file_size(backup.c_str()) >= 0;
+  }
+  CHECK(rotated);
+
+  h.local_close(kLocalConn);
+  CHECK(h.run_until([&] {
+    return h.client->counters().live == 0 && h.server->counters().live == 0;
+  }, 200));
+
+  // The previous generation holds everything up to the crossing, so it always
+  // exceeds the cap; the live file was restarted at 0 after it and picked up
+  // at most the teardown report, so it is the smaller of the two.
+  const long backup_size = trace_file_size(backup.c_str());
+  const long jsonl_size = trace_file_size(jsonl.c_str());
+  CHECK(backup_size > 0);
+  CHECK(jsonl_size >= 0);
+  CHECK(static_cast<size_t>(backup_size) > kRotate);
+  CHECK(static_cast<size_t>(jsonl_size) < static_cast<size_t>(backup_size));
+
+  // And the recorded reports still decode back into TraceEntry (#28).
+  std::FILE* f = std::fopen(backup.c_str(), "rb");
+  CHECK(f != nullptr);
+  char line[4096];
+  int lines = 0;
+  while (std::fgets(line, sizeof(line), f) != nullptr) {
+    fcp::TraceEntry e;
+    CHECK(fcp::decode_trace_line(line, &e));
+    CHECK(e.stat.data_expected >= fcp::kMinSamplePackets);
+    ++lines;
+  }
+  std::fclose(f);
+  CHECK(lines > 0);
+
+  CHECK(std::remove(jsonl.c_str()) == 0);
+  CHECK(std::remove(backup.c_str()) == 0);
+}
+
 // A server session is born from the first datagram that carries an unknown
 // salt, so that datagram has to authenticate. Before this check anybody with a
 // UDP socket could insert one Conn per random salt and pin --max-sessions: the
@@ -1298,6 +1384,7 @@ malformed_local_requests();
   session_limits();
   salt_tombstone_absorbs_tail();
   trace_sink_writes_controller_trace();
+  trace_sink_rotates_at_the_cap();
   unauthenticated_datagrams_do_not_create_sessions();
   authenticated_non_hello_session_times_out();
   dial_backpressure_bounds_pre_tunnel_bytes();

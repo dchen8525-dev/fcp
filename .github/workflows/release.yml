@@ -264,8 +264,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-
       # Qt 6 Widgets。install-qt-action 比在 CI 里用 vcpkg 现编 Qt 快得多；
       # QT_ROOT_DIR 指到 kit 目录，脚本从这里找 Qt6Config.cmake 与 windeployqt。
       - uses: jurplel/install-qt-action@v4

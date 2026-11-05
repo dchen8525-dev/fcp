@@ -6,6 +6,7 @@
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QComboBox>
+#include <QDateTime>
 #include <QDir>
 #include <QFrame>
 #include <QGraphicsDropShadowEffect>
@@ -32,6 +33,16 @@
 #include <QVBoxLayout>
 
 #include <cmath>
+
+#ifdef Q_OS_WIN
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
+#include <windows.h>
+#endif
 
 #include "sparkline.h"
 
@@ -161,6 +172,51 @@ void addCardShadow(QFrame* card) {
   card->setGraphicsEffect(shadow);
 }
 
+#ifdef Q_OS_WIN
+// 网络切换检测（稳定性包 5）：Qt 6.3 之前没有 QNetworkInformation，改用
+// GetAdaptersAddresses 每 5 秒取一次适配器快照。换 Wi-Fi、插拔网线、断网、
+// VPN 上下线都会让快照变化；摘要只用于相等比较，不落日志。
+QByteArray adaptersDigest() {
+  ULONG size = 16 * 1024;
+  QByteArray buffer;
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    buffer.resize(static_cast<int>(size));
+    auto* head = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
+    const ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                        GAA_FLAG_SKIP_DNS_SERVER | GAA_FLAG_SKIP_FRIENDLY_NAME;
+    const ULONG err = GetAdaptersAddresses(AF_UNSPEC, flags, nullptr, head, &size);
+    if (err == ERROR_SUCCESS) {
+      QByteArray digest;
+      for (auto* adapter = head; adapter != nullptr; adapter = adapter->Next) {
+        // Only stable identity: OperStatus flaps on DHCP renew / brief link
+        // blips and adapter list order is not guaranteed, so neither may
+        // trigger a rebuild. Unicast addresses are the actual path change.
+        digest.append(adapter->AdapterName);  // GUID 字符串，结尾含 '\0'
+        digest.append(reinterpret_cast<const char*>(adapter->PhysicalAddress),
+                      static_cast<int>(adapter->PhysicalAddressLength));
+        for (auto* addr = adapter->FirstUnicastAddress; addr != nullptr;
+             addr = addr->Next) {
+          const auto* sa = addr->Address.lpSockaddr;
+          if (sa != nullptr) {
+            digest.append(reinterpret_cast<const char*>(sa),
+                          static_cast<int>(addr->Address.iSockaddrLength));
+          }
+        }
+      }
+      return digest;
+    }
+    if (err != ERROR_BUFFER_OVERFLOW) {
+      return QByteArray();  // 调用不可用/被拒：本 tick 跳过
+    }
+  }
+  return QByteArray();  // 两次扩容都装不下：跳过
+}
+#else
+QByteArray adaptersDigest() {
+  return QByteArray();
+}
+#endif
+
 }  // namespace
 
 MainWindow::MainWindow(Sidecar* sidecar, QWidget* parent)
@@ -221,6 +277,11 @@ MainWindow::MainWindow(Sidecar* sidecar, QWidget* parent)
   setRunning(false, QString());
   syncAddr();
   updateKeyState();
+
+  // 网络切换轮询只在隧道运行时开着（见 setRunning）；这里的 connect 提前挂好。
+  net_watch_ = new QTimer(this);
+  net_watch_->setInterval(5000);
+  connect(net_watch_, &QTimer::timeout, this, &MainWindow::onNetWatchTick);
 }
 
 MainWindow::~MainWindow() = default;
@@ -400,15 +461,19 @@ QWidget* MainWindow::buildConnPage() {
   mtu_ = new QLineEdit(QStringLiteral("1400"));
   budget_ = new QLineEdit(QStringLiteral("0.5"));
   k_ = new QLineEdit(QStringLiteral("-1"));
+  rate_ = new QLineEdit(QStringLiteral("0"));
   adv_layout->addWidget(makeField(QStringLiteral("本地监听地址"), listen_), 0, 0);
   adv_layout->addWidget(makeField(QStringLiteral("MTU"), mtu_), 0, 1);
   adv_layout->addWidget(
       makeField(QStringLiteral("FEC 冗余上限"), budget_, QStringLiteral("0–1")), 1, 0);
   adv_layout->addWidget(
       makeField(QStringLiteral("固定 k"), k_, QStringLiteral("-1 为自适应")), 1, 1);
-  auto* adv_note = makeLabel(QStringLiteral("不展开时按默认值提交，与显式填写效果相同。"),
-                             "fieldNote");
-  adv_layout->addWidget(adv_note, 2, 0, 1, 2);
+  adv_layout->addWidget(
+      makeField(QStringLiteral("上行限速 (Mbps)"), rate_, QStringLiteral("0 为不限")), 2, 0);
+  auto* adv_note = makeLabel(
+      QStringLiteral("不展开时按默认值提交，与显式填写效果相同。"),
+      "fieldNote");
+  adv_layout->addWidget(adv_note, 3, 0, 1, 2);
   adv_body_->setVisible(false);
   form_layout->addWidget(adv_body_);
 
@@ -666,6 +731,26 @@ QWidget* MainWindow::buildSpeedPage() {
   results->addWidget(loss_tile, 1);
   layout->addLayout(results);
 
+  // 实时速率曲线：跟运行状态页同一块 Sparkline，沙色为上行、绿色为下行；
+  // 由进度事件差分出瞬时速率，爬坡段、掉速点一目了然。
+  auto* chart_frame = new QFrame;
+  chart_frame->setProperty("role", "chart");
+  auto* chart_layout = new QVBoxLayout(chart_frame);
+  chart_layout->setContentsMargins(12, 10, 12, 8);
+  chart_layout->setSpacing(6);
+  auto* chart_head = new QHBoxLayout;
+  chart_head->setContentsMargins(0, 0, 0, 0);
+  chart_head->setSpacing(6);
+  chart_head->addWidget(makeLabel(QStringLiteral("下行"), "legendRx"));
+  chart_head->addSpacing(10);
+  chart_head->addWidget(makeLabel(QStringLiteral("上行"), "legendTx"));
+  chart_head->addStretch();
+  chart_head->addWidget(makeLabel(QStringLiteral("实时速率"), "fieldNote"));
+  chart_layout->addLayout(chart_head);
+  sp_chart_ = new Sparkline;
+  chart_layout->addWidget(sp_chart_, 1);
+  layout->addWidget(chart_frame, 1);
+
   sp_progress_ = new QProgressBar;
   sp_progress_->setRange(0, 100);
   sp_progress_->setValue(0);
@@ -680,12 +765,9 @@ QWidget* MainWindow::buildSpeedPage() {
   tip_layout->setContentsMargins(14, 11, 14, 11);
   auto* tip_text = makeRichLabel(
       QStringLiteral(
-          "服务端需以 <b>--speedtest</b> 启动。测速不复用代理会话：客户端另起一个 "
-          "fcp-client 直连服务端同一个 UDP 端口，两端直接向 FCP 帧/FEC 层灌数据符号，"
-          "绕开代理的 TCP 流窗口和 HTTP 靶子，量到的是隧道本身能承载的裸吞吐。发送速率"
-          "从 20 Mbps 起每 0.5 秒 ×1.5 自动爬升，面板取接收端最好的一秒窗口。丢包取"
-          "测速期间最后一个 FEC 统计窗口（约 2 秒）的原始丢包率，即 FEC 恢复前就丢掉"
-          "的比例，后续被补齐也不会减少；下行由本端统计，上行随服务端回报带回。"),
+          "服务端需以 <b>--speedtest</b> 启动。测速另起 fcp-client 直连同一 UDP 端口，"
+          "直接向 FCP 帧/FEC 层灌数据，量的是隧道裸吞吐。丢包为 FEC 恢复前的原始丢包率，"
+          "后续被补齐也不回改。"),
       "muted");
   tip_text->setWordWrap(true);
   tip_layout->addWidget(tip_text);
@@ -756,6 +838,7 @@ MainWindow::Collected MainWindow::collect() const {
   const QString mtu_text = open ? mtu_->text().trimmed() : QStringLiteral("1400");
   const QString k_text = open ? k_->text().trimmed() : QStringLiteral("-1");
   const QString budget_text = open ? budget_->text().trimmed() : QStringLiteral("0.5");
+  const QString rate_text = open ? rate_->text().trimmed() : QStringLiteral("0");
   const QString listen_text =
       open ? listen_->text().trimmed() : QStringLiteral("127.0.0.1");
 
@@ -774,6 +857,17 @@ MainWindow::Collected MainWindow::collect() const {
     result.error = QStringLiteral("FEC 预算应在 0..1");
     return result;
   }
+  const double rate = rate_text.toDouble(&ok);
+  // 0 = 不限；0 与 0.1 是 CLI 侧"一秒预算须装下一个完整数据报"的下限
+  //（GUI MTU 上限 9000 < 0.1 Mbps 的 12500 B/s）。
+  if (!ok || !std::isfinite(rate) || rate < 0.0 || rate > 100000.0) {
+    result.error = QStringLiteral("上行限速应在 0..100000 Mbps");
+    return result;
+  }
+  if (rate > 0.0 && rate < 0.1) {
+    result.error = QStringLiteral("上行限速太小无法整形，请用 ≥0.1 Mbps 或 0（不限）");
+    return result;
+  }
   if (listen_text.isEmpty()) {
     result.error = QStringLiteral("本地监听地址不能为空");
     return result;
@@ -787,6 +881,7 @@ MainWindow::Collected MainWindow::collect() const {
   result.config.mtu = mtu;
   result.config.k = k;
   result.config.fec_budget = budget;
+  result.config.rate_up_mbps = rate;
   result.ok = true;
   return result;
 }
@@ -800,8 +895,8 @@ void MainWindow::setRunning(bool running, const QString& hint) {
         static_cast<QWidget*>(listen_port_), static_cast<QWidget*>(key_),
         static_cast<QWidget*>(remember_), static_cast<QWidget*>(listen_),
         static_cast<QWidget*>(mtu_), static_cast<QWidget*>(budget_),
-        static_cast<QWidget*>(k_), static_cast<QWidget*>(adv_toggle_),
-        static_cast<QWidget*>(key_toggle_)}) {
+        static_cast<QWidget*>(k_), static_cast<QWidget*>(rate_),
+        static_cast<QWidget*>(adv_toggle_), static_cast<QWidget*>(key_toggle_)}) {
     widget->setEnabled(!running);
   }
   speed_start_->setEnabled(!speed_running_);
@@ -826,6 +921,17 @@ void MainWindow::setRunning(bool running, const QString& hint) {
   const int page = running ? 1 : 0;
   if (page < nav_.size()) {
     nav_.at(page)->setChecked(true);
+  }
+  // 网络切换检测只在隧道运行时有意义：启动时取基线快照，停止即收。
+  if (running) {
+    if (net_watch_ != nullptr && !net_watch_->isActive()) {
+      net_digest_ = adaptersDigest();
+      net_watch_->start();
+    }
+  } else if (net_watch_ != nullptr) {
+    net_watch_->stop();
+    net_digest_.clear();
+    net_pending_digest_.clear();
   }
 }
 
@@ -909,6 +1015,7 @@ void MainWindow::onStart() {
   }
   saveSettings();
   last_t_ = last_tx_ = last_rx_ = 0.0;
+  tunnel_started_ms_ = QDateTime::currentMSecsSinceEpoch();
   setHint(QStringLiteral("本地代理 %1:%2 → %3:%4")
               .arg(collected.config.listen)
               .arg(collected.config.listen_port)
@@ -955,6 +1062,10 @@ void MainWindow::onSpeedStart() {
   sp_loss_out_->setText(QStringLiteral("--"));
   sp_loss_out_n_->clear();
   sp_progress_->setValue(0);
+  // 曲线从零开始：清掉上一轮的折线与差分缓冲。
+  sp_chart_->reset();
+  sp_slope_bytes_[0] = sp_slope_bytes_[1] = 0;
+  sp_slope_secs_[0] = sp_slope_secs_[1] = 0.0;
   speed_hint_->setText(QStringLiteral("测速中… 下行 %1s + 上行 %1s").arg(seconds));
   speed_hint_->setProperty("role", "hint");
   repolish(speed_hint_);
@@ -1063,6 +1174,17 @@ void MainWindow::onSpeedProgress(const QString& direction, quint64 bytes, double
     return;
   }
   const bool up = direction == QLatin1String("up");
+  const int idx = up ? 1 : 0;
+  // 曲线：相邻进度事件差分出瞬时速率（Mbps）。进展字节两向都是接收端口径、
+  // 单调不减（bench 层保证），零差值是真实的静默，照画。
+  const double dt = seconds - sp_slope_secs_[idx];
+  if (dt > 0.05) {
+    const double mbps =
+        static_cast<double>(bytes - sp_slope_bytes_[idx]) * 8.0 / dt / 1e6;
+    sp_slope_bytes_[idx] = bytes;
+    sp_slope_secs_[idx] = seconds;
+    sp_chart_->addSample(up ? mbps : 0.0, up ? 0.0 : mbps);
+  }
   const int total = qMax(3, speed_seconds_->currentData().toInt());
   const double base = up ? 50.0 : 0.0;
   sp_progress_->setValue(
@@ -1096,6 +1218,11 @@ void MainWindow::onSpeedDone(const QJsonObject& result) {
             : true;
     value->setText(QString::number(mbps, 'f', 2));
     QString text = QStringLiteral("%1 / %2s").arg(fmtBytes(bytes)).arg(seconds, 0, 'f', 1);
+    // 灌帧速率：发送端对帧层的注入速率，与上面的 mbps 对比就是开销/丢包吃掉的。
+    const double wire = sample.value(QStringLiteral("wireMbps")).toDouble();
+    if (wire > 0) {
+      text += QStringLiteral(" · 灌帧 %1").arg(wire, 0, 'f', 1);
+    }
     if (!acked) {
       const quint64 lost = static_cast<quint64>(
           sample.value(QStringLiteral("lostBytes")).toDouble());
@@ -1128,7 +1255,24 @@ void MainWindow::onSpeedDone(const QJsonObject& result) {
   const QString error = result.value(QStringLiteral("error")).toString();
   // 失败就归零，别留一条满格绿条让人以为测完了。
   sp_progress_->setValue(error.isEmpty() ? 100 : 0);
-  speed_hint_->setText(error.isEmpty() ? QStringLiteral("测速完成") : error);
+  // 建立耗时与链路延迟（最小/均值）随行显示；报错时给错误本身让位。
+  QString extra;
+  const double setup_ms = result.value(QStringLiteral("setupMs")).toDouble();
+  if (setup_ms >= 1) {
+    extra = setup_ms < 1000 ? QStringLiteral("建立 %1ms").arg(setup_ms, 0, 'f', 0)
+                            : QStringLiteral("建立 %1s").arg(setup_ms / 1000.0, 0, 'f', 1);
+  }
+  const int rtt_n = static_cast<int>(result.value(QStringLiteral("rttN")).toDouble());
+  if (rtt_n > 0) {
+    const int rtt_min = static_cast<int>(result.value(QStringLiteral("rttMinMs")).toDouble());
+    const int rtt_avg = static_cast<int>(result.value(QStringLiteral("rttAvgMs")).toDouble());
+    extra += (extra.isEmpty() ? QString() : QStringLiteral(" · ")) +
+             QStringLiteral("延迟 %1/%2ms").arg(rtt_min).arg(rtt_avg);
+  }
+  speed_hint_->setText(error.isEmpty()
+                           ? (extra.isEmpty() ? QStringLiteral("测速完成")
+                                              : QStringLiteral("测速完成 · %1").arg(extra))
+                           : error);
   speed_hint_->setProperty("role", error.isEmpty() ? "hint" : "hintError");
   repolish(speed_hint_);
 }
@@ -1164,6 +1308,7 @@ void MainWindow::loadSettings() {
     budget_->setText(
         settings.value(QStringLiteral("budget"), QStringLiteral("0.5")).toString());
     k_->setText(settings.value(QStringLiteral("k"), QStringLiteral("-1")).toString());
+    rate_->setText(settings.value(QStringLiteral("rate"), QStringLiteral("0")).toString());
     key_->setText(settings.value(QStringLiteral("key")).toString());
     const int seconds = settings.value(QStringLiteral("speedSeconds"), 8).toInt();
     for (int i = 0; i < speed_seconds_->count(); ++i) {
@@ -1197,6 +1342,7 @@ void MainWindow::saveSettings() {
   settings.setValue(QStringLiteral("mtu"), mtu_->text());
   settings.setValue(QStringLiteral("budget"), budget_->text());
   settings.setValue(QStringLiteral("k"), k_->text());
+  settings.setValue(QStringLiteral("rate"), rate_->text());
   settings.setValue(QStringLiteral("key"), key_->text());
   settings.setValue(QStringLiteral("advanced"), advanced_);
   settings.setValue(QStringLiteral("speedSeconds"), speed_seconds_->currentData().toInt());
@@ -1257,6 +1403,72 @@ void MainWindow::changeEvent(QEvent* event) {
       tray_->isVisible()) {
     QTimer::singleShot(0, this, [this] { hide(); });
   }
+}
+
+bool MainWindow::nativeEvent(const QByteArray& type, void* message, qint64* result) {
+#ifdef Q_OS_WIN
+  if (type == QStringLiteral("windows_generic_MSG")) {
+    auto* msg = static_cast<MSG*>(message);
+    // PBT_APMRESUMEAUTOMATIC = 系统从睡眠/休眠恢复（用户触发与否都算）。
+    // 唤醒后 UDP 路径通常已经换过一轮（NAT 映射失效），整组重建最干净。
+    if (msg->message == WM_POWERBROADCAST && msg->wParam == PBT_APMRESUMEAUTOMATIC &&
+        running_) {
+      restartTunnel(QStringLiteral("系统唤醒"));
+    }
+  }
+#endif
+  return QMainWindow::nativeEvent(type, message, result);
+}
+
+void MainWindow::onNetWatchTick() {
+  if (!running_) {
+    return;
+  }
+  const QByteArray digest = adaptersDigest();
+  if (digest.isEmpty()) {
+    return;  // API 不可读：跳过本 tick，保留上一次的基线
+  }
+  // 基线为空只记快照不动作（启动后第一次拉取）。变化要连续两个 tick 一致
+  // 才算真切换：一次 DHCP 续租 / 瞬断抖动不该把整条隧道拆了重建。
+  if (net_digest_.isEmpty()) {
+    net_digest_ = digest;
+    net_pending_digest_.clear();
+    return;
+  }
+  if (digest == net_digest_) {
+    net_pending_digest_.clear();
+    return;
+  }
+  if (digest == net_pending_digest_) {
+    net_pending_digest_.clear();
+    net_digest_ = digest;
+    restartTunnel(QStringLiteral("网络适配器变化"));
+    return;
+  }
+  net_pending_digest_ = digest;
+}
+
+void MainWindow::restartTunnel(const QString& reason) {
+  if (!running_) {
+    return;
+  }
+  // 事件风暴限频：刚 (重) 建的隧道 3 秒内再触发大概率是同一轮事件的余波，
+  // 重启只会把新建的连接又拆一遍。
+  const qint64 now = QDateTime::currentMSecsSinceEpoch();
+  if (tunnel_started_ms_ != 0 && now - tunnel_started_ms_ < 3000) {
+    appendLog(QStringLiteral("网络事件 %1 与重建隔得过近，跳过").arg(reason), true);
+    return;
+  }
+  appendLog(QStringLiteral("网络事件：%1 → 重建隧道").arg(reason), true);
+  tunnel_started_ms_ = 0;
+  onStop();
+  // 400ms 后再拉起；若这中间用户手动点了停止，就尊重他——不再掉钩启动。
+  QTimer::singleShot(400, this, [this] {
+    if (running_) {
+      return;
+    }
+    onStart();
+  });
 }
 
 QString MainWindow::fmtBytes(quint64 bytes) {

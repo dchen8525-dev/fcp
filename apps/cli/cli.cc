@@ -165,6 +165,7 @@ const std::vector<tools::Alias>& OptionAliases() {
       {"--no-pmtud", false},
       {"--no-window-probe", false},
       {"--no-bbr", false},
+      {"--no-udp-gro", false},
       {"--bbr-version", true},
       {"--idle", true},
       {"--dial-timeout", true},
@@ -172,6 +173,8 @@ const std::vector<tools::Alias>& OptionAliases() {
       {"--max-sessions", true},
       {"--speedtest", false},
       {"--speedtest-seconds", true},
+      {"--stall-ms", true},
+      {"--rate-limit", true},
       {"--no-prewarm", false},
       {"--log", true},
       {"--help", false},
@@ -218,6 +221,9 @@ void Usage(EngineRole role, const char* argv0) {
       "                       default; both ends must support it)\n"
       "  --pmtu-max=N         largest IP packet PMTUD may prove, 1280..9000\n"
       "                       (default 1500; jumbo is a LAN property, ask for it)\n"
+      "  --no-udp-gro         disable kernel UDP GRO receive aggregation (Linux\n"
+      "                       only; on by default, dropped quietly if the kernel\n"
+      "                       cannot)\n"
       "  --fec=D:P            frame geometry (default 10:3)\n"
       "  --p-max=N            controller parity ceiling 0..7 (default 4; the\n"
       "                       documented 5..7 range needs this raised)\n"
@@ -252,6 +258,13 @@ void Usage(EngineRole role, const char* argv0) {
       "  --connect-timeout=ms per-address TCP connect budget (default 5000)\n"
       "  --max-sessions=N     concurrent sessions (default 256; warns when the fd\n"
       "                       or address-space limit cannot cover the worst case)\n"
+      "  --rate-limit=UP[:DOWN]  Mbps send shaping (0 = off); the client enforces\n"
+      "                       UP, the server enforces DOWN -- each end shapes the\n"
+      "                       direction it sends, inapplicable half is a setting\n"
+      "                       for the other end\n"
+      "  --stall-ms=N         client dead-path watchdog: log a stall when TX\n"
+      "                       keeps moving but nothing comes back for N ms\n"
+      "                       (0 = off, default 60000)\n"
       "  --no-prewarm         start every session cold (default: reuse RTT/k/window priors)\n"
       "  --log=LEVEL          off (default; exit summary only) |\n"
       "                       stats[:ms] (periodic line) | verbose\n"
@@ -329,6 +342,8 @@ struct ProxyFlags {
   SeenValue max_sessions;
   bool speedtest = false;
   SeenValue speedtest_seconds;
+  SeenValue stall_ms;
+  SeenValue rate_limit;
   SeenValue log;
   SeenValue rcv_buf;
   SeenValue fec_budget;
@@ -341,6 +356,7 @@ struct ProxyFlags {
   bool no_auto_window = false;
   bool no_window_probe = false;
   bool no_bbr = false;
+  bool no_udp_gro = false;
   SeenValue bbr_version;
 };
 
@@ -383,6 +399,10 @@ bool ApplyValue(const tools::Match& m, ProxyFlags* f, ParsedWindows* windows, Pr
     f->speedtest = true;
   } else if (name == "--speedtest-seconds") {
     f->speedtest_seconds = {true, v};
+  } else if (name == "--stall-ms") {
+    f->stall_ms = {true, v};
+  } else if (name == "--rate-limit") {
+    f->rate_limit = {true, v};
   } else if (name == "--log") {
     f->log = {true, v};
   } else if (name == "--rcv-buf") {
@@ -407,6 +427,8 @@ bool ApplyValue(const tools::Match& m, ProxyFlags* f, ParsedWindows* windows, Pr
     f->no_window_probe = true;
   } else if (name == "--no-bbr") {
     f->no_bbr = true;
+  } else if (name == "--no-udp-gro") {
+    f->no_udp_gro = true;
   } else if (name == "--bbr-version") {
     f->bbr_version = {true, v};
   } else if (name == "--fec") {
@@ -697,12 +719,11 @@ std::string JsonEscape(const std::string& in) {
   return out;
 }
 
-std::string BenchSampleJson(const bench::Sample& s, double user_bytes_per_sec) {
-  // "wireMbps" is the offered load at the framer (user bytes plus the 16-byte
-  // bench header); "mbps" is what the receiver counted, post-FEC and
-  // post-dedup. The gap between them is FEC redundancy plus whatever the
-  // direction lost.
-  const double wire_mbps = user_bytes_per_sec * 8.0 / 1e6;
+std::string BenchSampleJson(const bench::Sample& s) {
+  // "wireMbps" is the sender's best one-second offered (framer) rate; "mbps"
+  // is the receiver's best one-second delivered rate, post-FEC and post-dedup.
+  // The gap between them is FEC redundancy plus whatever the direction lost.
+  const double wire_mbps = static_cast<double>(s.wire_bps) / 1e6;
   char buf[320];
   std::snprintf(buf, sizeof(buf),
                 "{\"mbps\":%.2f,\"wireMbps\":%.2f,\"bytes\":%llu,\"lostBytes\":%llu,"
@@ -741,17 +762,19 @@ int RunBench(const ProxyArgs& args) {
   std::string json = "{\"event\":\"done\",\"seconds\":";
   json += std::to_string(args.speedtest_seconds);
   json += ",\"download\":";
-  // The download's offered rate is not known to this process (the server
-  // sends it), so only the upload side carries wireMbps.
-  json += result.have_download ? BenchSampleJson(result.download, 0.0) : "null";
+  json += result.have_download ? BenchSampleJson(result.download) : "null";
   json += ",\"upload\":";
-  json += result.have_upload
-              ? BenchSampleJson(result.upload,
-                                result.upload.seconds > 0
-                                    ? static_cast<double>(result.upload.bytes) /
-                                          result.upload.seconds
-                                    : 0.0)
-              : "null";
+  json += result.have_upload ? BenchSampleJson(result.upload) : "null";
+  json += ",\"setupMs\":";
+  json += std::to_string(result.setup_ms);
+  json += ",\"rttN\":";
+  json += std::to_string(result.rtt.n);
+  json += ",\"rttMinMs\":";
+  json += std::to_string(result.rtt.min_ms);
+  json += ",\"rttAvgMs\":";
+  json += std::to_string(result.rtt.avg_ms);
+  json += ",\"rttMaxMs\":";
+  json += std::to_string(result.rtt.max_ms);
   json += ",\"error\":";
   json += result.error.empty() ? "null" : "\"" + JsonEscape(result.error) + "\"";
   json += "}";
@@ -1150,6 +1173,11 @@ bool parse_proxy_args(EngineRole role, int argc, char** argv, ProxyArgs* out,
   if (given.no_auto_window) {
     out->ec.auto_window = false;
   }
+  // UDP GRO (kernel-side receive aggregation) defaults on: it pairs with the
+  // GSO batch sender and the reactor drops it quietly when the kernel cannot
+  // -- but a benchmarked-gainful environment can retire it here instead of
+  // recompiling (docs/交付历史.md §32 saw loopback CPU-side regressions).
+  out->ro.udp_gro = !given.no_udp_gro;
   out->ec.window_probe = !given.no_window_probe;
   // BBR is the default congestion controller for the adaptive window. The
   // epoch controller (--no-bbr) is kept for comparison and for reproducing
@@ -1364,6 +1392,101 @@ bool parse_proxy_args(EngineRole role, int argc, char** argv, ProxyArgs* out,
       return false;
     }
     out->speedtest_seconds = static_cast<int>(n);
+  }
+  // --stall-ms belongs to the client: the tunnel's inbound stream is watched
+  // from the end that keeps pushing traffic into it, and every deployment has
+  // the client pushing (the server only relays back). One client-side flag is
+  // the whole picture.
+  if (given.stall_ms.given) {
+    if (role != EngineRole::kClient) {
+      *error = "--stall-ms only applies to the client";
+      return false;
+    }
+    long n = 0;
+    if (!tools::ParseLong("--stall-ms", given.stall_ms.value.c_str(), 0, 86400000, &n, error)) {
+      return false;
+    }
+    out->ro.stall_ms = static_cast<int64_t>(n);
+  }
+  // --rate-limit=UP[:DOWN] Mbps. Each end shapes only the direction it sends:
+  // the client takes the UP half, the server the DOWN half. The other half is
+  // parsed and echoed in a note because arguments do not cross the wire --
+  // the far end needs its own --rate-limit to enforce them.
+  if (given.rate_limit.given) {
+    // Client one-shot only: there is no tunnel to shape, so the flag has
+    // nothing to apply to. The server's --speedtest is different -- it merely
+    // ADDS the bench responder while the proxy keeps running, so --rate-limit
+    // stays meaningful there (it shapes the tunnels; the responder measures
+    // raw throughput by design and is deliberately unshaped).
+    if (role == EngineRole::kClient && given.speedtest) {
+      *error = "--rate-limit does not apply to the one-shot --speedtest run "
+               "(it measures raw link throughput)";
+      return false;
+    }
+    const auto mbps = [](double v) {
+      std::string s = std::to_string(v);  // fixed 6 decimals
+      s = s.substr(0, s.find('.') + 7);   // keep all 6: halves can be tiny
+      while (s.back() == '0') {
+        s.pop_back();
+      }
+      if (s.back() == '.') {
+        s.pop_back();
+      }
+      return s;
+    };
+    const std::vector<std::string> parts = tools::SplitFields(given.rate_limit.value);
+    if (parts.empty() || parts.size() > 2) {
+      *error = "--rate-limit takes UP or UP:DOWN (got '" + given.rate_limit.value + "')";
+      return false;
+    }
+    double rate[2] = {0.0, 0.0};
+    for (size_t i = 0; i < parts.size(); ++i) {
+      if (parts[i].empty()) {
+        *error = "--rate-limit half " + std::to_string(i + 1) + " is empty (got '" +
+                 given.rate_limit.value + "')";
+        return false;
+      }
+      if (!tools::ParseDouble(i == 0 ? "--rate-limit UP" : "--rate-limit DOWN",
+                              parts[i].c_str(), 0.0, 100000.0, &rate[i], error)) {
+        return false;
+      }
+    }
+    const size_t mine = role == EngineRole::kClient ? 0 : 1;
+    if (rate[mine] <= 0.0) {
+      *error = "--rate-limit shapes nothing here: the " +
+               std::string(mine == 0 ? "client applies UP" : "server applies DOWN") +
+               ", so '" + given.rate_limit.value + "' leaves this end unshaped "
+               "(shown in Mbps)";
+      return false;
+    }
+    const uint64_t bytes_per_sec = static_cast<uint64_t>(rate[mine] * 125000.0 + 0.5);
+    if (bytes_per_sec < static_cast<uint64_t>(out->ec.mtu)) {
+      // One second of budget must admit at least one full datagram; below
+      // that the shaper's >budget passthrough fires on every symbol and the
+      // link runs unshaped while the config line still prints a rate.
+      *error = "--rate-limit " + given.rate_limit.value +
+               " is too small to shape anything: one second of budget (" +
+               std::to_string(bytes_per_sec) +
+               " B/s) is below one datagram at --mtu=" +
+               std::to_string(static_cast<int>(out->ec.mtu)) +
+               "; raise the rate";
+      return false;
+    }
+    if (mine == 0) {
+      out->ro.rate_up_bytes = bytes_per_sec;
+      if (rate[1] > 0.0) {
+        out->notes.push_back("[fcp] note: --rate-limit DOWN=" + mbps(rate[1]) +
+                             " Mbps is enforced by the server; give the server its "
+                             "own --rate-limit=<UP>:DOWN");
+      }
+    } else {
+      out->ro.rate_down_bytes = bytes_per_sec;
+      if (rate[0] > 0.0) {
+        out->notes.push_back("[fcp] note: --rate-limit UP=" + mbps(rate[0]) +
+                             " Mbps is enforced by the client; give the client its "
+                             "own --rate-limit=UP[:DOWN]");
+      }
+    }
   }
   return true;
 }

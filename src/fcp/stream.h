@@ -115,8 +115,8 @@ enum class CloseReason : uint8_t {
 struct StreamConfig {
   // Largest segment payload the session can carry: Session::mtu_limits().payload_max.
   size_t max_segment = 1336;
-  // Send window. With auto_window off this is the fixed window (legacy
-  // behaviour); with it on it is only the starting value -- see below.
+  // Send window. With auto_window off this is the constant window; with it on
+  // it is only the starting value -- see below.
   size_t send_window_bytes = kDefaultSendWindowBytes;
   // Set when send_window_bytes came from an explicit choice (a CLI --window or
   // the GUI spinbox) rather than the default. The prewarm cache may replace a
@@ -294,6 +294,9 @@ class Stream {
   uint64_t bytes_delivered() const { return bytes_delivered_; }
   uint64_t retransmits() const { return retransmits_; }
   uint64_t retx_fast() const { return retx_fast_; }
+  // Dup-burst repairs that a cumulative advance discounted as reordering;
+  // each one widens the burst gates for this stream (P1-3).
+  uint64_t spur_bursts() const { return spur_bursts_; }
   uint64_t retx_fill() const { return retx_fill_; }
   uint64_t retx_rto() const { return retx_rto_; }
   // Probes sent by the tail-loss timer, apart from RTO repairs and fills.
@@ -535,12 +538,28 @@ class Stream {
   bool eof_delivered_ = false;
   bool notified_ = false;            // ClosedFn fires at most once per stream
   // #27: duplicate-ACK tracking on the send side (same cumulative point as
-  // the previous ACK while data is unacked). At kDupAckThresh, force-retransmit
-  // tx_.front() once per batch — this is the only path through the
-  // sack_filled_up_to_ guard when a repair itself was lost.
+  // the previous ACK while data is unacked). At the effective packet
+  // threshold, force-retransmit tx_.front() once per batch — this is the only
+  // path through the sack_filled_up_to_ guard when a repair itself was lost.
   uint32_t last_cum_ = 0;
   uint32_t dup_acks_ = 0;
   bool have_cum_ = false;
+
+  // Adaptive reordering tolerance (borrowed from quic-go): a dup-ACK burst
+  // that fires and is then confirmed by a cumulative advance sooner than one
+  // round trip cannot have been answered by the repair copy — the repaired
+  // byte needed its own transit — so the burst raced a reordered original and
+  // the retransmission was spurious. Each observation widens the first-burst
+  // time gate (`reorder_grace_ms_`) geometrically from one eighth of an RTT
+  // up to a full RTT and doubles the packet threshold, so reordered shadows
+  // stop firing repairs; behaviour is byte-identical to the fixed thresholds
+  // until the first spurious repair is observed on that stream.
+  int64_t reorder_grace_ms_ = 0;
+  uint32_t dup_thresh_ = kDupAckThresh;
+  // Earliest duplicate-burst retransmission still unexplained (for the
+  // since-burst < RTT test above); -1 = none.
+  int64_t dup_burst_ms_ = -1;
+  uint64_t spur_bursts_ = 0;  // diagnostics: dup-bursts confirmed spurious
 
   // BBR (auto mode when cfg_.bbr): the model, the round boundary used to tell
   // "a new RTT has started" on a cumulative ACK, and the pacing token bucket.

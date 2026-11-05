@@ -16,8 +16,24 @@
 #include <cerrno>
 #include <fcntl.h>
 #include <netdb.h>
+#include <netinet/udp.h>
 #include <sys/select.h>
 #include <unistd.h>
+#else
+#include <timeapi.h>
+#endif
+
+#ifdef __linux__
+// UDP GSO segmentation cmsg (kernel >= 4.18; older glibc headers lack it, the
+// socket setup below degrades to plain sends when the kernel rejects it).
+#ifndef UDP_SEGMENT
+#define UDP_SEGMENT 103
+#endif
+// Receive aggregation socket option (kernel >= 5.0). The same-numbered cmsg
+// on recvmsg names the segment size of a coalesced read; see drain_gro().
+#ifndef UDP_GRO
+#define UDP_GRO 104
+#endif
 #endif
 
 namespace fcp {
@@ -34,6 +50,29 @@ std::string ErrText(int err) {
   std::snprintf(buf, sizeof(buf), "winsock error %d", err);
   return buf;
 }
+// Windows select() quantizes its timeout to the system timer tick (~15.6 ms),
+// unless the process raises the timer resolution. Everything in the reactor
+// below one tick -- the pacer's token release, delayed ACKs, TLP/PMTU probes --
+// then arrives at whole ~15 ms quanta, which is the Windows-only slice of the
+// quic-go pacer gap. timeGivePeriod requests 1 ms around the whole run loop.
+struct TimerResolution {
+  explicit TimerResolution(bool want) {
+    if (want) {
+      timeBeginPeriod(1);
+      active_ = true;
+    }
+  }
+  ~TimerResolution() {
+    if (active_) {
+      timeEndPeriod(1);
+    }
+  }
+  TimerResolution(const TimerResolution&) = delete;
+  TimerResolution& operator=(const TimerResolution&) = delete;
+
+ private:
+  bool active_ = false;
+};
 #else
 using SOCKET = int;
 int SockErr() { return errno; }
@@ -74,11 +113,38 @@ bool SetNonBlocking(SOCKET s) {
 #endif
 }
 
+// Borrowed from quic-go's sys_conn (7 MiB receive buffer): on an untuned
+// kernel even ~1 KB/MTU packets queue up exactly no room at all on a
+// multi-hundred-Mbps link, and the reactor's single-threaded select() loop
+// makes the socket the only buffer between the NIC and sessions. The Linux
+// *_FORCE setsockopts ask the kernel to go past rmem_max/wmem_max (quic-go
+// does the same via GSO-capable socket setup); without CAP_NET_ADMIN they
+// fail and we fall back to the plain options, which are capped at the sysctl.
+#ifdef _WIN32
 void TuneUdp(SOCKET s) {
-  const int size = 2 * 1024 * 1024;
+  const int size = 7 * 1024 * 1024;
   setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&size), sizeof(size));
   setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&size), sizeof(size));
 }
+#else
+#ifndef SO_RCVBUFFORCE
+#define SO_RCVBUFFORCE 33
+#endif
+#ifndef SO_SNDBUFFORCE
+#define SO_SNDBUFFORCE 34
+#endif
+static bool SockBufForceOrPlain(SOCKET s, int force_opt, int plain_opt, int size) {
+  if (setsockopt(s, SOL_SOCKET, force_opt, &size, sizeof(size)) == 0) {
+    return true;
+  }
+  return setsockopt(s, SOL_SOCKET, plain_opt, &size, sizeof(size)) == 0;
+}
+void TuneUdp(SOCKET s) {
+  const int size = 7 * 1024 * 1024;
+  SockBufForceOrPlain(s, SO_RCVBUFFORCE, SO_RCVBUF, size);
+  SockBufForceOrPlain(s, SO_SNDBUFFORCE, SO_SNDBUF, size);
+}
+#endif
 
 // PMTUD (pmtu.h) is only sound when the kernel refuses to fragment: a router
 // that fragments an oversized probe lets it arrive, and the session would then
@@ -235,6 +301,30 @@ bool Reactor::open_udp(std::string* error) {
     return false;
   }
   TuneUdp(udp_);
+#ifdef __linux__
+  // P1-4 receive arena, allocated only on Linux. The slot bound has to cover
+  // the largest GRO bundle: 64 segments within the biggest datagram this
+  // socket can carry — the PMTUD ceiling when probing is on (a raised receive
+  // size is how that ladder works), else --mtu.
+  const size_t wire_cap =
+      base_config_.pmtud && base_config_.pmtu_max_mtu > base_config_.mtu
+          ? static_cast<size_t>(base_config_.pmtu_max_mtu)
+          : static_cast<size_t>(base_config_.mtu);
+  udp_slot_bytes_ = 64 * wire_cap;
+  udp_batch_.resize(static_cast<size_t>(kRecvBatchMsgs) * udp_slot_bytes_);
+  // Receive aggregation: same-size same-flow datagrams coalesce in-kernel and
+  // the read names its segment size via cmsg. On by default (--no-udp-gro to
+  // retire it); a kernel without UDP_GRO (or a sandbox that says no) keeps the
+  // plain loop below.
+  if (opt_.udp_gro) {
+    const int one = 1;
+    if (setsockopt(udp_, SOL_UDP, UDP_GRO, &one, sizeof(one)) != 0) {
+      gro_ok_ = false;
+    }
+  } else {
+    gro_ok_ = false;
+  }
+#endif
   // DF is socket-wide, so it also covers the configured-size data path. Only
   // ask for it when PMTUD is actually on: with --no-pmtud (or when the CLI
   // disabled it because --mtu exceeds the local interface) the old behaviour --
@@ -352,10 +442,18 @@ bool Reactor::start(std::string* error) {
   }
   wsa_owner_ = true;
 #endif
+  // Startup phase timing: the console/one-shot companions of the desktop
+  // launcher (P-启动快照). Measured here, printed once below the endpoint echo.
+  const int64_t started_at = NowMs();
   if (!open_udp(error)) {
     return false;
   }
+  const int64_t udp_done = NowMs();
+  int64_t listener_done = udp_done;
   if (opt_.role == EngineRole::kServer && opt_.speedtest) {
+    // The responder's send callback goes straight to ::sendto and thus bypasses
+    // the shaper on purpose: the bench measures raw link throughput (--rate-limit
+    // shapes the tunnels this server also serves, which this socket is not).
     bench::Options bench_options;
     std::memcpy(bench_options.key, base_config_.key, sizeof(bench_options.key));
     bench_options.d = base_config_.d;
@@ -389,10 +487,12 @@ bool Reactor::start(std::string* error) {
     }
     return false;
   }
+  listener_done = NowMs();
   workers_.reserve(kResolverWorkers);
   for (size_t i = 0; i < kResolverWorkers; ++i) {
     workers_.emplace_back([queue = resolve_]() { resolve_worker(queue); });
   }
+  const int64_t workers_done = NowMs();
   if (opt_.role == EngineRole::kClient) {
     std::printf("client: socks5/http on %s -> fcp %s\n",
                 host_port(opt_.listen_addr, opt_.listen_port).c_str(),
@@ -403,6 +503,33 @@ bool Reactor::start(std::string* error) {
       std::printf("server: speedtest responder on the same UDP port\n");
     }
   }
+  // One-line config echo for support tickets. Never prints key material: the
+  // PSK lives in a file or an environment variable and stays there (C-18).
+  {
+    const EngineConfig& ec = base_config_;
+    std::string where = opt_.role == EngineRole::kClient
+                            ? host_port(opt_.listen_addr, opt_.listen_port) + " -> " +
+                                  host_port(opt_.remote_host, opt_.remote_port)
+                            : host_port(opt_.bind_addr, opt_.bind_port);
+    std::printf(
+        "config: %s mtu=%u pmtud=%s pmtu_max=%u fec=%u:%u p_max=%u k=%d budget=%.2f "
+        "window=%s:%zuK bbr=v%d probe=%s ackx%u idle=%.0fs stall=%lldms rate=%.1fMbps\n",
+        where.c_str(), static_cast<unsigned>(ec.mtu), ec.pmtud ? "on" : "off",
+        static_cast<unsigned>(ec.pmtu_max_mtu), static_cast<unsigned>(ec.d),
+        static_cast<unsigned>(ec.p), static_cast<unsigned>(ec.p_max), ec.pinned_k,
+        ec.fec_budget, ec.auto_window ? "auto" : "fixed",
+        ec.send_window_bytes / 1024, ec.bbr_version, ec.window_probe ? "on" : "off",
+        static_cast<unsigned>(ec.ack_every), ec.idle_timeout_ms / 1000.0,
+        static_cast<long long>(opt_.role == EngineRole::kClient ? opt_.stall_ms : 0),
+        static_cast<double>(shaper_bytes_per_sec()) * 8.0 / 1e6);
+  }
+  // The "startup" line names bytes/s as Mbps because it is what the shaper
+  // was handed; --rate-limit halves that do not apply to this role read 0.
+  std::printf("startup: udp=%dms listen=%dms workers=%dms total=%dms\n",
+              static_cast<int>(udp_done - started_at),
+              static_cast<int>(listener_done - udp_done),
+              static_cast<int>(workers_done - listener_done),
+              static_cast<int>(workers_done - started_at));
   std::fflush(stdout);
   // Save the handlers this instance replaces: they are process-wide, and a
   // second Reactor in the same process must not inherit a stale callback.
@@ -427,6 +554,12 @@ bool Reactor::start(std::string* error) {
   started_ms_ = NowMs();
   next_tick_ms_ = started_ms_;
   next_stats_ms_ = opt_.stats_ms != 0 ? started_ms_ + opt_.stats_ms : 0;
+  // The watchdog measures "no inbound since X"; without a seed, a tunnel that
+  // has never received a byte would look dark since epoch 0 and the first
+  // outbound datagram would instantly declare a stall. Start both clocks at
+  // startup so the first stall can only be a real silence after real traffic.
+  stall_last_rx_ms_ = started_ms_;
+  stall_last_tx_ms_ = started_ms_;
   return true;
 }
 
@@ -435,10 +568,17 @@ void Reactor::run() {
   // Reactor that was stopped and started again must not exit on the first
   // loop iteration because of the previous run's signal (A-13).
   g_signalled.store(false);
+  // Sub-tick wakeups need the 1 ms timer resolution; see TimerResolution. A
+  // server that would rather trade latency for CPU is out of scope here: the
+  // pacer fires under this resolution by design (P1-1).
+#ifdef _WIN32
+  TimerResolution timer(true);
+#endif
   while (!g_signalled.load()) {
     int64_t now = NowMs();
 
     flush_dead_apps(now);
+    flush_wire_deferred(now);
     drain_resolves(now);
     drain_udp(now);
     expire_connects(now);
@@ -461,6 +601,12 @@ void Reactor::run() {
     // next segment. Without it the token bucket and delayed ACKs would only
     // move on the 25 ms tick, which is what turned BBR pacing into a burst
     // emitter and delayed a short exchange's ACK by up to a tick.
+#ifdef __linux__
+    // The engine's sends during this iteration (ACK repairs, pacer releases,
+    // app reads) pulled from UDP buffers: ship the batch now, before the loop
+    // can wait in select() with data still buffered.
+    flush_udp_batch();
+#endif
     const int64_t wake = engine_.next_wake_ms(now);
     const int64_t wait = wait_ms(now, wake);
     tv.tv_sec = static_cast<decltype(tv.tv_sec)>(wait / 1000);
@@ -548,6 +694,7 @@ void Reactor::run() {
       if (bench_ != nullptr) {
         bench_->OnTick(now);
       }
+      check_stall(now);
       // Anything the engine still owes an application socket gets another try
       // here, whether or not select reported it: the pending byte count is the
       // engine's, so this is the only place a stalled write can be retried.
@@ -583,6 +730,14 @@ void Reactor::run() {
   }
   // One last tick so the teardown logs and the final counters are complete.
   engine_.on_tick(NowMs());
+  // The last tick's and the teardown's own datagrams may still sit in the
+  // GSO batch or the shaper hold queue (engine counters already claim them
+  // as accepted): drain both before the watchdog calls the process goodbye,
+  // or the session-closing FECSTAT rides nowhere.
+  flush_wire_deferred(NowMs(), /*force=*/true);
+#ifdef __linux__
+  flush_udp_batch();
+#endif
   print_stats(NowMs());
 }
 
@@ -722,6 +877,11 @@ void Reactor::drain_udp(int64_t now_ms) {
   if (udp_ == kBadSock) {
     return;
   }
+#ifdef __linux__
+  // P1-4: one syscall per batch of up to 8 reads. No fallback: recvmmsg
+  // predates every feature this build needs (UDP_SEGMENT is 4.18+, GRO 5.0+).
+  drain_udp_mmsg(now_ms);
+#else
   for (int i = 0; i < 128; ++i) {  // bounded: a flood must not starve the tick
     sockaddr_in from{};
     socklen_t from_len = sizeof(from);
@@ -731,27 +891,108 @@ void Reactor::drain_udp(int64_t now_ms) {
     if (n <= 0) {
       return;
     }
-    if (bench_ != nullptr) {
-      BenchServer::Peer key{};
-      static_assert(sizeof(key.bytes) == sizeof(from),
-                    "the bench peer key is a raw sockaddr_in");
-      std::memcpy(key.bytes, &from, sizeof(from));
-      if (bench_->OnDatagram(key, udp_buf_.data(), static_cast<size_t>(n), now_ms)) {
-        continue;
-      }
+    drain_datagram(from, udp_buf_.data(), static_cast<size_t>(n), now_ms);
+  }
+#endif
+}
+
+void Reactor::drain_datagram(const sockaddr_in& from, const uint8_t* data,
+                             size_t len, int64_t now_ms) {
+  if (len == 0) {
+    return;
+  }
+  if (bench_ != nullptr) {
+    BenchServer::Peer key{};
+    static_assert(sizeof(key.bytes) == sizeof(from),
+                  "the bench peer key is a raw sockaddr_in");
+    std::memcpy(key.bytes, &from, sizeof(from));
+    if (bench_->OnDatagram(key, data, len, now_ms)) {
+      return;  // answered in the same pass; do not hand it to a session
     }
-    uint64_t peer = 0;
-    if (opt_.role == EngineRole::kServer) {
-      const auto it = peer_ids_.find(addr_key(reinterpret_cast<sockaddr*>(&from)));
-      if (it != peer_ids_.end()) {
-        peer = it->second;
-      } else if (!add_peer(from, &peer)) {
-        continue;  // every slot is bound to a live session: drop, do not track
-      }
+  }
+  uint64_t peer = 0;
+  if (opt_.role == EngineRole::kServer) {
+    const auto it = peer_ids_.find(addr_key(reinterpret_cast<const sockaddr*>(&from)));
+    if (it != peer_ids_.end()) {
+      peer = it->second;
+    } else if (!add_peer(from, &peer)) {
+      return;  // every slot is bound to a live session: drop, do not track
     }
-    engine_.on_wire(peer, udp_buf_.data(), static_cast<size_t>(n), now_ms);
+  }
+  engine_.on_wire(peer, data, len, now_ms);
+}
+
+#ifdef __linux__
+void Reactor::drain_gro(const sockaddr_in& from, const uint8_t* data, size_t len,
+                        int gro_seg, int64_t now_ms) {
+  // The kernel names a coalesced read's segment size and guarantees the whole
+  // bundle came from that size; splitting it is exact, not a guess. A cmsg
+  // whose arithmetic does not add up (or a zero/negative one) is treated as a
+  // single arrival: the engine's own frame validation is the safety net.
+  if (gro_seg > 0 && static_cast<size_t>(gro_seg) < len &&
+      len % static_cast<size_t>(gro_seg) == 0) {
+    for (size_t off = 0; off < len; off += static_cast<size_t>(gro_seg)) {
+      drain_datagram(from, data + off, static_cast<size_t>(gro_seg), now_ms);
+    }
+    return;
+  }
+  drain_datagram(from, data, len, now_ms);
+}
+
+void Reactor::drain_udp_mmsg(int64_t now_ms) {
+  mmsghdr msgs[kRecvBatchMsgs];
+  iovec iov[kRecvBatchMsgs];
+  sockaddr_in from[kRecvBatchMsgs];
+  // Per-slot ancillary space for the kernel's UDP_GRO cmsg (absent on every
+  // single-datagram arrival).
+  alignas(cmsghdr) char cbuf[kRecvBatchMsgs][CMSG_SPACE(sizeof(int))];
+  // The pass is bounded twice on purpose: by bytes (with GRO one read can
+  // carry up to 64 datagrams, so the old per-datagram count bound no longer
+  // represents the engine work) and by rounds (an empty datagram costs no
+  // bytes, so a zero-length flood is a count problem only). 128 KiB/16 reads
+  // per pass keeps the 25ms tick comfortable at multi-hundred-Mbps waves.
+  size_t budget = kUdpRecvBytes * 2;
+  int rounds_left = 128 / kRecvBatchMsgs;
+  while (rounds_left-- > 0) {
+    for (int i = 0; i < kRecvBatchMsgs; ++i) {
+      std::memset(&msgs[i], 0, sizeof(msgs[i]));
+      std::memset(&from[i], 0, sizeof(from[i]));
+      iov[i].iov_base = udp_batch_.data() + static_cast<size_t>(i) * udp_slot_bytes_;
+      iov[i].iov_len = udp_slot_bytes_;
+      msgs[i].msg_hdr.msg_iov = &iov[i];
+      msgs[i].msg_hdr.msg_iovlen = 1;
+      msgs[i].msg_hdr.msg_name = &from[i];
+      msgs[i].msg_hdr.msg_namelen = sizeof(from[i]);
+      msgs[i].msg_hdr.msg_control = cbuf[i];
+      msgs[i].msg_hdr.msg_controllen = sizeof(cbuf[i]);
+    }
+    const int got = ::recvmmsg(udp_, msgs, kRecvBatchMsgs, MSG_DONTWAIT, nullptr);
+    if (got <= 0) {
+      return;  // drained (or EAGAIN): the next readiness edge re-enters
+    }
+    for (int i = 0; i < got; ++i) {
+      const size_t len = static_cast<size_t>(msgs[i].msg_len);
+      int gro_seg = 0;
+      if (gro_ok_ && len > 0 && msgs[i].msg_hdr.msg_controllen >= sizeof(cmsghdr)) {
+        for (cmsghdr* cm = CMSG_FIRSTHDR(&msgs[i].msg_hdr); cm != nullptr;
+             cm = CMSG_NXTHDR(&msgs[i].msg_hdr, cm)) {
+          if (cm->cmsg_level == SOL_UDP && cm->cmsg_type == UDP_GRO &&
+              cm->cmsg_len == CMSG_LEN(sizeof(int))) {
+            std::memcpy(&gro_seg, CMSG_DATA(cm), sizeof(gro_seg));
+            break;
+          }
+        }
+      }
+      drain_gro(from[i], udp_batch_.data() + static_cast<size_t>(i) * udp_slot_bytes_,
+                len, gro_seg, now_ms);
+      budget = budget > len ? budget - len : 0;
+    }
+    if (budget == 0 || got < kRecvBatchMsgs) {
+      return;  // budget spent, or the socket emptied for now
+    }
   }
 }
+#endif
 
 void Reactor::accept_local(int64_t now_ms) {
   for (int i = 0; i < 32; ++i) {
@@ -1293,9 +1534,97 @@ void Reactor::note_udp_send_error(int err, size_t len) {
 }
 
 size_t Reactor::wire_send(uint64_t peer, const uint8_t* wire, size_t len) {
-  if (udp_ == kBadSock) {
+  if (udp_ == kBadSock || len == 0) {
     return 0;
   }
+  const sockaddr_in* to = nullptr;
+  if (opt_.role == EngineRole::kServer) {
+    if (peer >= peers_.size() || !peers_[peer].used) {
+      return 0;
+    }
+    to = &peers_[peer].addr;
+  }
+  const uint64_t budget = shaper_bytes_per_sec();
+  if (budget == 0) {
+    return emit_wire(peer, wire, len, to);
+  }
+  // A datagram bigger than the whole second's budget can never be admitted;
+  // the CLI forbids such a --rate-limit, so this is a defensive passthrough
+  // only (better one unshaped datagram than a permanent hold). While any
+  // datagram is held, this one queues behind it: the hold queue is strictly
+  // in order, and letting a newcomer pass through would hand the FEC layer
+  // out-of-order symbols the shaping was not asked for.
+  const int64_t now = NowMs();
+  wire_charge(now, 0);  // expire the trailing window's aged entries first
+  if (!wire_deferred_.empty()) {
+    if (wire_deferred_bytes_ + len <= budget) {
+      DeferredWire held;
+      held.peer = peer;
+      if (to != nullptr) {
+        held.to = *to;
+        held.has_addr = true;
+      }
+      held.bytes.assign(wire, wire + len);
+      wire_deferred_bytes_ += len;
+      wire_deferred_.push_back(std::move(held));
+      return len;
+    }
+    ++wire_over_budget_;
+    return len;
+  }
+  if (len > budget) {
+    // An impossible-to-shape datagram goes through rather than stuck forever,
+    // but must not be charged: one oversized report would otherwise lock the
+    // whole next second's budget and black-hole every normal datagram behind
+    // it. The CLI rejects such a --rate-limit; this is a defensive passthrough.
+    return emit_wire(peer, wire, len, to);
+  }
+  if (wire_admit(len)) {
+    wire_charge(now, len);
+    return emit_wire(peer, wire, len, to);
+  }
+  // Over budget: hold at the tail of the queue (in order) while the queue is
+  // within one second of budget, else drop as a shaped link would. Either way
+  // the engine sees an accept -- a shaped drop is link loss, not a wire error,
+  // and re-enqueueing the symbol is the FEC/ARQ layer's own business.
+  if (wire_deferred_bytes_ + len <= budget) {
+    DeferredWire held;
+    held.peer = peer;
+    if (to != nullptr) {
+      held.to = *to;
+      held.has_addr = true;
+    }
+    held.bytes.assign(wire, wire + len);
+    wire_deferred_bytes_ += len;
+    wire_deferred_.push_back(std::move(held));
+    return len;
+  }
+  ++wire_over_budget_;
+  return len;
+}
+
+size_t Reactor::emit_wire(uint64_t peer, const uint8_t* wire, size_t len,
+                          const sockaddr_in* to) {
+#ifndef __linux__
+  (void)peer;  // only the Linux GSO batch keys by peer id
+#endif
+#ifdef __linux__
+  // P1-4: coalesce equal-size datagrams into one GSO sendmsg (one syscall for
+  // a whole pacer burst). Failures surface at flush_udp_batch(), which degrades
+  // the socket to plain sends; the engine's flow-control read of the return
+  // value relied on the old byte-for-byte contract, which the buffering keeps
+  // (the batch is "accepted" on the spot, kernel loss is UDP loss either way).
+  if (gso_reprieve_ > 0) {
+    // Count down the pause an EINVAL asked for and re-arm once when it lapses.
+    if (--gso_reprieve_ == 0) {
+      gso_ok_ = true;
+    }
+  }
+  if (gso_ok_) {
+    gso_append(peer, wire, len, to);
+    return len;
+  }
+#endif
   if (opt_.role == EngineRole::kClient) {
     const int n =
         ::send(udp_, reinterpret_cast<const char*>(wire), static_cast<int>(len), 0);
@@ -1305,18 +1634,242 @@ size_t Reactor::wire_send(uint64_t peer, const uint8_t* wire, size_t len) {
     }
     return n > 0 ? static_cast<size_t>(n) : 0;
   }
-  if (peer >= peers_.size() || !peers_[peer].used) {
-    return 0;
-  }
-  const sockaddr_in& to = peers_[peer].addr;
   const int n = ::sendto(udp_, reinterpret_cast<const char*>(wire), static_cast<int>(len), 0,
-                         reinterpret_cast<const sockaddr*>(&to), sizeof(to));
+                         reinterpret_cast<const sockaddr*>(to), sizeof(*to));
   if (n < 0) {
     note_udp_send_error(SockErr(), len);
     return 0;
   }
   return n > 0 ? static_cast<size_t>(n) : 0;
 }
+
+uint64_t Reactor::shaper_bytes_per_sec() const {
+  return opt_.role == EngineRole::kClient ? opt_.rate_up_bytes : opt_.rate_down_bytes;
+}
+
+bool Reactor::wire_admit(size_t len) {
+  return wire_window_bytes_ + len <= shaper_bytes_per_sec();
+}
+
+void Reactor::wire_charge(int64_t now_ms, size_t len) {
+  if (len != 0) {
+    wire_window_.emplace_back(now_ms, len);
+    wire_window_bytes_ += len;
+  }
+  // Retire what aged out of the trailing second (len == 0 is the pure-expire
+  // entry point wire_send uses before testing admission).
+  const int64_t floor = now_ms - 1000;
+  while (!wire_window_.empty() && wire_window_.front().first <= floor) {
+    wire_window_bytes_ -= wire_window_.front().second;
+    wire_window_.pop_front();
+  }
+}
+
+void Reactor::flush_wire_deferred(int64_t now_ms, bool force) {
+  if (wire_deferred_.empty()) {
+    return;
+  }
+  const uint64_t budget = shaper_bytes_per_sec();
+  if (budget == 0 || force) {
+    // `force` is the shutdown path: engine counters already claim these bytes,
+    // so hold state must not strand them past budget either.
+    while (!wire_deferred_.empty()) {
+      DeferredWire& held = wire_deferred_.front();
+      wire_deferred_bytes_ -= held.bytes.size();
+      emit_wire(held.peer, held.bytes.data(), held.bytes.size(),
+                held.has_addr ? &held.to : nullptr);
+      wire_deferred_.pop_front();
+    }
+    wire_window_.clear();
+    wire_window_bytes_ = 0;
+    return;
+  }
+  wire_charge(now_ms, 0);
+  while (!wire_deferred_.empty() && wire_admit(wire_deferred_.front().bytes.size())) {
+    DeferredWire& held = wire_deferred_.front();
+    const std::vector<uint8_t> bytes = std::move(held.bytes);
+    const uint64_t peer = held.peer;
+    const sockaddr_in to = held.to;
+    const bool has_addr = held.has_addr;
+    wire_deferred_bytes_ -= bytes.size();
+    wire_deferred_.pop_front();
+    wire_charge(now_ms, bytes.size());
+    emit_wire(peer, bytes.data(), bytes.size(), has_addr ? &to : nullptr);
+  }
+}
+
+void Reactor::check_stall(int64_t now_ms) {
+  if (opt_.role != EngineRole::kClient || opt_.stall_ms <= 0) {
+    return;
+  }
+  const ProxyEngine::Counters& c = engine_.counters();
+  const bool rx_moved = c.bytes_rx != stall_seen_rx_bytes_;
+  const bool tx_moved = c.bytes_tx != stall_seen_tx_bytes_;
+  if (rx_moved) {
+    stall_seen_rx_bytes_ = c.bytes_rx;
+    stall_last_rx_ms_ = now_ms;
+  }
+  if (tx_moved) {
+    stall_seen_tx_bytes_ = c.bytes_tx;
+    stall_last_tx_ms_ = now_ms;
+  }
+  if (stall_since_ms_ != 0) {
+    // Recovery needs inbound on two consecutive ticks: `bytes_rx` grows on
+    // anything that reaches the socket (the engine drops forcible junk on a
+    // later validation step), so one forged datagram must not print
+    // "recovered" and silence the watchdog. Real traffic recovers within 50ms.
+    if (rx_moved && stall_rx_pending_) {
+      const double lasted = (now_ms - stall_since_ms_) / 1000.0;
+      stall_since_ms_ = 0;
+      stall_rx_pending_ = false;
+      std::fprintf(stderr, "tunnel stall recovered after %.1fs (inbound resumed)\n", lasted);
+      std::fflush(stderr);
+      return;
+    }
+    stall_rx_pending_ = rx_moved;
+    if (c.live == 0) {
+      const double lasted = (now_ms - stall_since_ms_) / 1000.0;
+      stall_since_ms_ = 0;
+      std::fprintf(stderr, "tunnel closed after %.1fs of stall\n", lasted);
+      std::fflush(stderr);
+    } else if (now_ms >= stall_next_log_ms_) {
+      // Still dark: re-state the stall every kStallLogMs so a long outage
+      // does not look like a single forgotten line in a long log.
+      stall_next_log_ms_ = now_ms + kStallLogMs;
+      std::fprintf(stderr, "tunnel stall: no inbound for %.1fs (still dark)\n",
+                   (now_ms - stall_since_ms_) / 1000.0);
+      std::fflush(stderr);
+    }
+    return;
+  }
+  // A tunnel nobody is using freezes both directions; that is an idle tunnel,
+  // not a dead path. The stall claim needs traffic still being pushed out
+  // (retransmissions count) and a live session behind it. `live` is the
+  // current session count (it decrements on teardown); `tunnels` is a
+  // monotonic lifetime total and must never gate a "still alive" check.
+  const bool looking = c.live != 0 && now_ms - stall_last_rx_ms_ >= opt_.stall_ms;
+  const bool pushing = stall_last_tx_ms_ + kStallTxWindowMs > now_ms;
+  if (looking && pushing) {
+    stall_since_ms_ = stall_last_rx_ms_;
+    stall_next_log_ms_ = now_ms + kStallLogMs;
+    stall_rx_pending_ = false;
+    std::fprintf(stderr, "tunnel stall: no inbound for %.1fs while TX is still moving "
+                         "(half-open path?); watching for recovery\n",
+                 (now_ms - stall_since_ms_) / 1000.0);
+    std::fflush(stderr);
+  }
+  // Dark path with a retransmission engine that has also gone quiet: keep
+  // watching without re-declaring (the idle timeout is the backstop that
+  // closes the session, which routes through the closed branch above).
+}
+
+#ifdef __linux__
+void Reactor::gso_append(uint64_t peer, const uint8_t* wire, size_t len,
+                         const sockaddr_in* to) {
+  // A batch is one (peer, size, address) triple: a changed key flushes
+  // whatever packed up before it. Segment size changes (control frames, the
+  // tail of a chunk) do the same, so windows between GSO shipments cost at
+  // most one sendmsg. The address matters as well as the id: a retired peer's
+  // id is reused for a different source address, and two clients may share a
+  // segment size -- the batch must never mix their destinations.
+  const bool has_to = to != nullptr;
+  if (gso_seg_len_ != 0 &&
+      (len != gso_seg_len_ || peer != gso_peer_ ||
+       (has_to != gso_has_to_ || (has_to && 0 != std::memcmp(to, &gso_to_, sizeof(*to)))) ||
+       gso_segs_ >= kGsoMaxSegs)) {
+    flush_udp_batch();
+  }
+  if (gso_buf_.size() < (gso_segs_ + 1) * len) {
+    gso_buf_.resize(kGsoMaxSegs * len);
+  }
+  if (gso_segs_ == 0) {
+    gso_has_to_ = has_to;
+    if (has_to) {
+      gso_to_ = *to;
+    }
+  }
+  std::memcpy(gso_buf_.data() + gso_segs_ * len, wire, len);
+  gso_seg_len_ = len;
+  gso_peer_ = peer;
+  ++gso_segs_;
+}
+
+void Reactor::flush_udp_batch() {
+  if (gso_seg_len_ == 0) {
+    return;
+  }
+  const size_t seg_len = gso_seg_len_;
+  const size_t segs = gso_segs_;
+  bool addressed = false;
+  sockaddr_in to{};
+  // Address what was batched, not what the peer slot may hold by flush time.
+  if (gso_has_to_) {
+    to = gso_to_;
+    addressed = true;
+  }
+  gso_seg_len_ = 0;
+  gso_segs_ = 0;
+  gso_has_to_ = false;
+
+  iovec iov{gso_buf_.data(), seg_len * segs};
+  msghdr mh{};
+  mh.msg_iov = &iov;
+  mh.msg_iovlen = 1;
+  if (addressed) {
+    mh.msg_name = &to;
+    mh.msg_namelen = sizeof(to);
+  }
+  if (gso_ok_ && segs >= 2) {
+    alignas(cmsghdr) char cbuf[CMSG_SPACE(sizeof(uint16_t))];
+    mh.msg_control = cbuf;
+    mh.msg_controllen = sizeof(cbuf);
+    cmsghdr* cm = CMSG_FIRSTHDR(&mh);
+    cm->cmsg_level = IPPROTO_UDP;
+    cm->cmsg_type = UDP_SEGMENT;
+    cm->cmsg_len = CMSG_LEN(sizeof(uint16_t));
+    const uint16_t gso_size = static_cast<uint16_t>(seg_len);
+    std::memcpy(CMSG_DATA(cm), &gso_size, sizeof(gso_size));
+    const int n = ::sendmsg(udp_, &mh, 0);
+    if (n >= 0) {
+      return;
+    }
+    const int err = SockErr();
+    if (err == EIO || err == EOPNOTSUPP) {
+      // The kernel or the path below it refuses to segment: this socket never
+      // tries GSO again, and what was already batched goes out per datagram.
+      // quic-go treats the same pair as a permanent local degradation.
+      gso_ok_ = false;
+    } else if (err == EINVAL) {
+      // Ambiguous: a PMTUD probe above the path MTU produces this (its GSO
+      // size exceeds the interface MTU) without GSO being broken at all, and
+      // deactivating segmentation for good over one probe is exactly the
+      // quiet throughput loss this batch path exists to avoid. Pause instead
+      // of retire: wire_send re-arms after the pause lapses, so a PMTUD
+      // stream pays at most one failed cmsg per pause, and a kernel without
+      // UDP_SEGMENT degrades for real on the first re-arm attempt.
+      gso_ok_ = false;
+      gso_reprieve_ = 16;
+    } else if (err != EINTR) {
+      note_udp_send_error(err, seg_len);
+      return;
+    }
+  }
+  // Per-datagram fallback: the normal path for single-segment batches, and
+  // the recovery path after the failure above.
+  const uint8_t* p = reinterpret_cast<const uint8_t*>(gso_buf_.data());
+  for (size_t i = 0; i < segs; ++i, p += seg_len) {
+    const int n = addressed ? ::sendto(udp_, reinterpret_cast<const char*>(p),
+                                       static_cast<int>(seg_len), 0,
+                                       reinterpret_cast<const sockaddr*>(&to), sizeof(to))
+                            : ::send(udp_, reinterpret_cast<const char*>(p),
+                                     static_cast<int>(seg_len), 0);
+    if (n < 0) {
+      note_udp_send_error(SockErr(), seg_len);
+      return;
+    }
+  }
+}
+#endif
 
 std::string Reactor::peer_key(uint64_t peer) {
   if (peer >= peers_.size() || !peers_[peer].used) {
@@ -1441,7 +1994,8 @@ void Reactor::print_stats(int64_t now_ms) {
       "stats %6.1fs live=%zu up=%zu tunnels=%zu tx=%" PRIu64 "B rx=%" PRIu64
       "B bad_entry=%u refused=%u hs_failed=%u reset=%u idle=%u clash=%u over=%u"
       " bad_cfg=%u no_entropy=%u budget=%u unknown=%u tomb=%u duprec=%u wrerr=%llu"
-      " loss_in_ppm=%u loss_in_n=%llu loss_out_ppm=%u loss_out_n=%llu\n",
+      " loss_in_ppm=%u loss_in_n=%llu loss_out_ppm=%u loss_out_n=%llu"
+      " stall=%d held=%zu shaped=%llu\n",
       (now_ms - started_ms_) / 1000.0, c.live, c.established, c.tunnels, c.bytes_tx, c.bytes_rx,
       c.bad_entry, c.open_failed, c.handshake_failed, c.reset, c.idle_closed, c.salt_clash,
       c.over_limit, c.bad_config, c.no_entropy, c.over_budget, c.unknown_salt,
@@ -1450,7 +2004,10 @@ void Reactor::print_stats(int64_t now_ms) {
       ppm(loss.in_lost, loss.in_expected),
       static_cast<unsigned long long>(loss.in_expected),
       ppm(loss.out_lost, loss.out_expected),
-      static_cast<unsigned long long>(loss.out_expected));
+      static_cast<unsigned long long>(loss.out_expected),
+      stall_since_ms_ != 0 ? static_cast<int>((now_ms - stall_since_ms_) / 1000) : 0,
+      wire_deferred_bytes_,
+      static_cast<unsigned long long>(wire_over_budget_));
   std::fflush(stdout);
 }
 

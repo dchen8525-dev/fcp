@@ -1,0 +1,35 @@
+# 由 scripts/test_baseline.sh --write 生成。数字是地板：重构只许加
+# 测试，不许减。降低某个数字的提交必须说明原因。格式：
+# <test> <functions> <checks>
+#
+adv_test 11 328
+aes_test 2 4
+bbr_test 11 43
+cauchy_test 2 7
+cli_test 17 476
+e2e_test 6 143
+envelope_test 13 137
+fecstat_test 4 30
+frame_rx_test 21 210
+frame_tx_test 10 116
+gcm_test 3 26
+gf256_test 2 20
+ghash_test 4 8
+handshake_test 18 201
+hdr_test 3 37
+kfor_test 4 30
+pmtu_test 8 72
+prewarm_test 13 113
+proxy_engine_test 23 201
+proxy_proto_test 18 209
+random_test 4 13
+replay_test 7 59
+reporter_test 7 85
+rs_test 4 12
+session_test 23 304
+settle_test 18 197
+soak_test 0 32
+strategy_test 26 163
+stream_e2e_test 7 91
+stream_test 58 448
+wire_test 4 22

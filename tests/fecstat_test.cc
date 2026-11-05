@@ -63,9 +63,9 @@ void TestGoldenLayout() {
 
   // Build the wire image with literal offsets from 协议规格.md §7.1.
   uint8_t expected[128] = {};
-  std::memcpy(expected + 0, "FCP_FECSTAT_V6", 15);  // 14 chars + NUL; rest zero
+  std::memcpy(expected + 0, "FCP_FECSTAT_V1", 15);  // 14 chars + NUL; rest zero
   std::memcpy(expected + 16, kSalt, 8);
-  expected[24] = 6;
+  expected[24] = 1;
   expected[25] = 0x05;
   put16(expected, 26, 2000);
   put32(expected, 28, 0x11223344u);
@@ -114,14 +114,14 @@ void TestGoldenLayout() {
   CHECK_EQ(fcp::ledger_burst_kl(decoded), 0x4342);
 }
 
-// A pre-M3 peer sends reserved bytes as zeros and no flg bit3; the new
-// consumer must read that as "no ledger" without any negotiation.
-void TestLegacyZeroLedger() {
+// A report without flg bit3 carries no ledger: the consumer must read it as
+// "no ledger for this interval", not as zero-damage data.
+void TestNoLedgerGate() {
   uint8_t wire[128] = {};
   std::memcpy(wire, fcp::kFecstatMagic, sizeof(fcp::kFecstatMagic));
   std::memcpy(wire + 16, kSalt, 8);
   wire[24] = fcp::kFecstatVersion;
-  wire[25] = 0x01;  // flg bit0 direction only: a pre-M3 sender knows no bit3
+  wire[25] = 0x01;  // flg bit0 direction only: the ledger bit is unset
   put32(wire, 28, 7);  // accounted_through_set_id
 
   fcp::FecstatPacket decoded{};
@@ -156,7 +156,7 @@ void TestValidation() {
   CHECK(fcp::decode_fecstat(bad_ver, 128, kSalt, &out) == fcp::FecstatStatus::kBadVer);
 
   // The magic occupies exactly 16 bytes with two NULs.
-  CHECK_EQ(std::memcmp(wire, "FCP_FECSTAT_V6", 14), 0);
+  CHECK_EQ(std::memcmp(wire, "FCP_FECSTAT_V1", 14), 0);
   CHECK_EQ(wire[14], 0);
   CHECK_EQ(wire[15], 0);
 }
@@ -193,7 +193,7 @@ void TestMonotonicKey() {
 
 int main() {
   TestGoldenLayout();
-  TestLegacyZeroLedger();
+  TestNoLedgerGate();
   TestValidation();
   TestMonotonicKey();
   return fcp_test::finish();

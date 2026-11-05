@@ -37,6 +37,32 @@ const uint8_t kMagic[kMagicLen] = {'F', 'C', 'P', 'S', 'T', 'E', 'S', 'T'};
 
 namespace {
 
+// Running min/avg/max over one run's RTT samples.
+struct RttAcc {
+  uint32_t n = 0;
+  uint64_t sum = 0;
+  uint32_t min_ms = 0;
+  uint32_t max_ms = 0;
+  void Add(uint32_t ms) {
+    if (n == 0 || ms < min_ms) {
+      min_ms = ms;
+    }
+    if (ms > max_ms) {
+      max_ms = ms;
+    }
+    sum += ms;
+    ++n;
+  }
+  RttStats Finish() const {
+    RttStats stats;
+    stats.n = n;
+    stats.min_ms = min_ms;
+    stats.max_ms = max_ms;
+    stats.avg_ms = n > 0 ? static_cast<uint32_t>((sum + n / 2) / n) : 0;
+    return stats;
+  }
+};
+
 int64_t NowMs() {
   using namespace std::chrono;
   return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
@@ -98,8 +124,8 @@ void EncodeData(uint32_t sn, uint8_t* out, size_t len) {
   put_le32(sn, out + 12);
 }
 
-void EncodeReport(uint32_t sn, uint64_t delivered, uint64_t best_bps, uint8_t* out,
-                  size_t len) {
+void EncodeReport(uint32_t sn, uint64_t delivered, uint64_t best_bps,
+                  uint64_t down_wire_bps, uint8_t* out, size_t len) {
   if (out == nullptr || len < kReportPayloadLen) {
     return;
   }
@@ -107,6 +133,23 @@ void EncodeReport(uint32_t sn, uint64_t delivered, uint64_t best_bps, uint8_t* o
   out[kMagicLen + 2] = static_cast<uint8_t>(PayloadType::kReport);
   put_le64(delivered, out + kHeaderLen);
   put_le64(best_bps, out + kHeaderLen + 8);
+  put_le64(down_wire_bps, out + kHeaderLen + 16);
+}
+
+void EncodePing(uint32_t sn, uint64_t timestamp, uint8_t* out, size_t len) {
+  if (out == nullptr || len < kPingPayloadLen) {
+    return;
+  }
+  EncodeData(sn, out, len);
+  out[kMagicLen + 2] = static_cast<uint8_t>(PayloadType::kPing);
+  put_le64(timestamp, out + kHeaderLen);
+}
+
+void EncodePingEcho(uint32_t sn, uint64_t timestamp, uint8_t* out, size_t len) {
+  EncodePing(sn, timestamp, out, len);
+  if (out != nullptr && len >= kPingPayloadLen) {
+    out[kMagicLen + 2] = static_cast<uint8_t>(PayloadType::kPingEcho);
+  }
 }
 
 bool DecodePayload(const uint8_t* payload, size_t len, DecodedPayload* out) {
@@ -118,19 +161,30 @@ bool DecodePayload(const uint8_t* payload, size_t len, DecodedPayload* out) {
   }
   const uint8_t type = payload[kMagicLen + 2];
   if (type != static_cast<uint8_t>(PayloadType::kData) &&
-      type != static_cast<uint8_t>(PayloadType::kReport)) {
+      type != static_cast<uint8_t>(PayloadType::kReport) &&
+      type != static_cast<uint8_t>(PayloadType::kPing) &&
+      type != static_cast<uint8_t>(PayloadType::kPingEcho)) {
     return false;
   }
   out->type = static_cast<PayloadType>(type);
   out->sn = get_le32(payload + 12);
   out->delivered = 0;
   out->best_bps = 0;
+  out->down_wire_bps = 0;
+  out->timestamp = 0;
   if (out->type == PayloadType::kReport) {
     if (len < kReportPayloadLen) {
       return false;
     }
     out->delivered = get_le64(payload + kHeaderLen);
     out->best_bps = get_le64(payload + kHeaderLen + 8);
+    out->down_wire_bps = get_le64(payload + kHeaderLen + 16);
+  } else if (out->type == PayloadType::kPing ||
+             out->type == PayloadType::kPingEcho) {
+    if (len < kPingPayloadLen) {
+      return false;
+    }
+    out->timestamp = get_le64(payload + kHeaderLen);
   }
   return true;
 }
@@ -393,12 +447,16 @@ bool RunClient(const ClientOptions& opt, const ProgressFn& progress, Result* out
   uint64_t up_sent = 0;
   uint64_t up_reported = 0;
   uint64_t up_best_bps = 0;
+  uint64_t down_wire_bps = 0;
   bool have_report = false;
+  RttAcc rtt;
   RateWindow down_window;
+  RateWindow up_offered_window;
   int64_t first_down_ms = 0;
   int64_t last_down_ms = 0;
   int64_t phase_start = 0;
   int64_t next_ramp = 0;
+  int64_t next_ping = 0;
 
   Session session(
       cfg,
@@ -422,12 +480,25 @@ bool RunClient(const ClientOptions& opt, const ProgressFn& progress, Result* out
             first_down_ms = now;
           }
           last_down_ms = now;
-        } else if (decoded.delivered >= up_reported) {
-          // Reports are cumulative and can arrive late; never let a stale one
-          // walk the upload count back (that would look like lost data).
-          up_reported = decoded.delivered;
-          up_best_bps = decoded.best_bps;
-          have_report = true;
+        } else if (decoded.type == PayloadType::kPingEcho) {
+          // The echoed ts is our own ms counter; the difference is round-trip
+          // latency on this session's framing path.
+          const int64_t sent_ms = static_cast<int64_t>(decoded.timestamp);
+          if (sent_ms > 0) {
+            const int64_t delta = NowMs() - sent_ms;
+            if (delta >= 0 && delta < 60000) {
+              rtt.Add(static_cast<uint32_t>(delta));
+            }
+          }
+        } else if (decoded.type == PayloadType::kReport) {
+          if (decoded.delivered >= up_reported) {
+            // Reports are cumulative and can arrive late; never let a stale one
+            // walk the upload count back (that would look like lost data).
+            up_reported = decoded.delivered;
+            up_best_bps = decoded.best_bps;
+            have_report = true;
+          }
+          down_wire_bps = std::max(down_wire_bps, decoded.down_wire_bps);
         }
       },
       [](const std::string&) {});
@@ -479,10 +550,21 @@ bool RunClient(const ClientOptions& opt, const ProgressFn& progress, Result* out
       fatal = true;
       break;
     }
+    // Ping/echo RTT sampler, sharing the data session. Cheap at one shot per
+    // 500ms, and the echo rides whatever direction is busy so samples cover
+    // both the idle-ish download phase and the loaded upload phase.
+    if (session.established() && now >= next_ping) {
+      uint8_t ping[kPingPayloadLen];
+      EncodePing(sn++, now, ping, sizeof(ping));
+      session.on_kcp_output(ping, sizeof(ping), now);
+      next_ping = now + kPingEveryMs;
+    }
 
     switch (phase) {
       case Phase::kHandshake:
         if (session.established()) {
+          // From the first rendezvous datagram to a fully established session.
+          result.setup_ms = now - meet_start;
           phase = Phase::kDownload;
           phase_start = now;
         } else if (now - session_start > kSetupTimeoutMs) {
@@ -526,6 +608,7 @@ bool RunClient(const ClientOptions& opt, const ProgressFn& progress, Result* out
           put_le32(sn++, payload + 12);
           session.on_kcp_output(payload, sizeof(payload), now);
           up_sent += UserBytes(sizeof(payload));
+          up_offered_window.Add(now, UserBytes(sizeof(payload)));
           tokens -= wire_per_seg;
           ++burst;
         }
@@ -553,7 +636,15 @@ bool RunClient(const ClientOptions& opt, const ProgressFn& progress, Result* out
       if (phase == Phase::kDownload || phase == Phase::kWarmup) {
         progress("down", down_bytes, now - (first_down_ms != 0 ? first_down_ms : now));
       } else if (phase == Phase::kUpload || phase == Phase::kDrain) {
-        progress("up", have_report ? up_reported : up_sent, now - phase_start);
+        // Progress bytes are the *receiver-side* cumulative count in both
+        // directions: download is what we received, upload is what the server
+        // has confirmed. One semantics, monotonic in both -- no source switch.
+        // (kDrain phase_start is the drain's own start, so hold the upload
+        // elapsed instead: drain seconds are not upload seconds.)
+        const int64_t elapsed =
+            phase == Phase::kDrain ? static_cast<int64_t>(opt.seconds) * 1000
+                                   : now - phase_start;
+        progress("up", up_reported, elapsed);
       }
     }
     if (!drained_any) {
@@ -573,6 +664,9 @@ bool RunClient(const ClientOptions& opt, const ProgressFn& progress, Result* out
         first_down_ms != 0 ? static_cast<double>(last_down_ms - first_down_ms) / 1000.0
                            : 0.0;
     result.download.acked = true;
+    // The server's wire rate rides every report; reports stay cumulative-safe,
+    // the best window only grows.
+    result.download.wire_bps = down_wire_bps;
     if (session.reporter() != nullptr) {
       const uint32_t expected = session.reporter()->last_expected();
       const uint32_t lost = session.reporter()->last_lost();
@@ -594,6 +688,8 @@ bool RunClient(const ClientOptions& opt, const ProgressFn& progress, Result* out
     result.upload.mbps = static_cast<double>(up_best_bps) / 1e6;
     result.upload.seconds = static_cast<double>(opt.seconds);
     result.upload.acked = true;
+    // The client's own framer rate, best one-second window of what we poured.
+    result.upload.wire_bps = up_offered_window.best_bps();
     // The server counts what arrived, not what we handed to the framer. It
     // can only report at least as much as we sent (we stop sending first and
     // wait out the drain), so a smaller number is FEC/ARQ loss the upload
@@ -616,6 +712,7 @@ bool RunClient(const ClientOptions& opt, const ProgressFn& progress, Result* out
     result.error = "没有收到服务端的上传确认";
   }
 
+  result.rtt = rtt.Finish();
   *out = result;
   CloseSock(sock);
   cleanup();
@@ -649,6 +746,7 @@ void BenchServer::Reset() {
   have_peer_ = false;
   phase_ = Phase::kWaitEstablished;
   outcome_logged_ = false;
+  download_window_.Reset();
   std::memset(salt_, 0, sizeof(salt_));
   upload_bytes_ = 0;
   upload_window_.Reset();
@@ -781,6 +879,15 @@ void BenchServer::OnDelivered(const uint8_t* payload, size_t len, int64_t now_ms
   if (!bench::DecodePayload(payload, len, &decoded)) {
     return;
   }
+  if (decoded.type == bench::PayloadType::kPing) {
+    // Echo the RTT probe straight back through the same session. The ts is the
+    // client's clock and is returned untouched; the server learns nothing and
+    // needs nothing.
+    uint8_t echo[bench::kPingPayloadLen];
+    bench::EncodePingEcho(decoded.sn, decoded.timestamp, echo, sizeof(echo));
+    session_->on_kcp_output(echo, sizeof(echo), now_ms);
+    return;
+  }
   if (decoded.type != bench::PayloadType::kData) {
     return;  // the client does not send reports
   }
@@ -805,8 +912,8 @@ void BenchServer::SendReport(int64_t now_ms, bool final) {
     return;
   }
   uint8_t report[bench::kReportPayloadLen] = {};
-  bench::EncodeReport(sn_++, upload_bytes_, upload_window_.best_bps(), report,
-                      sizeof(report));
+  bench::EncodeReport(sn_++, upload_bytes_, upload_window_.best_bps(),
+                      download_window_.best_bps(), report, sizeof(report));
   session_->on_kcp_output(report, sizeof(report), now_ms);
   last_report_ms_ = now_ms;
   // final is true for every repeat of the final report; log the outcome once.
@@ -840,10 +947,14 @@ void BenchServer::ApplyTokens(int64_t now_ms) {
   const double wire_per_seg = bench::WireBytesPerSegment() * 8.0;
   tokens_ = std::min(tokens_ + ramp_.bps() * dt,
                      std::max(ramp_.bps() * 0.05, wire_per_seg));
+  const bool offering = phase_ == Phase::kDownload;
   int burst = 0;
   while (tokens_ >= wire_per_seg && burst < 4096) {
     put_le32(sn_++, payload_ + 12);
     session_->on_kcp_output(payload_, sizeof(payload_), now_ms);
+    if (offering) {
+      download_window_.Add(now_ms, bench::UserBytes(sizeof(payload_)));
+    }
     tokens_ -= wire_per_seg;
     ++burst;
   }

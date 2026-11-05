@@ -13,7 +13,7 @@
 namespace fcp {
 
 constexpr size_t kFecstatLen = 128;
-constexpr uint8_t kFecstatVersion = 6;
+constexpr uint8_t kFecstatVersion = 1;
 // A report's key may lead the last accepted one by at most this many sets.
 // One interval cannot settle more groups than the active-set window even at
 // line rate; anything larger is a stale/forged neighbour, not progress.
@@ -23,7 +23,7 @@ constexpr uint32_t kFecstatMaxForwardSets = 1u << 20;
 // decision gate are the same threshold — one constant so they cannot drift
 // into "reports on a sample the controller refuses to act on".
 constexpr uint32_t kMinSamplePackets = 256;
-constexpr char kFecstatMagic[16] = "FCP_FECSTAT_V6";
+constexpr char kFecstatMagic[16] = "FCP_FECSTAT_V1";
 
 // flg bit3: the M3 ledger fields (ledger_groups/fail_ppm/meta) are valid.
 // Sender sets it only when the interval accounted at least one full-size
@@ -38,9 +38,9 @@ constexpr uint8_t kFlgTailDropped = 0x02;
 constexpr uint8_t kFlgLateRecovery = 0x04;
 
 struct FecstatPacket {
-  char magic[16];              // "FCP_FECSTAT_V6" + 2 x NUL, fixed width
+  char magic[16];              // "FCP_FECSTAT_V1" + 2 x NUL, fixed width
   uint8_t session_salt[8];
-  uint8_t ver;                 // 6
+  uint8_t ver;                 // 1
   uint8_t flg;                 // bit0 direction(1 = you->me), bit1 tail drop, bit2 late recovery
   uint16_t interval_ms;        // <= 60000
   uint32_t accounted_through_set_id;
@@ -65,9 +65,9 @@ struct FecstatPacket {
   uint32_t data_late_rx;
   uint32_t sets_partial;
   // M3 R(k) ledger (M3控制设计.md §1.2), carved out of the frozen
-  // reserved[5]. Old peers leave these zero and every consumer treats
-  // ledger_groups == 0 as "no ledger", so no handshake negotiation is needed
-  // in either direction.
+  // reserved[5]. bit3 marks the fields present; a report without it carries
+  // no ledger, and ledger_groups == 0 means the interval accounted no
+  // full-size group. The gate is one condition, worth no negotiation.
   uint32_t ledger_groups;      // settled sets with n_used == D, k known, k >= 1
   uint32_t ledger_fail_ppm;    // of those, >= 1 data unrecovered at settlement
   uint32_t ledger_meta;        // byte0 = dominant k; byte1 = 0;

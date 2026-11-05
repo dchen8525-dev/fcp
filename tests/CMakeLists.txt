@@ -65,7 +65,9 @@ target_include_directories(fcp_cli_test PRIVATE
                ${CMAKE_CURRENT_SOURCE_DIR}/../apps/cli)
 target_link_libraries(fcp_cli_test PRIVATE fcp_proxy_core)
 if(WIN32)
-  target_link_libraries(fcp_cli_test PRIVATE ws2_32 iphlpapi)
+  # Same libs as fcp-client/server (iphlpapi: MTU default; winmm: the reactor's
+  # timeBeginPeriod around the select loop, P1-1).
+  target_link_libraries(fcp_cli_test PRIVATE ws2_32 iphlpapi winmm)
 endif()
 add_test(NAME cli_test COMMAND fcp_cli_test)
 set_tests_properties(cli_test PROPERTIES TIMEOUT 300)
@@ -131,17 +133,17 @@ endif()
 
 # 重构护栏：ctest 全绿只证明"没坏"，不证明"断言还在"。这一步把测试套件的
 # 形状钉住（每个测试二进制的测试函数数与 CHECK 数只许涨不许跌），防止重构
-# 过程中靠删断言把红灯变绿。基线 tests/test_baseline.json 随代码评审。
-# 缺 python3 时跳过而不是失败：VPS 门禁机器不一定装了 Python，而"没跑护栏"
-# 比"门禁因为缺解释器挂掉"好查得多。
-find_package(Python3 COMPONENTS Interpreter QUIET)
-if(Python3_Interpreter_FOUND)
+# 过程中靠删断言把红灯变绿。基线 tests/test_baseline.txt 随代码评审。
+# 解释器是 bash（POSIX sh 友好的 awk）；CI Windows runner 与开发机都自带 Git
+# Bash。缺 bash 时跳过而不是失败："没跑护栏"比"门禁因为缺解释器挂掉"好查。
+find_program(BASH bash QUIET)
+if(BASH)
   add_test(NAME test_baseline
-           COMMAND ${Python3_EXECUTABLE}
-                   ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/test_baseline.py)
+           COMMAND ${BASH}
+                   ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/test_baseline.sh)
   set_tests_properties(test_baseline PROPERTIES TIMEOUT 60)
 else()
-  message(STATUS "python3 未找到；跳过 test_baseline 护栏")
+  message(STATUS "bash 未找到；跳过 test_baseline 护栏")
 endif()
 
 # deb 打包器（scripts/build_deb.sh）只用 dpkg-deb，没有可跨平台跑的纯逻辑单测；

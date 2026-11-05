@@ -31,9 +31,13 @@
 //   magic[8] | version u16 | type u8 | reserved u8 | sn u32 | body...
 //
 // type=kData body is filler. type=kReport carries the receiver's cumulative
-// delivered bytes and best one-second rate; only the server sends reports (the
+// delivered bytes and best one-second rate, plus the sender's best one-second
+// offered (framer) rate for the download direction; only the server sends reports (the
 // client is the receiver of the upload phase), and they ride the same session
-// in the opposite direction.
+// in the opposite direction. type=kPing (client -> server, ts in the body) and
+// type=kPingEcho (the server's answer, ts echoed untouched) add a lightweight
+// RTT sampler that shares the data session; the server answers pings whenever
+// the session is established, in every phase.
 
 #ifndef FCP_BENCH_H_
 #define FCP_BENCH_H_
@@ -63,8 +67,17 @@ constexpr size_t kRendezvousLen = kMagicLen + 2 + 2 + kSaltLen;  // 20
 constexpr size_t kHeaderLen = 16;
 constexpr size_t kDataPayloadLen = 1200;  // <= payload_max at the default MTU
 // magic[8] + version[2] + type[1] + reserved[1] + sn[4] + delivered[8] +
-// best_bps[8]
-constexpr size_t kReportPayloadLen = kHeaderLen + 16;
+// best_bps[8] + down_wire_bps[8]. down_wire_bps is the sender's best
+// one-second offered (framer) rate for the download direction -- the same side
+// and the same scale as the receiver's best_bps, so the desktop can put wire
+// and received side by side without an averaging-window mismatch. Reports are
+// fixed length; no version tolerance.
+constexpr size_t kReportPayloadLen = kHeaderLen + 24;
+// magic[8] .. sn[4] + ts[8]. The ts is the sender's NowMs; the echo carries it
+// back untouched, and whoever sent the ping turns the difference into an RTT
+// sample.
+constexpr size_t kPingPayloadLen = kHeaderLen + 8;
+constexpr int64_t kPingEveryMs = 500;
 
 constexpr int kMinSeconds = 3;
 constexpr int kMaxSeconds = 30;
@@ -92,7 +105,7 @@ constexpr int64_t kSettleBeforePhaseMs = 300;
 // reactor's 25ms tick. Two seconds is far beyond any of those.
 constexpr int64_t kFinalReportsMs = 2000;
 
-enum class PayloadType : uint8_t { kData = 0, kReport = 1 };
+enum class PayloadType : uint8_t { kData = 0, kReport = 1, kPing = 2, kPingEcho = 3 };
 
 extern const uint8_t kMagic[kMagicLen];
 
@@ -111,14 +124,20 @@ bool IsMagicPrefix(const uint8_t* data, size_t len);
 // Fills exactly `len` bytes (len >= kHeaderLen) with a data payload; the body
 // is zero. A unique `sn` per payload keeps the frame layer's dedup honest.
 void EncodeData(uint32_t sn, uint8_t* out, size_t len);
-void EncodeReport(uint32_t sn, uint64_t delivered, uint64_t best_bps, uint8_t* out,
-                  size_t len);
+void EncodeReport(uint32_t sn, uint64_t delivered, uint64_t best_bps,
+                  uint64_t down_wire_bps, uint8_t* out, size_t len);
+// Ping bodies carry the sender's NowMs; the echo reverses only the type byte
+// and keeps the sn (already unique at the sender).
+void EncodePing(uint32_t sn, uint64_t timestamp, uint8_t* out, size_t len);
+void EncodePingEcho(uint32_t sn, uint64_t timestamp, uint8_t* out, size_t len);
 
 struct DecodedPayload {
   PayloadType type = PayloadType::kData;
   uint32_t sn = 0;
   uint64_t delivered = 0;  // kReport only: receiver's cumulative user bytes
   uint64_t best_bps = 0;   // kReport only: receiver's best one-second goodput
+  uint64_t down_wire_bps = 0;  // kReport only: sender's download wire rate
+  uint64_t timestamp = 0;  // kPing / kPingEcho only
 };
 bool DecodePayload(const uint8_t* payload, size_t len, DecodedPayload* out);
 
@@ -192,9 +211,23 @@ struct Sample {
   // (upload.loss_n is the server's symbol-level loss; this one only moves
   // when something was actually lost). acked is false whenever it is > 0.
   uint64_t lost_bytes = 0;
+  // The sender's best one-second offered (framer) rate for this direction, on
+  // the same scale as `mbps` (receiver's best one-second delivered rate). The
+  // gap between the two is FEC redundancy plus whatever the direction lost.
+  // Download receives it via the kReport down_wire_bps field; upload keeps the
+  // client's own RateWindow over the payloads it poured.
+  uint64_t wire_bps = 0;
   // Pre-FEC raw loss of this direction's receive side, as last reported.
   uint32_t loss_ppm = 0;
   uint32_t loss_n = 0;
+};
+
+// RTT samples from the ping/echo exchange across the whole run.
+struct RttStats {
+  uint32_t n = 0;
+  uint32_t min_ms = 0;
+  uint32_t avg_ms = 0;
+  uint32_t max_ms = 0;
 };
 
 struct Result {
@@ -202,6 +235,9 @@ struct Result {
   Sample upload;
   bool have_download = false;
   bool have_upload = false;
+  // Rendezvous start -> session established.
+  int64_t setup_ms = 0;
+  RttStats rtt;
   std::string error;
 };
 
@@ -290,6 +326,9 @@ class BenchServer {
 
   uint64_t upload_bytes_ = 0;
   bench::RateWindow upload_window_;
+  // One-second offered-rate window for the download phase (the server is the
+  // sender there); its best value rides every report.
+  bench::RateWindow download_window_;
   bool outcome_logged_ = false;
   uint8_t payload_[bench::kDataPayloadLen] = {};
 };

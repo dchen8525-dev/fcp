@@ -616,7 +616,7 @@ void TestHandshakeTimeout() {
   s.on_tick(2100);
   CHECK(s.state() == fcp::HandshakeState::kFailed);
   CHECK(s.error() == fcp::HandshakeError::kNoAck);
-  CHECK(HasLine(logs, "FEC handshake failed: V4 no ACK after 3 tries"));
+  CHECK(HasLine(logs, "FEC handshake failed: no ACK after 3 tries"));
 }
 
 void TestPreNegotiationCache() {

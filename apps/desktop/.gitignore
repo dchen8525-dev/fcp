@@ -1,4 +1,3 @@
-# 单文件引导器（apps/desktop/launcher）的构建产物
-launcher/target/
+
 # 偶尔在图省事在 apps/desktop 里直接 cmake 出来的目录
 build/

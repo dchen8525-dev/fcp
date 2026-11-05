@@ -46,8 +46,15 @@ namespace fcp {
 // Qt client (settings proxy/trace_prefix). `log` routes the diagnostic to the
 // host too: a GUI has no stderr, so a trace that silently records nothing used
 // to be invisible (C-16).
+//
+// Rotation: the live file is capped at kTraceRotateBytes -- on crossing, it
+// becomes ".1" and recording continues into a fresh file. `rotate_bytes` is a
+// hook for tests: 64 MiB is the shipping default, not reachable in a unit
+// test, so a test shrinks it; the constant carries that default in one place.
+constexpr size_t kTraceRotateBytes = 64u * 1024u * 1024u;
 SessionConfig::TraceFn make_trace_sink(const std::string& prefix, uint64_t cid,
-                                       std::function<void(const std::string&)> log = {});
+                                       std::function<void(const std::string&)> log = {},
+                                       size_t rotate_bytes = kTraceRotateBytes);
 
 enum class EngineRole : uint8_t {
   kClient = 0,  // local SOCKS5/HTTP listener, one session per connection
@@ -76,6 +83,10 @@ struct EngineConfig {
   // controller trace (SessionConfig::trace) to `<prefix>.<cid>.jsonl` —
   // the calibration input for tools/fcp-replay.
   std::string trace_prefix;
+  // Cap for that trace file (passed to make_trace_sink's rotate_bytes). The
+  // default is the shipping value; only tests shrink it (64 MiB cannot be
+  // crossed in a unit test).
+  size_t trace_rotate_bytes = kTraceRotateBytes;
   size_t send_window_bytes = kDefaultSendWindowBytes;
   // True when the start was set explicitly (CLI --window / GUI spinbox), which
   // keeps the prewarm cache from replacing it with the peer's converged value.

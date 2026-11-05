@@ -603,6 +603,13 @@ void TestDefaultsSurvive() {
   // The positive spelling is gone: PMTUD is on unless told otherwise.
   CHECK(!Ok(EngineRole::kClient, {"--pmtud"}, &no_pmtu, &error));
   CHECK(error.find("unknown") != std::string::npos);
+
+  // UDP GRO receive aggregation defaults on; the flag retires it for hosts
+  // where the benchmark says the deep copies cost more than the interrupts.
+  CHECK(a.ro.udp_gro);
+  ProxyArgs no_gro;
+  CHECK(Ok(EngineRole::kClient, {"--no-udp-gro"}, &no_gro, &error));
+  CHECK(!no_gro.ro.udp_gro);
 }
 
 void TestMetaFlagsWinOverBadValues() {
@@ -725,6 +732,61 @@ void TestSpeedTestFlags() {
   CHECK(!Ok(EngineRole::kClient, {"--speedtest", "--speedtest-seconds=abc"}, &a, &error));
 }
 
+void TestStallAndRateFlags() {
+  ProxyArgs a;
+  std::string error;
+
+  // The watchdog is a client flag: the server's inbound stream is watched
+  // from the end that feeds it.
+  CHECK(Ok(EngineRole::kClient, {}, &a, &error));
+  CHECK_EQ(a.ro.stall_ms, 60000);
+  CHECK(Ok(EngineRole::kClient, {"--stall-ms=15000"}, &a, &error));
+  CHECK_EQ(a.ro.stall_ms, 15000);
+  CHECK(Ok(EngineRole::kClient, {"--stall-ms=0"}, &a, &error));
+  CHECK_EQ(a.ro.stall_ms, 0);
+  CHECK(!Ok(EngineRole::kServer, {"--stall-ms=15000"}, &a, &error));
+  CHECK(error.find("client") != std::string::npos);
+  CHECK(!Ok(EngineRole::kClient, {"--stall-ms=-1"}, &a, &error));
+  CHECK(!Ok(EngineRole::kClient, {"--stall-ms=abc"}, &a, &error));
+
+  // --rate-limit=UP[:DOWN] Mbps; the client shapes its upload.
+  CHECK(Ok(EngineRole::kClient, {"--rate-limit=8"}, &a, &error));
+  CHECK_EQ(a.ro.rate_up_bytes, 1000000);  // 8 Mbps = 1 MB/s
+  CHECK_EQ(a.ro.rate_down_bytes, 0);
+  CHECK(Ok(EngineRole::kClient, {"--rate-limit=8:20"}, &a, &error));
+  CHECK_EQ(a.ro.rate_up_bytes, 1000000);
+  // The DOWN half is the server's setting; the client locally unshaped.
+  CHECK(!Ok(EngineRole::kClient, {"--rate-limit=0:20"}, &a, &error));
+  CHECK(error.find("UP") != std::string::npos);
+  CHECK(!Ok(EngineRole::kClient, {"--rate-limit="}, &a, &error));
+  CHECK(!Ok(EngineRole::kClient, {"--rate-limit=8:"}, &a, &error));
+  CHECK(!Ok(EngineRole::kClient, {"--rate-limit=8:20:5"}, &a, &error));
+  CHECK(!Ok(EngineRole::kClient, {"--rate-limit=abc:20"}, &a, &error));
+  CHECK(!Ok(EngineRole::kClient, {"--rate-limit=100001"}, &a, &error));
+  // One second of budget must cover one full datagram: below that the shaper
+  // passes everything through and the link runs unshaped behind a rate line.
+  CHECK(!Ok(EngineRole::kClient, {"--rate-limit=0.0000001"}, &a, &error));
+  CHECK(error.find("too small to shape") != std::string::npos);
+  CHECK(!Ok(EngineRole::kClient, {"--rate-limit=0.01"}, &a, &error));  // 1250 B/s < mtu 1400
+  CHECK(error.find("one datagram") != std::string::npos);
+  // Just above the floor shapes for real.
+  CHECK(Ok(EngineRole::kClient, {"--rate-limit=0.05"}, &a, &error));  // 6250 B/s
+  CHECK_EQ(a.ro.rate_up_bytes, 6250);
+  // The one-shot bench measures raw throughput; shaping is meaningless there.
+  CHECK(!Ok(EngineRole::kClient, {"--speedtest", "--rate-limit=8"}, &a, &error));
+  CHECK(error.find("--speedtest") != std::string::npos);
+
+  // The server enforces the DOWN half (it serves the download).
+  CHECK(Ok(EngineRole::kServer, {"--rate-limit=0:5"}, &a, &error));
+  CHECK_EQ(a.ro.rate_down_bytes, 625000);
+  CHECK_EQ(a.ro.rate_up_bytes, 0);
+  CHECK(!Ok(EngineRole::kServer, {"--rate-limit=5:0"}, &a, &error));
+  CHECK(error.find("DOWN") != std::string::npos);
+  // A server bar one half ("=5") shapes nothing: DOWN is its half.
+  CHECK(!Ok(EngineRole::kServer, {"--rate-limit=5"}, &a, &error));
+  CHECK(error.find("shapes nothing") != std::string::npos);
+}
+
 void TestBbrFlags() {
   ProxyArgs a;
   std::string error;
@@ -801,19 +863,36 @@ void TestBenchCodec() {
   CHECK_EQ(decoded.delivered, 0ull);
 
   uint8_t report[kReportPayloadLen] = {};
-  EncodeReport(7, 123456789ull, 987654321ull, report, sizeof(report));
+  EncodeReport(7, 123456789ull, 987654321ull, 424242ull, report, sizeof(report));
   CHECK(DecodePayload(report, sizeof(report), &decoded));
   CHECK(decoded.type == PayloadType::kReport);
   CHECK_EQ(decoded.sn, 7u);
   CHECK_EQ(decoded.delivered, 123456789ull);
   CHECK_EQ(decoded.best_bps, 987654321ull);
+  CHECK_EQ(decoded.down_wire_bps, 424242ull);
   // Truncated report, truncated header, and a wrong version are all rejected.
+  CHECK(!DecodePayload(report, kReportPayloadLen - 1, &decoded));
   CHECK(!DecodePayload(report, kHeaderLen + 4, &decoded));
   CHECK(!DecodePayload(report, kHeaderLen - 1, &decoded));
   uint8_t bad_version[kReportPayloadLen];
   std::memcpy(bad_version, report, sizeof(report));
   bad_version[kMagicLen] = static_cast<uint8_t>(bad_version[kMagicLen] ^ 0xFF);
   CHECK(!DecodePayload(bad_version, sizeof(bad_version), &decoded));
+
+  // Ping payloads are kHeaderLen + ts; the echo flips only the type byte.
+  uint8_t ping[kPingPayloadLen] = {};
+  EncodePing(9, 1234567890123ull, ping, sizeof(ping));
+  CHECK(DecodePayload(ping, sizeof(ping), &decoded));
+  CHECK(decoded.type == PayloadType::kPing);
+  CHECK_EQ(decoded.sn, 9u);
+  CHECK_EQ(decoded.timestamp, 1234567890123ull);
+  CHECK_EQ(decoded.delivered, 0ull);
+  EncodePingEcho(9, 1234567890123ull, ping, sizeof(ping));
+  CHECK(DecodePayload(ping, sizeof(ping), &decoded));
+  CHECK(decoded.type == PayloadType::kPingEcho);
+  CHECK_EQ(decoded.timestamp, 1234567890123ull);
+  // A ping with only its header is rejected.
+  CHECK(!DecodePayload(ping, kHeaderLen, &decoded));
 
   // Ramp: x1.5 per interval, saturating at the ceiling.
   Ramp ramp;
@@ -951,6 +1030,7 @@ int main() {
   TestMetaFlagsWinOverBadValues();
   TestFlagsAndValues();
   TestSpeedTestFlags();
+  TestStallAndRateFlags();
   TestBbrFlags();
   TestBenchCodec();
   TestEnvironmentDefaults();

@@ -48,19 +48,19 @@ constexpr uint8_t kCapDeadline = 1u << 3;  // optional, M2
 // PMTUD (pmtu.h): the peer may send path-MTU probes and expects acks. The
 // flag is only advertised when the session is configured for it; a peer that
 // does not know the bit rejects the caps (reserved bits are a hard gate), so
-// this release requires both ends to be updated -- the same policy as the v7
-// handshake magic (#31).
+// both ends must be updated together for PMTUD to be usable.
 constexpr uint8_t kCapPmtud = 1u << 4;     // optional, M2
 constexpr uint8_t kCapKnownMask = 0x1F;    // bits 5..7 must be zero
 
 // M1 advertises framing + FECSTAT + per-set k.
 constexpr uint8_t kLocalFlagsM1 = kCapFraming | kCapFecstat | kCapPerSetK;
 
-// oob magic (§4.7): fixed 16 bytes, and it doubles as the handshake version
-// (v3 had no nonces; v4 is the R3-1 fix, so a v3 node cannot be talked into the
-// old derivation by an attacker -- it simply fails to match the magic).
-constexpr char kHelloMagic[] = "FCP_HELLO_V4\0\0\0\0";
-constexpr char kHelloAckMagic[] = "FCP_HELLO_ACK_V4";
+// oob magic (§4.7): fixed 16 bytes, and it doubles as the handshake version --
+// byte-for-byte equality is the gate, so a message that does not carry our
+// magic exactly is not a HELLO/HELLO_ACK and can never enter the key
+// schedule.
+constexpr char kHelloMagic[] = "FCP_HELLO_V1\0\0\0\0";
+constexpr char kHelloAckMagic[] = "FCP_HELLO_ACK_V1";
 constexpr size_t kHelloMagicLen = 16;
 constexpr size_t kHelloAckMagicLen = sizeof(kHelloAckMagic) - 1;  // 16
 static_assert(kHelloMagicLen == sizeof(kHelloMagic) - 1, "HELLO magic must be 16 bytes");

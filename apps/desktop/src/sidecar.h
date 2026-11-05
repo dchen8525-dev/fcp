@@ -33,6 +33,7 @@ struct ProxyConfig {
   int mtu = 1400;
   int k = -1;
   double fec_budget = 0.5;
+  double rate_up_mbps = 0.0;  // 上行限速（--rate-limit=UP[:DOWN]，客户端只发 UP）
   QString trace;
 };
 

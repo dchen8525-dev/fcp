@@ -27,7 +27,7 @@ src/mainwindow.*      左栏 + 连接 / 运行状态 / 链路测速 / 日志 四
 src/sidecar.*          fcp-client 子进程管理、stats / @speedtest 解析
 src/sparkline.*       最近 60 秒上下行折线（QPainter）
 assets/               fcp.png、fcp.ico、check.png、app.qss、fcp.desktop、fcp.rc
-launcher/             Windows 单文件引导器（Rust，仅打包用）
+launcher-cpp/         Windows 单文件引导器（C++/Win32 + vendored miniz，仅打包用）
 ```
 
 ## 构建
@@ -70,7 +70,7 @@ cmake -S . -B build -DFCP_BUILD_PROXY=ON -DFCP_BUILD_GUI=ON \
 * **参数**：`--host --port --listen --local-port --mtu --fec-budget --window=:4096
   --key-env=FCP_PSK --log=stats:500`，`k >= 0` 时再加 `--k`。PSK 走环境变量
   `FCP_PSK`，不出现在命令行。
-* **校验顺序**（与旧版一致）：密钥 32 位十六进制 → UDP 端口 → 本地端口 →
+* **校验顺序**：密钥 32 位十六进制 → UDP 端口 → 本地端口 →
   MTU 576..9000 → k -1..7 → FEC 0..1 → 监听地址非空 → 服务器地址非空。
   高级设置折叠时按默认值提交（127.0.0.1 / 1400 / -1 / 0.5）。
 * **设置**：`QSettings`（Windows 注册表 `HKCU\Software\FCP\FCP Client`，
@@ -99,10 +99,11 @@ FCP_SPEEDTEST_KEY=<32 位十六进制> FCP_SPEEDTEST_SECONDS=8 \
 ## 打包
 
 * Windows：`scripts/desktop/build_windows.ps1` 构建 GUI + 收集 Qt 运行库 +
-  `fcp-client`，`scripts/desktop/bundle_windows_portable.ps1` 用
-  `launcher/` 打成单文件便携 exe（载荷是整棵目录树）。
+  `fcp-client`，`scripts/desktop/bundle_windows_portable.ps1` 现编
+  `launcher-cpp/` 引导器并打成单文件便携 exe（载荷是整棵目录树）。
 * Linux：`scripts/desktop/build_linux.sh` 构造 AppDir，用 linuxdeploy 的 Qt
   插件生成 AppImage。
-* 图标：`node scripts/desktop/make_icons.mjs`（产物进仓库）。
+* 图标：`scripts/desktop/make_icons.cc`（纯 C++ + vendored miniz 做
+  deflate；产物进仓库，图标几何修改后手动重编重跑，编译命令见文件头）。
 
 发布流水线与排障见 `docs/发布流程.md`。

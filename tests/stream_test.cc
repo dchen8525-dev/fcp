@@ -1194,6 +1194,72 @@ void TestDupAckForceRefill() {
   CHECK_EQ(f.sa().retransmits(), 2u);
 }
 
+// P1-3 adaptive reordering tolerance (quic-go-style undo evidence): a dup-burst
+// that is confirmed by a cumulative advance sooner than one RTT cannot have
+// been answered by its own repair copy, so it retransmitted a byte the peer
+// already held. Each observation widens the burst gates for the rest of the
+// stream: the packet threshold doubles 3 -> 6 -> 12 and a first-burst age gate
+// grows from rtt/8 towards one full RTT. Until the first spurious observation
+// the thresholds behave exactly as before (TestDupAckForceRefill covers that).
+void TestSpuriousBurstWidensTolerance() {
+  Fixture f;
+  f.cut_all();  // everything moves by hand; time stands still
+  const std::vector<uint8_t> src = MakeBytes(600, 21);  // 6 segments
+  CHECK_EQ(f.push(kA, src), src.size());
+  const int64_t t0 = f.now();
+  CHECK_EQ(f.sa().spur_bursts(), 0u);
+  const uint64_t fast0 = f.sa().retx_fast();
+
+  // Reordering: everything except the head reaches the peer (its copies are
+  // what later ACK cums will be stuck behind), and the head itself will show
+  // up out of order when the advance below feeds cum past it.
+  const auto advance = [&f](uint32_t cum) {
+    f.feed(kA, MakeAck(cum, 4096, 0, 0));
+  };
+  // A same-cum repeat: `count` of them drive the dup counter. Must be fed at
+  // the cum the sender is standing on, so the repeat branch counts.
+  const auto burst = [&f](uint32_t cum, uint32_t count) {
+    for (uint32_t i = 0; i < count; ++i) {
+      f.feed(kA, MakeAck(cum, 4096, 0, 0));
+    }
+  };
+
+  // Enough clock below the RTO (400 ms) and above the grace that will be set
+  // (rtt/8 = 25 ms): the burst path only, nothing else may fire.
+  f.tick(220);  // now = t0 + 220; head age clears both later gates
+  burst(0, 4);  // the first feed registers the cum, three repeats fire (thresh 3)
+  CHECK_EQ(f.sa().retx_fast(), fast0 + 1);
+
+  // The reorder resolves: the head's original copy arrives after the ACK
+  // stream the burst retransmitted for — an advance within one RTT of the
+  // burst, exactly the quic-go undo observation (none in this process can
+  // carry the repair copy that fast).
+  advance(100);
+  CHECK_EQ(f.sa().spur_bursts(), 1u);
+
+  // Losing the burst-triggered copy entirely is the probe that widens; the
+  // stream may still burst again above the same stuck point, now at a doubled
+  // packet threshold. Five duplicates no longer fire.
+  burst(100, 5);
+  CHECK_EQ(f.sa().retx_fast(), fast0 + 1);
+  burst(100, 1);  // the sixth repeat must fire over the doubled threshold
+  CHECK_EQ(f.sa().retx_fast(), fast0 + 2);
+
+  // Second spurious observation: threshold to 12, gate to rtt/4.
+  advance(200);
+  CHECK_EQ(f.sa().spur_bursts(), 2u);
+  for (uint32_t i = 0; i < 11; ++i) {
+    f.feed(kA, MakeAck(200, 4096, 0, 0));
+  }
+  CHECK_EQ(f.sa().retx_fast(), fast0 + 2);  // 11 duplicates under the ceiling
+  f.feed(kA, MakeAck(200, 4096, 0, 0));
+  CHECK_EQ(f.sa().retx_fast(), fast0 + 3);
+
+  // The logged state must not have drifted: nothing above ran a timer path.
+  // (Time never advanced past the single tick; every step was a hand feed.)
+  CHECK_EQ(f.now(), t0 + 220);
+}
+
 // Tail loss probe: the newest segment on the wire is lost and no later data
 // exists, so there is neither a duplicate ACK nor a SACK block to reveal it.
 // The old path could only wait for the RTO; the probe resends the tail after
@@ -1943,7 +2009,7 @@ void TestSynchronousAckDuringPumpKeepsQueueConsistent() {
   CHECK(f.b().delivered == src);
 }
 
-// auto_window off is the legacy fixed window: no growth, no probes of the path.
+// auto_window off is the fixed-window mode: no growth, no probes of the path.
 void TestFixedWindowUnchanged() {
   Fixture f;
   const std::vector<uint8_t> src = MakeBytes(4000, 12);
@@ -2341,6 +2407,7 @@ int main() {
   TestSackFillsHoleWithoutTimeout();
   TestSackRotationReportsAllHoles();
   TestDupAckForceRefill();
+  TestSpuriousBurstWidensTolerance();
   TestTailLossProbeRepairsLostTail();
   TestLostSackFillRetriedAfterOneRtt();
   TestSackFillsWholeHoleInOnePass();

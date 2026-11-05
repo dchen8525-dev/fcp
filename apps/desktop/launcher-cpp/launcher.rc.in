@@ -1,0 +1,26 @@
+// 由 CMake configure_file 生成（launcher.rc.in → launcher.rc）。
+// 图标 + VERSIONINFO，对齐退役 Rust 版 build.rs（tauri_winres）写进去的内容。
+// 含中文，rc 文件需按 UTF-16 处理 —— 由 /utf-8 编译选项之外的 rc 编译器读
+// BOM；CMake 的 configure_file 原样拷贝 UTF-8 内容，rc.exe 用 -c 65001。
+
+1 ICON "@FCP_ICON@"
+
+1 VERSIONINFO
+FILEVERSION     @APP_VERSION_COMMA@
+PRODUCTVERSION  @APP_VERSION_COMMA@
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "080904B0"
+    BEGIN
+      VALUE "FileDescription", "FCP portable launcher (single-file bootstrap)"
+      VALUE "FileVersion",     "@APP_VERSION@"
+      VALUE "ProductName",     "FCP"
+      VALUE "ProductVersion",  "@APP_VERSION@"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0809, 0x04B0  // English (UK), Unicode
+  END
+END

@@ -223,6 +223,12 @@ bool Sidecar::startProxy(const ProxyConfig& config, QString* error) {
   if (config.k >= 0) {
     args.append(QStringLiteral("--k=%1").arg(config.k));
   }
+  if (config.rate_up_mbps > 0.0) {
+    // 'g' 不定长（尾部零自动裁剪）：'f',1 会把 0.05 四舍五入成 0.1（限速翻倍）
+    // 或把 0.04 舍成 0.0（CLI 直接报错拒绝启动）。
+    args.append(QStringLiteral("--rate-limit=%1").arg(
+        QString::number(config.rate_up_mbps, 'g', 15)));
+  }
   if (!config.trace.trimmed().isEmpty()) {
     args.append(QStringLiteral("--trace=%1").arg(config.trace.trimmed()));
   }

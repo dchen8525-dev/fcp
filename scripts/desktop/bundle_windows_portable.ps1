@@ -1,7 +1,8 @@
 ﻿# 把 Qt 客户端（FCP.exe + fcp-client.exe + Qt 运行库）打成单文件便携 exe。
 #
 # 安装器（NSIS/MSI）不是这里的目标；要的是"双击即用、删除即卸载"。
-# 做法是一个很小的 Rust 引导器（apps/desktop/launcher）：
+# 做法是一个很小的 C++ 引导器（apps/desktop/launcher-cpp，独立 CMake 工程，
+# 静态 CRT 零依赖；彻底无 Rust，决策 #75）：
 #
 #   [fcp-launcher.exe][payload.zip][64 字节尾部]
 #
@@ -45,25 +46,27 @@ if (-not [BitConverter]::IsLittleEndian) {
 $stage = Join-Path ([System.IO.Path]::GetTempPath()) ("fcp-launcher-stage-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 try {
-  # 1) 编译引导器。target-dir 显式指定，避免被外部 CARGO_TARGET_DIR 影响。
-  $crateDir = Join-Path $repo "apps\desktop\launcher"
-  $targetDir = Join-Path $crateDir "target"
-  Push-Location $crateDir
-  $prevVersion = $env:FCP_VERSION
-  try {
-    $env:FCP_VERSION = $Version
-    cargo build --release --target-dir $targetDir
-    if ($LASTEXITCODE -ne 0) { throw "cargo build（引导器）失败" }
-  } finally {
-    if ($null -eq $prevVersion) {
-      Remove-Item Env:\FCP_VERSION -ErrorAction SilentlyContinue
+  # 1) 编译引导器（launcher-cpp 独立 CMake 工程；MSVC 默认生成器，
+  #    版本号经 APP_VERSION 写进 VERSIONINFO）。
+  #    注意：`-DAPP_VERSION=$Version` 这种不带引号的写法在 Windows
+  #    PowerShell 5.1 里不展开变量（整段原样传给 cmake），必须先拼成
+  #    单个参数传。VS 生成器是 multi-config，CMAKE_BUILD_TYPE 无意义不传。
+  $launcherSrc = Join-Path $repo "apps\desktop\launcher-cpp"
+  $launcherBuild = Join-Path $stage "launcher-build"
+  $versionArg = "-DAPP_VERSION=$Version"
+  cmake -S $launcherSrc -B $launcherBuild $versionArg
+  if ($LASTEXITCODE -ne 0) { throw "cmake configure（引导器）失败" }
+  cmake --build $launcherBuild --config Release
+  if ($LASTEXITCODE -ne 0) { throw "cmake build（引导器）失败" }
+  $launcher = Join-Path $launcherBuild "Release\fcp-launcher.exe"
+  if (!(Test-Path $launcher)) {
+    # 单配置生成器（如 Ninja + msbuild 变体）时产物不带 Release 子目录。
+    if (Test-Path (Join-Path $launcherBuild "fcp-launcher.exe")) {
+      $launcher = Join-Path $launcherBuild "fcp-launcher.exe"
     } else {
-      $env:FCP_VERSION = $prevVersion
+      throw "找不到 $launcher"
     }
-    Pop-Location
   }
-  $launcher = Join-Path $targetDir "release\fcp-launcher.exe"
-  if (!(Test-Path $launcher)) { throw "找不到 $launcher" }
 
   # 2) 载荷 zip：整个收集目录递归入包（Qt 插件在 platforms/、styles/ 等子目录里）。
   #    .NET 的 ZipFile 用标准 deflate；引导器只启用了 deflate 解码。

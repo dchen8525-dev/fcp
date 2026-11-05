@@ -56,7 +56,7 @@ const char* handshake_error_text(HandshakeError error) {
     case HandshakeError::kNone:
       return "none";
     case HandshakeError::kNoAck:
-      return "V4 no ACK after 3 tries";
+      return "no ACK after 3 tries";
     case HandshakeError::kBadCaps:
       return "invalid caps";
     case HandshakeError::kMissingCapability:

@@ -56,17 +56,17 @@ std::wstring path_to_wide(const std::string& path) {
   return w;
 }
 
-std::FILE* open_trace_file(const std::string& path) {
+std::FILE* open_trace_file(const std::string& path, bool append) {
   const std::wstring w = path_to_wide(path);
   if (w.empty()) {
     return nullptr;
   }
   std::FILE* f = nullptr;
-  return _wfopen_s(&f, w.c_str(), L"wb") == 0 ? f : nullptr;
+  return _wfopen_s(&f, w.c_str(), append ? L"ab" : L"wb") == 0 ? f : nullptr;
 }
 #else
-std::FILE* open_trace_file(const std::string& path) {
-  return std::fopen(path.c_str(), "wb");
+std::FILE* open_trace_file(const std::string& path, bool append) {
+  return std::fopen(path.c_str(), append ? "ab" : "wb");
 }
 #endif
 
@@ -171,8 +171,15 @@ const char* stream_reason_text(CloseReason reason) {
 // file per forged 8-byte salt (a trivially amplified inode DoS). Only
 // authenticated sessions emit a controller report, so the file appears only
 // for those.
+//
+// Rotation: a calibrated trace runs unattended for as long as the session
+// lives, so the file is capped at kTraceRotateBytes -- on crossing, the
+// current file becomes ".1" (the previous ".1" is dropped) and recording
+// continues into a fresh file. One generation is deliberately all the trace
+// keeps: it is a debugging aid, not an audit archive.
 SessionConfig::TraceFn make_trace_sink(const std::string& prefix, uint64_t cid,
-                                       std::function<void(const std::string&)> log) {
+                                       std::function<void(const std::string&)> log,
+                                       size_t rotate_bytes) {
   if (prefix.empty()) {
     return nullptr;
   }
@@ -181,6 +188,8 @@ SessionConfig::TraceFn make_trace_sink(const std::string& prefix, uint64_t cid,
     std::shared_ptr<std::FILE> file;
     bool attempted = false;
     bool disabled = false;
+    bool warned_rotate = false;
+    size_t written = 0;
   };
   auto state = std::make_shared<Lazy>();
   state->path = prefix + "." + std::to_string(cid) + ".jsonl";
@@ -194,22 +203,49 @@ SessionConfig::TraceFn make_trace_sink(const std::string& prefix, uint64_t cid,
       log(line);
     }
   };
-  return [state, report](const TraceEntry& e) {
+  return [state, report, log, rotate_bytes](const TraceEntry& e) {
+    if (state->disabled) {
+      return;
+    }
     if (!state->attempted) {
       state->attempted = true;
       make_directories_for(state->path);
-      state->file = std::shared_ptr<std::FILE>(open_trace_file(state->path), [](std::FILE* f) {
-        if (f != nullptr) {
-          std::fclose(f);
-        }
-      });
+    }
+    if (!state->file || state->written > rotate_bytes) {
+      state->file.reset();  // Windows rename() needs the file closed first
+      bool rotated = true;
+      if (state->written != 0) {
+        const std::string backup = state->path + ".1";
+        std::remove(backup.c_str());
+        rotated = std::rename(state->path.c_str(), backup.c_str()) == 0;
+      }
+      // A failed rename is a transient filesystem/permission hiccup, not a
+      // reason to lose the session's whole remaining trace: reopen the existing
+      // file in append mode, keep `written`, and try the rotation again on the
+      // next entry. A busy file then costs one line of delay, not the trace.
+      state->file = std::shared_ptr<std::FILE>(
+          open_trace_file(state->path, !rotated), [](std::FILE* f) {
+            if (f != nullptr) {
+              std::fclose(f);
+            }
+          });
+      if (rotated) {
+        state->written = 0;
+        state->warned_rotate = false;
+      }
       if (!state->file) {
         report("unopenable");
         return;
       }
-    }
-    if (state->disabled || !state->file) {
-      return;
+      if (!rotated && !state->warned_rotate) {
+        state->warned_rotate = true;
+        const std::string line = "trace path " + state->path +
+                                 " rotate failed; retrying on next entry";
+        std::fprintf(stderr, "fcp: %s\n", line.c_str());
+        if (log) {
+          log(line);
+        }
+      }
     }
     std::string line;
     encode_trace_line(e, &line);
@@ -218,7 +254,9 @@ SessionConfig::TraceFn make_trace_sink(const std::string& prefix, uint64_t cid,
     // pretending the file is a full trace (disk full / read-only media).
     if (std::fwrite(line.data(), 1, line.size(), state->file.get()) != line.size()) {
       report("write failed (disk full or read-only)");
+      return;
     }
+    state->written += line.size();
   };
 }
 
@@ -642,7 +680,8 @@ void ProxyEngine::fill_session_config(SessionConfig* sc, uint64_t conn_id) const
   sc->pinned_k = cfg_.pinned_k;
   sc->fec_budget = cfg_.fec_budget;
   sc->trace = make_trace_sink(cfg_.trace_prefix, conn_id,
-                              [this](const std::string& line) { log(line); });
+                              [this](const std::string& line) { log(line); },
+                              cfg_.trace_rotate_bytes);
   // A stream numbers bytes, so a retransmission deliberately repeats an id the
   // peer has to see again; the frame-layer dedup keyed on the KCP sn would eat
   // it and stall the send window (session.h, SessionConfig::sn_of).

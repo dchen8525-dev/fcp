@@ -95,6 +95,20 @@ constexpr size_t kResolverMaxAddrs = 16;
 // truncated every symbol once --mtu exceeded ~2 KiB, which the session then
 // dropped as an authentication failure with no diagnostic.
 constexpr size_t kUdpRecvBytes = 64 * 1024;
+// Linux recvmmsg datagrams per syscall (P1-4, mirroring quic-go's 8-message
+// read loop). The receive arena is this × the per-slot byte bound; a read
+// shorter than a full batch means the socket emptied for now.
+constexpr int kRecvBatchMsgs = 8;
+// Linux UDP_SEGMENT GSO batch (P1-4): segments coalesced per sendmsg. The
+// kernel's own ceiling for a UDP GSO send is 64 segments.
+constexpr size_t kGsoMaxSegs = 64;
+// Dead-path watchdog cadence: while a stall is declared the reminder repeats
+// this often until recovery, and TX counts as "still moving" when it advanced
+// within this window (the stream retransmission timer backs off, so the window
+// must cover its gaps; truly idle tunnels freeze both directions and stay
+// silent on purpose).
+constexpr int64_t kStallLogMs = 30000;
+constexpr int64_t kStallTxWindowMs = 10000;
 
 struct ReactorOptions {
   EngineRole role = EngineRole::kClient;
@@ -110,12 +124,34 @@ struct ReactorOptions {
   // port (bench.h). Off by default: the responder creates an authenticated
   // session from an unauthenticated rendezvous, so exposing it is opt-in.
   bool speedtest = false;
+  // Linux UDP GRO receive aggregation (P1-4). On by default; --no-udp-gro
+  // retires it for hosts where the benchmark says the deep copies cost more
+  // than the interrupts they save. A kernel without the option (or a sandbox
+  // refusing the setsockopt) degrades to the plain loop regardless.
+  bool udp_gro = true;
   // TCP connect budget for one resolved address. A name with several records
   // may spend this per record; the engine's own dial_timeout_ms still bounds
   // resolution plus all attempts from above.
   int64_t connect_timeout_ms = 5000;
   int64_t stats_ms = 0;  // 0 = no periodic stats line
   bool verbose = false;
+  // Client only: dead-path watchdog (半开/断流). A tunnel that keeps ACKs and
+  // retransmitted segments going out while nothing at all comes back for this
+  // long is logged as a stall (and again every kStallLogMs until it recovers);
+  // recovery is logged with its duration. 0 = off. Data traffic untouched --
+  // the idle timeout is still the thing that closes genuinely dead sessions;
+  // this exists so an operator (and the GUI log page) can see the wall-clock
+  // window the path was dark.
+  int64_t stall_ms = 60000;
+  // Send shaping budget, bytes/s (0 = off; the CLI converts --rate-limit's
+  // Mbps). The tunnel has one upload end and one download end, so the halves
+  // never apply to the same host: the client shapes what it sends with UP, the
+  // server shapes what it sends down with DOWN. Applied at the socket send
+  // path: datagrams over the allowance are held in order for at most one
+  // second's worth of budget, then dropped as a shaped link would drop them --
+  // the FEC/ARQ layer is built to absorb exactly that loss.
+  uint64_t rate_up_bytes = 0;
+  uint64_t rate_down_bytes = 0;
 };
 
 class Reactor {
@@ -197,9 +233,29 @@ class Reactor {
   void app_shutdown(uint64_t conn);
   void app_close(uint64_t conn);
   size_t wire_send(uint64_t peer, const uint8_t* wire, size_t len);
+  // wire_send's send path under no shaping: the GSO batch on Linux, else the
+  // plain ::send/::sendto. `to` is the destination captured at wire_send time
+  // (nullptr on the connected client socket), so a datagram held by the shaper
+  // can never be re-routed to a peer id that was freed and reused meanwhile.
+  size_t emit_wire(uint64_t peer, const uint8_t* wire, size_t len,
+                   const sockaddr_in* to);
+  // Send-shaping budget this host enforces (rate_up_bytes on the client that
+  // uploads, rate_down_bytes on the server that serves the download).
+  uint64_t shaper_bytes_per_sec() const;
+  // Sliding one-second admission window: true when `len` fits the budget that
+  // is still charged for datagrams sent over the trailing second.
+  bool wire_admit(size_t len);
+  void wire_charge(int64_t now_ms, size_t len);
+  // Releases the head of the hold queue while budget lasts (or everything, in
+  // force mode: the shutdown path must drain the shaper even past budget).
+  // Called once per loop pass, never re-entrant.
+  void flush_wire_deferred(int64_t now_ms, bool force = false);
   // Count a permanent UDP send error and explain the first one per second on
   // stderr (EMSGSIZE is the "MTU larger than the path" case and names --mtu).
   void note_udp_send_error(int err, size_t len);
+  // Dead-path watchdog (opt_.stall_ms): one counters snapshot per tick. Nothing
+  // functional hangs on it -- the log line is its output.
+  void check_stall(int64_t now_ms);
   // Connections whose application socket hit a fatal send error. The engine
   // must not be re-entered from a host callback, so they are queued and the
   // loop tells it once the call stack has unwound (M-05).
@@ -218,6 +274,28 @@ class Reactor {
 
   // Loop steps.
   void drain_udp(int64_t now_ms);
+  // One received UDP datagram, shared by the recvfrom path and the recvmmsg
+  // batch: bench dispatch, peer-id books on the server, engine delivery.
+  void drain_datagram(const sockaddr_in& from, const uint8_t* data, size_t len,
+                      int64_t now_ms);
+#ifdef __linux__
+  void drain_udp_mmsg(int64_t now_ms);
+  // Hand GRO cmsg results to the engine: an aggregated read (kernel-verified
+  // same-size run) splits into exact-size pieces; anything else goes whole.
+  void drain_gro(const sockaddr_in& from, const uint8_t* data, size_t len,
+                 int gro_seg, int64_t now_ms);
+  // Coalesce one datagram into the pending GSO batch (flushing a mismatched
+  // batch first); `to` is the destination captured at send time (nullptr on
+  // the connected client socket), so a batch is never re-addressed via a peer
+  // id that may have been freed and reused by flush time.
+  void gso_append(uint64_t peer, const uint8_t* wire, size_t len,
+                  const sockaddr_in* to);
+  // One sendmsg per batch with UDP_SEGMENT; falls back to per-datagram sends
+  // when the kernel does not segment (or the batch already had to be flushed
+  // by a mismatch). Called before every select() wait: a pump burst goes out
+  // within the iteration that produced it.
+  void flush_udp_batch();
+#endif
   void accept_local(int64_t now_ms);
   void read_socket(Sock sock, uint64_t conn, bool target, int64_t now_ms);
   void flush_conn(uint64_t conn, int64_t now_ms);
@@ -268,6 +346,43 @@ class Reactor {
   // Dropped on success, on the final failure and when the conn goes away.
   std::unordered_map<uint64_t, std::deque<ResolvedAddr>> dial_addrs_;
   std::vector<uint8_t> udp_buf_ = std::vector<uint8_t>(kUdpRecvBytes);
+#ifdef __linux__
+  // P1-4 Linux fast paths. UDP_SEGMENT is retired on EIO/EOPNOTSUPP (with an
+  // EINVAL pause+rearm for the PMTU-probe case); recvmmsg + UDP_GRO degrade by
+  // their own option failures, not by per-read fallbacks. The batch buffers
+  // are allocated in open_udp and never change after that.
+  std::vector<uint8_t> udp_batch_;
+  // Per-slot byte bound: a GRO bundle is at most 64 segments, each within the
+  // largest datagram this socket can carry (PMTUD ceiling when probing is on,
+  // else --mtu). A smaller slot would make the kernel truncate the bundle
+  // silently — the rest is dropped, not re-read later.
+  size_t udp_slot_bytes_ = 0;
+  // Coalesced equal-size equal-peer datagrams waiting for one GSO sendmsg.
+  std::vector<uint8_t> gso_buf_;
+  size_t gso_seg_len_ = 0;  // datagram size of the pending batch; 0 = empty
+  size_t gso_segs_ = 0;
+  uint64_t gso_peer_ = 0;   // batching key only; the address below is the truth
+  // Destination captured when the first segment entered the batch. flush time
+  // is arbitrary relative to peer retirement, and a server peer id can be
+  // freed and reused for a different source address inside the same loop
+  // iteration -- the batch must address what was batched, not what the slot
+  // holds later.
+  sockaddr_in gso_to_{};
+  bool gso_has_to_ = false;
+  bool gso_ok_ = true;
+  // P1-4 receive counterpart: UDP_GRO coalesces same-size same-flow datagrams
+  // in the kernel and the read that returns them carries a SOL_UDP/UDP_GRO
+  // cmsg with the segment size, so the reactor never has to guess the symbol
+  // wire length. A kernel without the option (or a sandbox that says no)
+  // keeps the plain per-datagram reads.
+  bool gro_ok_ = true;
+  // After an EINVAL (which a PMTUD probe above the path MTU legitimately
+  // produces) GSO pauses for this many sends and is re-armed once, instead of
+  // dying to one probe forever. Fully unsupported kernels fail teardown
+  // every re-arm attempt, so their steady-state cost is one rejected cmsg
+  // per ~16 datagrams; the fast-path sockets never see an EINVAL at all.
+  int gso_reprieve_ = 0;
+#endif
   // Per-iteration scratch, reused across passes instead of reallocated: run()
   // is the proxy's hot loop and these are cleared (capacity kept) every time.
   // build_sets() fills the four maps; the three id vectors carry the walks that
@@ -292,6 +407,36 @@ class Reactor {
   uint64_t udp_send_errors_ = 0;          // permanent send failures (stats/debug)
   int64_t last_udp_send_error_ms_ = 0;    // rate limit for the log line above
   int64_t next_skip_log_ms_ = 0;
+  // Send shaper: the sliding window holds {ms, bytes} of what this host has
+  // passed through in the trailing second; wire_deferred_ is the ordered hold
+  // queue for datagrams that arrived over budget (capped at one second's worth,
+  // so a sustained overload turns into shaped-link loss instead of memory).
+  // The destination address, not the peer id, is captured: on the server a
+  // peer slot can be retired and its id reused for a different source address
+  // between enqueue and the next flush.
+  struct DeferredWire {
+    uint64_t peer = 0;  // GSO batching key (same iteration only)
+    sockaddr_in to{};    // server: destination; unused on the client
+    bool has_addr = false;
+    std::vector<uint8_t> bytes;
+  };
+  std::deque<DeferredWire> wire_deferred_;
+  size_t wire_deferred_bytes_ = 0;
+  uint64_t wire_over_budget_ = 0;  // datagrams past the cap: shaped-link drops
+  std::deque<std::pair<int64_t, size_t>> wire_window_;
+  size_t wire_window_bytes_ = 0;
+  // Stall watchdog state, seeded from the counters at start().
+  uint64_t stall_seen_rx_bytes_ = 0;
+  uint64_t stall_seen_tx_bytes_ = 0;
+  int64_t stall_last_rx_ms_ = 0;
+  int64_t stall_last_tx_ms_ = 0;
+  int64_t stall_since_ms_ = 0;  // 0 = not stalled
+  int64_t stall_next_log_ms_ = 0;
+  // Recovery confirmation: `bytes_rx` also counts datagrams the engine then
+  // drops (unknown salt, tombstone, garbage), so one spoofed packet must not
+  // print "recovered". A stall clears only after inbound moved on two
+  // consecutive watchdog ticks.
+  bool stall_rx_pending_ = false;
   size_t max_sessions_ = 0;
   using SignalHandler = void (*)(int);
   SignalHandler prev_int_ = nullptr;

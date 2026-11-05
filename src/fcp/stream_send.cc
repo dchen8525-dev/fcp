@@ -86,7 +86,7 @@ void Stream::ack_dup_burst(uint32_t cum, int64_t now_ms) {
   }
   last_cum_ = cum;
   have_cum_ = true;
-  if (dup_acks_ < kDupAckThresh || tx_.empty() || !tx_.front().sent) {
+  if (dup_acks_ < dup_thresh_ || tx_.empty() || !tx_.front().sent) {
     return;
   }
   // A repair already on the wire gets one RTT to land. The peer ACKs every
@@ -96,15 +96,22 @@ void Stream::ack_dup_burst(uint32_t cum, int64_t now_ms) {
   // hole into hundreds of copies of the same 1.3 KB segment per RTT. That
   // storm was ~26k retransmissions per 50 MB transfer on the 205ms/15% WAN
   // path and starved the very ACKs it was waiting for.
-  {
-    const PendingSeg& head = tx_.front();
-    // Wait the path's current RTT, not its historical minimum: a standing
-    // queue stretches the repair's round trip too.
-    const int64_t rtt = std::max<int64_t>(std::max(min_rtt_ms_, srtt_ms_), 1);
-    if (head.retrans && now_ms - head.sent_ms < rtt) {
-      return;  // the previous repair is still in flight
-    }
+  PendingSeg& head = tx_.front();
+  // Wait the path's current RTT, not its historical minimum: a standing
+  // queue stretches the repair's round trip too.
+  const int64_t rtt = std::max<int64_t>(std::max(min_rtt_ms_, srtt_ms_), 1);
+  if (head.retrans && now_ms - head.sent_ms < rtt) {
+    return;  // the previous repair is still in flight
   }
+  // Adaptive first-burst gate (P1-3): after the tolerance has been widened,
+  // the head must have had a chance to round-trip before a burst may blame
+  // it. A genuinely lost head has unbounded age, so this only delays the
+  // repair to ~grace; a reordered shadow fires below the gate and is mode
+  // silently absorbed instead of being answered with duplicate bytes.
+  if (!head.retrans && now_ms - head.sent_ms < reorder_grace_ms_) {
+    return;
+  }
+  dup_burst_ms_ = now_ms;
   dup_acks_ = 0;
   // FEC can deliver a set out of order, so three duplicates can mean a
   // reordered symbol rather than a lost one. The forced retransmission is
@@ -164,6 +171,28 @@ void Stream::ack_advance_cum(uint32_t cum, int64_t now_ms) {
     tx_.pop_front();
   }
   snd_una_ = cum;
+  // Adaptive reordering evidence (P1-3): the pending dup-burst repair was
+  // confirmed too fast for its own bytes to have made the trip. The byte the
+  // burst retransmitted sits at the cumulative point, so only its arrival can
+  // advance cum — and an arrival within one RTT of the burst must be the
+  // original, which the burst duplicated while it sat reordered in the peer's
+  // receive window. That is quic-go's undo observation in FCP clothing.
+  if (dup_burst_ms_ >= 0) {
+    const int64_t since_burst = now_ms - dup_burst_ms_;
+    dup_burst_ms_ = -1;
+    const int64_t rtt = std::max<int64_t>(std::max(min_rtt_ms_, srtt_ms_), 1);
+    if (popped_retrans && since_burst >= 0 && since_burst < rtt) {
+      ++spur_bursts_;
+      // quic-go widens the reordering tolerance up to 1xRTT and retires the
+      // packet-count trigger at the ceiling; here doubling the count to 12
+      // keeps one press of the brake (renaming it disabled invites a full-
+      // window RTO recovery on a path that goes quiet mid-transfer).
+      dup_thresh_ = std::min<uint32_t>(dup_thresh_ * 2, kDupAckThresh * 4);
+      reorder_grace_ms_ =
+          reorder_grace_ms_ == 0 ? std::max<int64_t>(rtt / 8, 1)
+                                 : std::min<int64_t>(reorder_grace_ms_ * 2, rtt);
+    }
+  }
   // The peer confirmed progress: the tail-loss clock restarts and the probe
   // budget for the previous stall is spent.
   progress_ms_ = now_ms;

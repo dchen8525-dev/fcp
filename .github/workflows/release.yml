@@ -133,6 +133,13 @@ jobs:
           deb="$(ls build/packages/*.deb)"
           version="${{ needs.prep.outputs.version }}"
 
+          # 带一行回显的断言（第四/五次跑挂过：set -e 静默退出时日志里只看到
+          # 段落标题，不知道是哪一条）。定义放在所有使用之前。
+          check() {
+            echo "  - $1"; shift
+            if ! "$@"; then echo "::error::检查失败：$*"; return 1; fi
+          }
+
           sudo dpkg -i "$deb"
 
           echo "== 版本自检"
@@ -163,10 +170,6 @@ jobs:
           echo "== 包内文件落点"
           # 每一步都带一行回显：第四次跑时这里直接 exit 1，日志里只看到
           # "== 包内文件落点" 三个字，不知道是哪一条挂的（set -e 静默退出）。
-          check() {
-            echo "  - $1"; shift
-            if ! "$@"; then echo "::error::落点检查失败：$*"; return 1; fi
-          }
           check "/usr/bin/fcp-server 可执行" test -x /usr/bin/fcp-server
           check "/usr/bin/fcp-client 可执行" test -x /usr/bin/fcp-client
           check "/etc/fcp/fcp.env 存在" sudo test -f /etc/fcp/fcp.env

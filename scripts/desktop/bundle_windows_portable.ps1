@@ -4,7 +4,7 @@
 # 做法是一个很小的 C++ 引导器（apps/desktop/launcher-cpp，独立 CMake 工程，
 # 静态 CRT 零依赖；彻底无 Rust，决策 #75）：
 #
-#   [fcp-launcher.exe][payload.zip][64 字节尾部]
+#   [fcp-launcher.exe][payload.lzma][80 字节尾部]
 #
 # 首次运行时引导器把载荷（整个目录树，含 platforms/ 等 Qt 插件）解到
 # %LOCALAPPDATA%\FCP\bin\<SHA-256 前 8 字节>\，之后直接启动缓存里的 FCP.exe；
@@ -69,7 +69,8 @@ try {
   }
 
   # 2) 载荷 zip：整个收集目录递归入包（Qt 插件在 platforms/、styles/ 等子目录里）。
-  #    .NET 的 ZipFile 用标准 deflate；引导器只启用了 deflate 解码。
+  #    这里用 store（不压缩）：外层还要整体 LZMA，先 deflate 一遍只会让
+  #    LZMA 面对已经熵化的字节，两层的总量反而更大。
   try {
     Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
   } catch {
@@ -78,38 +79,49 @@ try {
   $payload = Join-Path $stage "payload.zip"
   [System.IO.Compression.ZipFile]::CreateFromDirectory(
     $PayloadDir, $payload,
-    [System.IO.Compression.CompressionLevel]::Optimal, $false)
+    [System.IO.Compression.CompressionLevel]::NoCompression, $false)
 
-  # 3) 64 字节尾部：magic + 格式版本 + 偏移/长度 + SHA-256。
-  $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $payload).Hash
+  # 3) 整体 LZMA1_alone（引导器里是 7-Zip 的 LzmaDec）。编码端用 Python
+  #    标准库，避免再引入 7z 可执行文件；windows-latest 自带 Python。
+  $packed = Join-Path $stage "payload.lzma"
+  $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
+  if (-not $pythonCmd) { throw "找不到 python；LZMA 载荷需要 Python 3.x（CI: windows-latest 自带）" }
+  & $pythonCmd.Source (Join-Path $PSScriptRoot "lzma_pack.py") $payload $packed
+  if ($LASTEXITCODE -ne 0) { throw "LZMA 压缩失败" }
+
+  # 4) 80 字节尾部：magic + 版本 + 编码 + 偏移/压缩长/原长 + SHA-256。
+  $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $packed).Hash
   $hash = [byte[]]::new(32)
   for ($i = 0; $i -lt 32; $i++) {
     $hash[$i] = [Convert]::ToByte($sha.Substring($i * 2, 2), 16)
   }
   $offset = (Get-Item $launcher).Length
-  $length = (Get-Item $payload).Length
+  $length = (Get-Item $packed).Length
+  $raw = (Get-Item $payload).Length
 
-  $footer = [byte[]]::new(64)
-  [Text.Encoding]::ASCII.GetBytes("FCPBOOT1").CopyTo($footer, 0)
-  [BitConverter]::GetBytes([uint32]1).CopyTo($footer, 8)   # 格式版本
-  # 12..16 保留，保持 0
+  $footer = [byte[]]::new(80)
+  [Text.Encoding]::ASCII.GetBytes("FCPBOOT2").CopyTo($footer, 0)
+  [BitConverter]::GetBytes([uint32]2).CopyTo($footer, 8)   # 格式版本
+  [BitConverter]::GetBytes([uint32]1).CopyTo($footer, 12)  # 编码：LZMA1_alone
   [BitConverter]::GetBytes([uint64]$offset).CopyTo($footer, 16)
   [BitConverter]::GetBytes([uint64]$length).CopyTo($footer, 24)
-  $hash.CopyTo($footer, 32)
+  [BitConverter]::GetBytes([uint64]$raw).CopyTo($footer, 32)
+  $hash.CopyTo($footer, 40)
+  # 72..80 保留，保持 0
 
-  # 4) 拼接：引导器 + 载荷 + 尾部。
+  # 5) 拼接：引导器 + 载荷 + 尾部。
   $out = Join-Path $OutDir "fcp-client-gui-${Version}-windows-amd64.exe"
   $fs = [System.IO.File]::Create($out)
   try {
-    foreach ($part in @($launcher, $payload)) {
+    foreach ($part in @($launcher, $packed)) {
       $bytes = [System.IO.File]::ReadAllBytes($part)
       $fs.Write($bytes, 0, $bytes.Length)
     }
     $fs.Write($footer, 0, $footer.Length)
   } finally { $fs.Close() }
 
-  Write-Host ("便携 exe: {0} ({1:N1} MiB；载荷 {2:N1} MiB)" -f `
-    $out, ((Get-Item $out).Length / 1MB), ($length / 1MB))
+  Write-Host ("便携 exe: {0} ({1:N1} MiB；载荷 LZMA {2:N1} MiB / zip {3:N1} MiB)" -f `
+    $out, ((Get-Item $out).Length / 1MB), ($length / 1MB), ($raw / 1MB))
 } finally {
   Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
 }

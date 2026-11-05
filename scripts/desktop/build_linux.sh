@@ -1,12 +1,18 @@
 #!/bin/bash
 # Linux 侧构建（在 VPS / CI 上跑）：CMake 出 fcp-client → CMake 出 Qt GUI
-# → linuxdeploy（Qt 插件）打成 .AppImage（便携、双击运行，不需要安装）。
+# → linuxdeploy（Qt 插件）→ 裁掉无用插件 → appimagetool（xz）打成 .AppImage
+# （便携、双击运行，不需要安装）。
 #
 # 用法：在仓库根执行
 #   bash scripts/desktop/build_linux.sh [--skip-fcp]
 #
-# 环境：Qt 6 Widgets 开发包（Ubuntu 22.04: qt6-base-dev）、cmake、ninja、
-# patchelf、libgl1-mesa-dev、curl。CLI 另需 vcpkg（见 docs/发布流程.md）。
+# 环境变量：
+#   FCP_QT_PREFIX  可选，自编 Qt 的前缀（例如 CI 里 -no-icu 的 Qt）；
+#                  不给就用系统 Qt（Ubuntu: qt6-base-dev）。自编 Qt 必须
+#                  提供 bin/qmake，linuxdeploy-plugin-qt 靠它找插件。
+#
+# 环境：cmake、ninja、patchelf、libgl1-mesa-dev、curl、binutils(strip)。
+# CLI 另需 vcpkg（见 docs/发布流程.md）。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -38,10 +44,12 @@ BIN="$CLI_BUILD/apps/cli/fcp-client"
 [ -x "$BIN" ] || { echo "缺少可执行文件：$BIN"; exit 1; }
 
 # ---------------------------------------------------------------- Qt GUI
-echo "== CMake: Qt GUI"
-cmake -S "$ROOT/apps/desktop" -B "$GUI_BUILD" \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_INSTALL_PREFIX=/usr
+echo "== CMake: Qt GUI${FCP_QT_PREFIX:+ (prefix=$FCP_QT_PREFIX)}"
+GUI_CMAKE_ARGS=(-DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr)
+if [ -n "${FCP_QT_PREFIX:-}" ]; then
+  GUI_CMAKE_ARGS+=(-DCMAKE_PREFIX_PATH="$FCP_QT_PREFIX")
+fi
+cmake -S "$ROOT/apps/desktop" -B "$GUI_BUILD" "${GUI_CMAKE_ARGS[@]}"
 cmake --build "$GUI_BUILD" --parallel
 
 # ---------------------------------------------------------------- AppDir
@@ -55,6 +63,8 @@ install -Dm644 "$ROOT/apps/desktop/assets/fcp.png" \
   "$APPDIR/usr/share/icons/hicolor/512x512/apps/fcp.png"
 # linuxdeploy 既接受 AppDir 根下的图标，也接受 hicolor 布局；两处都放一份。
 install -Dm644 "$ROOT/apps/desktop/assets/fcp.png" "$APPDIR/fcp.png"
+# linuxdeploy 只 strip 它自己部署的库；这两个是我们 install 进来的。
+strip --strip-all "$APPDIR/usr/bin/fcp-client" "$APPDIR/usr/bin/FCP"
 
 # ---------------------------------------------------------------- linuxdeploy
 fetch() {
@@ -69,26 +79,35 @@ fetch "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/l
   "$TOOLS/linuxdeploy"
 fetch "https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage" \
   "$TOOLS/linuxdeploy-plugin-qt"
+# linuxdeploy 自带的 appimagetool 只出 zstd；这里单独用它选 xz。
+fetch "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage" \
+  "$TOOLS/appimagetool"
 
 # CI 的容器里没有 FUSE；让 AppImage 自解压运行。
 export APPIMAGE_EXTRACT_AND_RUN=1
-# Qt 插件通过 QMAKE 找 Qt 安装；Ubuntu 的 qmake6 在 /usr/bin。
-if [ -z "${QMAKE:-}" ]; then
+# Qt 插件通过 QMAKE 找 Qt 安装；自编 Qt 用它的 qmake，系统 Qt 用 qmake6。
+if [ -n "${FCP_QT_PREFIX:-}" ] && [ -x "$FCP_QT_PREFIX/bin/qmake" ]; then
+  QMAKE="$FCP_QT_PREFIX/bin/qmake"
+elif [ -z "${QMAKE:-}" ]; then
   QMAKE="$(command -v qmake6 || command -v qmake || echo /usr/lib/qt6/bin/qmake)"
 fi
 export QMAKE
 
 echo "== linuxdeploy（Qt 插件）"
 cd "$WORK"
-"$TOOLS/linuxdeploy" --appdir "$APPDIR" --plugin qt --output appimage \
+"$TOOLS/linuxdeploy" --appdir "$APPDIR" --plugin qt \
   --desktop-file "$APPDIR/usr/share/applications/fcp.desktop" \
   --icon-file "$ROOT/apps/desktop/assets/fcp.png"
 
-SRC="$(ls -1t "$WORK"/*.AppImage | head -1)"
-[ -f "$SRC" ] || { echo "没有生成 AppImage"; exit 1; }
+# 裁掉用不到的 Qt 插件：PNG 解码内建于 Qt6Gui，GUI 里没有 GIF/ICO/JPEG
+# 资源；输入法插件（ibus/compose）必须保留，否则中文输入失效。
+rm -rf "$APPDIR/usr/plugins/imageformats" \
+       "$APPDIR/usr/translations" "$APPDIR/usr/qt6/translations"
+
 mkdir -p "$ROOT/dist"
 OUT="$ROOT/dist/fcp-client-gui-$VERSION-linux-amd64.AppImage"
-cp "$SRC" "$OUT"
+echo "== appimagetool（xz）"
+ARCH=x86_64 "$TOOLS/appimagetool" --comp xz --no-appstream "$APPDIR" "$OUT"
 chmod +x "$OUT"
 
 echo "== 产物："

@@ -2,17 +2,22 @@
 //
 // 发行物布局（scripts/desktop/bundle_windows_portable.ps1 拼装）：
 //
-//   [本 exe][zip 载荷][64 字节尾部]
+//   [本 exe][LZMA1 载荷（内层是 zip）][80 字节尾部]
 //
 // 尾部（小端）：
 //
-//   0..8    "FCPBOOT1"
-//   8..12   u32 格式版本（当前为 1）
-//   12..16  u32 保留（0）
+//   0..8    "FCPBOOT2"
+//   8..12   u32 格式版本（当前为 2）
+//   12..16  u32 编码（1 = LZMA1_alone：5 字节 props + 8 字节原长 + 流）
 //   16..24  u64 载荷偏移
-//   24..32  u64 载荷长度
-//   32..64  SHA-256（打包器用 Get-FileHash 算好写进尾部，本程序只透传 ——
+//   24..32  u64 载荷长度（压缩态）
+//   32..40  u64 解压后长度（内层 zip 的 store 长度）
+//   40..72  SHA-256（对压缩态载荷；打包器算好写进尾部，本程序只透传 ——
 //           缓存目录名用它，不自己算哈希）
+//   72..80  保留（0）
+//
+// 内层 zip 以 store（不压缩）写入再整体 LZMA：两次压缩叠在同一段字节上
+// 只会互相干扰，实测 LZMA 比 zip 的 deflate 小约 27%。
 //
 // 首次运行把载荷解到 %LOCALAPPDATA%\FCP\bin\<SHA-256 前 8 字节十六进制>\，
 // 之后直接启动缓存里的 FCP.exe；不同版本按内容哈希分目录共存，7 天未用的
@@ -28,18 +33,23 @@
 #include <shlobj.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <string>
 #include <vector>
 
+#include "lzma/LzmaDec.h"
 #include "miniz/miniz.h"
 
 namespace {
 
-constexpr uint64_t kFooterLen = 64;
-constexpr char kMagic[8] = {'F', 'C', 'P', 'B', 'O', 'O', 'T', '1'};
-constexpr uint32_t kFormatVersion = 1;
+constexpr uint64_t kFooterLen = 80;
+constexpr char kMagic[8] = {'F', 'C', 'P', 'B', 'O', 'O', 'T', '2'};
+constexpr uint32_t kFormatVersion = 2;
+constexpr uint32_t kCodecLzma1 = 1;
+// LZMA1_alone 头：1 字节属性 + 4 字节字典大小 + 8 字节原长。
+constexpr size_t kLzmaAloneHeader = 13;
 // 解压总量护栏：本发行物的 Qt 目录树 ~40 MiB 未压缩，留一个量级余量。
 // 它拦"被篡改发行物里的解压炸弹"；路径越界由 SafeEntryName 把守。
 constexpr uint64_t kMaxUncompressedTotal = 1ull << 30;  // 1 GiB
@@ -183,9 +193,22 @@ std::wstring LaunchLog() { return FcpRoot() + L"\\launcher.log"; }
 
 struct Footer {
   uint64_t offset = 0;
-  uint64_t len = 0;
+  uint64_t len = 0;    // 压缩态长度
+  uint64_t usize = 0;  // 解压后（内层 zip）长度
   uint8_t sha256[32] = {};
 };
+
+uint32_t ReadU32(const uint8_t* p) {
+  return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+         (static_cast<uint32_t>(p[2]) << 16) |
+         (static_cast<uint32_t>(p[3]) << 24);
+}
+
+uint64_t ReadU64(const uint8_t* p) {
+  uint64_t v = 0;
+  for (int b = 7; b >= 0; --b) v = (v << 8) | p[b];
+  return v;
+}
 
 // error 只在返回 false 时被赋值。
 bool ParseFooter(const uint8_t* buf, uint64_t total, Footer* out,
@@ -194,29 +217,33 @@ bool ParseFooter(const uint8_t* buf, uint64_t total, Footer* out,
     *error = L"不是 FCP 单文件发行物：缺少引导尾部标记（文件可能被截断）";
     return false;
   }
-  const uint32_t format = static_cast<uint32_t>(buf[8]) |
-                          (static_cast<uint32_t>(buf[9]) << 8) |
-                          (static_cast<uint32_t>(buf[10]) << 16) |
-                          (static_cast<uint32_t>(buf[11]) << 24);
+  const uint32_t format = ReadU32(buf + 8);
   if (format != kFormatVersion) {
     *error = L"不支持的引导格式版本 " + std::to_wstring(format) +
              L"，请重新下载发行物";
     return false;
   }
-  uint64_t u64s[2] = {};
-  for (int i = 0; i < 2; ++i) {
-    for (int b = 7; b >= 0; --b)
-      u64s[i] = (u64s[i] << 8) | buf[16 + 8 * i + b];
+  if (ReadU32(buf + 12) != kCodecLzma1) {
+    *error = L"不支持的载荷编码（需要重新下载发行物）";
+    return false;
   }
-  // 不接受 len==0；offset+len 必须正好指到尾部开头。
-  if (u64s[1] == 0 || u64s[0] > total - kFooterLen ||
-      u64s[0] + u64s[1] != total - kFooterLen) {
+  const uint64_t offset = ReadU64(buf + 16);
+  const uint64_t len = ReadU64(buf + 24);
+  const uint64_t usize = ReadU64(buf + 32);
+  // 不接受空载荷；offset+len 必须正好指到尾部开头。
+  if (len == 0 || usize == 0 || offset > total - kFooterLen ||
+      offset + len != total - kFooterLen) {
     *error = L"引导尾部与载荷长度不一致（文件被截断或拼接错误）";
     return false;
   }
-  std::memcpy(out->sha256, buf + 32, 32);
-  out->offset = u64s[0];
-  out->len = u64s[1];
+  if (usize > kMaxUncompressedTotal) {
+    *error = L"引导尾部声明了异常的解压体积";
+    return false;
+  }
+  std::memcpy(out->sha256, buf + 40, 32);
+  out->offset = offset;
+  out->len = len;
+  out->usize = usize;
   return true;
 }
 
@@ -264,20 +291,45 @@ bool SafeEntryName(const char* utf8, std::wstring* out) {
   return true;
 }
 
+// LZMA SDK 的分配器接口：解压时的概率模型缓冲区。
+void* LzmaAlloc(ISzAllocPtr, size_t size) { return std::malloc(size); }
+void LzmaFree(ISzAllocPtr, void* address) { std::free(address); }
+const ISzAlloc kLzmaAlloc = {LzmaAlloc, LzmaFree};
+
 bool ExtractPayload(HANDLE archive, const Footer& footer,
                     const std::wstring& dest, std::wstring* error) {
-  // 64 位下 footer.len 一定装得进 size_t（打包器产物 ~12 MiB；若真被篡改
-  // 成大值，vector 分配会以 bad_alloc 终止，不会静默截断）。
+  // 64 位下尾部里的长度一定装得进 size_t（发行物压缩态 ~9 MiB、解压后
+  // ~40 MiB；真被篡改成大值由 ParseFooter 的护栏与 bad_alloc 兜住）。
   const LARGE_INTEGER at{.LowPart = static_cast<DWORD>(footer.offset),
                          .HighPart = static_cast<LONG>(footer.offset >> 32)};
   if (!::SetFilePointerEx(archive, at, nullptr, FILE_BEGIN)) {
     *error = L"无法定位载荷：" + ErrorText(::GetLastError());
     return false;
   }
-  // 整段载荷一次读入（~12 MiB 压缩态，与 Rust 版一致）。
-  std::vector<uint8_t> payload(static_cast<size_t>(footer.len));
-  if (!ReadFull(archive, payload.data(), payload.size())) {
+  // 整段载荷一次读入（压缩态）。
+  std::vector<uint8_t> packed(static_cast<size_t>(footer.len));
+  if (!ReadFull(archive, packed.data(), packed.size())) {
     *error = L"无法读取载荷：" + ErrorText(::GetLastError());
+    return false;
+  }
+  if (packed.size() < kLzmaAloneHeader) {
+    *error = L"载荷短于 LZMA 头（文件损坏）";
+    return false;
+  }
+
+  // LZMA1_alone：前 13 字节是属性/字典/原长，LzmaDecode 只吃前 5 字节属性，
+  // 压缩流从第 13 字节开始；原长已由尾部给出，按精确长度解。
+  std::vector<uint8_t> payload(static_cast<size_t>(footer.usize));
+  SizeT dest_len = payload.size();
+  SizeT src_len = packed.size() - kLzmaAloneHeader;
+  ELzmaStatus status = LZMA_STATUS_NOT_SPECIFIED;
+  const SRes res =
+      LzmaDecode(payload.data(), &dest_len, packed.data() + kLzmaAloneHeader,
+                 &src_len, packed.data(), 5, LZMA_FINISH_END, &status,
+                 &kLzmaAlloc);
+  if (res != SZ_OK || dest_len != payload.size()) {
+    *error = L"载荷解压失败（LZMA 错误 " + std::to_wstring(res) +
+             L"，输出 " + std::to_wstring(dest_len) + L" 字节）";
     return false;
   }
 

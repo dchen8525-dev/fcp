@@ -235,14 +235,38 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build pkg-config libssl-dev file curl \
-            qt6-base-dev libgl1-mesa-dev patchelf xvfb xauth \
-            libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+            libgl1-mesa-dev patchelf xvfb xauth binutils \
+            libfontconfig1-dev libfreetype6-dev \
+            libx11-dev libx11-xcb-dev libxext-dev libxfixes-dev libxi-dev \
+            libxrender-dev libxcb1-dev libxcb-cursor-dev libxcb-glx0-dev \
+            libxcb-icccm4-dev libxcb-image0-dev libxcb-keysyms1-dev \
+            libxcb-randr0-dev libxcb-render-util0-dev libxcb-shape0-dev \
+            libxcb-shm0-dev libxcb-sync-dev libxcb-util-dev \
+            libxcb-xfixes0-dev libxcb-xinerama0-dev libxcb-xkb-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libxkbcommon-x11-0 \
+            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
             libxcb-render-util0 libxcb-xinerama0
           # 24.04 的 Qt xcb 插件需要它；22.04 不一定有这个包。
           sudo apt-get install -y --no-install-recommends libxcb-cursor0 || true
 
+      # AppImage 体积的大头是发行版 Qt 依赖的 ICU（解包后 ~35 MiB）。
+      # 自编 qtbase 时关掉 ICU/OpenSSL/DBus，包体预计减半；Qt 编译约
+      # 10 分钟，按版本+选项缓存，命中时直接复用前缀。
+      - name: Qt 无 ICU（缓存）
+        id: qt-noicu
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/qt-noicu-6.8.3
+          key: qt-noicu-6.8.3-linux-${{ hashFiles('scripts/desktop/build_qt_noicu.sh') }}
+
+      - name: 构建 Qt（缓存未命中时）
+        if: steps.qt-noicu.outputs.cache-hit != 'true'
+        run: bash scripts/desktop/build_qt_noicu.sh "${{ runner.temp }}/qt-noicu-6.8.3"
+
       # CLI 构建 + Qt GUI + linuxdeploy 都在脚本里；本地同一命令可复现。
       - name: 构建 + AppImage（发布门禁）
+        env:
+          FCP_QT_PREFIX: ${{ runner.temp }}/qt-noicu-6.8.3
         run: bash scripts/desktop/build_linux.sh
 
       # Qt 在无显示环境下用 xvfb 起；6 秒后被 timeout 杀掉（rc=124）
@@ -273,6 +297,11 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
+      # 单文件载荷用 Python 标准库做 LZMA（scripts/desktop/lzma_pack.py）。
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
 
       # Qt 6 Widgets。install-qt-action 比在 CI 里用 vcpkg 现编 Qt 快得多；
       # QT_ROOT_DIR 指到 kit 目录，脚本从这里找 Qt6Config.cmake 与 windeployqt。

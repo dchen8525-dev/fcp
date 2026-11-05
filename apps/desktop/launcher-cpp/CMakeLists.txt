@@ -27,10 +27,11 @@ configure_file(${CMAKE_CURRENT_SOURCE_DIR}/launcher.rc.in
 add_executable(fcp-launcher WIN32
   launcher.cc
   miniz/miniz.c          # amalgamated 全量实现（tinfl+tdefl+zip）
+  lzma/LzmaDec.c         # 7-Zip LZMA SDK 解码器（public domain，仅解码）
   ${CMAKE_CURRENT_BINARY_DIR}/launcher.rc
 )
 
-target_include_directories(fcp-launcher PRIVATE miniz)
+target_include_directories(fcp-launcher PRIVATE miniz lzma)
 target_link_libraries(fcp-launcher PRIVATE shell32)
 
 # miniz 只用得到 zip 读取：关掉写归档端。其余剪裁宏不能开 ——

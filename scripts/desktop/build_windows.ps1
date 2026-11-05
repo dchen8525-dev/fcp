@@ -97,6 +97,21 @@ foreach ($unused in @("dxcompiler.dll", "dxil.dll", "vc_redist.x64.exe")) {
   if (Test-Path $path) { Remove-Item -Force $path }
 }
 
+# GUI 只链接 Qt6Widgets/Gui/Core（FCP.exe 的导入表里没有 Qt6Network），
+# windeployqt 仍会按默认清单带上 Network 与全部图片插件：
+#   * tls/、networkinformation/ 依赖 Qt6Network，应用不用网络也不做 TLS；
+#   * generic/ 只有 TUIO 触摸输入插件，它反过来 import Qt6Network，是
+#     Qt6Network 留在载荷里的唯一原因；
+#   * PNG 解码内建于 Qt6Gui，.ico 编在 PE 资源里，imageformats 全不需要。
+# 必须在下面的依赖递归之前删：否则 dumpbin 会把 qjpeg/Qt6Network 的
+# jpeg62/libcrypto 也补进载荷。
+foreach ($dir in @("tls", "networkinformation", "imageformats", "generic")) {
+  $path = Join-Path $StageDir $dir
+  if (Test-Path $path) { Remove-Item -Recurse -Force $path }
+}
+$network = Join-Path $StageDir "Qt6Network.dll"
+if (Test-Path $network) { Remove-Item -Force $network }
+
 # Visual Studio 路径：dumpbin 与 CRT 都用得上。vcvars 下未必在 PATH，用 vswhere 找。
 $vsdir = $null
 $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"

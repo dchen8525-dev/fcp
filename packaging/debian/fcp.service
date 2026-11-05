@@ -26,7 +26,8 @@ Restart=on-failure
 RestartSec=3
 
 # trace 与日志目录由 systemd 创建并归服务用户所有：
-#   LogsDirectory   -> /var/log/fcp   （--trace 前缀写这里）
+#   LogsDirectory   -> /var/log/fcp   （--trace 前缀与默认
+#                       --log-file=/var/log/fcp/server.log 都写这里）
 #   StateDirectory  -> /var/lib/fcp
 LogsDirectory=fcp
 LogsDirectoryMode=0750

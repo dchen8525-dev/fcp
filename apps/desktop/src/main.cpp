@@ -29,8 +29,8 @@ void writeSelftestResult(const QString& text) {
 }
 
 // 无界面的测速自检：`FCP.exe --fcp-speedtest-selftest`（参数走环境变量）。
-// 和界面走同一条路径（第二个 fcp-client 进程），服务端需以 --speedtest 启动；
-// 结果同时写到临时目录的 fcp-speedtest.txt（release 是 GUI 子系统，没有控制台）。
+// 和界面走同一条路径（第二个 fcp-client 进程）；结果同时写到临时目录的
+// fcp-speedtest.txt（release 是 GUI 子系统，没有控制台）。
 int speedtestSelftest() {
   const auto fail = [](const QString& text) {
     QTextStream(stdout) << text << '\n';

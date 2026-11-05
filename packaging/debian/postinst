@@ -53,7 +53,11 @@ FCP 服务端已安装。已自动生成 PSK 并写入 /etc/fcp/fcp.env（0600�
   1. systemctl enable --now fcp     （密钥已就位，直接就能起）
   2. journalctl -u fcp -f
 
-要更换的话：openssl rand -hex 16，替换 fcp.env 的 FCP_PSK 行，systemctl restart fcp。
+日志：默认 --log=debug，逐请求日志同时写 journald 和
+/var/log/fcp/server.log（32 MiB 轮转）；要安静就改 FCP_ARGS 里的
+--log=LEVEL（off/error/warn/info/debug）。
+
+要更换密钥：openssl rand -hex 16，替换 fcp.env 的 FCP_PSK 行，systemctl restart fcp。
 版本自检：fcp-server --version
 
 EOF
@@ -67,6 +71,10 @@ FCP 服务端已安装。下一步：
      （会暴露在 ps 的 argv 里）
   2. systemctl enable --now fcp
   3. journalctl -u fcp -f
+
+日志：默认 --log=debug，逐请求日志同时写 journald 和
+/var/log/fcp/server.log（32 MiB 轮转）；要安静就改 FCP_ARGS 里的
+--log=LEVEL（off/error/warn/info/debug）。
 
 版本自检：fcp-server --version
 EOF

@@ -73,7 +73,8 @@ done
   exit 1
 }
 
-# conffile 里有运维填的 FCP_ARGS（通常含 --key=PSK），0600 起步；systemd 以
+# conffile 里有 FCP_PSK（postinst 首装自动生成）和运维填的 FCP_ARGS
+# （默认 --speedtest --log=debug --log-file=…），0600 起步；systemd 以
 # PID 1 读 EnvironmentFile 后注入，服务进程本身（DynamicUser）从不打开它。
 chmod 0600 "$STAGE/etc/fcp/fcp.env"
 

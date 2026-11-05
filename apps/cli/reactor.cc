@@ -2053,7 +2053,16 @@ void Reactor::print_stats(int64_t now_ms) {
       stall_since_ms_ != 0 ? static_cast<int>((now_ms - stall_since_ms_) / 1000) : 0,
       wire_deferred_bytes_,
       static_cast<unsigned long long>(wire_over_budget_));
-  note(row);
+  // stdout 是给 GUI/脚本的机器通道：sidecar 逐行解析这一行算出采样图与
+  // 连接时长，因此与 --log 等级无关、永远输出（--log=off 时也不静默，
+  // 那是"人读通道"的开关）。
+  std::printf("%s\n", row);
+  std::fflush(stdout);
+  // 文件里按 info 级落一份带时间戳的存档（与其它引擎行同一把阈值尺）；
+  // 不写 stderr：GUI 的日志窗显示 stderr，0.5s 一行会把逐请求行冲掉。
+  if (Severity(opt_.log_level) <= Severity(LogLevel::kInfo)) {
+    write_log(row);
+  }
 }
 
 void Reactor::open_log_file() {

@@ -23,6 +23,7 @@
 #include <QProgressBar>
 #include <QPushButton>
 #include <QRegularExpression>
+#include <QScrollArea>
 #include <QScrollBar>
 #include <QSettings>
 #include <QStackedWidget>
@@ -288,7 +289,17 @@ MainWindow::MainWindow(Sidecar* sidecar, QWidget* parent)
   root->addWidget(stage, 1);
   setCentralWidget(central);
 
-  stack_->addWidget(buildConnPage());
+  // 连接页展开高级设置后需要 ~736px 高，而默认窗口 960×680 只有约 640px
+  // 可用（高分屏缩放下更紧）。空间不足时 Qt 会把布局压到 minimumSize 以下，
+  // 输入框因此被裁成一条细缝。放进滚动区：放不下就整页滚动。
+  auto* conn_scroll = new QScrollArea;
+  conn_scroll->setWidgetResizable(true);
+  conn_scroll->setFrameShape(QFrame::NoFrame);
+  conn_scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+  conn_scroll->setWidget(buildConnPage());
+  conn_scroll->viewport()->setAutoFillBackground(false);
+  conn_scroll->setStyleSheet(QStringLiteral("QScrollArea{background:transparent;}"));
+  stack_->addWidget(conn_scroll);
   stack_->addWidget(buildStatusPage());
   stack_->addWidget(buildSpeedPage());
   stack_->addWidget(buildLogPage());
@@ -708,7 +719,8 @@ QWidget* MainWindow::buildSpeedPage() {
   speed_start_->setObjectName(QStringLiteral("primary"));
   speed_start_->setCursor(Qt::PointingHandCursor);
   controls->addWidget(speed_start_, 0, Qt::AlignBottom);
-  speed_hint_ = makeLabel(QStringLiteral("服务端需以 --speedtest 启动"), "hint");
+  // 提示行只留给进度/错误，不常驻说明文字。
+  speed_hint_ = makeLabel(QString(), "hint");
   speed_hint_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
   controls->addWidget(speed_hint_, 1);
   layout->addLayout(controls);
@@ -742,6 +754,9 @@ QWidget* MainWindow::buildSpeedPage() {
     big->addStretch();
     box->addLayout(big);
     *sub = makeLabel(QStringLiteral("等待测速"), "tileSub");
+    // "8.0 MiB / 8.0s · 发送速率 12.3 Mbps（含冗余，1.2 MiB 未到达）" 比格子宽，不换行时
+    // QLabel 直接裁掉尾部——括号里的"未到达"正是要看的量，允许它折到第二行。
+    (*sub)->setWordWrap(true);
     box->addWidget(*sub);
     results->addWidget(tile, 1);
   };
@@ -811,9 +826,8 @@ QWidget* MainWindow::buildSpeedPage() {
   tip_layout->setContentsMargins(14, 11, 14, 11);
   auto* tip_text = makeRichLabel(
       QStringLiteral(
-          "服务端需以 <b>--speedtest</b> 启动。测速另起 fcp-client 直连同一 UDP 端口，"
-          "直接向 FCP 帧/FEC 层灌数据，量的是隧道裸吞吐。丢包为 FEC 恢复前的原始丢包率，"
-          "后续被补齐也不回改。"),
+          "测速另起 fcp-client 直连同一 UDP 端口，直接向 FCP 帧/FEC 层灌数据，"
+          "量的是隧道裸吞吐。丢包为 FEC 恢复前的原始丢包率，后续被补齐也不回改。"),
       "muted");
   tip_text->setWordWrap(true);
   tip_layout->addWidget(tip_text);
@@ -847,9 +861,9 @@ QWidget* MainWindow::buildLogPage() {
   log_ = new QPlainTextEdit;
   log_->setObjectName(QStringLiteral("log"));
   log_->setReadOnly(true);
-  // 只是一扇窗：最近 500 行（stats 每 500ms 一行，加上逐请求事件，足以
-  // 覆盖最近几分钟）。完整档案由 sidecar 的 --log-file 落在用户日志目录，
-  // 翻旧账去文件，不靠窗口。
+  // 只是一扇窗：最近 500 行（stats 走 stdout 不进这里，窗口留给逐请求
+  // 与诊断行，足以覆盖最近几分钟）。完整档案由 sidecar 的 --log-file 落在
+  // 用户日志目录，翻旧账去文件，不靠窗口。
   log_->setMaximumBlockCount(500);
   log_->setWordWrapMode(QTextOption::WrapAnywhere);
   layout->addWidget(log_, 1);
@@ -951,8 +965,7 @@ void MainWindow::setRunning(bool running, const QString& hint) {
   }
   speed_start_->setEnabled(!speed_running_);
   if (!speed_running_) {
-    speed_hint_->setText(running ? QStringLiteral("约 2 × 单程时长")
-                                 : QStringLiteral("服务端需以 --speedtest 启动"));
+    speed_hint_->setText(running ? QStringLiteral("约 2 × 单程时长") : QString());
     speed_hint_->setProperty("role", "hint");
     repolish(speed_hint_);
   }
@@ -1268,16 +1281,23 @@ void MainWindow::onSpeedDone(const QJsonObject& result) {
             : true;
     value->setText(QString::number(mbps, 'f', 2));
     QString text = QStringLiteral("%1 / %2s").arg(fmtBytes(bytes)).arg(seconds, 0, 'f', 1);
-    // 灌帧速率：发送端对帧层的注入速率，与上面的 mbps 对比就是开销/丢包吃掉的。
+    // 发送速率（含冗余）：发送端每秒送入帧层的数据量，含 FEC 冗余与封装
+    // 开销；与上面的大字（接收端实际送达）之差就是冗余和丢包吃掉的。
     const double wire = sample.value(QStringLiteral("wireMbps")).toDouble();
-    if (wire > 0) {
-      text += QStringLiteral(" · 灌帧 %1").arg(wire, 0, 'f', 1);
-    }
     if (!acked) {
-      const quint64 lost = static_cast<quint64>(
-          sample.value(QStringLiteral("lostBytes")).toDouble());
-      text += QStringLiteral("（%1 未到达）").arg(fmtBytes(lost));
       sub->setProperty("role", "tileSubBad");
+    }
+    const QString lost =
+        acked ? QString()
+              : QStringLiteral("%1 未到达").arg(fmtBytes(static_cast<quint64>(
+                    sample.value(QStringLiteral("lostBytes")).toDouble())));
+    if (wire > 0) {
+      text += QStringLiteral(" · 发送速率 %1 Mbps（含冗余%2）")
+                  .arg(wire, 0, 'f', 1)
+                  .arg(lost.isEmpty() ? QString()
+                                      : QStringLiteral("，") + lost);
+    } else if (!lost.isEmpty()) {
+      text += QStringLiteral("（%1）").arg(lost);
     }
     sub->setText(text);
     repolish(sub);

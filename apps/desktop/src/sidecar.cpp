@@ -221,7 +221,8 @@ bool Sidecar::startProxy(const ProxyConfig& config, QString* error) {
       // PSK 只给环境变量 FCP_PSK：未给 --key* 参数时 CLI 默认读它，
       // argv 里不再需要重复指路。
       QStringLiteral("--log=debug"),
-      // stderr 上每 500ms 一行统计（--log 里只管级别，频率单独给 --stats）。
+      // stdout 上每 500ms 一行 stats（机器通道，与 --log 等级无关；
+      // 采样图与连接时长就靠逐行解析它）。
       QStringLiteral("--stats=500"),
       // 每条请求的行落到用户数据目录的 log/ 子目录（Windows:
       // %LOCALAPPDATA%\FCP\FCP Client\log，Linux: ~/.local/share/…），

@@ -464,11 +464,15 @@ class Reactor {
   std::mutex log_mutex_;
   void open_log_file();
   void rotate_log_file();
+  // 给行补时间戳后落文件（stats/启动横幅用；注意正文要自带 [LEVEL]）。
   void write_log(const std::string& line);
-  // 分级汇集点：标签分级 → 过滤 → 双落（stderr + 文件同阈值）。
+  // 已经渲染好（时间戳 + 级别）的行直接落文件（log_line()/note() 用）。
+  void write_log_stamped(const std::string& line);
+  // 分级汇集点：标签分级 → 过滤 → 渲染（时间戳 + [LEVEL]）→ 双落
+  // （stderr + 文件同一行文本；颜色由读日志的 GUI 按级别加，CLI 不吐 ANSI）。
   void log_line(const std::string& line);
-  // 调试行到 stderr + --log-file 文件两端：控制台行原样，文件里带时间戳。
-  void note(const std::string& line);
+  // 不走标签的内部行（启动/配置/stall）：同样渲染时间戳 + 级别，双落。
+  void note(const std::string& line, int severity = Severity(LogLevel::kInfo));
   size_t max_sessions_ = 0;
   using SignalHandler = void (*)(int);
   SignalHandler prev_int_ = nullptr;

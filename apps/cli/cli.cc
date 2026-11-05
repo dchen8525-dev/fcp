@@ -1556,13 +1556,26 @@ int run_proxy(EngineRole role, int argc, char** argv) {
   if (args.key_in_argv) {
     // The help already says --key-file keeps the key out of 'ps'; say it where
     // an operator will actually see it (C-18).
-    std::fprintf(stderr,
-                 "[fcp] warning: --key is visible in the process command line "
-                 "(ps, /proc/<pid>/cmdline, Windows task manager); prefer "
-                 "--key-file or --key-env\n");
+    std::fprintf(stderr, "%s\n",
+                 LogLine(Severity(LogLevel::kWarn),
+                         "--key is visible in the process command line "
+                         "(ps, /proc/<pid>/cmdline, Windows task manager); prefer "
+                         "--key-file or --key-env")
+                     .c_str());
   }
+  // 解析期的提示与警告和运行期日志同一排版：时间戳 + 级别 + 正文。
   for (const std::string& note : args.notes) {
-    std::fprintf(stderr, "%s\n", note.c_str());
+    int severity = Severity(LogLevel::kInfo);
+    std::string body = note;
+    constexpr const char* kWarnPrefix = "[fcp] warning: ";
+    constexpr const char* kNotePrefix = "[fcp] note: ";
+    if (body.rfind(kWarnPrefix, 0) == 0) {
+      severity = Severity(LogLevel::kWarn);
+      body.erase(0, std::strlen(kWarnPrefix));
+    } else if (body.rfind(kNotePrefix, 0) == 0) {
+      body.erase(0, std::strlen(kNotePrefix));
+    }
+    std::fprintf(stderr, "%s\n", LogLine(severity, body).c_str());
   }
   if (role == EngineRole::kClient && args.speedtest) {
     return RunBench(args);

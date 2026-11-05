@@ -65,7 +65,7 @@ class MainWindow : public QMainWindow {
   void setAdvanced(bool open);
   void updateKeyState();
   void syncAddr();
-  void appendLog(const QString& line, bool is_stderr);
+  void appendLog(const QString& line, const char* level = nullptr);
   void rebuildDiag(const QJsonObject& stats);
 
   void loadSettings();

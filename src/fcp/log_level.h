@@ -9,6 +9,11 @@
 #ifndef FCP_LOG_LEVEL_H_
 #define FCP_LOG_LEVEL_H_
 
+#include <chrono>
+#include <cstdio>
+#include <ctime>
+#include <string>
+
 namespace fcp {
 
 enum class LogLevel : int {
@@ -25,7 +30,7 @@ inline constexpr const char* kTagInfo = "[i] ";
 inline constexpr const char* kTagWarn = "[w] ";
 inline constexpr const char* kTagError = "[e] ";
 
-inline int Severity(LogLevel level) { return static_cast<int>(level); }
+inline constexpr int Severity(LogLevel level) { return static_cast<int>(level); }
 
 // 汇集点用：识别行首标签 → severity。无标签（含 [x] 这种非标签开头）→
 // kInfo 且返回 false。
@@ -49,7 +54,46 @@ inline std::string LineBody(const std::string& line) {
   return TaggedLine(line, &severity) ? line.substr(4) : line;
 }
 
-// 显示名（stderr 行的 [warn]/[error] 前缀在汇集点自带，正文不再重复渲染）。
+// 显示名：行里写一次 `[INFO]`/`[WARN]`/`[ERROR]`/`[DEBUG]`。
+inline const char* LevelName(int severity) {
+  switch (severity) {
+    case Severity(LogLevel::kDebug): return "DEBUG";
+    case Severity(LogLevel::kWarn):  return "WARN";
+    case Severity(LogLevel::kError): return "ERROR";
+    default:                         return "INFO";
+  }
+}
+
+// 本地时间戳 "YYYY-MM-DD HH:MM:SS.mmm"；取不到时间就留空（宁可少一列，
+// 也不让日志行变成乱码）。
+inline std::string LogStamp() {
+  const auto now = std::chrono::system_clock::now();
+  const std::time_t t = std::chrono::system_clock::to_time_t(now);
+  const long ms = static_cast<long>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch())
+          .count() % 1000);
+  std::tm tm{};
+#ifdef _WIN32
+  if (localtime_s(&tm, &t) != 0) {
+    return {};
+  }
+#else
+  if (localtime_r(&t, &tm) == nullptr) {
+    return {};
+  }
+#endif
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%03ld",
+                tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour,
+                tm.tm_min, tm.tm_sec, ms);
+  return buf;
+}
+
+// 人读日志行的唯一排版：`时间戳 [级别] 正文`。stderr、--log-file 与 GUI
+// 日志窗都吃同一种行，GUI 才能按 `[LEVEL]` 着色。
+inline std::string LogLine(int severity, const std::string& body) {
+  return LogStamp() + " [" + LevelName(severity) + "] " + body;
+}
 
 }  // namespace fcp
 

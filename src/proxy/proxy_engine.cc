@@ -198,10 +198,12 @@ SessionConfig::TraceFn make_trace_sink(const std::string& prefix, uint64_t cid,
     state->disabled = true;
     const std::string line = "trace path " + state->path + " " + why +
                              "; recording disabled";
-    // stderr for the CLI, host log for the GUI (which has no console).
-    std::fprintf(stderr, "fcp: %s\n", line.c_str());
+    // 有汇集点就只走汇集点（CLI 的 stderr 与 GUI 的日志窗都由它渲染），
+    // 否则才是无宿主的 stderr 兜底——避免同一行出现两次。
     if (log) {
       log(std::string(kTagWarn) + line);
+    } else {
+      std::fprintf(stderr, "fcp: %s\n", line.c_str());
     }
   };
   return [state, report, log, rotate_bytes](const TraceEntry& e) {
@@ -242,9 +244,10 @@ SessionConfig::TraceFn make_trace_sink(const std::string& prefix, uint64_t cid,
         state->warned_rotate = true;
         const std::string line = "trace path " + state->path +
                                  " rotate failed; retrying on next entry";
-        std::fprintf(stderr, "fcp: %s\n", line.c_str());
         if (log) {
           log(std::string(kTagWarn) + line);
+        } else {
+          std::fprintf(stderr, "fcp: %s\n", line.c_str());
         }
       }
     }

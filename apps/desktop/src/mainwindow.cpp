@@ -9,7 +9,6 @@
 #include <QDateTime>
 #include <QDir>
 #include <QFrame>
-#include <QGraphicsDropShadowEffect>
 #include <QGridLayout>
 #include <QHBoxLayout>
 #include <QIcon>
@@ -55,8 +54,11 @@ constexpr const char* kAccentDark = "#0b8563";
 constexpr const char* kMuted = "#5b6b63";
 constexpr const char* kMuted2 = "#8a9a91";
 constexpr const char* kErr = "#c2410c";
-constexpr const char* kLogOut = "#5b6b63";
-constexpr const char* kLogErr = "#a56a12";
+// 日志窗按级别上色：正文颜色即级别，DEBUG 最淡、ERROR 最重。
+constexpr const char* kLogDebug = "#8a9a91";
+constexpr const char* kLogInfo = "#5b6b63";
+constexpr const char* kLogWarn = "#a56a12";
+constexpr const char* kLogError = "#b91c1c";
 
 QLabel* makeLabel(const QString& text, const char* role = nullptr) {
   auto* label = new QLabel(text);
@@ -210,14 +212,6 @@ QWidget* makeField(const QString& text, QWidget* input, const QString& note = {}
   return holder;
 }
 
-void addCardShadow(QFrame* card) {
-  auto* shadow = new QGraphicsDropShadowEffect(card);
-  shadow->setBlurRadius(34);
-  shadow->setOffset(0, 14);
-  shadow->setColor(QColor(20, 80, 60, 40));
-  card->setGraphicsEffect(shadow);
-}
-
 #ifdef Q_OS_WIN
 // 网络切换检测（稳定性包 5）：Qt 6.3 之前没有 QNetworkInformation，改用
 // GetAdaptersAddresses 每 5 秒取一次适配器快照。换 Wi-Fi、插拔网线、断网、
@@ -305,7 +299,8 @@ MainWindow::MainWindow(Sidecar* sidecar, QWidget* parent)
   stack_->addWidget(buildLogPage());
 
   connect(sidecar_, &Sidecar::proxyStats, this, &MainWindow::onStats);
-  connect(sidecar_, &Sidecar::proxyLog, this, &MainWindow::appendLog);
+  connect(sidecar_, &Sidecar::proxyLog, this,
+          [this](const QString& line, bool) { appendLog(line); });
   connect(sidecar_, &Sidecar::proxyStateChanged, this,
           [this](bool running, int exit_code, bool abnormal) {
             if (running) {
@@ -345,7 +340,6 @@ MainWindow::~MainWindow() = default;
 QFrame* MainWindow::makeCard() {
   auto* card = new QFrame;
   card->setProperty("role", "card");
-  addCardShadow(card);
   return card;
 }
 
@@ -848,7 +842,7 @@ QWidget* MainWindow::buildLogPage() {
   head->setContentsMargins(0, 0, 0, 2);
   head->setSpacing(10);
   head->addWidget(makeLabel(QStringLiteral("日志"), "h2"));
-  head->addWidget(makeLabel(QStringLiteral("stdout / stderr"), "headSub"));
+  head->addWidget(makeLabel(QStringLiteral("时间戳 · 级别着色"), "headSub"));
   head->addStretch();
   log_count_ = makeLabel(QString(), "mono");
   head->addWidget(log_count_);
@@ -1072,7 +1066,7 @@ void MainWindow::onStart() {
   QString error;
   if (!sidecar_->startProxy(collected.config, &error)) {
     setHint(error, true);
-    appendLog(QStringLiteral("start failed: %1").arg(error), true);
+    appendLog(QStringLiteral("start failed: %1").arg(error), "ERROR");
     setRunning(false, QString());
     return;
   }
@@ -1347,12 +1341,35 @@ void MainWindow::onSpeedDone(const QJsonObject& result) {
   repolish(speed_hint_);
 }
 
-void MainWindow::appendLog(const QString& line, bool is_stderr) {
+void MainWindow::appendLog(const QString& line, const char* level) {
   QScrollBar* bar = log_->verticalScrollBar();
   const bool at_bottom = bar->value() >= bar->maximum() - 4;
+  // CLI 侧所有日志行统一是 `YYYY-MM-DD HH:MM:SS.mmm [LEVEL] 正文`，按级别
+  // 上色。GUI 自己产生的行（没有前缀）补上同样的时间戳与级别，窗口里
+  // 就不会混进两种排版。
+  static const QRegularExpression kStamped(
+      QStringLiteral("^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\.\\d{3} "
+                     "\\[(DEBUG|INFO|WARN|ERROR)\\] "));
+  QString text = line;
+  QRegularExpressionMatch match = kStamped.match(line);
+  if (!match.hasMatch()) {
+    text = QDateTime::currentDateTime().toString(
+               QStringLiteral("yyyy-MM-dd HH:mm:ss.zzz")) +
+           QStringLiteral(" [") + QLatin1String(level ? level : "INFO") +
+           QStringLiteral("] ") + line;
+    match = kStamped.match(text);
+  }
+  const QString name = match.captured(1);
+  const char* color = kLogInfo;
+  if (name == QLatin1String("DEBUG")) {
+    color = kLogDebug;
+  } else if (name == QLatin1String("WARN")) {
+    color = kLogWarn;
+  } else if (name == QLatin1String("ERROR")) {
+    color = kLogError;
+  }
   log_->appendHtml(QStringLiteral("<span style=\"color:%1\">%2</span>")
-                       .arg(QLatin1String(is_stderr ? kLogErr : kLogOut),
-                            line.toHtmlEscaped()));
+                       .arg(QLatin1String(color), text.toHtmlEscaped()));
   // 自己数，不用 blockCount()：空文档的首个空段落会让计数差一。
   log_lines_ = qMin(log_lines_ + 1, 500);
   log_count_->setText(QStringLiteral("%1 行").arg(log_lines_));
@@ -1526,10 +1543,10 @@ void MainWindow::restartTunnel(const QString& reason) {
   // 重启只会把新建的连接又拆一遍。
   const qint64 now = QDateTime::currentMSecsSinceEpoch();
   if (tunnel_started_ms_ != 0 && now - tunnel_started_ms_ < 3000) {
-    appendLog(QStringLiteral("网络事件 %1 与重建隔得过近，跳过").arg(reason), true);
+    appendLog(QStringLiteral("网络事件 %1 与重建隔得过近，跳过").arg(reason), "WARN");
     return;
   }
-  appendLog(QStringLiteral("网络事件：%1 → 重建隧道").arg(reason), true);
+  appendLog(QStringLiteral("网络事件：%1 → 重建隧道").arg(reason), "INFO");
   tunnel_started_ms_ = 0;
   onStop();
   // 400ms 后再拉起；若这中间用户手动点了停止，就尊重他——不再掉钩启动。

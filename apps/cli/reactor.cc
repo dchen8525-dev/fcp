@@ -103,30 +103,6 @@ uint32_t ThisPid() {
 #endif
 }
 
-// 本地时间戳 "YYYY-MM-DD HH:MM:SS.mmm"（写日志行用； failing 就留空）。
-std::string LogStamp() {
-  const auto now = std::chrono::system_clock::now();
-  const std::time_t t = std::chrono::system_clock::to_time_t(now);
-  const long ms = static_cast<long>(
-      std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch())
-          .count() % 1000);
-  std::tm tm{};
-#ifdef _WIN32
-  if (localtime_s(&tm, &t) != 0) {
-    return {};
-  }
-#else
-  if (localtime_r(&t, &tm) == nullptr) {
-    return {};
-  }
-#endif
-  char buf[32];
-  std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%03ld",
-                tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min,
-                tm.tm_sec, ms);
-  return buf;
-}
-
 // Same underlying type as Reactor::Sock, so the helpers below and the members
 // hand each other descriptors without casts.
 using Sock = SOCKET;
@@ -381,7 +357,8 @@ bool Reactor::open_udp(std::string* error) {
       engine_.set_pmtud(false);
       // Not verbose-gated: this silently changes what the tunnel can discover,
       // and the operator should see it exactly once at startup.
-      note("[fcp] note: UDP socket has no DF mode; PMTUD disabled");
+      note("UDP socket has no DF mode; PMTUD disabled",
+           Severity(LogLevel::kWarn));
     }
   }
   // P5-09: a failed start must not leak the descriptor it already created.
@@ -663,10 +640,10 @@ void Reactor::run() {
     if (ready < 0) {
       const int err = SockErr();
 #ifdef _WIN32
-      note("select: " + ErrText(err));
+      note("select: " + ErrText(err), Severity(LogLevel::kError));
 #else
       if (err != EINTR) {
-        note("select: " + ErrText(err));
+        note("select: " + ErrText(err), Severity(LogLevel::kError));
         break;
       }
 #endif
@@ -726,7 +703,7 @@ void Reactor::run() {
                       "(total %llu); lower --max-sessions",
                       skipped_this_pass_,
                       static_cast<unsigned long long>(skipped_total_));
-        note(msg);
+        note(msg, Severity(LogLevel::kWarn));
       }
     }
 
@@ -1570,15 +1547,17 @@ void Reactor::note_udp_send_error(int err, size_t len) {
   const bool too_big = err == EMSGSIZE;
 #endif
   if (too_big) {
-    std::fprintf(stderr,
-                 "fcp: UDP send rejected a %zu-byte datagram (EMSGSIZE) at --mtu=%u: "
-                 "the path's MTU is smaller, so no data reaches the peer. Lower --mtu "
-                 "(1472 is safe on Ethernet/Wi-Fi paths, 1400 through tunnels).\n",
-                 len, static_cast<unsigned>(base_config_.mtu));
+    char msg[512];
+    std::snprintf(msg, sizeof(msg),
+                  "UDP send rejected a %zu-byte datagram (EMSGSIZE) at --mtu=%u: "
+                  "the path's MTU is smaller, so no data reaches the peer. Lower --mtu "
+                  "(1472 is safe on Ethernet/Wi-Fi paths, 1400 through tunnels).",
+                  len, static_cast<unsigned>(base_config_.mtu));
+    note(msg, Severity(LogLevel::kError));
   } else {
-    std::fprintf(stderr, "fcp: UDP send failed: %s\n", ErrText(err).c_str());
+    note(std::string("UDP send failed: ") + ErrText(err),
+         Severity(LogLevel::kError));
   }
-  std::fflush(stderr);
 }
 
 size_t Reactor::wire_send(uint64_t peer, const uint8_t* wire, size_t len) {
@@ -1779,20 +1758,23 @@ void Reactor::check_stall(int64_t now_ms) {
       const double lasted = (now_ms - stall_since_ms_) / 1000.0;
       stall_since_ms_ = 0;
       stall_rx_pending_ = false;
-      note("tunnel stall recovered after " + Secs(lasted) + "s (inbound resumed)");
+      note("tunnel stall recovered after " + Secs(lasted) + "s (inbound resumed)",
+           Severity(LogLevel::kWarn));
       return;
     }
     stall_rx_pending_ = rx_moved;
     if (c.live == 0) {
       const double lasted = (now_ms - stall_since_ms_) / 1000.0;
       stall_since_ms_ = 0;
-      note("tunnel closed after " + Secs(lasted) + "s of stall");
+      note("tunnel closed after " + Secs(lasted) + "s of stall",
+           Severity(LogLevel::kWarn));
     } else if (now_ms >= stall_next_log_ms_) {
       // Still dark: re-state the stall every kStallLogMs so a long outage
       // does not look like a single forgotten line in a long log.
       stall_next_log_ms_ = now_ms + kStallLogMs;
       note("tunnel stall: no inbound for " + Secs((now_ms - stall_since_ms_) / 1000.0) +
-           "s (still dark)");
+               "s (still dark)",
+           Severity(LogLevel::kWarn));
     }
     return;
   }
@@ -1808,7 +1790,8 @@ void Reactor::check_stall(int64_t now_ms) {
     stall_next_log_ms_ = now_ms + kStallLogMs;
     stall_rx_pending_ = false;
     note("tunnel stall: no inbound for " + Secs((now_ms - stall_since_ms_) / 1000.0) +
-         "s while TX is still moving (half-open path?); watching for recovery");
+             "s while TX is still moving (half-open path?); watching for recovery",
+         Severity(LogLevel::kWarn));
   }
   // Dark path with a retransmission engine that has also gone quiet: keep
   // watching without re-declaring (the idle timeout is the backstop that
@@ -2070,7 +2053,7 @@ void Reactor::print_stats(int64_t now_ms) {
   // 文件里按 info 级落一份带时间戳的存档（与其它引擎行同一把阈值尺）；
   // 不写 stderr：GUI 的日志窗显示 stderr，0.5s 一行会把逐请求行冲掉。
   if (Severity(opt_.log_level) <= Severity(LogLevel::kInfo)) {
-    write_log(row);
+    write_log(std::string("[INFO] ") + row);
   }
 }
 
@@ -2095,25 +2078,29 @@ void Reactor::open_log_file() {
   if (!log_stream_) {
     // 保持语义：起不来 ≠ 拒绝启动，stderr 提示即可（响应"响亮失败"的同时
     // 不让排障工具把隧道拖死）。
-    std::fprintf(stderr, "[fcp] note: --log-file %s 写入失败，日志只到 stderr\n",
-                 opt_.log_file.c_str());
+    note("--log-file " + opt_.log_file + " 写入失败，日志只到 stderr",
+         Severity(LogLevel::kWarn));
     return;
   }
   log_path_ = path.string();
   log_bytes_ = static_cast<size_t>(std::filesystem::exists(path, ec)
                                        ? std::filesystem::file_size(path, ec)
                                        : 0);
-  write_log("== start pid=" + std::to_string(ThisPid()) + " log=" + log_path_);
+  write_log("[INFO] == start pid=" + std::to_string(ThisPid()) + " log=" + log_path_);
 }
 
-void Reactor::note(const std::string& line) {
-  std::fprintf(stderr, "%s\n", line.c_str());
-  write_log(line);
+void Reactor::note(const std::string& line, int severity) {
+  // 启动/配置/stall 这类内部行没有标签，级别由调用点给（默认 info）。
+  // 时间戳 + 级别与 log_line 同一种渲染，GUI 才能统一解析/上色。
+  const std::string rendered = LogLine(severity, line);
+  std::fprintf(stderr, "%s\n", rendered.c_str());
+  write_log_stamped(rendered);
 }
 
 // 唯一的分级汇集点：标签分级 → 阈值过滤（stderr 与文件同一把尺）→ 渲染。
-// 无法分级（无标签）按 info；warn/error 在正文前加 [warn]/[error] 让
-// 关键行一眼可辨。
+// 无法分级（无标签）按 info。行文本统一是
+// `YYYY-MM-DD HH:MM:SS.mmm [LEVEL] 正文`；GUI 的日志窗按 [LEVEL] 上色，
+// CLI 本身不吐 ANSI（服务端 journal 保持纯文本）。
 void Reactor::log_line(const std::string& line) {
   int severity = 0;
   TaggedLine(line, &severity);
@@ -2121,14 +2108,9 @@ void Reactor::log_line(const std::string& line) {
     return;
   }
   const std::string body = LineBody(line);
-  const char* prefix = "";
-  if (severity == Severity(LogLevel::kWarn)) {
-    prefix = "[warn] ";
-  } else if (severity == Severity(LogLevel::kError)) {
-    prefix = "[error] ";
-  }
-  std::fprintf(stderr, "%s%s\n", prefix, body.c_str());
-  write_log(std::string(prefix) + body);
+  const std::string rendered = LogLine(severity, body);
+  std::fprintf(stderr, "%s\n", rendered.c_str());
+  write_log_stamped(rendered);
 }
 
 // 契约：持有 log_mutex_ 时调用。
@@ -2148,7 +2130,8 @@ void Reactor::rotate_log_file() {
     log_stream_.open(log_path_, std::ios::app | std::ios::binary);
     if (!log_rotate_warned_) {
       log_rotate_warned_ = true;
-      std::fprintf(stderr, "[fcp] note: --log-file 轮转失败，继续追加写\n");
+      std::fprintf(stderr, "%s [WARN] --log-file 轮转失败，继续追加写\n",
+                   LogStamp().c_str());
     }
     return;
   }
@@ -2158,11 +2141,15 @@ void Reactor::rotate_log_file() {
 }
 
 void Reactor::write_log(const std::string& line) {
+  // 每行一个时间戳 + 每行 flush：排障时崩溃前的最后一行必须已经在盘上。
+  write_log_stamped(LogStamp() + " " + line);
+}
+
+void Reactor::write_log_stamped(const std::string& line) {
   if (!log_stream_.is_open()) {
     return;
   }
-  // 每行一个时间戳 + 每行 flush：排障时崩溃前的最后一行必须已经在盘上。
-  const std::string stamped = LogStamp() + " " + line + "\n";
+  const std::string stamped = line + "\n";
   const std::lock_guard<std::mutex> lock(log_mutex_);
   log_stream_ << stamped;
   log_stream_.flush();

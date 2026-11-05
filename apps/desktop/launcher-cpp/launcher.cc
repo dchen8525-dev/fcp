@@ -81,8 +81,11 @@ std::wstring Utf8ToWide(const char* s) {
   if (s == nullptr) return std::wstring();
   const int need = ::MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0);
   if (need <= 0) return std::wstring();
-  std::wstring out(static_cast<size_t>(need - 1), L'\0');
+  // need 含结尾 NUL：按 need 分配再缩掉最后一个字符，避免把 NUL 写到
+  // need-1 大小的缓冲外（曾按 need-1 分配却让 API 写 need 个字符）。
+  std::wstring out(static_cast<size_t>(need), L'\0');
   ::MultiByteToWideChar(CP_UTF8, 0, s, -1, out.data(), need);
+  out.resize(static_cast<size_t>(need - 1));
   return out;
 }
 
@@ -230,9 +233,11 @@ bool ParseFooter(const uint8_t* buf, uint64_t total, Footer* out,
   const uint64_t offset = ReadU64(buf + 16);
   const uint64_t len = ReadU64(buf + 24);
   const uint64_t usize = ReadU64(buf + 32);
-  // 不接受空载荷；offset+len 必须正好指到尾部开头。
-  if (len == 0 || usize == 0 || offset > total - kFooterLen ||
-      offset + len != total - kFooterLen) {
+  // 不接受空载荷；offset+len 必须正好指到尾部开头。用减法写比较，
+  // 避免 offset+len 在 2^64 回绕绕过校验。
+  const uint64_t payload_end = total - kFooterLen;
+  if (len == 0 || usize == 0 || offset > payload_end ||
+      len != payload_end - offset) {
     *error = L"引导尾部与载荷长度不一致（文件被截断或拼接错误）";
     return false;
   }
@@ -266,8 +271,26 @@ bool MkDirs(const std::wstring& path) {
   return true;
 }
 
-// zip 条目名安全门（对应 Rust 版 enclosed_name）：拒绝盘符、UNC、`..` 段。
-// 两种分隔符都当段界，比 Rust 版更保守。
+// Win32 把 CON/NUL/COM1 这类保留设备名按设备解析，哪怕在深层子目录里
+// （`C:\dir\CON.txt` 也可能打开控制台）。载荷条目名来自 zip 中央目录，
+// 被篡改的发行物不该有把日志/解压写进设备的机会。
+bool IsReservedDeviceName(const std::wstring& part) {
+  const size_t dot = part.find(L'.');
+  const std::wstring stem = dot == std::wstring::npos ? part : part.substr(0, dot);
+  if (stem.empty()) return false;
+  static const wchar_t* kReserved[] = {
+      L"CON", L"PRN", L"AUX", L"NUL",
+      L"COM1", L"COM2", L"COM3", L"COM4", L"COM5", L"COM6", L"COM7", L"COM8",
+      L"COM9", L"LPT1", L"LPT2", L"LPT3", L"LPT4", L"LPT5", L"LPT6", L"LPT7",
+      L"LPT8", L"LPT9"};
+  for (const wchar_t* name : kReserved) {
+    if (_wcsicmp(stem.c_str(), name) == 0) return true;
+  }
+  return false;
+}
+
+// zip 条目名安全门（对应 Rust 版 enclosed_name）：拒绝盘符、UNC、`..` 段、
+// 保留设备名。两种分隔符都当段界，比 Rust 版更保守。
 bool SafeEntryName(const char* utf8, std::wstring* out) {
   const std::wstring wide = Utf8ToWide(utf8);
   if (wide.empty()) return false;
@@ -282,6 +305,7 @@ bool SafeEntryName(const char* utf8, std::wstring* out) {
     start = i + 1;
     if (part.empty() || part == L".") continue;
     if (part == L"..") return false;
+    if (IsReservedDeviceName(part)) return false;
     if (!first) joined.push_back(L'\\');
     joined += part;
     first = false;
@@ -384,12 +408,42 @@ bool ExtractPayload(HANDLE archive, const Footer& footer,
       ok = false;
       break;
     }
-    // 打包器 .NET ZipFile 生成的条目名是 ASCII（Qt DLL 与本工程文件名的
-    // 英文子集），miniz 窄字符 fopen 直接可用；非 ASCII 条目名不属于本
-    // 发行物。缺 WideToNarrow 语义时 miniz 的 zip 层以原地 fopen 打开。
-    if (!mz_zip_reader_extract_to_file(&zip, index, WideToNarrow(out).c_str(),
-                                       0)) {
-      *error = L"解压 " + rel + L" 失败（磁盘满或路径被占用）";
+    // 条目先解到内存再落盘：miniz 的 extract_to_file 走窄字符 fopen，
+    // %LOCALAPPDATA% 带非 ASCII 字符（中文用户名很常见）时路径按 ANSI
+    // 代码页误解，解压必挂；这里读写全走宽字符 API。extract_to_mem 会
+    // 校验实际解压长度与 CRC 都等于中央目录声明，短了/坏了直接失败。
+    // 打包器 .NET ZipFile 生成的条目都是 store 模式（m_is_supported 恒真）。
+    std::vector<uint8_t> buf(static_cast<size_t>(stat.m_uncomp_size));
+    if (mz_zip_reader_extract_to_mem(&zip, index, buf.data(), buf.size(), 0) !=
+        MZ_TRUE) {
+      *error = L"解压 " + rel + L" 失败（载荷损坏）";
+      ok = false;
+      break;
+    }
+    HANDLE out_file = ::CreateFileW(out.c_str(), GENERIC_WRITE, 0, nullptr,
+                                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                                    nullptr);
+    if (out_file == INVALID_HANDLE_VALUE) {
+      *error = L"无法写入 " + out + L"：" + ErrorText(::GetLastError());
+      ok = false;
+      break;
+    }
+    bool wrote_all = true;
+    size_t at = 0;
+    while (at < buf.size()) {
+      const DWORD chunk = static_cast<DWORD>(
+          (buf.size() - at) > 0x40000000u ? 0x40000000u : (buf.size() - at));
+      DWORD wrote = 0;
+      if (!::WriteFile(out_file, buf.data() + at, chunk, &wrote, nullptr) ||
+          wrote != chunk) {
+        wrote_all = false;
+        break;
+      }
+      at += chunk;
+    }
+    ::CloseHandle(out_file);
+    if (!wrote_all) {
+      *error = L"写入 " + rel + L" 失败（磁盘满或路径被占用）";
       ok = false;
       break;
     }
@@ -535,6 +589,32 @@ bool EnsurePayload(HANDLE archive, const Footer& footer, std::wstring* dir_out,
 
 // ---------- 报告/启动 ----------
 
+// 按 CommandLineToArgvW 的规则把单个参数还原成命令行片段：含空白或引号
+// 时加引号；参数内的 `"` 转成 `\"`，引号前与结尾的连续反斜杠翻倍，否则
+// `arg"box` 这类参数会提前终止引号、把后面的字符漏进可执行名。
+std::wstring QuoteArg(const wchar_t* arg) {
+  if (arg[0] == L'\0') return L"\"\"";
+  if (::wcspbrk(arg, L" \t\"") == nullptr) return arg;
+  std::wstring out = L"\"";
+  size_t backslashes = 0;
+  for (const wchar_t* p = arg; *p != L'\0'; ++p) {
+    if (*p == L'\\') {
+      ++backslashes;
+    } else if (*p == L'"') {
+      out.append(backslashes * 2 + 1, L'\\');
+      out.push_back(L'"');
+      backslashes = 0;
+    } else {
+      out.append(backslashes, L'\\');
+      out.push_back(*p);
+      backslashes = 0;
+    }
+  }
+  out.append(backslashes * 2, L'\\');
+  out.push_back(L'"');
+  return out;
+}
+
 void AppendLaunchLog(const std::wstring& message) {
   MkDirs(FcpRoot());
   HANDLE h = ::CreateFileW(LaunchLog().c_str(), FILE_APPEND_DATA, 0, nullptr,
@@ -587,12 +667,7 @@ int RunMain(int argc, wchar_t** argv) {
       continue;
     }
     if (!tail.empty()) tail.push_back(L' ');
-    // 带空格的参数需要再包一层引号（简单粗暴，防"参数里带空格"）。
-    const bool needs_quote =
-        argv[i][0] != L'\0' && ::wcspbrk(argv[i], L" ") != nullptr;
-    if (needs_quote) tail.push_back(L'"');
-    tail += argv[i];
-    if (needs_quote) tail.push_back(L'"');
+    tail += QuoteArg(argv[i]);
   }
 
   wchar_t self_path[MAX_PATH] = {};

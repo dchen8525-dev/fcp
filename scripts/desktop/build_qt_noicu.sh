@@ -66,9 +66,9 @@ cmake --build . --parallel
 echo "== install"
 cmake --install .
 
-# 源码树很大，装完就删；失败也不影响结果。
+# 源码树很大，装完就删；删不掉（只读/占用）不影响已装好的前缀。
 cd /
-rm -rf "$SRC"
+rm -rf "$SRC" 2>/dev/null || true
 
 echo "== 完成：$PREFIX"
 "$PREFIX/bin/qmake" -query QT_VERSION

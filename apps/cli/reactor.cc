@@ -2091,6 +2091,11 @@ void Reactor::open_log_file() {
 
 void Reactor::note(const std::string& line, int severity) {
   // 启动/配置/stall 这类内部行没有标签，级别由调用点给（默认 info）。
+  // 与 log_line 同一把阈值尺：--log=off / --log=error 时低级别行不出场，
+  // stderr 与文件都不写（否则 --log=off 下启动横幅还会漏出来）。
+  if (severity < Severity(opt_.log_level)) {
+    return;
+  }
   // 时间戳 + 级别与 log_line 同一种渲染，GUI 才能统一解析/上色。
   const std::string rendered = LogLine(severity, line);
   std::fprintf(stderr, "%s\n", rendered.c_str());
@@ -2130,8 +2135,10 @@ void Reactor::rotate_log_file() {
     log_stream_.open(log_path_, std::ios::app | std::ios::binary);
     if (!log_rotate_warned_) {
       log_rotate_warned_ = true;
-      std::fprintf(stderr, "%s [WARN] --log-file 轮转失败，继续追加写\n",
-                   LogStamp().c_str());
+      std::fprintf(stderr, "%s\n",
+                   LogLine(Severity(LogLevel::kWarn),
+                           "--log-file 轮转失败，继续追加写")
+                       .c_str());
     }
     return;
   }

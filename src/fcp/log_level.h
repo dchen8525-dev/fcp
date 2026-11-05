@@ -82,7 +82,9 @@ inline std::string LogStamp() {
     return {};
   }
 #endif
-  char buf[32];
+  // 32 足够放下 23 字符 + NUL，但 GCC 的 -Wformat-truncation 会按 %04d
+  // 的最坏展开（tm_year 可为任意 int）报可能截断；64 让告警闭嘴。
+  char buf[64];
   std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%03ld",
                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour,
                 tm.tm_min, tm.tm_sec, ms);

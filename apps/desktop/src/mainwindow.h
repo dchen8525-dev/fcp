@@ -118,7 +118,6 @@ class MainWindow : public QMainWindow {
   QLineEdit* k_ = nullptr;
   QLineEdit* rate_ = nullptr;
   QPushButton* start_ = nullptr;
-  QPushButton* stop_ = nullptr;
   QLabel* hint_ = nullptr;
   QLabel* conn_addr_ = nullptr;
 

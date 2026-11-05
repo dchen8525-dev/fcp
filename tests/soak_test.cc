@@ -19,6 +19,8 @@
 #include <thread>
 #include <vector>
 
+#include "fcp/log_level.h"
+
 #include "e2e_link.h"
 #include "test_util.h"
 
@@ -134,7 +136,7 @@ struct Channel {
     uint32_t n = 0;
     for (const std::vector<std::string>* logs : {&h.log_a, &h.log_b}) {
       for (const std::string& line : *logs) {
-        if (line.rfind("FECSTAT sets=", 0) == 0) {
+        if (fcp::LineBody(line).rfind("FECSTAT sets=", 0) == 0) {
           ++n;
         }
       }

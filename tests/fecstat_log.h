@@ -13,6 +13,8 @@
 #include <string>
 #include <vector>
 
+#include "fcp/log_level.h"
+
 namespace fcp_test {
 
 struct FecstatLogFields {
@@ -30,14 +32,19 @@ struct FecstatLogFields {
 
 // Returns true and fills *out from the first FECSTAT line in `logs`. False when
 // no line parses -- e.g. the format drifted, which is itself worth failing on.
+// Tolerates the leading severity tag ("[i] ", "[d] ", … ) the log levels add;
+// the parser should not care which level the report rides.
 inline bool ParseFecstatLog(const std::vector<std::string>& logs, FecstatLogFields* out) {
   for (const std::string& line : logs) {
-    if (line.rfind("FECSTAT sets=", 0) != 0) {
+    int severity = 0;
+    const bool tagged = fcp::TaggedLine(line, &severity);
+    const std::string body = fcp::LineBody(line);
+    if (body.rfind("FECSTAT sets=", 0) != 0) {
       continue;
     }
     char state[8] = {};
     const int n = std::sscanf(
-        line.c_str(),
+        body.c_str(),
         "FECSTAT sets=%u expect=%u rx=%u rec=%u late=%u lost=%u pre=%uppm "
         "usable=%uppm -> k=%u state=%7s",
         &out->sets, &out->expect, &out->rx, &out->rec, &out->late, &out->lost,

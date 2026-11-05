@@ -23,18 +23,54 @@ if [ "$1" = "configure" ]; then
   # 只有首次安装才打印上手步骤 —— 升级的人早就配好了，每次升级再刷一遍三行
   # 提示只会让人怀疑是不是又要重配。
   if [ -z "$2" ]; then
-    cat <<'EOF'
+    # 首次安装且 fcp.env 里还没有非空 FCP_PSK 时，自动生成一个写进去：
+    # 装完即可 enable --now，客户端拿同一个值就能连。fcp.env 已有 FCP_PSK
+    # （升级场景 conffile 原样保留）就一字不动，运维的密钥不会被动换。
+    # 运维换钥匙：openssl rand -hex 16，替换那一行即可。
+    key=""
+    if [ -f /etc/fcp/fcp.env ] &&
+       ! grep -qE '^FCP_PSK=[[:alnum:]]' /etc/fcp/fcp.env; then
+      key="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+      echo "$key" | grep -qE '^[0-9a-f]{32}$' || key=""
+      if [ -n "$key" ]; then
+        if grep -q '^FCP_PSK=' /etc/fcp/fcp.env; then
+          # 空的 FCP_PSK= 占位行就位替换，不重复堆行。
+          sed -i "s/^FCP_PSK=.*/FCP_PSK=$key/" /etc/fcp/fcp.env
+        else
+          printf 'FCP_PSK=%s\n' "$key" >> /etc/fcp/fcp.env
+        fi
+      fi
+    fi
+
+    if [ -n "$key" ]; then
+      cat <<EOF
+
+FCP 服务端已安装。已自动生成 PSK 并写入 /etc/fcp/fcp.env（0600，root 可读）：
+
+  FCP_PSK=$key
+
+客户端用同一个值即可连接。下一步：
+  1. systemctl enable --now fcp     （密钥已就位，直接就能起）
+  2. journalctl -u fcp -f
+
+要更换的话：openssl rand -hex 16，替换 fcp.env 的 FCP_PSK 行，systemctl restart fcp。
+版本自检：fcp-server --version
+
+EOF
+    else
+      cat <<'EOF'
 
 FCP 服务端已安装。下一步：
-  1. 编辑 /etc/fcp/fcp.env，设置 FCP_PSK=HEX32（openssl rand -hex 16）与
-     FCP_ARGS=--key-env=FCP_PSK —— 本 unit 是 DynamicUser，服务用户读不了
-     root 的 0600 文件，--key-file 在 systemd 下不工作；--key=HEX32 会把
-     PSK 暴露在 ps 的 argv 里，也不要用（fcp.env 顶部注释是权威说明）
+  1. 编辑 /etc/fcp/fcp.env，设置 FCP_PSK=HEX32（openssl rand -hex 16）——
+     一行即可，fcp-server 未给 --key* 参数时默认读该环境变量；不用
+     --key-file（DynamicUser 读不了 root 的 0600 文件）、不用 --key=
+     （会暴露在 ps 的 argv 里）
   2. systemctl enable --now fcp
   3. journalctl -u fcp -f
 
 版本自检：fcp-server --version
 EOF
+    fi
   fi
 fi
 

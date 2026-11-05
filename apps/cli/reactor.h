@@ -35,6 +35,7 @@
 #include <csignal>
 #include <cstdint>
 #include <deque>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -42,6 +43,8 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include "fcp/log_level.h"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -108,6 +111,8 @@ constexpr size_t kGsoMaxSegs = 64;
 // must cover its gaps; truly idle tunnels freeze both directions and stay
 // silent on purpose).
 constexpr int64_t kStallLogMs = 30000;
+// --log-file 的单文件上限：写满即轮转到 <名字>.1（保留上一份）。
+constexpr size_t kLogFileRotateBytes = 32u * 1024u * 1024u;
 constexpr int64_t kStallTxWindowMs = 10000;
 
 struct ReactorOptions {
@@ -134,7 +139,9 @@ struct ReactorOptions {
   // resolution plus all attempts from above.
   int64_t connect_timeout_ms = 5000;
   int64_t stats_ms = 0;  // 0 = no periodic stats line
-  bool verbose = false;
+  // 显示级别的下限：Debug 打开全部（默认），Off 全关。stderr 与 --log-file
+  // 用同一个阈值（排障问题的答案两处一致——fcp.env 里怎么调，两边就一样）。
+  LogLevel log_level = LogLevel::kDebug;
   // Client only: dead-path watchdog (半开/断流). A tunnel that keeps ACKs and
   // retransmitted segments going out while nothing at all comes back for this
   // long is logged as a stall (and again every kStallLogMs until it recovers);
@@ -143,6 +150,16 @@ struct ReactorOptions {
   // this exists so an operator (and the GUI log page) can see the wall-clock
   // window the path was dark.
   int64_t stall_ms = 60000;
+  // Persistent file log (排障用)：`--log-file=<路径>`。路径落在目录形式
+  // （以 / 或 \\ 结尾，或本身就是目录）时写 `<目录>/fcp-<角色>-<pid>.log`；
+  // 否则按给定文件名追加写。写满 kLogFileRotateBytes（32 MiB）轮转到
+  // `<名字>.1`。文件与 stderr 共用 log_level 阈值（日志等级是全局裁决
+  // 者）：默认 debug 下逐请求行都在，--log=off 时文件也安静。
+  std::string log_file;
+  // No --key* argument was given and the key came from the FCP_PSK variable
+  // (the packaged /etc/fcp/fcp.env shape: one line, unit injects it). Only
+  // marks the config echo; the key value itself is never printed anywhere.
+  bool psk_from_default_env = false;
   // Send shaping budget, bytes/s (0 = off; the CLI converts --rate-limit's
   // Mbps). The tunnel has one upload end and one download end, so the halves
   // never apply to the same host: the client shapes what it sends with UP, the
@@ -437,6 +454,21 @@ class Reactor {
   // print "recovered". A stall clears only after inbound moved on two
   // consecutive watchdog ticks.
   bool stall_rx_pending_ = false;
+  // --log-file 的落盘端：追加写 + 32 MiB 轮转（.1），改名失败降级继续
+  // 追加（与 trace 的容错策略一致）。引擎 log 回调与关键内部行都经
+  // emit()/写走文件；stderr 行为照旧。
+  std::ofstream log_stream_;
+  std::string log_path_;
+  size_t log_bytes_ = 0;
+  bool log_rotate_warned_ = false;
+  std::mutex log_mutex_;
+  void open_log_file();
+  void rotate_log_file();
+  void write_log(const std::string& line);
+  // 分级汇集点：标签分级 → 过滤 → 双落（stderr + 文件同阈值）。
+  void log_line(const std::string& line);
+  // 调试行到 stderr + --log-file 文件两端：控制台行原样，文件里带时间戳。
+  void note(const std::string& line);
   size_t max_sessions_ = 0;
   using SignalHandler = void (*)(int);
   SignalHandler prev_int_ = nullptr;

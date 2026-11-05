@@ -19,12 +19,15 @@
 
 #include "bench.h"
 #include "cli.h"
+#include "fcp/log_level.h"
 #include "test_util.h"
 
 namespace {
 
 using fcp::EngineRole;
+using fcp::LogLevel;
 using fcp::ProxyArgs;
+using fcp::Severity;
 
 // Builds argv the way main() would see it; argv[0] is a placeholder since the
 // parser never reads it (only run_proxy's Usage does).
@@ -178,6 +181,60 @@ void TestKeyEnv() {
   CHECK(error.find("more than once") != std::string::npos);
   CHECK(!TryParse(EngineRole::kServer, {"--key-env="}, &a, &error));
   UnsetEnv("FCP_TEST_PSK");
+}
+
+// 无任何 --key* 参数时默认读 FCP_PSK 环境变量：这是 deb 包的 /etc/fcp/fcp.env
+// 只写一行 `FCP_PSK=…` 的依据（unit 是 DynamicUser，systemd 以 root 读
+// EnvironmentFile 后注入进程环境，进程无参数、ps 里也没有密钥）。
+void TestKeyDefaultsToFcpPskEnv() {
+  ProxyArgs a;
+  std::string error;
+  UnsetEnv("FCP_PSK");
+
+  // 什么来源都没有 → 报错原因必须点到 FCP_PSK，运维不用翻 --help。
+  CHECK(!TryParse(EngineRole::kServer, {}, &a, &error));
+  CHECK(error.find("FCP_PSK") != std::string::npos);
+
+  // 设置了就直接生效，等价于 --key-env=FCP_PSK；config 回显要标出来源。
+  CHECK(SetEnv("FCP_PSK", kGoodKey));
+  CHECK(TryParse(EngineRole::kServer, {}, &a, &error));
+  CHECK_EQ(a.ec.key[0], 0x00);
+  CHECK_EQ(a.ec.key[15], 0x0f);
+  CHECK(a.ro.psk_from_default_env);
+
+  // 空变量不是"已配置"——与未设置走同一条响亮失败路径。
+  CHECK(SetEnv("FCP_PSK", ""));
+  CHECK(!TryParse(EngineRole::kServer, {}, &a, &error));
+
+  // 显式来源优先：给了 --key-env=别的名字，FCP_PSK 的有无都不干扰，
+  // 也不算隐式来源。
+  UnsetEnv("FCP_PSK");
+  CHECK(SetEnv("FCP_TEST_PSK2", kGoodKey));
+  CHECK(TryParse(EngineRole::kServer, {"--key-env=FCP_TEST_PSK2"}, &a, &error));
+  CHECK(!a.ro.psk_from_default_env);
+  UnsetEnv("FCP_TEST_PSK2");
+
+  // FCP_PSK 内容坏了要报错，且原因里不回显值本身。
+  CHECK(SetEnv("FCP_PSK", "not a key"));
+  CHECK(!TryParse(EngineRole::kServer, {}, &a, &error));
+  CHECK(error.find("not a key") == std::string::npos);
+  UnsetEnv("FCP_PSK");
+}
+
+// --log-file=PATH：路径或目录名原样进 ReactorOptions；重复给两次按"同一参数
+// 只能出现一次"的组规则响亮报错。
+void TestLogFileFlag() {
+  ProxyArgs a;
+  std::string error;
+
+  CHECK(Ok(EngineRole::kServer, {}, &a, &error));
+  CHECK(a.ro.log_file.empty());
+  CHECK(Ok(EngineRole::kClient, {"--log-file=/var/log/fcp"}, &a, &error));
+  CHECK_EQ(a.ro.log_file, "/var/log/fcp");
+  CHECK(Ok(EngineRole::kServer, {"--log-file=C:\\logs\\server.log"}, &a, &error));
+  CHECK_EQ(a.ro.log_file, "C:\\logs\\server.log");
+  CHECK(!Ok(EngineRole::kClient, {"--log-file=a", "--log-file=b"}, &a, &error));
+  CHECK(error.find("more than once") != std::string::npos);
 }
 
 void TestNumericRanges() {
@@ -558,7 +615,7 @@ void TestDefaultsSurvive() {
   CHECK_EQ(a.ec.dial_timeout_ms, 5000);
   CHECK(a.ec.prewarm);
   CHECK(a.ro.remote_port == 4460 && a.ro.listen_port == 1080);
-  CHECK(!a.ro.verbose);
+  CHECK_EQ(Severity(a.ro.log_level), Severity(LogLevel::kDebug));  // 默认 debug
   CHECK_EQ(a.ro.stats_ms, 0);
   CHECK_EQ(a.ro.connect_timeout_ms, 5000);
   CHECK(a.ec.trace_prefix.empty());
@@ -642,44 +699,50 @@ void TestFlagsAndValues() {
            {"--no-prewarm", "-v", "--trace=/tmp/calib", "--connect-timeout=2500"},
            &a, &error));
   CHECK(!a.ec.prewarm);
-  CHECK(a.ro.verbose);
+  CHECK_EQ(Severity(a.ro.log_level), Severity(LogLevel::kDebug));  // -v = debug 别名
   CHECK_EQ(a.ec.trace_prefix, std::string("/tmp/calib"));
   CHECK_EQ(a.ro.connect_timeout_ms, 2500);
   CHECK(Ok(EngineRole::kServer,
            {"-v", "--max-sessions=512", "--idle=1000", "--no-prewarm"}, &a, &error));
-  CHECK(a.ro.verbose);
+  CHECK_EQ(Severity(a.ro.log_level), Severity(LogLevel::kDebug));
   CHECK(!a.ec.prewarm);
   CHECK_EQ(a.ec.max_sessions, 512u);
   CHECK_EQ(a.ec.idle_timeout_ms, 1000);
-  // --stats is gone; -v rewrites to --log=verbose, so the two still collide
-  // as one setting.
-  CHECK(!Ok(EngineRole::kServer, {"--stats=1000"}, &a, &error));
-  CHECK(error.find("unknown") != std::string::npos);
+  // --stats 回来了，且是独立旋钮（0 = 关）。
+  CHECK(Ok(EngineRole::kServer, {"--stats=1000"}, &a, &error));
+  CHECK_EQ(a.ro.stats_ms, 1000);
+  CHECK(Ok(EngineRole::kServer, {"--stats=0"}, &a, &error));
+  CHECK_EQ(a.ro.stats_ms, 0);
+  CHECK(!Ok(EngineRole::kServer, {"--stats=-1"}, &a, &error));
+  CHECK(!Ok(EngineRole::kServer, {"--stats=abc"}, &a, &error));
   CHECK(!Ok(EngineRole::kServer, {"-v", "--log=off"}, &a, &error));
   CHECK(error.find("more than once") != std::string::npos);
 
   // Outside help/version, a value error always has a message.
   CHECK(!Ok(EngineRole::kServer, {"--mtu=abc"}, &a, &error));
   CHECK(error.find("--mtu") != std::string::npos);
-  CHECK(!Ok(EngineRole::kServer, {"--log=stats:abc"}, &a, &error));
+  CHECK(!Ok(EngineRole::kServer, {"--log=chatty"}, &a, &error));
   CHECK(error.find("--log") != std::string::npos);
 
-  // --log is the merged form: off / stats[:ms] / verbose.
+  // --log=LEVEL 四个阈值 + verbose 别名；周期统计归 --stats，两者互不干扰。
   CHECK(Ok(EngineRole::kServer, {"--log=off"}, &a, &error));
-  CHECK_EQ(a.ro.stats_ms, 0);
-  CHECK(!a.ro.verbose);
-  CHECK(Ok(EngineRole::kServer, {"--log=stats"}, &a, &error));
-  CHECK(a.ro.stats_ms > 0);
-  CHECK(Ok(EngineRole::kServer, {"--log=stats:2500"}, &a, &error));
-  CHECK_EQ(a.ro.stats_ms, 2500);
-  CHECK(Ok(EngineRole::kServer, {"--log=verbose"}, &a, &error));
-  CHECK(a.ro.verbose);
+  CHECK_EQ(Severity(a.ro.log_level), Severity(LogLevel::kOff));
+  CHECK_EQ(a.ro.stats_ms, 0);  // --log 不再影响统计
+  CHECK(Ok(EngineRole::kServer, {"--log=off", "--stats=5000"}, &a, &error));
+  CHECK_EQ(a.ro.stats_ms, 5000);
+  CHECK(Ok(EngineRole::kServer, {"--log=error"}, &a, &error));
+  CHECK_EQ(Severity(a.ro.log_level), Severity(LogLevel::kError));
+  CHECK(Ok(EngineRole::kServer, {"--log=warn"}, &a, &error));
+  CHECK_EQ(Severity(a.ro.log_level), Severity(LogLevel::kWarn));
+  CHECK(Ok(EngineRole::kServer, {"--log=info"}, &a, &error));
+  CHECK_EQ(Severity(a.ro.log_level), Severity(LogLevel::kInfo));
+  CHECK(Ok(EngineRole::kServer, {"--log=debug"}, &a, &error));
+  CHECK_EQ(Severity(a.ro.log_level), Severity(LogLevel::kDebug));
+  CHECK(Ok(EngineRole::kServer, {"--log=verbose", "--stats=1500"}, &a, &error));
+  CHECK_EQ(Severity(a.ro.log_level), Severity(LogLevel::kDebug));
+  CHECK_EQ(a.ro.stats_ms, 1500);
   CHECK(!Ok(EngineRole::kServer, {"--log=chatty"}, &a, &error));
-  CHECK(!Ok(EngineRole::kServer, {"--log=stats:0"}, &a, &error));
-  CHECK(!Ok(EngineRole::kServer, {"--log=stats:"}, &a, &error));
-  // A given -v cannot be combined with --log: one logger, one value.
-  CHECK(!Ok(EngineRole::kServer, {"--log=stats:1000", "-v"}, &a, &error));
-  CHECK(!Ok(EngineRole::kServer, {"--log=verbose", "--log=off"}, &a, &error));
+  CHECK(!Ok(EngineRole::kServer, {"--log=debug", "--log=off"}, &a, &error));
 
   // --help short-circuits into out->help instead of a key error.
   CHECK(TryParse(EngineRole::kServer, {"--help"}, &a, &error));
@@ -1021,6 +1084,7 @@ int main() {
   TestKeyValidation();
   TestKeyFile();
   TestKeyEnv();
+  TestKeyDefaultsToFcpPskEnv();
   TestNumericRanges();
   TestFecAliases();
   TestWindowForms();
@@ -1031,6 +1095,7 @@ int main() {
   TestFlagsAndValues();
   TestSpeedTestFlags();
   TestStallAndRateFlags();
+  TestLogFileFlag();
   TestBbrFlags();
   TestBenchCodec();
   TestEnvironmentDefaults();

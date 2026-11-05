@@ -67,9 +67,10 @@ cmake -S . -B build -DFCP_BUILD_PROXY=ON -DFCP_BUILD_GUI=ON \
 
 ## 行为约定
 
-* **参数**：`--host --port --listen --local-port --mtu --fec-budget --window=:4096
-  --key-env=FCP_PSK --log=stats:500`，`k >= 0` 时再加 `--k`。PSK 走环境变量
-  `FCP_PSK`，不出现在命令行。
+* **参数**：`--host --port --listen --local-port --mtu --fec-budget
+  --window=:4096 --log=debug --stats=500 --log-file=<数据目录>/log/`，
+  `k >= 0` 时再加 `--k`。PSK 走环境变量
+  `FCP_PSK`（CLI 未给 `--key*` 参数时默认读它），不出现在命令行。
 * **校验顺序**：密钥 32 位十六进制 → UDP 端口 → 本地端口 →
   MTU 576..9000 → k -1..7 → FEC 0..1 → 监听地址非空 → 服务器地址非空。
   高级设置折叠时按默认值提交（127.0.0.1 / 1400 / -1 / 0.5）。

@@ -12,6 +12,7 @@
 #include "fcp/fecstat.h"
 #include "fcp/handshake.h"
 #include "fcp/hdr.h"
+#include "fcp/log_level.h"
 #include "fcp/random.h"
 #include "fecstat_log.h"
 #include "test_util.h"
@@ -96,7 +97,10 @@ std::unique_ptr<fcp::Envelope> DataReader(fcp::Direction send, fcp::Direction re
 
 bool HasLine(const std::vector<std::string>& logs, const std::string& want) {
   for (const std::string& line : logs) {
-    if (line == want) {
+    // 行首带等级标签（"[i] "…）剥掉比对：测试关心的是正文而非级别。
+    if (line == want ||
+        (line.size() >= 4 && line.compare(4, std::string::npos, want) == 0 &&
+         line.compare(0, 1, "[") == 0 && line.compare(2, 2, "] ") == 0)) {
       return true;
     }
   }
@@ -105,7 +109,7 @@ bool HasLine(const std::vector<std::string>& logs, const std::string& want) {
 
 bool HasPrefix(const std::vector<std::string>& logs, const std::string& prefix) {
   for (const std::string& line : logs) {
-    if (line.rfind(prefix, 0) == 0) {
+    if (fcp::LineBody(line).rfind(prefix, 0) == 0) {
       return true;
     }
   }
@@ -1016,7 +1020,7 @@ void TestMissingFecstatWarning() {
   CHECK_EQ(b.reporter()->reports(), 3u);  // b reported at 2s / 4s / 6s
   int warnings = 0;
   for (const std::string& line : log_a) {
-    if (line.rfind("FEC WARNING: no FECSTAT", 0) == 0) {
+    if (fcp::LineBody(line).rfind("FEC WARNING: no FECSTAT", 0) == 0) {
       ++warnings;
     }
   }
@@ -1055,12 +1059,13 @@ std::vector<unsigned> AllKs(const std::vector<std::string>& logs) {
   std::vector<unsigned> ks;
   fcp_test::FecstatLogFields f;
   for (const std::string& line : logs) {
-    if (line.rfind("FECSTAT sets=", 0) != 0) {
+    const std::string body = fcp::LineBody(line);
+    if (body.rfind("FECSTAT sets=", 0) != 0) {
       continue;
     }
     char state[8] = {};
     unsigned k = 0;
-    if (std::sscanf(line.c_str(),
+    if (std::sscanf(body.c_str(),
                     "FECSTAT sets=%u expect=%u rx=%u rec=%u late=%u lost=%u "
                     "pre=%uppm usable=%uppm -> k=%u state=%7s",
                     &f.sets, &f.expect, &f.rx, &f.rec, &f.late, &f.lost, &f.pre,
@@ -1154,8 +1159,8 @@ void TestLedgerLiftsKUnderBursts() {
     ArmResult out;
     out.ks = AllKs(log_a);
     for (const std::string& s : log_a) {
-      if (s.rfind("FEC ledger: ", 0) == 0) {
-        out.ledger_lines.push_back(s);
+      if (fcp::LineBody(s).rfind("FEC ledger: ", 0) == 0) {
+        out.ledger_lines.push_back(fcp::LineBody(s));
       }
     }
     return out;

@@ -154,6 +154,12 @@ jobs:
           sudo ls -ld /etc/fcp
           sudo stat -c '%n  mode=%a  owner=%U:%G  size=%s' /etc/fcp/fcp.env
 
+          echo "== 首次安装自动生成的 FCP_PSK"
+          # postinst 在未配置 PSK 的新装上生成并写入一行 FCP_PSK；冒烟后面
+          # 还能用自选密钥，是因为它显式覆盖 fcp.env，两不相扰。
+          check "/etc/fcp/fcp.env 里已自动生成 FCP_PSK" \
+            sudo sh -c "grep -qE '^FCP_PSK=[0-9a-fA-F]{32}' /etc/fcp/fcp.env"
+
           echo "== 包内文件落点"
           # 每一步都带一行回显：第四次跑时这里直接 exit 1，日志里只看到
           # "== 包内文件落点" 三个字，不知道是哪一条挂的（set -e 静默退出）。
@@ -179,11 +185,12 @@ jobs:
           if [ "$(systemctl is-system-running 2>/dev/null || true)" = "running" ] ||
              [ "$(systemctl is-system-running 2>/dev/null || true)" = "degraded" ]; then
             key="$(openssl rand -hex 16)"
-            # Exercise the conffile's recommended shape, not just --key: the
-            # unit runs with DynamicUser=yes, which cannot read a root-owned
-            # 0600 key file, so the packaged deployment has to obtain the PSK
-            # through --key-env. A --key-only smoke test would not catch that.
-            printf 'FCP_PSK=%s\nFCP_ARGS=--key-env=FCP_PSK --bind=127.0.0.1 --port=45000 --log=stats:5000\n' \
+            # Exercise the operator story exactly as documented: the conffile
+            # lists FCP_PSK and nothing else (the unit is DynamicUser=yes,
+            # which cannot read a root-owned 0600 key file, and the CLI picks
+            # the FCP_PSK variable up implicitly when no --key* argument is
+            # given). A --key-only smoke test would not catch that.
+            printf 'FCP_PSK=%s\nFCP_ARGS=--bind=127.0.0.1 --port=45000 --log=debug --stats=5000 --speedtest\n' \
               "$key" | sudo tee /etc/fcp/fcp.env >/dev/null
             sudo systemctl start fcp
             sleep 2

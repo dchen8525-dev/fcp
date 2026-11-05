@@ -9,6 +9,7 @@
 #include <thread>
 
 #include "fcp/frame_tx.h"
+#include "fcp/log_level.h"
 #include "fcp/random.h"
 #include "fcp/wire.h"
 
@@ -797,13 +798,13 @@ void BenchServer::StartSession(const Peer& from, const uint8_t salt[bench::kSalt
       },
       [this](const std::string& line) {
         if (log_) {
-          log_("[bench] " + line);
+          log_(std::string(fcp::kTagDebug) + "[bench] " + line);
         }
       });
 
   if (session_->start(now_ms) != Session::StartStatus::kOk) {
     if (log_) {
-      log_("[bench] session start failed");
+      log_(std::string(fcp::kTagError) + "[bench] session start failed");
     }
     Reset();
     return;
@@ -816,7 +817,7 @@ void BenchServer::StartSession(const Peer& from, const uint8_t salt[bench::kSalt
   last_echo_ms_ = now_ms;
   send_(peer_, bench::kMagic, bench::kMagicLen);
   if (log_) {
-    log_("[bench] session started, " + std::to_string(seconds_) + "s per direction");
+    log_(std::string(fcp::kTagInfo) + "[bench] session started, " + std::to_string(seconds_) + "s per direction");
   }
 }
 
@@ -923,7 +924,7 @@ void BenchServer::SendReport(int64_t now_ms, bool final) {
     std::snprintf(line, sizeof(line), "[bench] upload %llu bytes delivered, best %.1f Mbps",
                   static_cast<unsigned long long>(upload_bytes_),
                   static_cast<double>(upload_window_.best_bps()) / 1e6);
-    log_(line);
+    log_(std::string(fcp::kTagDebug) + line);
   }
 }
 
@@ -967,7 +968,7 @@ void BenchServer::OnTick(int64_t now_ms) {
   session_->on_tick(now_ms);
   if (session_->state() == HandshakeState::kFailed) {
     if (log_) {
-      log_("[bench] handshake failed");
+      log_(std::string(fcp::kTagWarn) + "[bench] handshake failed");
     }
     Reset();
     return;

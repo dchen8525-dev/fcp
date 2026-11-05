@@ -1,7 +1,7 @@
 // sidecar 管理：启动/停止 fcp-client，解析 stats 与 @speedtest 输出。
 //
 // 这里没有任何 UI 依赖，MainWindow 只接信号。两个子进程：
-//   * 代理：`fcp-client --host=... --key-env=FCP_PSK ...`，stdout 里 `stats`
+//   * 代理：`fcp-client --host=... ...`（PSK 走 FCP_PSK 环境变量），stdout 里 `stats`
 //     行进统计信号，其余行进日志；stderr 全是日志。
 //   * 测速：第二个 fcp-client（`--speedtest`），输出 `@speedtest {json}`。
 //

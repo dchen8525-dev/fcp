@@ -131,6 +131,51 @@ QIcon makeNavIcon(int kind, const QColor& color) {
   return icon;
 }
 
+// 密钥框的显示/隐藏按钮：同一套 24 网格线性语言（1.8 描边、圆角端点）。
+// visible=false（文本隐藏）画睁眼（点下去就显示）；visible=true（文本已
+// 可见）画带斜杠的闭眼——按钮展示"点下去会发生什么"。
+QIcon makeEyeIcon(bool visible, const QColor& color) {
+  QPixmap pixmap(32, 32);
+  pixmap.setDevicePixelRatio(2.0);
+  pixmap.fill(Qt::transparent);
+  QPainter painter(&pixmap);
+  painter.setRenderHint(QPainter::Antialiasing, true);
+  painter.scale(16.0 / 24.0, 16.0 / 24.0);
+  painter.setPen(QPen(color, 1.8, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+  painter.setBrush(Qt::NoBrush);
+
+  if (visible) {
+    // 睁眼：上下眼睑各一条二次曲线围出杏仁形 + 实心瞳孔（和导航图标的
+    // 实心圆点同一个母题）。
+    QPainterPath lid;
+    lid.moveTo(3.0, 12.0);
+    lid.quadTo(12.0, 4.6, 21.0, 12.0);
+    lid.quadTo(12.0, 19.4, 3.0, 12.0);
+    painter.drawPath(lid);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(color);
+    painter.drawEllipse(QPointF(12.0, 12.0), 2.4, 2.4);
+  } else {
+    // 闭眼：眼睑收扁 + 贯穿的斜杠（端点压出轮廓一点，"划掉"的意思在
+    // 16px 下也立得住）+ 收小的实心瞳。
+    QPainterPath lid;
+    lid.moveTo(4.0, 13.0);
+    lid.quadTo(12.0, 5.8, 20.0, 13.0);
+    lid.quadTo(12.0, 20.2, 4.0, 13.0);
+    painter.drawPath(lid);
+    painter.setPen(QPen(color, 1.8, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    painter.drawLine(QPointF(4.5, 5.5), QPointF(19.5, 20.5));
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(color);
+    painter.drawEllipse(QPointF(12.0, 13.0), 1.1, 1.1);
+  }
+  painter.end();
+
+  QIcon icon;
+  icon.addPixmap(pixmap, QIcon::Normal, QIcon::Off);
+  return icon;
+}
+
 QPixmap pulsePixmap() {
   QPixmap pixmap(40, 40);
   pixmap.setDevicePixelRatio(2.0);
@@ -434,8 +479,11 @@ QWidget* MainWindow::buildConnPage() {
   key_input_row->addWidget(key_state_);
   key_toggle_ = new QToolButton;
   key_toggle_->setObjectName(QStringLiteral("eye"));
-  key_toggle_->setText(QStringLiteral("👁"));
   key_toggle_->setToolTip(QStringLiteral("显示 / 隐藏"));
+  // 与 app.qss 里 #eye 的文字色一致（emoji 换矢量图标后颜色仍照同一根色）。
+  key_toggle_->setIcon(makeEyeIcon(false, QColor(QStringLiteral("#5b6b63"))));
+  key_toggle_->setIconSize(QSize(18, 18));
+  key_toggle_->setAutoRaise(true);
   key_toggle_->setCursor(Qt::PointingHandCursor);
   key_input_row->addWidget(key_toggle_);
   key_layout->addLayout(key_input_row);
@@ -483,14 +531,9 @@ QWidget* MainWindow::buildConnPage() {
   start_ = new QPushButton(QStringLiteral("启动代理"));
   start_->setObjectName(QStringLiteral("primary"));
   start_->setCursor(Qt::PointingHandCursor);
-  stop_ = new QPushButton(QStringLiteral("停止"));
-  stop_->setObjectName(QStringLiteral("danger"));
-  stop_->setCursor(Qt::PointingHandCursor);
-  stop_->setEnabled(false);
   hint_ = makeLabel(QString(), "hint");
   hint_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
   actions->addWidget(start_);
-  actions->addWidget(stop_);
   actions->addWidget(hint_, 1);
   form_layout->addLayout(actions);
 
@@ -506,13 +549,16 @@ QWidget* MainWindow::buildConnPage() {
   tip_layout->addWidget(conn_addr_);
   layout->addWidget(tip);
 
-  connect(start_, &QPushButton::clicked, this, &MainWindow::onStart);
-  connect(stop_, &QPushButton::clicked, this, &MainWindow::onStop);
+  // 同一个按钮：未连接时是绿色"启动代理"，连接中变红色"停止代理"——
+  // 颜色与文案同时声明状态与下一次点击的作用，不会把"已启动"看成没启动。
+  connect(start_, &QPushButton::clicked, this, [this] {
+    running_ ? onStop() : onStart();
+  });
   connect(adv_toggle_, &QPushButton::clicked, this, [this] { setAdvanced(!advanced_); });
   connect(key_toggle_, &QToolButton::clicked, this, [this] {
     const bool hidden = key_->echoMode() == QLineEdit::Password;
     key_->setEchoMode(hidden ? QLineEdit::Normal : QLineEdit::Password);
-    key_toggle_->setText(hidden ? QStringLiteral("隐藏") : QStringLiteral("👁"));
+    key_toggle_->setIcon(makeEyeIcon(hidden, QColor(QStringLiteral("#5b6b63"))));
   });
   connect(key_, &QLineEdit::textChanged, this, [this] {
     updateKeyState();
@@ -801,7 +847,10 @@ QWidget* MainWindow::buildLogPage() {
   log_ = new QPlainTextEdit;
   log_->setObjectName(QStringLiteral("log"));
   log_->setReadOnly(true);
-  log_->setMaximumBlockCount(4000);
+  // 只是一扇窗：最近 500 行（stats 每 500ms 一行，加上逐请求事件，足以
+  // 覆盖最近几分钟）。完整档案由 sidecar 的 --log-file 落在用户日志目录，
+  // 翻旧账去文件，不靠窗口。
+  log_->setMaximumBlockCount(500);
   log_->setWordWrapMode(QTextOption::WrapAnywhere);
   layout->addWidget(log_, 1);
 
@@ -888,8 +937,9 @@ MainWindow::Collected MainWindow::collect() const {
 
 void MainWindow::setRunning(bool running, const QString& hint) {
   running_ = running;
-  start_->setEnabled(!running);
-  stop_->setEnabled(running);
+  start_->setText(running ? QStringLiteral("停止代理") : QStringLiteral("启动代理"));
+  start_->setObjectName(running ? QStringLiteral("danger") : QStringLiteral("primary"));
+  repolish(start_);
   for (QWidget* widget :
        {static_cast<QWidget*>(host_), static_cast<QWidget*>(port_),
         static_cast<QWidget*>(listen_port_), static_cast<QWidget*>(key_),
@@ -1284,7 +1334,7 @@ void MainWindow::appendLog(const QString& line, bool is_stderr) {
                        .arg(QLatin1String(is_stderr ? kLogErr : kLogOut),
                             line.toHtmlEscaped()));
   // 自己数，不用 blockCount()：空文档的首个空段落会让计数差一。
-  log_lines_ = qMin(log_lines_ + 1, 4000);
+  log_lines_ = qMin(log_lines_ + 1, 500);
   log_count_->setText(QStringLiteral("%1 行").arg(log_lines_));
   if (at_bottom) {
     bar->setValue(bar->maximum());

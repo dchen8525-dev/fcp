@@ -12,11 +12,14 @@ Type=simple
 # User= 时服务是以 root 跑的，目录自然归 root。
 # 代价：默认 --port=4460 无需特权端口，若运维把它改到 1024 以下会启动失败。
 DynamicUser=yes
-# 参数全部来自 /etc/fcp/fcp.env 的 FCP_ARGS（包内的 conffile）；PSK 用
-# 该文件里的 FCP_PSK + --key-env=FCP_PSK——DynamicUser 读不了 root 的 0600
-# 密钥文件，而 EnvironmentFile 是 systemd 以 root 读取后注入的。
-# 未填 FCP_ARGS 时服务会以 "--key ... is required" 退出，这是有意的：
-# 装了包不等于配好了密钥，见 部署运维指南.md §3/§4。
+# 参数全部来自 /etc/fcp/fcp.env（包内的 conffile）。密钥只要在里面写一行
+# `FCP_PSK=HEX32`：本 unit 以 DynamicUser 运行，systemd 以 root 读取
+# EnvironmentFile 后注入进程环境，而 fcp-server 在未给 --key* 参数时默认读
+# FCP_PSK —— 进程 argv 里没有密钥，ps 看不到，服务用户也读不了 root 的
+# 0600 文件所以 --key-file 在此不适用。显式 FCP_ARGS=--key-env=FCP_PSK
+# 依旧等价可用。
+# 未配置 FCP_PSK 时服务会以 "… FCP_PSK environment variable is required"
+# 退出，这是有意的：装了包不等于配好了密钥，见 部署运维指南.md §3/§4。
 EnvironmentFile=-/etc/fcp/fcp.env
 ExecStart=/usr/bin/fcp-server $FCP_ARGS
 Restart=on-failure

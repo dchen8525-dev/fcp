@@ -5,8 +5,12 @@
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <thread>
 #include <utility>
+
+#include <chrono>
+#include <ctime>
 
 #include "bench.h"
 #include "fcp/session.h"
@@ -82,6 +86,46 @@ bool Connecting(int err) { return err == EINPROGRESS || err == EALREADY; }
 void CloseSock(SOCKET s) { ::close(s); }
 std::string ErrText(int err) { return std::strerror(err); }
 #endif
+
+// 日志行里的小数秒，统一一位小数（%.1f），别让 to_string 的 6 位尾巴进档。
+std::string Secs(double v) {
+  char b[24];
+  std::snprintf(b, sizeof(b), "%.1f", v);
+  return b;
+}
+
+// --log-file 目录形式下的文件名后缀：fcp-<角色>-<pid>.log，避免两个实例互踩。
+uint32_t ThisPid() {
+#ifdef _WIN32
+  return GetCurrentProcessId();
+#else
+  return static_cast<uint32_t>(getpid());
+#endif
+}
+
+// 本地时间戳 "YYYY-MM-DD HH:MM:SS.mmm"（写日志行用； failing 就留空）。
+std::string LogStamp() {
+  const auto now = std::chrono::system_clock::now();
+  const std::time_t t = std::chrono::system_clock::to_time_t(now);
+  const long ms = static_cast<long>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch())
+          .count() % 1000);
+  std::tm tm{};
+#ifdef _WIN32
+  if (localtime_s(&tm, &t) != 0) {
+    return {};
+  }
+#else
+  if (localtime_r(&t, &tm) == nullptr) {
+    return {};
+  }
+#endif
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%03ld",
+                tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min,
+                tm.tm_sec, ms);
+  return buf;
+}
 
 // Same underlying type as Reactor::Sock, so the helpers below and the members
 // hand each other descriptors without casts.
@@ -219,9 +263,8 @@ EngineHost Reactor::make_host(Reactor* self) {
   host.peer_bound = [self](uint64_t peer) { self->peer_bound(peer); };
   host.peer_retired = [self](uint64_t peer) { self->peer_retired(peer); };
   host.log = [self](const std::string& line) {
-    if (self->opt_.verbose) {
-      std::fprintf(stderr, "%s\n", line.c_str());
-    }
+    // 等级是全局裁决者：阈值外的行 stderr 与文件都不落。
+    self->log_line(line);
   };
   return host;
 }
@@ -338,7 +381,7 @@ bool Reactor::open_udp(std::string* error) {
       engine_.set_pmtud(false);
       // Not verbose-gated: this silently changes what the tunnel can discover,
       // and the operator should see it exactly once at startup.
-      std::fprintf(stderr, "[fcp] note: UDP socket has no DF mode; PMTUD disabled\n");
+      note("[fcp] note: UDP socket has no DF mode; PMTUD disabled");
     }
   }
   // P5-09: a failed start must not leak the descriptor it already created.
@@ -445,6 +488,8 @@ bool Reactor::start(std::string* error) {
   // Startup phase timing: the console/one-shot companions of the desktop
   // launcher (P-启动快照). Measured here, printed once below the endpoint echo.
   const int64_t started_at = NowMs();
+  // --log-file 尽早开：后面每一步（socket、握手、tick）都该有一行落档。
+  open_log_file();
   if (!open_udp(error)) {
     return false;
   }
@@ -474,11 +519,7 @@ bool Reactor::start(std::string* error) {
                        reinterpret_cast<const sockaddr*>(&to), sizeof(to));
           return n > 0 ? static_cast<size_t>(n) : 0;
         },
-        [this](const std::string& line) {
-          if (opt_.verbose) {
-            std::fprintf(stderr, "%s\n", line.c_str());
-          }
-        });
+        [this](const std::string& line) { log_line(line); });
   }
   if (opt_.role == EngineRole::kClient && !open_listener(error)) {
     if (udp_ != kBadSock) {
@@ -494,26 +535,30 @@ bool Reactor::start(std::string* error) {
   }
   const int64_t workers_done = NowMs();
   if (opt_.role == EngineRole::kClient) {
-    std::printf("client: socks5/http on %s -> fcp %s\n",
-                host_port(opt_.listen_addr, opt_.listen_port).c_str(),
-                host_port(opt_.remote_host, opt_.remote_port).c_str());
+    note("client: socks5/http on " + host_port(opt_.listen_addr, opt_.listen_port) +
+         " -> fcp " + host_port(opt_.remote_host, opt_.remote_port));
   } else {
-    std::printf("server: fcp on %s\n", host_port(opt_.bind_addr, opt_.bind_port).c_str());
+    note("server: fcp on " + host_port(opt_.bind_addr, opt_.bind_port));
     if (bench_ != nullptr) {
-      std::printf("server: speedtest responder on the same UDP port\n");
+      note("server: speedtest responder on the same UDP port");
     }
   }
   // One-line config echo for support tickets. Never prints key material: the
   // PSK lives in a file or an environment variable and stays there (C-18).
+  if (opt_.psk_from_default_env) {
+    note("key: environment variable FCP_PSK (implicit; no --key* argument given)");
+  }
   {
     const EngineConfig& ec = base_config_;
     std::string where = opt_.role == EngineRole::kClient
                             ? host_port(opt_.listen_addr, opt_.listen_port) + " -> " +
                                   host_port(opt_.remote_host, opt_.remote_port)
                             : host_port(opt_.bind_addr, opt_.bind_port);
-    std::printf(
+    char echo[512];
+    std::snprintf(
+        echo, sizeof(echo),
         "config: %s mtu=%u pmtud=%s pmtu_max=%u fec=%u:%u p_max=%u k=%d budget=%.2f "
-        "window=%s:%zuK bbr=v%d probe=%s ackx%u idle=%.0fs stall=%lldms rate=%.1fMbps\n",
+        "window=%s:%zuK bbr=v%d probe=%s ackx%u idle=%.0fs stall=%lldms rate=%.1fMbps",
         where.c_str(), static_cast<unsigned>(ec.mtu), ec.pmtud ? "on" : "off",
         static_cast<unsigned>(ec.pmtu_max_mtu), static_cast<unsigned>(ec.d),
         static_cast<unsigned>(ec.p), static_cast<unsigned>(ec.p_max), ec.pinned_k,
@@ -522,15 +567,18 @@ bool Reactor::start(std::string* error) {
         static_cast<unsigned>(ec.ack_every), ec.idle_timeout_ms / 1000.0,
         static_cast<long long>(opt_.role == EngineRole::kClient ? opt_.stall_ms : 0),
         static_cast<double>(shaper_bytes_per_sec()) * 8.0 / 1e6);
+    note(echo);
   }
   // The "startup" line names bytes/s as Mbps because it is what the shaper
   // was handed; --rate-limit halves that do not apply to this role read 0.
-  std::printf("startup: udp=%dms listen=%dms workers=%dms total=%dms\n",
-              static_cast<int>(udp_done - started_at),
-              static_cast<int>(listener_done - udp_done),
-              static_cast<int>(workers_done - listener_done),
-              static_cast<int>(workers_done - started_at));
-  std::fflush(stdout);
+  char startup[128];
+  std::snprintf(startup, sizeof(startup),
+                "startup: udp=%dms listen=%dms workers=%dms total=%dms",
+                static_cast<int>(udp_done - started_at),
+                static_cast<int>(listener_done - udp_done),
+                static_cast<int>(workers_done - listener_done),
+                static_cast<int>(workers_done - started_at));
+  note(startup);
   // Save the handlers this instance replaces: they are process-wide, and a
   // second Reactor in the same process must not inherit a stale callback.
   SignalHandler prev = std::signal(SIGINT, OnSignal);
@@ -614,14 +662,13 @@ void Reactor::run() {
     const int ready = ::select(nfds, &read_set, &write_set, &except_set, &tv);
     if (ready < 0) {
       const int err = SockErr();
-#ifndef _WIN32
+#ifdef _WIN32
+      note("select: " + ErrText(err));
+#else
       if (err != EINTR) {
-        std::fprintf(stderr, "select: %s\n", ErrText(err).c_str());
+        note("select: " + ErrText(err));
         break;
       }
-#else
-      std::fprintf(stderr, "select: %s\n", ErrText(err).c_str());
-      break;
 #endif
     }
 
@@ -673,12 +720,13 @@ void Reactor::run() {
       skipped_total_ += skipped_this_pass_;
       if (now >= next_skip_log_ms_) {
         next_skip_log_ms_ = now + 5000;
-        std::fprintf(stderr,
-                     "reactor: %zu socket(s) could not be watched by select "
-                     "(total %llu); lower --max-sessions\n",
-                     skipped_this_pass_,
-                     static_cast<unsigned long long>(skipped_total_));
-        std::fflush(stderr);
+        char msg[128];
+        std::snprintf(msg, sizeof(msg),
+                      "reactor: %zu socket(s) could not be watched by select "
+                      "(total %llu); lower --max-sessions",
+                      skipped_this_pass_,
+                      static_cast<unsigned long long>(skipped_total_));
+        note(msg);
       }
     }
 
@@ -1722,23 +1770,20 @@ void Reactor::check_stall(int64_t now_ms) {
       const double lasted = (now_ms - stall_since_ms_) / 1000.0;
       stall_since_ms_ = 0;
       stall_rx_pending_ = false;
-      std::fprintf(stderr, "tunnel stall recovered after %.1fs (inbound resumed)\n", lasted);
-      std::fflush(stderr);
+      note("tunnel stall recovered after " + Secs(lasted) + "s (inbound resumed)");
       return;
     }
     stall_rx_pending_ = rx_moved;
     if (c.live == 0) {
       const double lasted = (now_ms - stall_since_ms_) / 1000.0;
       stall_since_ms_ = 0;
-      std::fprintf(stderr, "tunnel closed after %.1fs of stall\n", lasted);
-      std::fflush(stderr);
+      note("tunnel closed after " + Secs(lasted) + "s of stall");
     } else if (now_ms >= stall_next_log_ms_) {
       // Still dark: re-state the stall every kStallLogMs so a long outage
       // does not look like a single forgotten line in a long log.
       stall_next_log_ms_ = now_ms + kStallLogMs;
-      std::fprintf(stderr, "tunnel stall: no inbound for %.1fs (still dark)\n",
-                   (now_ms - stall_since_ms_) / 1000.0);
-      std::fflush(stderr);
+      note("tunnel stall: no inbound for " + Secs((now_ms - stall_since_ms_) / 1000.0) +
+           "s (still dark)");
     }
     return;
   }
@@ -1753,10 +1798,8 @@ void Reactor::check_stall(int64_t now_ms) {
     stall_since_ms_ = stall_last_rx_ms_;
     stall_next_log_ms_ = now_ms + kStallLogMs;
     stall_rx_pending_ = false;
-    std::fprintf(stderr, "tunnel stall: no inbound for %.1fs while TX is still moving "
-                         "(half-open path?); watching for recovery\n",
-                 (now_ms - stall_since_ms_) / 1000.0);
-    std::fflush(stderr);
+    note("tunnel stall: no inbound for " + Secs((now_ms - stall_since_ms_) / 1000.0) +
+         "s while TX is still moving (half-open path?); watching for recovery");
   }
   // Dark path with a retransmission engine that has also gone quiet: keep
   // watching without re-declaring (the idle timeout is the backstop that
@@ -1990,12 +2033,14 @@ void Reactor::print_stats(int64_t now_ms) {
                ? 0u
                : static_cast<unsigned>((lost * 1000000ull + expected / 2) / expected);
   };
-  std::printf(
+  char row[512];
+  std::snprintf(
+      row, sizeof(row),
       "stats %6.1fs live=%zu up=%zu tunnels=%zu tx=%" PRIu64 "B rx=%" PRIu64
       "B bad_entry=%u refused=%u hs_failed=%u reset=%u idle=%u clash=%u over=%u"
       " bad_cfg=%u no_entropy=%u budget=%u unknown=%u tomb=%u duprec=%u wrerr=%llu"
       " loss_in_ppm=%u loss_in_n=%llu loss_out_ppm=%u loss_out_n=%llu"
-      " stall=%d held=%zu shaped=%llu\n",
+      " stall=%d held=%zu shaped=%llu",
       (now_ms - started_ms_) / 1000.0, c.live, c.established, c.tunnels, c.bytes_tx, c.bytes_rx,
       c.bad_entry, c.open_failed, c.handshake_failed, c.reset, c.idle_closed, c.salt_clash,
       c.over_limit, c.bad_config, c.no_entropy, c.over_budget, c.unknown_salt,
@@ -2008,7 +2053,105 @@ void Reactor::print_stats(int64_t now_ms) {
       stall_since_ms_ != 0 ? static_cast<int>((now_ms - stall_since_ms_) / 1000) : 0,
       wire_deferred_bytes_,
       static_cast<unsigned long long>(wire_over_budget_));
-  std::fflush(stdout);
+  note(row);
+}
+
+void Reactor::open_log_file() {
+  if (opt_.log_file.empty()) {
+    return;
+  }
+  std::filesystem::path path = opt_.log_file;
+  std::error_code ec;
+  // 目录形式（结尾是分隔符，或路径本身就是存在的目录）：文件名放进程内造好。
+  if (path.filename().empty() || std::filesystem::is_directory(path, ec)) {
+    path /= "fcp-" +
+            std::string(opt_.role == EngineRole::kClient ? "client" : "server") +
+            "-" + std::to_string(ThisPid()) + ".log";
+  }
+  // 父目录不存在就现造（GUI 的 AppLogLocation / deb 的 /var/log/fcp 都是
+  // systemd 或 GUI 预先建好的；手工路径也能直接用）。
+  std::filesystem::create_directories(path.parent_path(), ec);
+  ec.clear();
+
+  log_stream_.open(path, std::ios::app | std::ios::binary);
+  if (!log_stream_) {
+    // 保持语义：起不来 ≠ 拒绝启动，stderr 提示即可（响应"响亮失败"的同时
+    // 不让排障工具把隧道拖死）。
+    std::fprintf(stderr, "[fcp] note: --log-file %s 写入失败，日志只到 stderr\n",
+                 opt_.log_file.c_str());
+    return;
+  }
+  log_path_ = path.string();
+  log_bytes_ = static_cast<size_t>(std::filesystem::exists(path, ec)
+                                       ? std::filesystem::file_size(path, ec)
+                                       : 0);
+  write_log("== start pid=" + std::to_string(ThisPid()) + " log=" + log_path_);
+}
+
+void Reactor::note(const std::string& line) {
+  std::fprintf(stderr, "%s\n", line.c_str());
+  write_log(line);
+}
+
+// 唯一的分级汇集点：标签分级 → 阈值过滤（stderr 与文件同一把尺）→ 渲染。
+// 无法分级（无标签）按 info；warn/error 在正文前加 [warn]/[error] 让
+// 关键行一眼可辨。
+void Reactor::log_line(const std::string& line) {
+  int severity = 0;
+  TaggedLine(line, &severity);
+  if (severity < Severity(opt_.log_level)) {
+    return;
+  }
+  const std::string body = LineBody(line);
+  const char* prefix = "";
+  if (severity == Severity(LogLevel::kWarn)) {
+    prefix = "[warn] ";
+  } else if (severity == Severity(LogLevel::kError)) {
+    prefix = "[error] ";
+  }
+  std::fprintf(stderr, "%s%s\n", prefix, body.c_str());
+  write_log(std::string(prefix) + body);
+}
+
+// 契约：持有 log_mutex_ 时调用。
+void Reactor::rotate_log_file() {
+  if (!log_stream_.is_open()) {
+    return;
+  }
+  log_stream_.flush();
+  log_stream_.close();
+  std::error_code ec;
+  const std::filesystem::path rotated = log_path_ + ".1";
+  std::filesystem::remove(rotated, ec);
+  std::filesystem::rename(log_path_, rotated, ec);
+  if (ec) {
+    // Windows 先 fclose 再 rename 是铁律；被占用（编辑器开着）也只降级
+    // 继续追加，下次过阈值再试——与 trace 轮转同一容错策略。
+    log_stream_.open(log_path_, std::ios::app | std::ios::binary);
+    if (!log_rotate_warned_) {
+      log_rotate_warned_ = true;
+      std::fprintf(stderr, "[fcp] note: --log-file 轮转失败，继续追加写\n");
+    }
+    return;
+  }
+  log_rotate_warned_ = false;
+  log_stream_.open(log_path_, std::ios::app | std::ios::binary);
+  log_bytes_ = 0;
+}
+
+void Reactor::write_log(const std::string& line) {
+  if (!log_stream_.is_open()) {
+    return;
+  }
+  // 每行一个时间戳 + 每行 flush：排障时崩溃前的最后一行必须已经在盘上。
+  const std::string stamped = LogStamp() + " " + line + "\n";
+  const std::lock_guard<std::mutex> lock(log_mutex_);
+  log_stream_ << stamped;
+  log_stream_.flush();
+  log_bytes_ += stamped.size();
+  if (log_bytes_ >= kLogFileRotateBytes) {
+    rotate_log_file();
+  }
 }
 
 }  // namespace fcp

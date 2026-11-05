@@ -8,6 +8,7 @@
 #include <QProcess>
 #include <QProcessEnvironment>
 #include <QRegularExpression>
+#include <QStandardPaths>
 #include <QTimer>
 
 #ifdef Q_OS_WIN
@@ -217,8 +218,16 @@ bool Sidecar::startProxy(const ProxyConfig& config, QString* error) {
       // Raise the autotune ceiling / advertised receive capacity to 4 MiB while
       // leaving START implicit, so the prewarm cache can still seed it.
       QStringLiteral("--window=:4096"),
-      QStringLiteral("--key-env=FCP_PSK"),
-      QStringLiteral("--log=stats:500"),
+      // PSK 只给环境变量 FCP_PSK：未给 --key* 参数时 CLI 默认读它，
+      // argv 里不再需要重复指路。
+      QStringLiteral("--log=debug"),
+      // stderr 上每 500ms 一行统计（--log 里只管级别，频率单独给 --stats）。
+      QStringLiteral("--stats=500"),
+      // 每条请求的行落到用户数据目录的 log/ 子目录（Windows:
+      // %LOCALAPPDATA%\FCP\FCP Client\log，Linux: ~/.local/share/…），
+      // 32 MiB 轮转，关后可翻旧账。
+      QStringLiteral("--log-file=%1/log/").arg(
+          QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation)),
   };
   if (config.k >= 0) {
     args.append(QStringLiteral("--k=%1").arg(config.k));
@@ -391,7 +400,9 @@ bool Sidecar::startSpeedTest(const SpeedTestConfig& config, QString* error) {
       QStringLiteral("--mtu=%1").arg(config.mtu),
       QStringLiteral("--speedtest-seconds=%1").arg(config.seconds),
       QStringLiteral("--speedtest"),
-      QStringLiteral("--key-env=FCP_PSK"),
+      // 测速进程独立 pid → 独立文件（fcp-client-<pid>.log），看得清谁是谁。
+      QStringLiteral("--log-file=%1/log/").arg(
+          QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation)),
   });
 
   speed_ = process;

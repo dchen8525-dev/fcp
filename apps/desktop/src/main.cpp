@@ -6,6 +6,7 @@
 #include <QJsonObject>
 #include <QProcess>
 #include <QProcessEnvironment>
+#include <QStandardPaths>
 #include <QStyleFactory>
 #include <QTextStream>
 
@@ -64,7 +65,8 @@ int speedtestSelftest() {
                                                    QStringLiteral("4460"))),
       QStringLiteral("--speedtest-seconds=%1").arg(seconds),
       QStringLiteral("--speedtest"),
-      QStringLiteral("--key-env=FCP_PSK"),
+      QStringLiteral("--log-file=%1/log/").arg(
+          QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation)),
   });
   QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
   env.insert(QStringLiteral("FCP_PSK"), key);

@@ -5,6 +5,7 @@
 #include <cstring>
 #include <string>
 
+#include "fcp/log_level.h"
 #include "fcp/random.h"
 
 #ifdef _WIN32
@@ -200,7 +201,7 @@ SessionConfig::TraceFn make_trace_sink(const std::string& prefix, uint64_t cid,
     // stderr for the CLI, host log for the GUI (which has no console).
     std::fprintf(stderr, "fcp: %s\n", line.c_str());
     if (log) {
-      log(line);
+      log(std::string(kTagWarn) + line);
     }
   };
   return [state, report, log, rotate_bytes](const TraceEntry& e) {
@@ -243,7 +244,7 @@ SessionConfig::TraceFn make_trace_sink(const std::string& prefix, uint64_t cid,
                                  " rotate failed; retrying on next entry";
         std::fprintf(stderr, "fcp: %s\n", line.c_str());
         if (log) {
-          log(line);
+          log(std::string(kTagWarn) + line);
         }
       }
     }
@@ -274,7 +275,7 @@ void ProxyEngine::on_local_open(uint64_t conn, uint64_t peer, int64_t now_ms) {
   }
   if (by_conn_.size() >= cfg_.max_sessions) {
     ++counters_.over_limit;
-    log(label(conn) + " refused: session limit");
+    log(std::string(kTagWarn) + label(conn) + " refused: session limit");
     if (host_.app_close) {
       host_.app_close(conn);
     }
@@ -294,7 +295,7 @@ void ProxyEngine::on_local_open(uint64_t conn, uint64_t peer, int64_t now_ms) {
       return;
     case CreateStatus::kBadConfig:
       ++counters_.bad_config;
-      log(label(conn) + " refused: MTU leaves no room for a data symbol");
+      log(std::string(kTagWarn) + label(conn) + " refused: MTU leaves no room for a data symbol");
       if (host_.app_close) {
         host_.app_close(conn);
       }
@@ -393,7 +394,7 @@ void ProxyEngine::on_dial_result(uint64_t conn, bool ok, OpenError err, int64_t 
   append_bytes(&c->app_in, c->stream_in.data(), c->stream_in.size());
   c->stream_in.clear();
   flush_app(*c);
-  log(label(*c) + " tunnel open");
+  log(std::string(kTagInfo) + label(*c) + " tunnel open");
   reap(now_ms);
 }
 
@@ -471,7 +472,7 @@ void ProxyEngine::on_wire(uint64_t peer, const uint8_t* data, size_t len, int64_
     if (!rebind_drop_logged_ || now_ms - last_rebind_drop_log_ms_ >= 5000) {
       rebind_drop_logged_ = true;
       last_rebind_drop_log_ms_ = now_ms;
-      log(label(*c) + " authenticated datagram from another address dropped");
+      log(std::string(kTagWarn) + label(*c) + " authenticated datagram from another address dropped");
     }
     return;
   }
@@ -680,7 +681,9 @@ void ProxyEngine::fill_session_config(SessionConfig* sc, uint64_t conn_id) const
   sc->pinned_k = cfg_.pinned_k;
   sc->fec_budget = cfg_.fec_budget;
   sc->trace = make_trace_sink(cfg_.trace_prefix, conn_id,
-                              [this](const std::string& line) { log(line); },
+                              [this](const std::string& line) {
+                                log(std::string(kTagWarn) + line);
+                              },
                               cfg_.trace_rotate_bytes);
   // A stream numbers bytes, so a retransmission deliberately repeats an id the
   // peer has to see again; the frame-layer dedup keyed on the KCP sn would eat
@@ -747,7 +750,9 @@ std::unique_ptr<Session> ProxyEngine::make_session(uint64_t cid, const SessionCo
         }
         p->stream->on_segment(payload, len, now_ms_);
       },
-      [this](const std::string& line) { log(line); });
+      [this](const std::string& line) {
+        log(std::string(kTagInfo) + line);
+      });
 }
 
 // 会话建立失败的两种本质上不同的原因。混淆它们会让运维把一条熵源故障
@@ -771,7 +776,7 @@ ProxyEngine::CreateStatus ProxyEngine::create_client_conn(uint64_t id, uint64_t 
     host_.new_salt(sc.salt);
   } else if (!random_salt(sc.salt)) {
     // 熵源不可用时不建会话：固定盐会把 #28① 的跨会话密钥隔离整个打掉。
-    log(label(id) + " no CSPRNG entropy for session salt");
+    log(std::string(kTagError) + label(id) + " no CSPRNG entropy for session salt");
     return ProxyEngine::CreateStatus::kNoEntropy;
   }
   sc.send_direction = Direction::kC2S;
@@ -951,7 +956,9 @@ void ProxyEngine::attach_stream(Conn& conn) {
           p->session->on_rtt_sample(srtt_ms, now_ms_);
         }
       },
-      [this](const std::string& line) { log(line); });
+      [this](const std::string& line) {
+        log(std::string(kTagInfo) + line);
+      });
 }
 
 void ProxyEngine::session_events(Conn& conn, int64_t now_ms) {
@@ -1065,7 +1072,7 @@ bool ProxyEngine::parse_entry(Conn& conn, int64_t now_ms) {
         conn.want_fin = true;
         arm_grace(conn, /*only_if_idle=*/true);
         maybe_fin(conn);
-        log(label(conn) + "no acceptable SOCKS5 method");
+        log(std::string(kTagWarn) + label(conn) + "no acceptable SOCKS5 method");
         return false;
       }
       conn.phase = Phase::kSocks5Request;
@@ -1122,7 +1129,7 @@ void ProxyEngine::start_tunnel_client(Conn& conn, int64_t now_ms) {
   // up locally in the same tick the server refused, losing the real reason.
   conn.phase_deadline_ms = now_ms + cfg_.dial_timeout_ms + cfg_.flush_grace_ms;
   drain_stream(conn);
-  log(label(conn) + " OPEN sent");
+  log(std::string(kTagDebug) + label(conn) + " OPEN sent");
 }
 
 // 一个带回复的本地拒绝：把回复排队后走 grace 关机而不是立即 finish_conn。
@@ -1140,7 +1147,7 @@ void ProxyEngine::refuse_local(Conn& conn, const char* why, Socks5Rep rep,
   conn.want_fin = true;
   arm_grace(conn, /*only_if_idle=*/true);
   maybe_fin(conn);
-  log(label(conn) + why);
+  log(std::string(kTagWarn) + label(conn) + why);
 }
 
 void ProxyEngine::queue_local_reply(Conn& conn, Socks5Rep rep, HttpReply http) {
@@ -1203,7 +1210,7 @@ void ProxyEngine::parse_open_reply(Conn& conn) {
   append_bytes(&conn.app_in, conn.stream_in.data(), conn.stream_in.size());
   conn.stream_in.clear();
   flush_app(conn);
-  log(label(conn) + " tunnel established");
+  log(std::string(kTagInfo) + label(conn) + " tunnel established");
 }
 
 void ProxyEngine::parse_open_request(Conn& conn, int64_t now_ms) {
@@ -1229,7 +1236,7 @@ void ProxyEngine::parse_open_request(Conn& conn, int64_t now_ms) {
   conn.target = target;
   conn.phase = Phase::kDialing;
   conn.dial_deadline_ms = now_ms + cfg_.dial_timeout_ms;
-  log(label(conn) + " dial");
+  log(std::string(kTagInfo) + label(conn) + " dial");
   if (host_.dial) {
     // Deferred, not called here: a literal target connects synchronously, and the
     // resulting on_dial_result() can tear this Conn down while the caller above
@@ -1272,7 +1279,7 @@ void ProxyEngine::send_open_error(Conn& conn, OpenError err) {
   conn.want_fin = true;
   arm_grace(conn, /*only_if_idle=*/true);
   maybe_fin(conn);
-  log(label(conn) + " OPEN_ERR " + std::to_string(static_cast<unsigned>(err)));
+  log(std::string(kTagError) + label(conn) + " OPEN_ERR " + std::to_string(static_cast<unsigned>(err)));
 }
 
 // ---- buffers ----
@@ -1435,9 +1442,9 @@ void ProxyEngine::finish_conn(Conn& conn, int64_t now_ms, const char* why) {
                   static_cast<unsigned long long>(conn.stream->retx_rto()),
                   static_cast<unsigned long long>(conn.stream->fill_passes()),
                   conn.stream->oob_bytes(), conn.stream->delivery_pending(), bbr);
-    log(label(conn) + " closed: " + why + " [" + diag_ + "]");
+    log(std::string(kTagInfo) + label(conn) + " closed: " + why + " [" + diag_ + "]");
   } else {
-    log(label(conn) + " closed: " + why);
+    log(std::string(kTagInfo) + label(conn) + " closed: " + why);
   }
   (void)now_ms;
 }

@@ -35,15 +35,13 @@
 #include "cli_parse.h"
 #include "fcp/frame_rx.h"
 #include "fcp/frame_tx.h"
+#include "fcp/log_level.h"
 #include "fcp/session.h"
 #include "fcp/version.h"
 #include "reactor.h"
 
 namespace fcp {
 namespace {
-
-// Period of `--log=stats` when no milliseconds are given.
-constexpr int64_t kDefaultStatsMs = 10000;
 
 bool HexNibble(char c, uint8_t* out) {
   if (c >= '0' && c <= '9') {
@@ -177,6 +175,8 @@ const std::vector<tools::Alias>& OptionAliases() {
       {"--rate-limit", true},
       {"--no-prewarm", false},
       {"--log", true},
+      {"--stats", true},
+      {"--log-file", true},
       {"--help", false},
       {"--version", false},
   };
@@ -193,6 +193,9 @@ void Usage(EngineRole role, const char* argv0) {
       "  --key-env=VAR        read the key from environment variable VAR (for the\n"
       "                       packaged unit: a DynamicUser cannot read a 0600\n"
       "                       file, but systemd hands the service its env)\n"
+      "                       With no --key* argument the FCP_PSK variable is\n"
+      "                       read implicitly — /etc/fcp/fcp.env lists it and\n"
+      "                       nothing else\n"
       "  Addresses also take ADDR:PORT, so one argument replaces the pair:\n"
       "  -H 203.0.113.7:40000 is --host=203.0.113.7 --port=40000.\n",
       argv0, client ? "[-H IP[:P]] [-l IP[:P]] [options]"
@@ -266,9 +269,15 @@ void Usage(EngineRole role, const char* argv0) {
       "                       keeps moving but nothing comes back for N ms\n"
       "                       (0 = off, default 60000)\n"
       "  --no-prewarm         start every session cold (default: reuse RTT/k/window priors)\n"
-      "  --log=LEVEL          off (default; exit summary only) |\n"
-      "                       stats[:ms] (periodic line) | verbose\n"
-      "  -v                   shorthand for --log=verbose\n"
+      "  --log=LEVEL          what reaches stderr AND --log-file (one shared\n"
+      "                       threshold): off | error | warn | info | debug\n"
+      "                       (default debug; verbose is a debug alias)\n"
+      "  -v                   shorthand for --log=debug\n"
+      "  --stats=MS           periodic stats line every MS ms (0 = off, default off)\n"
+      "  --log-file=PATH      persistent log with timestamps (same level threshold\n"
+      "                       as stderr; rotation 32 MiB -> PATH.1); a trailing\n"
+      "                       separator or an existing directory writes\n"
+      "                       fcp-<role>-<pid>.log inside\n"
       "  -h, --help           this text; -V, --version prints the build and exits\n");
 }
 
@@ -345,6 +354,8 @@ struct ProxyFlags {
   SeenValue stall_ms;
   SeenValue rate_limit;
   SeenValue log;
+  SeenValue stats;
+  SeenValue log_file;
   SeenValue rcv_buf;
   SeenValue fec_budget;
   SeenValue p_max;
@@ -405,6 +416,10 @@ bool ApplyValue(const tools::Match& m, ProxyFlags* f, ParsedWindows* windows, Pr
     f->rate_limit = {true, v};
   } else if (name == "--log") {
     f->log = {true, v};
+  } else if (name == "--log-file") {
+    f->log_file = {true, v};
+  } else if (name == "--stats") {
+    f->stats = {true, v};
   } else if (name == "--rcv-buf") {
     f->rcv_buf = {true, v};
   } else if (name == "--fec-budget") {
@@ -559,30 +574,32 @@ bool ApplyHostPort(EngineRole role, const ProxyFlags& f, ProxyArgs* out, std::st
   return true;
 }
 
-// --log=off | stats[:ms] | verbose. `off` keeps the default of no periodic
-// line (exit summary only); `stats` without a period uses kDefaultStatsMs.
+// --log=LEVEL：off | error | warn | info | debug（verbose 是 debug 的别名，
+// 旧拼写肌肉记忆不查错）。默认 debug：排障是常态，安静是显式选择。
+// 周期统计行拆到 --stats=MS（0 = 关），两级之间互不干扰。
 bool ApplyLog(const std::string& value, ProxyArgs* out, std::string* error) {
-  if (value == "off") {
-    out->ro.stats_ms = 0;
+  const std::string level = value == "verbose" ? "debug" : value;
+  if (level == "off") {
+    out->ro.log_level = LogLevel::kOff;
     return true;
   }
-  if (value == "verbose") {
-    out->ro.verbose = true;
+  if (level == "error") {
+    out->ro.log_level = LogLevel::kError;
     return true;
   }
-  if (value == "stats") {
-    out->ro.stats_ms = kDefaultStatsMs;
+  if (level == "warn") {
+    out->ro.log_level = LogLevel::kWarn;
     return true;
   }
-  if (value.rfind("stats:", 0) == 0) {
-    long n = 0;
-    if (!tools::ParseLong("--log=stats", value.c_str() + 6, 1, 86400000, &n, error)) {
-      return false;
-    }
-    out->ro.stats_ms = static_cast<int64_t>(n);
+  if (level == "info") {
+    out->ro.log_level = LogLevel::kInfo;
     return true;
   }
-  *error = "--log must be off, stats[:ms] or verbose (got '" + value + "')";
+  if (level == "debug") {
+    out->ro.log_level = LogLevel::kDebug;
+    return true;
+  }
+  *error = "--log must be off, error, warn, info or debug (got '" + value + "')";
   return false;
 }
 
@@ -973,7 +990,7 @@ bool parse_proxy_args(EngineRole role, int argc, char** argv, ProxyArgs* out,
     }
     // Duplicate detection is per option group, not per spelling: --key,
     // --key-file and --key-env are one setting. -v is rewritten to
-    // --log=verbose, so it shares that group too.
+    // --log=verbose (= debug), so it shares that group too.
     const char* group = name.c_str() + 2;
     const bool key_option =
         name == "--key" || name == "--key-file" || name == "--key-env";
@@ -1048,8 +1065,24 @@ bool parse_proxy_args(EngineRole role, int argc, char** argv, ProxyArgs* out,
       return false;
     }
   } else {
-    *error = "--key=HEX32, --key-file=FILE or --key-env=VAR is required";
-    return false;
+    // No --key* argument at all: fall back to FCP_PSK. This is the packaged
+    // deployment shape — /etc/fcp/fcp.env holds exactly one line (FCP_PSK=…)
+    // and the DynamicUser unit injects it with no flags of its own. The
+    // explicit --key-env=FCP_PSK spelling stays valid and wins over this
+    // default whenever someone wants another variable name.
+    const char* env = std::getenv("FCP_PSK");
+    if (env == nullptr || *env == '\0') {
+      *error = "--key=HEX32, --key-file=FILE, --key-env=VAR, or the FCP_PSK "
+               "environment variable is required";
+      return false;
+    }
+    out->ro.psk_from_default_env = true;
+    if (!ParseKey(env, out->ec.key)) {
+      // Never echo the value: it is the secret.
+      *error = "FCP_PSK environment variable must hold 32 hex digits (16 bytes)"
+               " and nothing else";
+      return false;
+    }
   }
 
   // --connect-timeout is the per-address TCP budget inside the engine's
@@ -1368,8 +1401,17 @@ bool parse_proxy_args(EngineRole role, int argc, char** argv, ProxyArgs* out,
       return false;
     }
   }
-  if (given.log.given && given.log.value == "verbose") {
-    out->ro.verbose = true;
+  // 周期统计行的间隔（毫秒）：0 = 不打（退出摘要照旧）；默认关，deb 的
+  // fcp.env 与 GUI sidecar 自行给值。
+  if (given.stats.given) {
+    long n = 0;
+    if (!tools::ParseLong("--stats", given.stats.value.c_str(), 0, 86400000, &n, error)) {
+      return false;
+    }
+    out->ro.stats_ms = static_cast<int64_t>(n);
+  }
+  if (given.log_file.given) {
+    out->ro.log_file = given.log_file.value;
   }
   // --speedtest means different things by role: the server turns on the
   // frame-layer responder on its UDP port, the client runs one bench and

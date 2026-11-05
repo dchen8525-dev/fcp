@@ -1,5 +1,7 @@
 #include "fcp/session.h"
 
+#include "fcp/log_level.h"
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -130,27 +132,27 @@ Session::Session(const SessionConfig& config, SendFn send, DeliverFn deliver, Lo
 
 Session::StartStatus Session::start(int64_t now_ms) {
   if (!bootstrap_seed_ok_) {
-    log("FCP session refused: OS CSPRNG unavailable for the handshake nonce start");
+    log(std::string(kTagError) + "FCP session refused: OS CSPRNG unavailable for the handshake nonce start");
     return StartStatus::kNoEntropy;
   }
   // The Handshake constructor draws its own nonce and fails closed on a CSPRNG
   // error. A failed object must not be started either: it would sit in kIdle
   // forever while looking like a live session.
   if (hs_.state() == HandshakeState::kFailed) {
-    log(std::string("FCP handshake refused: ") + handshake_error_text(hs_.error()));
+    log(std::string(kTagWarn) + "FCP handshake refused: " + handshake_error_text(hs_.error()));
     return hs_.error() == HandshakeError::kBadNonce ? StartStatus::kNoEntropy
                                                     : StartStatus::kBadConfig;
   }
   if (!limits_.valid) {
-    log("FCP config invalid: MTU leaves no room for a data symbol");
+    log(std::string(kTagError) + "FCP config invalid: MTU leaves no room for a data symbol");
     return StartStatus::kBadConfig;
   }
   if (!mtu_fits_largest_oob(cfg_)) {
-    log("FCP config invalid: MTU too small for a 128-byte FECSTAT oob");
+    log(std::string(kTagError) + "FCP config invalid: MTU too small for a 128-byte FECSTAT oob");
     return StartStatus::kBadConfig;
   }
   if (!local_caps_valid(cfg_)) {
-    log("FCP config invalid: local D/P out of range");
+    log(std::string(kTagError) + "FCP config invalid: local D/P out of range");
     return StartStatus::kBadConfig;
   }
   hs_.start(now_ms);
@@ -337,7 +339,7 @@ void Session::on_kcp_output(const uint8_t* seg, size_t len, int64_t now_ms) {
     }
     if (!hs_.cache_data(std::move(copy)) &&
         hs_.state() == HandshakeState::kFailed) {
-      log(std::string("FEC handshake failed: ") + handshake_error_text(hs_.error()));
+      log(std::string(kTagWarn) + "FEC handshake failed: " + handshake_error_text(hs_.error()));
     }
     return;
   }
@@ -348,7 +350,7 @@ void Session::on_tick(int64_t now_ms) {
   const HandshakeState before = hs_.state();
   hs_.on_tick(now_ms);
   if (before != HandshakeState::kFailed && hs_.state() == HandshakeState::kFailed) {
-    log(std::string("FEC handshake failed: ") + handshake_error_text(hs_.error()));
+    log(std::string(kTagWarn) + "FEC handshake failed: " + handshake_error_text(hs_.error()));
   }
   if (!ensure_configured(now_ms)) {
     return;
@@ -384,7 +386,7 @@ void Session::on_tick(int64_t now_ms) {
       std::snprintf(line, sizeof(line),
                     "FEC WARNING: no FECSTAT for 3 report periods, keeping k=%u",
                     strategy_->k());
-      log(line);
+      log(std::string(kTagWarn) + line);
     }
   }
 }
@@ -513,14 +515,14 @@ void Session::configure(int64_t now_ms) {
   std::snprintf(line, sizeof(line),
                 "FCP v6 negotiated: data=%u parity=%u pmax=%u flags=framed,stats (peer V3)",
                 np.d, np.p, cfg_.p_max);
-  log(line);
+  log(std::string(kTagInfo) + line);
   if (strategy_config.pinned_k > 0) {
     std::snprintf(line, sizeof(line), "FEC pinned: k=%d (operator)", strategy_config.pinned_k);
-    log(line);
+    log(std::string(kTagInfo) + line);
   } else if (strategy_->initial_k() > 0) {
     // The value shown is post-clamp: what the session actually started with.
     std::snprintf(line, sizeof(line), "FEC warmed: k=%d (prewarm)", strategy_->initial_k());
-    log(line);
+    log(std::string(kTagInfo) + line);
   }
 
   reporter_->on_tick(now_ms);  // first tick only sets the interval baseline
@@ -548,7 +550,7 @@ bool Session::dispatch_handshake(const uint8_t* payload, size_t len, int64_t now
     return false;
   }
   if (hs_.on_oob(payload, len) == HandshakeStatus::kProtocolFailure) {
-    log(std::string("FEC handshake failed: ") + handshake_error_text(hs_.error()));
+    log(std::string(kTagWarn) + "FEC handshake failed: " + handshake_error_text(hs_.error()));
   }
   ensure_configured(now_ms);
   return true;
@@ -706,7 +708,7 @@ void Session::pmtu_tick(int64_t now_ms) {
                     "FCP PMTUD: %u-byte path did not answer, staying at %u",
                     static_cast<unsigned>(pmtu_max_mtu_),
                     static_cast<unsigned>(pmtu_mtu_));
-      log(line);
+      log(std::string(kTagWarn) + line);
       return;
     }
   }
@@ -812,7 +814,7 @@ void Session::pmtu_raise_send(uint16_t mtu) {
   char line[96];
   std::snprintf(line, sizeof(line), "FCP PMTUD: path MTU %u -> %u",
                 static_cast<unsigned>(before), static_cast<unsigned>(mtu));
-  log(line);
+  log(std::string(kTagDebug) + line);
 }
 
 void Session::sync_report_counters() {
@@ -848,7 +850,7 @@ void Session::emit_symbol(const TxSymbol& symbol, bool bootstrap) {
   if (!env.seal(plain.data(), plain.size(), &wire)) {
     if (!nonce_exhausted_logged_) {
       nonce_exhausted_logged_ = true;
-      log("FCP session exhausted nonce space");
+      log(std::string(kTagError) + "FCP session exhausted nonce space");
     }
     return;
   }

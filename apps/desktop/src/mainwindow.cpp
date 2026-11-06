@@ -821,7 +821,8 @@ QWidget* MainWindow::buildSpeedPage() {
   auto* tip_text = makeRichLabel(
       QStringLiteral(
           "测速另起 fcp-client 直连同一 UDP 端口，直接向 FCP 帧/FEC 层灌数据，"
-          "量的是隧道裸吞吐。丢包为 FEC 恢复前的原始丢包率，后续被补齐也不回改。"),
+          "量的是隧道裸吞吐。<br>"
+          "丢包为 FEC 恢复前的原始丢包率，后续被补齐也不回改。"),
       "muted");
   tip_text->setWordWrap(true);
   tip_layout->addWidget(tip_text);
@@ -1039,9 +1040,12 @@ void MainWindow::syncAddr() {
   // 不转义的话 `<x>:1080` 会被当 HTML 标签吞掉。
   const QString addr_html = addr.toHtmlEscaped();
   rail_addr_->setText(addr_html);
+  // 两行：用法一行，密钥保管一行（<br> 而不是靠自动换行，窗口宽度变了
+  // 也不会把一句拆到两行里）。
   conn_addr_->setText(
       QStringLiteral("启动后把浏览器或系统的 SOCKS5 / HTTP 代理指向 <b>%1</b>，"
-                     "流量即经隧道转发。密钥只保存在本机，不写入日志。")
+                     "流量即经隧道转发。<br>"
+                     "密钥只保存在本机，不写入日志。")
           .arg(addr_html));
   status_note_->setText(
       QStringLiteral("启动后这里显示实时吞吐与会话数；把系统的 SOCKS5 / HTTP 代理指向 "

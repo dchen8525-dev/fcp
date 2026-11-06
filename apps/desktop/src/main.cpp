@@ -20,10 +20,15 @@ QString envOrDefault(const char* name, const QString& fallback) {
   return value.isEmpty() ? fallback : value;
 }
 
+// 固定文件名（CI 靠它取结果），所以不能顺着已有文件写：临时目录在 Linux 上
+// 是全用户共享的 1777 目录，别人预置的符号链接会让我们把自检结果写进他指定的
+// 文件（例如把用户的 rc 文件截断）。先删掉再以 O_EXCL 新建——链接与既有文件都
+// 进不来，最坏情况是自检报告缺失，而不是替别人写文件。
 void writeSelftestResult(const QString& text) {
   const QString path = QDir(QDir::tempPath()).filePath(QStringLiteral("fcp-speedtest.txt"));
+  QFile::remove(path);
   QFile file(path);
-  if (file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+  if (file.open(QIODevice::WriteOnly | QIODevice::NewOnly)) {
     file.write(text.toUtf8());
   }
 }
@@ -83,8 +88,13 @@ int speedtestSelftest() {
     return fail(QStringLiteral("测速进程超时退出"));
   }
 
-  const QString stdout_text = QString::fromLocal8Bit(process.readAllStandardOutput());
-  const QString stderr_text = QString::fromLocal8Bit(process.readAllStandardError());
+  // The sidecar is built with /utf-8 and its "@speedtest" lines are JSON, i.e.
+  // UTF-8 by definition; fromLocal8Bit decoded them with the system code page
+  // instead, so any non-ASCII text in `error` was mangled (and a GBK trail byte
+  // could swallow the ASCII that followed it). Every other child-output reader
+  // in sidecar.cpp already uses fromUtf8.
+  const QString stdout_text = QString::fromUtf8(process.readAllStandardOutput());
+  const QString stderr_text = QString::fromUtf8(process.readAllStandardError());
 
   QString text;
   for (const QString& line : stdout_text.split(QLatin1Char('\n'))) {

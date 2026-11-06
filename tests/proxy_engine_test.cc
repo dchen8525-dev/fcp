@@ -503,6 +503,41 @@ void half_close_keeps_the_response_flowing() {
   CHECK(h.app_closed(kLocalConn));
 }
 
+// A half-close says "I am done sending", not "hang up": the target may think
+// for a long time before it answers. The refusal grace clock used to be armed
+// for this case too, so 2 s of silence after shutdown(SHUT_WR) closed the app
+// socket and the response never arrived (a slow HTTP endpoint, an LLM call).
+void slow_response_after_half_close_survives_the_grace_window() {
+  Harness h{Options()};  // flush_grace_ms = 2000
+  h.auto_close_target_on_shutdown = false;
+  post_socks5_entry(h);
+  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, kTunnelSteps));
+  const uint64_t target_conn = h.first_dial_conn();
+  h.local_send(kLocalConn, "GET");
+  CHECK(h.run_until([&] { return h.target_bytes(target_conn).size() == 3; }, 20));
+  h.local_close(kLocalConn);
+  CHECK(h.run_until([&] { return h.target_shut_down(target_conn); }, 60));
+
+  // Silent longer than flush_grace_ms: the tunnel must stay up.
+  for (int i = 0; i < 120; ++i) {  // 3 s
+    h.step();
+  }
+  CHECK(!h.app_closed(kLocalConn));
+  CHECK_EQ(h.client->counters().live, 1u);
+  CHECK_EQ(h.server->counters().live, 1u);
+
+  h.target_send(target_conn, std::vector<uint8_t>{'2', '0', '0'});
+  CHECK(h.run_until([&] {
+    return h.app_bytes(kLocalConn).size() == kEntryReplyBytes + 3;
+  }, 40));
+  CHECK_EQ(text_of(h.app_bytes(kLocalConn)).substr(kEntryReplyBytes), std::string("200"));
+
+  h.target_close(target_conn);
+  CHECK(h.run_until([&] {
+    return h.client->counters().live == 0 && h.server->counters().live == 0;
+  }, 80));
+}
+
 // §4.2 with a domain target: the name crosses the wire unresolved (§14 remote
 // resolution) and the local socket gets the HTTP status line, not a SOCKS reply.
 void http_connect_round_trip() {
@@ -608,6 +643,23 @@ void malformed_local_requests() {
     CHECK_EQ(static_cast<int>(reply[3]), 0x08);
     CHECK_EQ(h.client->counters().bad_entry, 1u);
   }
+  {  // after a refusal the rest of the socket is not entry parsing any more:
+     // it is dropped, so a second request cannot re-count bad_entry or parse
+     // bytes nobody will act on
+    Harness h{Options()};
+    h.local_open(kLocalConn);
+    h.local_send(kLocalConn, greeting());
+    h.local_send(kLocalConn, socks5_request(0x02, 0x01, ipv4_bytes("127.0.0.1"), 80));
+    CHECK_EQ(static_cast<int>(h.app_bytes(kLocalConn)[3]), 0x07);
+    h.local_send(kLocalConn, socks5_request(0x01, 0x01, ipv4_bytes("10.0.0.1"), 80));
+    for (int i = 0; i < 40; ++i) {
+      h.step();
+    }
+    CHECK_EQ(h.dials.size(), 0u);
+    CHECK_EQ(h.client->counters().tunnels, 0u);
+    CHECK_EQ(h.client->counters().bad_entry, 1u);
+    CHECK_EQ(h.app_bytes(kLocalConn).size(), kEntryReplyBytes);
+  }
   {  // an HTTP request that is not CONNECT
     Harness h{Options()};
     h.local_open(kLocalConn);
@@ -673,8 +725,10 @@ void backpressure_closes_the_window() {
 }
 
 // §3 + A1: the plaintext salt routes a datagram to its session, but only the
-// envelope can say who sent it. The source address binds a session only after
-// the datagram authenticates; a bare salt prefix must not be able to kill it.
+// envelope can say who sent it. The source address a session was born with is
+// the only address it accepts, and a datagram from anywhere else -- forged,
+// replayed, or genuinely re-sealed with the session key -- must not reach the
+// session at all, let alone tear it down.
 void salt_routing_and_replay_binding() {
   Harness h{Options()};
   post_socks5_entry(h);
@@ -683,16 +737,20 @@ void salt_routing_and_replay_binding() {
   CHECK_EQ(h.client->counters().unknown_salt, 0u);
   CHECK_EQ(h.server->counters().salt_clash, 0u);
 
-  // A1: a captured datagram replayed from another address carries a valid tag
-  // but a nonce the replay window has already seen. Authentication rejects it,
-  // so it never reaches the source binding and the tunnel stays up.
+  // A1: a captured datagram replayed from another address. The address binding
+  // is decided before Session::on_wire() -- an authenticated datagram used to
+  // be decrypted, fed to FrameRx and delivered to the application first, and
+  // only then logged as "dropped" -- so every mismatched datagram counts here,
+  // replay or not. The tunnel keeps its address either way (B-01: a single
+  // packet from anywhere must not be able to move or kill it).
   const std::vector<uint8_t> stolen = h.last_from_client;
   h.server->on_wire(kOtherPeer, stolen.data(), stolen.size(), h.now_ms);
-  CHECK_EQ(h.server->counters().salt_clash, 0u);
+  CHECK_EQ(h.server->counters().salt_clash, 1u);
   CHECK_EQ(h.server->counters().live, 1u);
 
-  // A fresh datagram that only the session key could have sealed is a genuine
-  // hijack of the salt: that is where the address binding is enforceable.
+  // A fresh datagram that only the session key could have sealed: even this
+  // one gets no authority, because "fresh" for the bootstrap epoch is a claim
+  // the receiver cannot check against an address it never authenticated.
   uint8_t salt[Envelope::kSaltLen];
   std::memcpy(salt, stolen.data(), sizeof(salt));
   uint8_t key[16];
@@ -709,12 +767,13 @@ void salt_routing_and_replay_binding() {
   const std::vector<uint8_t> payload{0xAA, 0xBB};
   CHECK(hijacker.seal_at(UINT64_MAX - 1, payload.data(), payload.size(), &hijack));
   h.server->on_wire(kOtherPeer, hijack.data(), hijack.size(), h.now_ms);
-  CHECK_EQ(h.server->counters().salt_clash, 1u);
-  // A valid tag does not prove freshness (the hijack still lands inside the
-  // replay window), so the packet is dropped and the live tunnel survives
-  // instead of being torn down by a replayed/sealed datagram from elsewhere.
+  CHECK_EQ(h.server->counters().salt_clash, 2u);
+  // Even a valid tag does not move the binding: the source address of a real
+  // NAT rebind and of a recorded-but-never-delivered datagram are
+  // indistinguishable, so the datagram is dropped before the AEAD sees it and
+  // the live tunnel survives instead of being torn down or redirected.
   CHECK_EQ(h.server->counters().live, 1u);
-  CHECK(logged(h.server_log, "authenticated datagram from another address dropped"));
+  CHECK(logged(h.server_log, "datagram from another address dropped"));
 
   // A datagram with no salt at all is neither routed nor fatal.
   const std::vector<uint8_t> stub{0x00, 0x01};
@@ -788,7 +847,9 @@ void dial_timeout_and_grace_clock() {
     // reason replaced the old premature-failure verdict above.
     CHECK(logged(h.server_log, "closed: flushed and closed"));
   }
-  {  // the local socket stops taking bytes while the tunnel still has some
+  {  // a stalled local reader across a half-close: the bytes stay buffered and
+     // the tunnel stays up. A half-close is not a hang-up, so the flush grace
+     // clock must not truncate the response the reader has not asked for yet.
     Options opt;
     opt.flush_grace_ms = 250;
     Harness h{opt};
@@ -800,11 +861,23 @@ void dial_timeout_and_grace_clock() {
     // for them, and it refuses them there, not before.
     CHECK(h.run_until([&] { return h.client->pending_app_bytes(kLocalConn) > 0; }, 20));
     h.local_close(kLocalConn);
-    CHECK(h.run_until([&] { return logged(h.client_log, "closed: "); }, 80));
-    CHECK_EQ(h.client->counters().live, 0u);
-    CHECK(logged(h.client_log, "the application socket stopped taking bytes"));
+    for (int i = 0; i < 40; ++i) {  // well past flush_grace_ms
+      h.step();
+    }
+    CHECK_EQ(h.client->counters().live, 1u);
+    CHECK_EQ(h.client->pending_app_bytes(kLocalConn), 64u);
+
+    // The reader wakes up and gets exactly the bytes that were held back.
+    h.client_accept_limit = kNoLimit;
+    CHECK(h.run_until([&] {
+      return h.app_bytes(kLocalConn).size() == kEntryReplyBytes + 64;
+    }, 40));
+    h.target_close(h.first_dial_conn());
+    CHECK(h.run_until([&] { return h.client->counters().live == 0; }, 80));
   }
-  {  // a peer that vanished mid-flush: the fin leaves but is never acknowledged
+  {  // a peer that vanished after the half-close is not torn down by the flush
+     // clock any more: the stream's own idle clock owns a dead peer, and the
+     // engine cannot tell "slow target" from "gone" by looking at traffic.
     Options opt;
     opt.flush_grace_ms = 250;
     Harness h{opt};
@@ -812,12 +885,14 @@ void dial_timeout_and_grace_clock() {
     CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, kTunnelSteps));
     h.local_close(kLocalConn);
     h.mute_server = true;
-    CHECK(h.run_until(
-        [&] { return logged(h.client_log, "the peer stopped acknowledging"); }, 60));
-    CHECK_EQ(h.client->counters().live, 0u);
-    // The server discovers it on its own idle clock (idle_timeout_ms), which is
-    // the stream's dead-peer path and already covered by stream_test.cc; 300s of
-    // virtual time to watch an engine do nothing is not worth the runtime here.
+    for (int i = 0; i < 60; ++i) {
+      h.step();
+    }
+    CHECK_EQ(h.client->counters().live, 1u);
+    CHECK(!h.app_closed(kLocalConn));
+    // The stream's idle timeout ends it; that path is stream_test.cc's, and
+    // 300 s of virtual time to watch an engine do nothing is not worth the
+    // runtime here.
   }
 }
 
@@ -1369,6 +1444,7 @@ void prewarm_seeds_the_next_stream_window() {
 
 int main() {
   socks5_round_trip();
+  slow_response_after_half_close_survives_the_grace_window();
   half_close_keeps_the_response_flowing();
   socks5_request_corked_with_greeting();
   socks5_greeting_without_request_waits();

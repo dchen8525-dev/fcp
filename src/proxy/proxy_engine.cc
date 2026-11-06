@@ -317,6 +317,9 @@ void ProxyEngine::on_local_bytes(uint64_t conn, const uint8_t* data, size_t len,
     return;
   }
   if (in_entry_phase(c->phase)) {
+    if (c->closing) {
+      return;  // refused: the reply is out and the grace clock decides the rest
+    }
     append_bytes(&c->entry, data, len);
     parse_entry(*c, now_ms);
   } else {
@@ -436,6 +439,35 @@ void ProxyEngine::on_wire(uint64_t peer, const uint8_t* data, size_t len, int64_
     }
     born = true;
   }
+  // Same salt, a different source address. The check has to run before
+  // Session::on_wire(), not after it: on_wire decrypts, feeds FrameRx and
+  // delivers payload straight to host_.app_send, so an "address mismatch" that
+  // was only noticed afterwards had already processed the datagram -- stored
+  // its symbols, consumed its nonce and poisoned the cross-set dedup -- while
+  // the log said it was dropped.
+  //
+  // The binding must not move either way. A genuine NAT rebind is
+  // indistinguishable from a recorded datagram the original address never
+  // delivered, and adopting the new address would hand that replayer a full
+  // redirect of the downstream. So a mismatched datagram gets no authority at
+  // all; it does not even buy an AEAD attempt.
+  //
+  // A1 still holds where it matters: after this branch, nothing is done with
+  // the datagram before the envelope authenticates it (the born path below
+  // destroys the session when the first datagram fails the tag).
+  if (!born && c->peer != peer) {
+    // salt_clash now counts unauthenticated mismatches too. The salt travels in
+    // the clear, so a spoofed prefix could always have been aimed at this
+    // table; the counter is a warning signal ("someone else is racing this
+    // session"), not an accounting identity, and the log is rate-limited.
+    ++counters_.salt_clash;
+    if (!rebind_drop_logged_ || now_ms - last_rebind_drop_log_ms_ >= 5000) {
+      rebind_drop_logged_ = true;
+      last_rebind_drop_log_ms_ = now_ms;
+      log(std::string(kTagWarn) + label(*c) + " datagram from another address dropped");
+    }
+    return;
+  }
   // A1: the salt rides in the clear, so the lookup above proves nothing. The
   // envelope must authenticate before the datagram gets any authority over the
   // session -- in particular before a mismatched source address may tear it
@@ -458,26 +490,6 @@ void ProxyEngine::on_wire(uint64_t peer, const uint8_t* data, size_t len, int64_
       reap(now_ms);
       return;
     }
-  } else if (c->peer != peer) {
-    if (!authenticated) {
-      // Replayed or forged prefix from another address: it never reached the
-      // session (no tag, no nonce accepted), so dropping it is enough.
-      return;
-    }
-    // Same salt, a different source address, and a valid tag. The tag proves
-    // possession of the session key but NOT freshness: a recorded datagram the
-    // original address never delivered still authenticates inside the replay
-    // window, so tearing the tunnel down here was a no-PSK single-packet DoS
-    // (B-01). The envelope cannot attribute an address, so the packet is
-    // dropped and the binding stays with the address that created the session.
-    // A genuine NAT rebind is indistinguishable; it has to reconnect.
-    ++counters_.salt_clash;
-    if (!rebind_drop_logged_ || now_ms - last_rebind_drop_log_ms_ >= 5000) {
-      rebind_drop_logged_ = true;
-      last_rebind_drop_log_ms_ = now_ms;
-      log(std::string(kTagWarn) + label(*c) + " authenticated datagram from another address dropped");
-    }
-    return;
   }
   session_events(*c, now_ms);
   if (c->phase != Phase::kDone) {
@@ -1009,7 +1021,10 @@ void ProxyEngine::session_events(Conn& conn, int64_t now_ms) {
 // ---- entry protocol (client) ----
 
 bool ProxyEngine::parse_entry(Conn& conn, int64_t now_ms) {
-  while (in_entry_phase(conn.phase) && !conn.entry.empty()) {
+  // A refused connection keeps its phase inside the entry family, so the phase
+  // alone does not say "stop": on_local_bytes() drops what arrives after the
+  // refusal, and this guard keeps a parse already in flight from acting on it.
+  while (in_entry_phase(conn.phase) && !conn.closing && !conn.entry.empty()) {
     if (!conn.sniffed) {
       conn.sniffed = true;
       conn.socks5 = conn.entry[0] == kSocks5Version;
@@ -1355,22 +1370,28 @@ void ProxyEngine::maybe_fin(Conn& conn) {
   if (!conn.want_fin || conn.stream == nullptr || conn.phase == Phase::kDone) {
     return;
   }
+  // The grace clock belongs to the refusal path (refuse_local/send_open_error:
+  // the reply is out, the socket only has to live long enough for the app to
+  // read it). A plain half-close is not that: the app said "done sending" and
+  // is waiting for a response that may legitimately take far longer than
+  // flush_grace_ms. Arming here used to kill the tunnel -- and the app socket --
+  // 2 s after shutdown(SHUT_WR), so a slow target's answer never arrived.
+  // A vanished peer is still bounded: the stream retransmits the fin under its
+  // own RTO rules and its idle timeout ends the connection.
   if (!conn.app_in.empty() || !conn.to_stream.empty()) {
-    // A wedged application socket must not pin the session: the grace clock is
-    // already running for whoever asked for the fin.
-    arm_grace(conn, /*only_if_idle=*/true);
+    if (conn.closing) {
+      arm_grace(conn, /*only_if_idle=*/true);
+    }
     return;
   }
   if (conn.stream->state() == StreamState::kOpen ||
       conn.stream->state() == StreamState::kPeerClosed) {
     conn.stream->close(now_ms_);
   }
-  // The fin still has to reach the peer. Keeping the clock armed here rather
-  // than clearing it bounds the case where the peer has vanished: without it the
-  // session retransmits a fin nobody will ever acknowledge, until the idle
-  // timeout. on_tick() is what slides the clock, and only on real progress, so
-  // arming must stay idle-only: re-arming here every tick would never expire.
-  arm_grace(conn, /*only_if_idle=*/true);
+  if (conn.closing) {
+    // Slide on real progress only; re-arming every tick would never expire.
+    arm_grace(conn, /*only_if_idle=*/true);
+  }
 }
 
 uint64_t ProxyEngine::progress_of(const Conn& conn) const {

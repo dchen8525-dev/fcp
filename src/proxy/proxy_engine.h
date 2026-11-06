@@ -448,8 +448,9 @@ class ProxyEngine {
   uint64_t next_server_conn_ = 1;
   int64_t now_ms_ = 0;
   int64_t next_prune_ms_ = 0;
-  // Rate limit for the "authenticated datagram from another address" line: the
-  // drop path is reachable by a replayer, so it must not turn into a log flood.
+  // Rate limit for the "datagram from another address" line. The salt travels
+  // in the clear, so anyone who has seen the session can reach this drop path;
+  // it must not turn into a log flood.
   int64_t last_rebind_drop_log_ms_ = 0;
   bool rebind_drop_logged_ = false;
   std::vector<uint64_t> reap_ids_;

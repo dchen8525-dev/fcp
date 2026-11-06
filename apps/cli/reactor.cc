@@ -2129,10 +2129,16 @@ void Reactor::rotate_log_file() {
   const std::filesystem::path rotated = log_path_ + ".1";
   std::filesystem::remove(rotated, ec);
   std::filesystem::rename(log_path_, rotated, ec);
+  // 无论成败都必须重新打开并清账：close() 之后留着无流，write_log_stamped
+  // 的 is_open() 会直接 return，此后整个进程的日志全丢（stderr 还在，不显眼）。
+  // 计数不按新文件大小重算——正是那个等于旧文件大小的值让下一行立刻再次
+  // 轮转，于是每次轮转都把一个空文件 .1、上一个文件被删掉。
+  log_stream_.open(log_path_, std::ios::app | std::ios::binary);
+  log_bytes_ = 0;
   if (ec) {
     // Windows 先 fclose 再 rename 是铁律；被占用（编辑器开着）也只降级
-    // 继续追加，下次过阈值再试——与 trace 轮转同一容错策略。
-    log_stream_.open(log_path_, std::ios::app | std::ios::binary);
+    // 继续追加，再写满 32 MiB 后重试——与 trace 轮转同一容错策略。降级后
+    // 计数归零，这条 warn 也就不会每行打一次。
     if (!log_rotate_warned_) {
       log_rotate_warned_ = true;
       std::fprintf(stderr, "%s\n",
@@ -2140,11 +2146,9 @@ void Reactor::rotate_log_file() {
                            "--log-file 轮转失败，继续追加写")
                        .c_str());
     }
-    return;
+  } else {
+    log_rotate_warned_ = false;
   }
-  log_rotate_warned_ = false;
-  log_stream_.open(log_path_, std::ios::app | std::ios::binary);
-  log_bytes_ = 0;
 }
 
 void Reactor::write_log(const std::string& line) {

@@ -334,12 +334,16 @@ void Sidecar::onProxyFinished(int exit_code, QProcess::ExitStatus status) {
 }
 
 void Sidecar::stopProxy() {
+  // An in-flight dial of the dying sidecar is about to fail with "connection
+  // refused"; reporting it as an abnormal exit would replace the UI's "已断开"
+  // with a scary line and a red dot the user never asked for. Set before the
+  // early return so a finished-but-not-yet-observed process is covered too.
+  proxy_stopping_ = true;
   if (!proxy_) {
     return;
   }
   QProcess* process = proxy_;
   proxy_ = nullptr;
-  proxy_stopping_ = true;
   process->disconnect(this);
   killProcess(process, 1500);
   process->deleteLater();

@@ -174,9 +174,10 @@ void FcpSettle::account(const RxSetView& view) {
       ++counters_.run_hist[std::min<unsigned>(best, 8)];
     }
   }
-  if (accounted_through_ == 0 || set_id_after(accounted_through_, view.set_id)) {
+  if (!have_accounted_ || set_id_after(accounted_through_, view.set_id)) {
     accounted_through_ = view.set_id;
   }
+  have_accounted_ = true;
 }
 
 void FcpSettle::on_event(RxEvent event, uint32_t value) {

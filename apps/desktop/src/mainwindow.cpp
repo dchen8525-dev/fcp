@@ -25,6 +25,7 @@
 #include <QScrollArea>
 #include <QScrollBar>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QStackedWidget>
 #include <QSystemTrayIcon>
 #include <QTextDocument>
@@ -1057,6 +1058,7 @@ void MainWindow::onStart() {
   if (running_) {
     return;
   }
+  restarting_ = false;
   const Collected collected = collect();
   if (!collected.ok) {
     setHint(collected.error, true);
@@ -1386,6 +1388,10 @@ void MainWindow::loadSettings() {
   loading_ = true;
   QSettings settings;
   const bool remember = settings.value(QStringLiteral("remember"), true).toBool();
+  // setChecked() emits toggled -> saveSettings(). loading_ already suppresses
+  // that, but the suppression must not hinge on the order of two adjacent
+  // lines: the load is what the store must survive intact.
+  QSignalBlocker block_toggle(remember_);
   remember_->setChecked(remember);
 
   if (remember) {
@@ -1540,7 +1546,7 @@ void MainWindow::onNetWatchTick() {
 }
 
 void MainWindow::restartTunnel(const QString& reason) {
-  if (!running_) {
+  if (!running_ || restarting_) {
     return;
   }
   // 事件风暴限频：刚 (重) 建的隧道 3 秒内再触发大概率是同一轮事件的余波，
@@ -1551,10 +1557,14 @@ void MainWindow::restartTunnel(const QString& reason) {
     return;
   }
   appendLog(QStringLiteral("网络事件：%1 → 重建隧道").arg(reason), "INFO");
-  tunnel_started_ms_ = 0;
+  // 一次重建会被两条信号重复触发（唤醒广播与适配器轮询落在同一个事件循环
+  // 里）。restarting_ 让第二次直接返回：否则两次 onStart 排队，第二次撞上
+  // "代理已在运行"，界面上一条红字压在一条本来跑得好好的隧道上。
+  restarting_ = true;
   onStop();
   // 400ms 后再拉起；若这中间用户手动点了停止，就尊重他——不再掉钩启动。
   QTimer::singleShot(400, this, [this] {
+    restarting_ = false;
     if (running_) {
       return;
     }

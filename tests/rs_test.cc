@@ -53,7 +53,7 @@ void TestGoldenParity() {
 void TestFuzzRecovery() {
   for (int iter = 0; iter < 300; ++iter) {
     const size_t n = 1 + fcp_test::rng()() % 10;
-    const size_t k = fcp_test::rng()() % 5;
+    const size_t k = 1 + fcp_test::rng()() % 5;  // k == 0 has no code to decode
     const size_t symbol_max = 1 + fcp_test::rng()() % 1400;
 
     Symbols data(n, std::vector<uint8_t>(symbol_max));
@@ -162,6 +162,14 @@ void TestTooManyErasures() {
   present[n + 1] = false;
   const std::vector<const uint8_t*> no_parity = ConstPointers(all, present);
   CHECK(!fcp::decode(no_parity.data(), n, k, symbol_max, &recovered));
+
+  // k == 0 is not a code, so the call fails instead of leaving the caller to
+  // deal with a success whose output (resized to n) cannot be honoured.
+  present.assign(all.size(), true);
+  const std::vector<const uint8_t*> no_code = ConstPointers(all, present);
+  std::vector<std::vector<uint8_t>> untouched(3);
+  CHECK(!fcp::decode(no_code.data(), n, 0, symbol_max, &untouched));
+  CHECK_EQ(untouched.size(), 3);
 }
 
 }  // namespace

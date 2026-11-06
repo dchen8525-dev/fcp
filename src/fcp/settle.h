@@ -153,7 +153,13 @@ class FcpSettle {
   FrameRx* rx_ = nullptr;
   EventObserver observer_;
   SettleCounters counters_{};
+  // The report key: the lowest set id accounted so far, i.e. the contiguous
+  // watermark. set id 0 is a legal id, so "nothing accounted yet" needs a flag
+  // of its own -- the ==0 sentinel it used to carry made the first account's
+  // value indistinguishable from "unset" and let the key jump forward past sets
+  // that had not been accounted.
   uint32_t accounted_through_ = 0;
+  bool have_accounted_ = false;
   // Reused by tick() for the active set ids; see FrameRx::active_set_ids().
   std::vector<uint32_t> tick_ids_;
 };

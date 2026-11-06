@@ -41,7 +41,7 @@ void encode(const uint8_t* const* data, size_t n, size_t k, size_t symbol_max,
 
 bool decode(const uint8_t* const* symbols, size_t n, size_t k, size_t symbol_max,
             std::vector<std::vector<uint8_t>>* recovered) {
-  if (recovered == nullptr || n == 0 || n + k > kRsMaxShards) {
+  if (recovered == nullptr || n == 0 || k == 0 || n + k > kRsMaxShards) {
     return false;
   }
   recovered->assign(n, std::vector<uint8_t>());
@@ -55,7 +55,7 @@ bool decode(const uint8_t* const* symbols, size_t n, size_t k, size_t symbol_max
   if (missing.empty()) {
     return true;
   }
-  if (k == 0 || missing.size() > k) {
+  if (missing.size() > k) {
     return false;
   }
 

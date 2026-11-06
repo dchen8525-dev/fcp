@@ -153,8 +153,18 @@ void Envelope::install_keys(const uint8_t session_key[16]) {
   uint8_t key_c2s[16];
   uint8_t key_s2c[16];
   derive_direction_keys(session_key, key_c2s, key_s2c);
-  gcm_key_init(send_direction_ == Direction::kC2S ? key_c2s : key_s2c, &send_key_);
-  gcm_key_init(recv_direction_ == Direction::kC2S ? key_c2s : key_s2c, &recv_key_);
+  // Expanded into locals and committed together, so the two directions can
+  // never be left on different generations if anything above fails.
+  GcmKey send_key;
+  GcmKey recv_key;
+  gcm_key_init(send_direction_ == Direction::kC2S ? key_c2s : key_s2c, &send_key);
+  gcm_key_init(recv_direction_ == Direction::kC2S ? key_c2s : key_s2c, &recv_key);
+  secure_zero(key_c2s, sizeof(key_c2s));
+  secure_zero(key_s2c, sizeof(key_s2c));
+  send_key_ = send_key;
+  recv_key_ = recv_key;
+  secure_zero(&send_key, sizeof(send_key));
+  secure_zero(&recv_key, sizeof(recv_key));
   // #26①: a fresh data key starts at 0, so its packet budget is exactly the
   // 2^32 ceiling on both directions.
   send_nonce_ = 0;

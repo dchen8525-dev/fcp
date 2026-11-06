@@ -172,6 +172,8 @@ class MainWindow : public QMainWindow {
   QTimer* net_watch_ = nullptr;
   QByteArray net_digest_;
   QByteArray net_pending_digest_;  // 待确认的变化（连续两次相同才重建）
+  // 一次重建已排队：唤醒广播与适配器轮询可能落在同一个事件循环里，各要一次。
+  bool restarting_ = false;
   qint64 tunnel_started_ms_ = 0;
 };
 

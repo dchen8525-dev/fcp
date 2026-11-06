@@ -30,11 +30,13 @@
 // --fcp-launcher-selftest 冒烟不改。
 
 #include <windows.h>
+#include <bcrypt.h>
 #include <shlobj.h>
 
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <exception>
 #include <string>
 #include <vector>
@@ -147,6 +149,48 @@ int64_t FiletimeAge100ns(const FILETIME& older) {
   return d > 0 ? d : 0;
 }
 
+// 载荷完整性：尾部带了 SHA-256，就得真的校验一次。LZMA1_alone 流本身没有
+// 校验和，miniz 的 CRC 只对着"同一个 zip"里的中央目录自洽——被截断或传输
+// 损坏的载荷有可能解出一份自洽但内容已坏的 zip。CNG 是系统自带，静态 CRT
+// 之外只多一个 bcrypt.dll（Vista 起就有）。
+bool Sha256Of(const std::vector<uint8_t>& data, uint8_t out[32]) {
+  BCRYPT_ALG_HANDLE alg = nullptr;
+  if (::BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) <
+      0) {
+    return false;
+  }
+  bool ok = false;
+  BCRYPT_HASH_HANDLE hash = nullptr;
+  DWORD object_len = 0;
+  DWORD produced = 0;
+  if (::BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH,
+                          reinterpret_cast<PUCHAR>(&object_len),
+                          sizeof(object_len), &produced, 0) >= 0 &&
+      object_len != 0) {
+    std::vector<uint8_t> object(object_len);
+    if (::BCryptCreateHash(alg, &hash, object.data(), object_len, nullptr, 0,
+                           0) >= 0) {
+      ok = true;
+      size_t at = 0;
+      while (at < data.size()) {
+        // BCryptHashData 的入参是 ULONG：分段喂，免得 4 GiB 以上截断。
+        const ULONG chunk = static_cast<ULONG>(
+            (data.size() - at) > 0x40000000u ? 0x40000000u : (data.size() - at));
+        if (::BCryptHashData(hash, const_cast<PUCHAR>(data.data() + at), chunk,
+                             0) < 0) {
+          ok = false;
+          break;
+        }
+        at += chunk;
+      }
+      if (ok) ok = ::BCryptFinishHash(hash, out, 32, 0) >= 0;
+      ::BCryptDestroyHash(hash);
+    }
+  }
+  ::BCryptCloseAlgorithmProvider(alg, 0);
+  return ok;
+}
+
 bool ReadFull(HANDLE file, void* buf, size_t want) {
   uint8_t* cursor = static_cast<uint8_t*>(buf);
   while (want != 0) {
@@ -166,10 +210,22 @@ bool WriteFileNarrow(const std::wstring& path, const std::string& text,
       path.c_str(), append ? FILE_APPEND_DATA : GENERIC_WRITE, 0, nullptr,
       append ? OPEN_ALWAYS : CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (h == INVALID_HANDLE_VALUE) return false;
-  DWORD wrote = 0;
-  ::WriteFile(h, text.data(), static_cast<DWORD>(text.size()), &wrote, nullptr);
+  // 短写（磁盘满、配额）必须当失败：`.ready` 只写进去半截会让目录永远
+  // 不成"就绪"，下次启动又要重解一遍；自检报告写不全也不该报成功。
+  bool ok = true;
+  size_t at = 0;
+  while (at < text.size()) {
+    const DWORD chunk = static_cast<DWORD>(text.size() - at);
+    DWORD wrote = 0;
+    if (!::WriteFile(h, text.data() + at, chunk, &wrote, nullptr) ||
+        wrote != chunk) {
+      ok = false;
+      break;
+    }
+    at += chunk;
+  }
   ::CloseHandle(h);
-  return true;
+  return ok;
 }
 
 // ---------- 路径 ----------
@@ -354,6 +410,17 @@ bool ExtractPayload(HANDLE archive, const Footer& footer,
   if (res != SZ_OK || dest_len != payload.size()) {
     *error = L"载荷解压失败（LZMA 错误 " + std::to_wstring(res) +
              L"，输出 " + std::to_wstring(dest_len) + L" 字节）";
+    return false;
+  }
+  // 完整性：解压前先校验压缩态的 SHA-256（尾部 40..72）。不匹配说明下载/
+  // 传输损坏或被替换，宁可拒绝也不把半坏的 Qt 树写进缓存。
+  uint8_t digest[32] = {};
+  if (!Sha256Of(packed, digest)) {
+    *error = L"无法计算载荷校验和（系统 CNG 不可用）";
+    return false;
+  }
+  if (std::memcmp(digest, footer.sha256, sizeof(digest)) != 0) {
+    *error = L"载荷校验和不匹配（文件损坏或被篡改），请重新下载发行物";
     return false;
   }
 
@@ -553,9 +620,13 @@ bool EnsurePayload(HANDLE archive, const Footer& footer, std::wstring* dir_out,
   // 上次可能留下半截目录（没有 .ready），先清掉。
   if (DirExists(dir)) DeleteTree(dir);
 
+  // 临时目录名带 pid 与随机段：同一进程连续两次启动（自检后立刻双击）时
+  // pid 相同，固定名会让第二次的 DeleteTree 打到第一次正在写的目录。
+  LARGE_INTEGER nonce{};
+  ::QueryPerformanceCounter(&nonce);
   const std::wstring tmp =
-      root + L"\\.tmp-" + key + L"-" + std::to_wstring(::GetCurrentProcessId());
-  DeleteTree(tmp);
+      root + L"\\.tmp-" + key + L"-" + std::to_wstring(::GetCurrentProcessId()) +
+      L"-" + std::to_wstring(nonce.QuadPart);
   if (!MkDirs(tmp)) {
     *error = L"无法创建临时目录 " + tmp + L"：" + ErrorText(::GetLastError());
     return false;
@@ -575,13 +646,19 @@ bool EnsurePayload(HANDLE archive, const Footer& footer, std::wstring* dir_out,
   }
 
   // 目录改名是原子的：另一实例已放好同名目录时，直接用它的。
-  if (!::MoveFileExW(tmp.c_str(), dir.c_str(), MOVEFILE_WRITE_THROUGH) &&
-      !CacheDirReady(dir)) {
-    *error = L"无法把解压结果放到 " + dir + L"（可能被占用：" +
-             ErrorText(::GetLastError()) + L"）";
-    return false;  // guard 收尾删 tmp
+  if (!::MoveFileExW(tmp.c_str(), dir.c_str(), MOVEFILE_WRITE_THROUGH)) {
+    if (!CacheDirReady(dir)) {
+      *error = L"无法把解压结果放到 " + dir + L"（可能被占用：" +
+               ErrorText(::GetLastError()) + L"）";
+      return false;  // guard 收尾删 tmp
+    }
+    // 竞态输了：别人的目录可用，我们自己这份解压结果没人要，必须删掉，
+    // 否则留下一个 `.tmp-<key>-<pid>-<nonce>` 孤儿目录（一小时后才清）。
+    DeleteTree(tmp);
+    guard.keep = true;  // tmp 已删，别让 guard 再删一次
+  } else {
+    guard.keep = true;  // 成功：tmp 已改名
   }
-  guard.keep = true;  // 成功：tmp 已改名（或被另一个实例收走）
   TouchUsed(dir);
   *dir_out = dir;
   return true;
@@ -592,41 +669,45 @@ bool EnsurePayload(HANDLE archive, const Footer& footer, std::wstring* dir_out,
 // 按 CommandLineToArgvW 的规则把单个参数还原成命令行片段：含空白或引号
 // 时加引号；参数内的 `"` 转成 `\"`，引号前与结尾的连续反斜杠翻倍，否则
 // `arg"box` 这类参数会提前终止引号、把后面的字符漏进可执行名。
+// 测试夹具：tmp_t3.cc（15 组含反斜杠/引号/空串，往返全部无损）。
 std::wstring QuoteArg(const wchar_t* arg) {
-  if (arg[0] == L'\0') return L"\"\"";
-  if (::wcspbrk(arg, L" \t\"") == nullptr) return arg;
+  const bool need_quote =
+      arg[0] == L'\0' || ::wcspbrk(arg, L" \t\"") != nullptr;
+  if (!need_quote) return arg;
   std::wstring out = L"\"";
-  size_t backslashes = 0;
-  for (const wchar_t* p = arg; *p != L'\0'; ++p) {
-    if (*p == L'\\') {
+  size_t i = 0;
+  for (;;) {
+    size_t backslashes = 0;
+    while (arg[i] == L'\\') {
       ++backslashes;
-    } else if (*p == L'"') {
+      ++i;
+    }
+    if (arg[i] == L'\0') {
+      // 结尾的反斜杠会被当成"转义收尾引号"，翻倍后让解析器还原成原文。
+      out.append(backslashes * 2, L'\\');
+      break;
+    }
+    if (arg[i] == L'"') {
       out.append(backslashes * 2 + 1, L'\\');
       out.push_back(L'"');
-      backslashes = 0;
-    } else {
-      out.append(backslashes, L'\\');
-      out.push_back(*p);
-      backslashes = 0;
+      ++i;
+      continue;
     }
+    out.append(backslashes, L'\\');
+    out.push_back(arg[i]);
+    ++i;
   }
-  out.append(backslashes * 2, L'\\');
   out.push_back(L'"');
   return out;
 }
 
 void AppendLaunchLog(const std::wstring& message) {
   MkDirs(FcpRoot());
-  HANDLE h = ::CreateFileW(LaunchLog().c_str(), FILE_APPEND_DATA, 0, nullptr,
-                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (h == INVALID_HANDLE_VALUE) return;
-  // 一行：[秒级 Unix 时间] 消息（UTF-8），对齐 Rust 版。
-  std::string line =
-      "[" + std::to_string(::GetTickCount64() / 1000) + "] " +
-      WideToNarrow(message) + "\n";
-  DWORD wrote = 0;
-  ::WriteFile(h, line.data(), static_cast<DWORD>(line.size()), &wrote, nullptr);
-  ::CloseHandle(h);
+  // 一行：[秒级 Unix 时间] 消息（UTF-8）。以前这里是 GetTickCount64()/1000
+  // ——那是开机以来的秒数，不是 Unix 时间，排障时对不上任何时间线。
+  std::string line = "[" + std::to_string(static_cast<long long>(::time(nullptr))) +
+                     "] " + WideToNarrow(message) + "\n";
+  WriteFileNarrow(LaunchLog(), line, /*append=*/true);
 }
 
 void ReportError(const std::wstring& message) {
@@ -635,8 +716,25 @@ void ReportError(const std::wstring& message) {
   ::MessageBoxW(nullptr, text.c_str(), L"FCP", MB_OK | MB_ICONERROR);
 }
 
+// 自检是 CI/脚本用的：失败时只写日志文件，不弹模态框——无人值守的机器上
+// 一个 MessageBox 会把 runner 挂到超时。
+void ReportSelftestError(const std::wstring& message) {
+  AppendLaunchLog(L"selftest: " + message);
+  WriteFileNarrow(SelftestFile(), "failed: " + WideToNarrow(message) + "\n",
+                  false);
+}
+
 bool LaunchApp(const std::wstring& dir, const wchar_t* cmd_tail) {
-  std::wstring cmd = L"\"" + dir + L"\\" + kAppName + L"\"";
+  std::wstring exe_path = dir + L"\\" + kAppName;
+  // CreateProcessW 的命令行上限 32767 字符；AppId 名可以到 255 字符，
+  // %LOCALAPPDATA% 本身也可能很长。常规写法够不到，超长时走 \\?\ 长路径
+  // 形式，免得用户在某台机器上莫名其妙起不来。
+  bool long_path = false;
+  if (exe_path.size() + 3 > MAX_PATH && exe_path.rfind(L"\\\\?\\", 0) != 0) {
+    exe_path = L"\\\\?\\" + exe_path;
+    long_path = true;
+  }
+  std::wstring cmd = L"\"" + exe_path + L"\"";
   if (cmd_tail != nullptr && cmd_tail[0] != L'\0') {
     cmd += L" ";
     cmd += cmd_tail;
@@ -646,8 +744,9 @@ bool LaunchApp(const std::wstring& dir, const wchar_t* cmd_tail) {
   PROCESS_INFORMATION pi{};
   // cwd = 缓存目录：sidecar 解析按"主程序同目录"找 fcp-client.exe。
   // CREATE_NO_WINDOW 只是不让某些环境闪控制台，GUI 程序本身无控制台。
+  const std::wstring cwd = long_path ? (L"\\\\?\\" + dir) : dir;
   const bool ok = ::CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE,
-                                   CREATE_NO_WINDOW, nullptr, dir.c_str(), &si,
+                                   CREATE_NO_WINDOW, nullptr, cwd.c_str(), &si,
                                    &pi);
   if (ok) {
     ::CloseHandle(pi.hProcess);
@@ -670,14 +769,31 @@ int RunMain(int argc, wchar_t** argv) {
     tail += QuoteArg(argv[i]);
   }
 
-  wchar_t self_path[MAX_PATH] = {};
-  if (::GetModuleFileNameW(nullptr, self_path, MAX_PATH) == 0) {
+  // 自身路径可能超过 MAX_PATH（从长路径目录启动），按可能截断逐步加长读取。
+  std::wstring self_path(MAX_PATH, L'\0');
+  for (;;) {
+    const DWORD n =
+        ::GetModuleFileNameW(nullptr, self_path.data(), static_cast<DWORD>(self_path.size()));
+    if (n == 0) break;
+    if (n < self_path.size()) {
+      self_path.resize(n);
+      break;
+    }
+    if (self_path.size() >= 32767) {
+      self_path.clear();
+      break;
+    }
+    self_path.resize(self_path.size() * 2);
+  }
+  if (self_path.empty()) {
     ReportError(L"无法定位自身路径");
     return 1;
   }
-  HANDLE archive = ::CreateFileW(self_path, GENERIC_READ, FILE_SHARE_READ,
-                                 nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
-                                 nullptr);
+  const std::wstring open_path =
+      self_path.size() >= MAX_PATH ? (L"\\\\?\\" + self_path) : self_path;
+  HANDLE archive = ::CreateFileW(open_path.c_str(), GENERIC_READ,
+                                 FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                 FILE_ATTRIBUTE_NORMAL, nullptr);
   if (archive == INVALID_HANDLE_VALUE) {
     ReportError(L"无法打开自身：" + ErrorText(::GetLastError()));
     return 1;
@@ -722,10 +838,7 @@ int RunMain(int argc, wchar_t** argv) {
     MkDirs(FcpRoot());
     for (const wchar_t* name : {kAppName, kSidecarName}) {
       if (!FileExists(dir + L"\\" + name)) {
-        WriteFileNarrow(SelftestFile(),
-                        "failed: cache missing " + WideToNarrow(name) + "\n",
-                        false);
-        ReportError(std::wstring(L"自检失败：缓存里缺少 ") + name);
+        ReportSelftestError(std::wstring(L"缓存里缺少 ") + name);
         return 1;
       }
     }

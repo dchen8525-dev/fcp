@@ -32,7 +32,9 @@ add_executable(fcp-launcher WIN32
 )
 
 target_include_directories(fcp-launcher PRIVATE miniz lzma)
-target_link_libraries(fcp-launcher PRIVATE shell32)
+# bcrypt：载荷 SHA-256 校验走 CNG（系统自带，Vista 起就有）。shell32 给
+# SHFileOperationW 的目录删除。
+target_link_libraries(fcp-launcher PRIVATE shell32 bcrypt)
 
 # miniz 只用得到 zip 读取：关掉写归档端。其余剪裁宏不能开 ——
 # 整个 miniz_zip.c 包在 MINIZ_NO_ARCHIVE_APIS 里、extract_to_file 走

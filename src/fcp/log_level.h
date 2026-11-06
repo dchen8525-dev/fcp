@@ -32,6 +32,13 @@ inline constexpr const char* kTagError = "[e] ";
 
 inline constexpr int Severity(LogLevel level) { return static_cast<int>(level); }
 
+// `--log=LEVEL` 的判定：severity 是否达到显示门槛。汇集点（reactor 的
+// log_line/note）、启动期提示（cli 的 main）与文件存档共用它，免得三处
+// 各写一遍比较方向还写反。
+inline constexpr bool Wanted(int severity, int floor) {
+  return severity >= floor;
+}
+
 // 汇集点用：识别行首标签 → severity。无标签（含 [x] 这种非标签开头）→
 // kInfo 且返回 false。
 inline bool TaggedLine(const std::string& line, int* severity) {

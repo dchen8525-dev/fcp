@@ -28,6 +28,7 @@ using fcp::EngineRole;
 using fcp::LogLevel;
 using fcp::ProxyArgs;
 using fcp::Severity;
+using fcp::Wanted;
 
 // Builds argv the way main() would see it; argv[0] is a placeholder since the
 // parser never reads it (only run_proxy's Usage does).
@@ -743,6 +744,14 @@ void TestFlagsAndValues() {
   CHECK_EQ(a.ro.stats_ms, 1500);
   CHECK(!Ok(EngineRole::kServer, {"--log=chatty"}, &a, &error));
   CHECK(!Ok(EngineRole::kServer, {"--log=debug", "--log=off"}, &a, &error));
+
+  // 阈值判定的唯一实现：启动期提示（cli main）、汇集点与文件存档共用。
+  // 这组断言盯的正是"note()/启动提示绕过 --log"那类回归。
+  CHECK(Wanted(Severity(LogLevel::kWarn), Severity(LogLevel::kWarn)));
+  CHECK(!Wanted(Severity(LogLevel::kInfo), Severity(LogLevel::kWarn)));
+  CHECK(!Wanted(Severity(LogLevel::kError), Severity(LogLevel::kOff)));
+  CHECK(!Wanted(Severity(LogLevel::kDebug), Severity(LogLevel::kInfo)));
+  CHECK(Wanted(Severity(LogLevel::kInfo), Severity(LogLevel::kDebug)));
 
   // --help short-circuits into out->help instead of a key error.
   CHECK(TryParse(EngineRole::kServer, {"--help"}, &a, &error));

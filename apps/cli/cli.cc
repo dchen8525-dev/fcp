@@ -1553,15 +1553,21 @@ int run_proxy(EngineRole role, int argc, char** argv) {
   // Interface MTU and process limits are facts about this host, not argv; they
   // are applied here so parsing stays pure and testable.
   ApplyEnvironmentDefaults(&args);
+  // 启动期的提示与警告也必须走同一把 --log 阈值尺（运行期日志由
+  // Reactor::log_line/note 把关，这里在 reactor 起来之前，得自己判）。
+  // 否则 --log=off 仍是满屏 note，--log=error 也压不住 info 提示。
+  const int log_floor = Severity(args.ro.log_level);
+  auto say = [log_floor](int severity, const std::string& body) {
+    if (!Wanted(severity, log_floor)) return;
+    std::fprintf(stderr, "%s\n", LogLine(severity, body).c_str());
+  };
   if (args.key_in_argv) {
     // The help already says --key-file keeps the key out of 'ps'; say it where
     // an operator will actually see it (C-18).
-    std::fprintf(stderr, "%s\n",
-                 LogLine(Severity(LogLevel::kWarn),
-                         "--key is visible in the process command line "
-                         "(ps, /proc/<pid>/cmdline, Windows task manager); prefer "
-                         "--key-file or --key-env")
-                     .c_str());
+    say(Severity(LogLevel::kWarn),
+        "--key is visible in the process command line "
+        "(ps, /proc/<pid>/cmdline, Windows task manager); prefer "
+        "--key-file or --key-env");
   }
   // 解析期的提示与警告和运行期日志同一排版：时间戳 + 级别 + 正文。
   for (const std::string& note : args.notes) {
@@ -1575,7 +1581,7 @@ int run_proxy(EngineRole role, int argc, char** argv) {
     } else if (body.rfind(kNotePrefix, 0) == 0) {
       body.erase(0, std::strlen(kNotePrefix));
     }
-    std::fprintf(stderr, "%s\n", LogLine(severity, body).c_str());
+    say(severity, body);
   }
   if (role == EngineRole::kClient && args.speedtest) {
     return RunBench(args);

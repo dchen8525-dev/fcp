@@ -214,9 +214,6 @@ bool Sidecar::startProxy(const ProxyConfig& config, QString* error) {
       QStringLiteral("--listen=%1").arg(config.listen),
       QStringLiteral("--local-port=%1").arg(config.listen_port),
       QStringLiteral("--mtu=%1").arg(config.mtu),
-      // PMTUD 探测不带任何上限参数：上限是引擎内建常量（见 defaults.h）；
-      // pmtud 关闭时才需要显式 --no-pmtud（CLI 默认即开）。
-      config.pmtud ? QString() : QStringLiteral("--no-pmtud"),
       QStringLiteral("--fec-budget=%1").arg(QString::number(config.fec_budget)),
       // Raise the autotune ceiling / advertised receive capacity to 4 MiB while
       // leaving START implicit, so the prewarm cache can still seed it.
@@ -233,6 +230,12 @@ bool Sidecar::startProxy(const ProxyConfig& config, QString* error) {
       QStringLiteral("--log-file=%1/log/").arg(
           QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation)),
   };
+  // PMTUD 探测不带任何上限参数：上限是引擎内建常量（见 defaults.h）；pmtud
+  // 关闭时才需要显式 --no-pmtud（CLI 默认即开）。不能在参数表里用空串占位：
+  // QProcess 会把空串当真实空参数传给子进程，CLI 报 unknown argument 退出。
+  if (!config.pmtud) {
+    args.append(QStringLiteral("--no-pmtud"));
+  }
   if (config.k >= 0) {
     args.append(QStringLiteral("--k=%1").arg(config.k));
   }
@@ -402,18 +405,21 @@ bool Sidecar::startSpeedTest(const SpeedTestConfig& config, QString* error) {
   env.insert(QStringLiteral("FCP_PSK"), config.key_hex.toUpper());
   process->setProcessEnvironment(env);
   process->setProgram(binary);
-  process->setArguments({
+  QStringList args{
       QStringLiteral("--host=%1").arg(config.host),
       QStringLiteral("--port=%1").arg(config.port),
       QStringLiteral("--mtu=%1").arg(config.mtu),
-      // 同上：上限是引擎内建常量；pmtud 关闭时才显式 --no-pmtud。
-      config.pmtud ? QString() : QStringLiteral("--no-pmtud"),
       QStringLiteral("--speedtest-seconds=%1").arg(config.seconds),
       QStringLiteral("--speedtest"),
       // 测速进程独立 pid → 独立文件（fcp-client-<pid>.log），看得清谁是谁。
       QStringLiteral("--log-file=%1/log/").arg(
           QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation)),
-  });
+  };
+  // 同 startProxy：pmtud 关闭时才显式 --no-pmtud，空串占位会变成真实空参数。
+  if (!config.pmtud) {
+    args.append(QStringLiteral("--no-pmtud"));
+  }
+  process->setArguments(args);
 
   speed_ = process;
   speed_out_buf_.clear();

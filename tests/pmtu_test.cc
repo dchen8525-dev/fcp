@@ -5,7 +5,9 @@
 // a probe the path drops is recorded and the search narrows around it instead
 // of giving up, an ack raises the receive bound before the send bound and
 // clears loss records, the search stops when the interval is inside
-// kPmtuMaxDiffMtu, and the send bound never moves down.
+// kPmtuMaxDiffMtu, and a raised size the path black-holes in bulk falls back
+// to the configured base in-session (watchdog + clamp, see
+// TestFullSizeDataDropFallsBackToBase).
 //
 // The harness is the one the e2e tests use, with `path_max_wire` standing in
 // for a path MTU: datagrams larger than it are dropped before the peer ever
@@ -309,15 +311,19 @@ void TestCeilingAtConfiguredMtuIsInert() {
   CHECK_EQ(h.a->pmtu_probes_sent(), 0u);
 }
 
-// Full-size data dropped at a size the probes did prove (congestion, not an
-// MTU property): this is the case the old loss-report fallback reacted to.
-// Under quic-go semantics the MTU cannot be lowered from loss reports -- the
-// bound says alive, the search continues (and has already closed here), and
-// recovery is the transport's job (ARQ + parity), exactly as QUIC relies on
-// its retransmissions. The only in-session reaction is the reachability
-// WARN: >= 256 data symbols over >= 6 s with zero receiver feedback names
-// the state for the operator, one logged line per episode.
-void TestFullSizeDataDropsKeepMtu() {
+// Full-size data dropped at a size the probes did prove -- the size-based
+// path-policing case (isolated probes pass, bulk at the raised size is
+// black-holed, ICMP can't-fragment suppressed). Probes proved the rung, so
+// the loss ledger never sees it; the only evidence is silence: >= 256 data
+// symbols over >= 6 s with zero FECSTAT. That state is unrecoverable by ARQ
+// (retransmissions leave at the same dead size), so the watchdog falls back
+// in-session: the send bound reverts to the configured base, the dead size
+// enters the ledger, and a clamp keeps the search from re-climbing into the
+// dead rung for the hold window -- probes still get acked there on a
+// rate-policing path, so without the clamp the search would walk straight
+// back in. Past the hold the search resumes; the path may have healed, and
+// if it has not, the next watchdog episode re-clamps.
+void TestFullSizeDataDropFallsBackToBase() {
   Harness h;
   CHECK(h.Init(PmtuConfig(fcp::Direction::kC2S, fcp::Direction::kS2C),
                PmtuConfig(fcp::Direction::kS2C, fcp::Direction::kC2S)));
@@ -326,6 +332,7 @@ void TestFullSizeDataDropsKeepMtu() {
   h.TickAt(2025);
   h.TickAt(3025);
   CHECK_EQ(h.a->path_mtu(), 1487u);
+  CHECK_EQ(h.a->pmtu_probes_sent(), 3u);
 
   // Data/parity datagrams above 1400 bytes now vanish; oob still flows (the
   // peer keeps proving it receives nothing new by sending no FECSTAT).
@@ -337,13 +344,14 @@ void TestFullSizeDataDropsKeepMtu() {
   }
   h.pump();
 
-  // Nothing moved the proven bound down: the acknowledged size stands, loss
-  // reports never touch it. Past the watchdog window the WARN appears, once.
+  // The fallback fires inside the watchdog window, once: the send bound is
+  // back at the configured base, the payload shrank with it, and the clamp
+  // keeps the search below the dead rung's neighborhood -- no probe is spent
+  // on a size this session must not re-climb to yet.
   h.TickTo(2200, 6200);
   h.TickAt(8025);
-  CHECK_EQ(h.a->path_mtu(), 1487u);
-  CHECK_EQ(h.a->payload_max(), 1423u);
-  CHECK(h.a->pmtu_search_done());
+  CHECK_EQ(h.a->path_mtu(), 1400u);
+  CHECK_EQ(h.a->payload_max(), 1336u);
   size_t warns = 0;
   for (const auto& line : h.log_a) {
     if (line.find("raised size 1487 unreachable") != std::string::npos) {
@@ -351,45 +359,30 @@ void TestFullSizeDataDropsKeepMtu() {
     }
   }
   CHECK(warns == 1u);
+  CHECK_EQ(h.a->pmtu_probes_sent(), 3u);
+  CHECK(!h.a->pmtu_search_done());
 
-  // Any feedback resets the watchdog: a later episode, same session, warns
-  // again. The harness has no retransmission driver (segment retx lives in
-  // the stream layer), so the unblock window must carry fresh data - which is
-  // exactly the real-world shape anyway: the watchdog resets when the next
-  // confirmed progress happens, not on empty reconnects. Re-block AFTER the
-  // peer's last report has landed: a report still in flight would erase this
-  // episode's send evidence, correctly - the peer was alive then.
-  h.data_max_wire = 0;
-  h.TickAt(6300);
-  h.now = 6350;
-  for (uint32_t set = 0; set < 300; ++set) {
-    Bytes seg(1423, 0);
-    h.a->on_kcp_output(seg.data(), seg.size(), h.now);
-  }
-  h.pump();
-  h.TickTo(6400, 10600);  // fresh data lands; B reports at its 2 s cadence
-  h.data_max_wire = 1400;
-  h.TickAt(10650);        // consume the last FECSTAT
-  h.now = 10700;
-  for (uint32_t set = 0; set < 300; ++set) {
-    Bytes seg(1423, 0);
-    h.a->on_kcp_output(seg.data(), seg.size(), h.now);
-  }
-  h.pump();
-  h.TickTo(10750, 17700);
+  // Hold window: no data flows, so the watchdog cannot re-fire, and the
+  // clamped search spends nothing -- the bound stays at the base. The window
+  // ends well inside the hold (the clamp lifts at fallback+120 s, i.e.
+  // ~126 s here).
+  h.TickTo(8100, 60000);
+  CHECK_EQ(h.a->path_mtu(), 1400u);
+  CHECK_EQ(h.a->pmtu_probes_sent(), 3u);
+
+  // Hold over: the search resumes and, with oob always passable in this
+  // harness, climbs the ladder back to just under the ceiling -- the
+  // "path healed" shape. The fallback warned exactly once for the episode.
+  h.TickTo(126500, 141000);
+  CHECK(h.a->pmtu_search_done());
+  CHECK(h.a->path_mtu() > 1400u);
   warns = 0;
   for (const auto& line : h.log_a) {
-    if (line.find("raised size 1487 unreachable") != std::string::npos) {
+    if (line.find("unreachable") != std::string::npos) {
       ++warns;
     }
   }
-  // DEBUG
-  for (const auto& line : h.log_a) {
-    if (line.find("unreachable") != std::string::npos) {
-      fprintf(stderr, "A: %s\n", line.c_str());
-    }
-  }
-  CHECK(warns == 2u);
+  CHECK(warns == 1u);
 }
 
 }  // namespace
@@ -404,6 +397,6 @@ int main() {
   TestFullSizeSymbolAfterRaise();
   TestPeerCeilingDoesNotRaiseOurs();
   TestCeilingAtConfiguredMtuIsInert();
-  TestFullSizeDataDropsKeepMtu();
+  TestFullSizeDataDropFallsBackToBase();
   return fcp_test::finish();
 }

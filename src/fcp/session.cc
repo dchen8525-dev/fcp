@@ -86,6 +86,17 @@ constexpr int64_t kPmtuResolveFloorMs = kSessionTickMs;
 // forced 60 s door accepts a single accounted symbol.
 constexpr uint32_t kPmtuUnreachableSymbols = 256;
 constexpr int64_t kPmtuUnreachableMs = 6000;
+// Black-hole fallback (pmtu_blackhole): after a fallback the search may not
+// climb back into the dead rung's neighborhood for a while. Margin: bulk is
+// not re-sent within this many bytes below the size the watchdog reverted;
+// a rate-policing path (probes pass, bulk at the raised size dies) re-probes
+// past its policing rung otherwise, because probe acks -- the only evidence
+// the ledger records -- keep coming from isolated one-datagram probes. Hold:
+// the clamp expires and the search resumes; on a healed path the climb
+// succeeds, on a persistent one the next watchdog episode re-clamps, so the
+// cost of being wrong is bounded either way.
+constexpr int kPmtuBlackholeMargin = 64;
+constexpr int64_t kPmtuBlackholeHoldMs = 120000;
 
 uint8_t handshake_flags(const SessionConfig& cfg) {
   return static_cast<uint8_t>(kLocalFlagsM1 | (cfg.pmtud ? kCapPmtud : 0));
@@ -403,35 +414,43 @@ void Session::on_tick(int64_t now_ms) {
       log(std::string(kTagWarn) + line);
     }
   }
-  // Raised-size reachability watchdog (log only, pmtu.h). A session held at a
-  // size above the configured base while the peer reports NOTHING of it is
-  // the one state upward PMTUD cannot see in flight: the probe was answered
-  // and the data disappeared after -- exactly the overload case quic-go
-  // handles by never lowering CurrentSize either. The evidence is quantified:
-  // >= kPmtuUnreachableSymbols data symbols sent over >= kPmtuUnreachableMs
-  // with zero feedback. Enough symbols for the peer's 2 s cadence door, and a
-  // peer that heard even one of them still reports (its forced 60 s door
-  // needs a single accounted symbol, and the report is a small oob datagram
-  // far below any probe size -- size-based path drops cannot explain the
-  // silence). The proven bound does not move: no in-session downgrade. This
-  // names the state for the operator early, before the stream stalls into
-  // the dead-path watchdog; the next session re-probes from cfg_.mtu and
-  // converges under whichever reality the path now has.
+  // Raised-size reachability watchdog (log + fallback, pmtu.h). A session
+  // held at a size above the configured base while the peer reports NOTHING
+  // of it is the one state upward PMTUD cannot see in flight: the probe was
+  // answered and the data disappeared after -- exactly the size-based path
+  // policing case (a firewall that passes isolated probes but drops bulk at
+  // the raised size, with ICMP can't-fragment suppressed) and the overload
+  // case quic-go answers by recycling the whole connection. Here the
+  // evidence is quantified: >= kPmtuUnreachableSymbols data symbols sent over
+  // >= kPmtuUnreachableMs with zero feedback. Enough symbols for the peer's
+  // 2 s cadence door, and a peer that heard even one of them still reports
+  // (its forced 60 s door needs a single accounted symbol, and the report is
+  // a small oob datagram far below any probe size -- size-based path drops
+  // cannot explain the silence). Zero feedback over that window is also
+  // unrecoverable by ARQ: retransmissions leave at the same dead size. The
+  // pre-rewrite loss-report latch misfired on ordinary loss (it watched rates,
+  // not silence), which is why it was removed; this condition is silence
+  // alone, which ~12% random loss and 50% bursts never satisfy. So instead of
+  // warning and waiting for a teardown that small-datagram keepalive prevents,
+  // fall back in-session (pmtu_blackhole): revert the send bound to the
+  // configured base, ledger the dead size, let the paced search re-probe
+  // upward under whichever rung the path actually carries. A false alarm
+  // costs one climb from the base; a missed one stalls the session forever.
   if (pmtud_on_ && !pmtu_unreachable_warned_ && pmtu_mtu_ > cfg_.mtu &&
       data_tx_since_fecstat_ >= kPmtuUnreachableSymbols &&
       since_fecstat_ms >= kPmtuUnreachableMs) {
     pmtu_unreachable_warned_ = true;
-    char line[192];
+    char line[200];
     std::snprintf(line, sizeof(line),
                   "FCP PMTUD: raised size %u unreachable? %u data symbols (%lld "
-                  "ms) with no receiver feedback; no in-session downgrade -- the"
-                  " session stalls until teardown, and the next session probes"
-                  " from %u",
+                  "ms) with no receiver feedback; black-hole fallback, send "
+                  "bound back to %u and the search re-probes below it",
                   static_cast<unsigned>(pmtu_mtu_),
                   static_cast<unsigned>(data_tx_since_fecstat_),
                   static_cast<long long>(since_fecstat_ms),
                   static_cast<unsigned>(cfg_.mtu));
     log(std::string(kTagWarn) + line);
+    pmtu_blackhole(now_ms);
   }
 }
 
@@ -789,6 +808,17 @@ void Session::pmtu_tick(int64_t now_ms) {
   if (pmtu_probe_mtu_ != 0 && now_ms >= pmtu_probe_deadline_ms_) {
     pmtu_probe_lost(now_ms);
   }
+  // Black-hole clamp expiry: the hold window gave the reverted size its
+  // chance to prove traffic flows again. On a healed path the resumed climb
+  // now succeeds; on a persistent one the next watchdog episode re-clamps.
+  if (pmtu_clamp_ != 0 && now_ms >= pmtu_clamp_until_ms_) {
+    pmtu_clamp_ = 0;
+    char line[96];
+    std::snprintf(line, sizeof(line),
+                  "FCP PMTUD: black-hole hold over, search resumes from %u",
+                  static_cast<unsigned>(pmtu_mtu_));
+    log(std::string(kTagDebug) + line);
+  }
   if (pmtu_done()) {
     return;
   }
@@ -805,6 +835,12 @@ void Session::pmtu_tick(int64_t now_ms) {
   // repeated halving (legal: the packet at a proven size is just a packet) as
   // long as the ledger still separates far enough that done() has not fired.
   if (size == 0 || size > pmtu_search_max()) {
+    return;
+  }
+  // The black-hole clamp caps what this session may re-climb to (see
+  // pmtu_blackhole): candidate sizes above it are skipped without spending a
+  // probe, and the hold window expires into the clamp-lift above.
+  if (pmtu_clamp_ != 0 && size > pmtu_clamp_) {
     return;
   }
   // The token ties the ack to this probe. The ack itself is authenticated, so
@@ -920,15 +956,7 @@ void Session::pmtu_probe_lost(int64_t now_ms) {
   pmtu_probe_mtu_ = 0;
   pmtu_token_ = 0;
   ++pmtu_probes_lost_;
-  for (int i = 0; i < kPmtuMaxLostProbes; ++i) {
-    if (size < pmtu_lost_[i]) {
-      for (int j = kPmtuMaxLostProbes - 1; j > i; --j) {
-        pmtu_lost_[j] = pmtu_lost_[j - 1];
-      }
-      pmtu_lost_[i] = static_cast<int16_t>(size);
-      break;
-    }
-  }
+  pmtu_ledger_insert(size);
   pmtu_probe_was_lost_ = true;
   if (pmtu_done()) {
     char line[112];
@@ -973,6 +1001,74 @@ void Session::pmtu_probe_acked(uint16_t size, int64_t now_ms) {
                   static_cast<unsigned>(pmtu_search_max()));
     log(std::string(kTagDebug) + line);
   }
+}
+
+// The ascending loss-ledger insert mtuFinder's OnLost performs: entries shift
+// right, the largest is pushed out when the ledger is full. An entry is
+// provisional by construction -- an ack at or above its size clears it in
+// pmtu_probe_acked().
+void Session::pmtu_ledger_insert(int size) {
+  for (int i = 0; i < kPmtuMaxLostProbes; ++i) {
+    if (size < pmtu_lost_[i]) {
+      for (int j = kPmtuMaxLostProbes - 1; j > i; --j) {
+        pmtu_lost_[j] = pmtu_lost_[j - 1];
+      }
+      pmtu_lost_[i] = static_cast<int16_t>(size);
+      break;
+    }
+  }
+}
+
+// The reachability watchdog's fallback. Raised-size bulk is dying at the path
+// while the session's small datagrams keep it alive, so quic-go's "stall
+// until the connection dies, the next connection re-probes" recovery never
+// happens here: ARQ retransmits at the dead size, reports still cross (they
+// are far below any probe size), and the idle/stall watchdogs see a session
+// that is neither idle nor stalled -- only dead at full size. RFC 8899
+// section 5.2 answers this state by reverting to the base PMTU; do it
+// in-session instead of recycling every tunnel on the connection:
+//
+//   * any in-flight probe is cancelled without evidence -- its fate is
+//     unknowable on a dropping path, and pmtu_probe_was_lost_ biases the next
+//     candidate downward toward the smallest recorded loss;
+//   * the dead size enters the ledger, so the search ceiling (pmtu_search_max)
+//     and the halving target (pmtu_next_size) shrink beneath it -- each
+//     raise-blackhole-fallback cycle buys one entry, and the search settles
+//     under the rung the path actually carries within kPmtuMaxLostProbes
+//     cycles;
+//   * the send bound reverts to cfg_.mtu, the one size the operator vouched
+//     for. The receive bound stays where it is: smaller is always acceptable
+//     there, and its growth is what authorizes the peer's own climb.
+//
+// The host propagates payload_max() into the stream (proxy_engine's
+// set_max_segment sync), so queued segments re-carve at the reverted size and
+// retransmissions leave small enough to pass.
+void Session::pmtu_blackhole(int64_t now_ms) {
+  if (pmtu_probe_mtu_ != 0) {
+    pmtu_probe_mtu_ = 0;
+    pmtu_token_ = 0;
+    pmtu_probe_was_lost_ = true;
+  }
+  const int dead = pmtu_mtu_;
+  pmtu_ledger_insert(dead);
+  const MtuLimits base = compute_mtu_limits(cfg_.mtu, cfg_.ip_hdr_len);
+  if (base.valid && base.payload_max < limits_.payload_max) {
+    limits_ = base;
+    pmtu_mtu_ = cfg_.mtu;
+    if (tx_) {
+      tx_->lower_limits(base);
+    }
+  }
+  // Clamp the re-climb beneath the dead rung for the hold window. Probes keep
+  // getting acked on a rate-policing path even at sizes the path drops in
+  // bulk, so the ledger alone cannot keep the search out; the clamp is what
+  // turns each watchdog episode into progress instead of a cycle.
+  pmtu_clamp_ = static_cast<uint16_t>(std::max<int>(cfg_.mtu, dead - kPmtuBlackholeMargin));
+  pmtu_clamp_until_ms_ = now_ms + kPmtuBlackholeHoldMs;
+  // Pace the next probe a full spacing out from the fallback itself, so the
+  // reverted size gets that window to prove traffic is flowing again before
+  // the search climbs back toward the ledger.
+  pmtu_last_probe_ms_ = now_ms;
 }
 
 void Session::sync_report_counters() {

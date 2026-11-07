@@ -46,6 +46,17 @@
 // a router fragments the oversized probe instead of dropping it, the probe
 // arrives, and the session raises its MTU to a size the path cannot carry
 // whole.
+//
+// One deliberate deviation from "never lowers", in session.cc: bulk data at a
+// size the probes did prove can still black-hole -- a rate-policing path
+// passes isolated probes but drops full-size bulk, and the session's own
+// small datagrams keep it alive, so quic-go's "stall until the connection
+// dies, the next connection re-probes" never happens. The reachability
+// watchdog (>= kPmtuUnreachableSymbols data symbols over >=
+// kPmtuUnreachableMs with zero receiver feedback) falls back in-session per
+// RFC 8899 section 5.2: send bound reverts to the configured base, the dead
+// size enters the ledger, and a clamp keeps the search beneath the dead rung
+// for a hold window before it resumes.
 
 #ifndef FCP_PMTU_H_
 #define FCP_PMTU_H_

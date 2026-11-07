@@ -89,6 +89,12 @@ class FrameTx {
   // old value, and the sets in flight are encoded at their own set-local
   // symbol_max_, so raising this mid-set is safe.
   void raise_limits(const MtuLimits& limits);
+  // PMTUD black-hole fallback (session.cc): the raised size dies at the path,
+  // so sets that OPEN from now on must carry the reverted, smaller size. The
+  // open set keeps its own set-local symbol_max_ (its tail datagrams may die;
+  // the set closes on the usual path), and smaller symbols are always inside
+  // the peer's receive bound, which only ever grows.
+  void lower_limits(const MtuLimits& limits);
   // T_flush = clamp(srtt, 25ms, 200ms); default srtt is 200ms.
   void set_srtt_ms(int64_t srtt_ms);
 

@@ -257,6 +257,14 @@ class Session {
   // mtuFinder's OnLost / OnAcked for the single in-flight probe.
   void pmtu_probe_lost(int64_t now_ms);
   void pmtu_probe_acked(uint16_t size, int64_t now_ms);
+  // Ascending loss-ledger insert (mtuFinder's ledger): entries shift right,
+  // the largest is pushed out when the ledger is full. Shared by the probe
+  // loss path and the black-hole fallback.
+  void pmtu_ledger_insert(int size);
+  // Raised-size black-hole fallback (fired by the reachability watchdog): the
+  // send bound reverts to cfg_.mtu in-session and the dead size enters the
+  // ledger, so the paced search re-probes upward beneath it.
+  void pmtu_blackhole(int64_t now_ms);
   // Probe pacing: one probe every kPmtuProbeDelayRtt x srtt, and an
   // unacknowledged probe is resolved as lost after 2 x srtt (see pmtu.h).
   int64_t pmtu_spacing_ms() const;
@@ -354,6 +362,13 @@ class Session {
   // `pmtu_search_max()` reads the effective ceiling off the ledger.
   bool pmtud_on_ = false;          // capability negotiated (accept/answer probes)
   uint16_t pmtu_mtu_ = 0;          // proven send MTU (mtuFinder.min)
+  // Black-hole fallback state (pmtu_blackhole). `pmtu_clamp_` caps what the
+  // search may re-climb to until `pmtu_clamp_until_ms_`: probes keep getting
+  // acked on a rate-policing path even at sizes the path drops in bulk, so
+  // without the clamp the search would walk straight back into the rung the
+  // watchdog just reverted. 0 = no clamp.
+  uint16_t pmtu_clamp_ = 0;
+  int64_t pmtu_clamp_until_ms_ = 0;
   uint16_t pmtu_max_mtu_ = 0;      // configured ceiling, clamped to the hard cap
   int16_t pmtu_lost_[kPmtuMaxLostProbes] = {-1, -1, -1};  // ascending, -1 = empty
   bool pmtu_probe_was_lost_ = false;  // last probe resolved as lost

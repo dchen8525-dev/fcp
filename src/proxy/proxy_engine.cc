@@ -404,6 +404,25 @@ void ProxyEngine::on_dial_result(uint64_t conn, bool ok, OpenError err, int64_t 
   reap(now_ms);
 }
 
+// See the declaration. The kernel's EMSGSIZE is authoritative path evidence:
+// the refused datagram never reached the wire. Every live session sharing the
+// refused peer lowers its send bound at once -- on the client that is every
+// tunnel's session (one remote), on the server exactly the refused peer's.
+void ProxyEngine::on_wire_send_too_big(uint64_t peer, size_t wire_len,
+                                       int64_t now_ms) {
+  const bool client = cfg_.role == EngineRole::kClient;
+  for (auto& kv : by_conn_) {
+    Conn& c = *kv.second;
+    if (c.phase == Phase::kDone || c.session == nullptr) {
+      continue;
+    }
+    if (!client && c.peer != peer) {
+      continue;
+    }
+    c.session->on_kernel_send_too_big(wire_len, now_ms);
+  }
+}
+
 void ProxyEngine::on_wire(uint64_t peer, const uint8_t* data, size_t len, int64_t now_ms) {
   now_ms_ = now_ms;
   counters_.bytes_rx += len;

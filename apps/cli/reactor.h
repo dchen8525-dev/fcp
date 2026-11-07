@@ -278,7 +278,7 @@ class Reactor {
   void flush_wire_deferred(int64_t now_ms, bool force = false);
   // Count a permanent UDP send error and explain the first one per second on
   // stderr (EMSGSIZE is the "MTU larger than the path" case and names --mtu).
-  void note_udp_send_error(int err, size_t len);
+  void note_udp_send_error(int err, size_t len, uint64_t peer);
   // Dead-path watchdog (opt_.stall_ms): one counters snapshot per tick. Nothing
   // functional hangs on it -- the log line is its output.
   void check_stall(int64_t now_ms);

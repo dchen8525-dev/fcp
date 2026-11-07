@@ -1071,6 +1071,78 @@ void Session::pmtu_blackhole(int64_t now_ms) {
   pmtu_last_probe_ms_ = now_ms;
 }
 
+// The kernel refused an outbound datagram of udp_len bytes with EMSGSIZE: its
+// ICMP-learned path-MTU cache sits below the refused IP size, and datagrams
+// of that size die inside send() without ever reaching the wire. This is the
+// strongest evidence a sender can get -- no watchdog window, no probe/ack
+// round trip -- and it is exactly the case upward-only PMTUD cannot see: the
+// configured base (say 1400) outruns what the path currently carries, so the
+// search never probes low enough to learn the true floor. Full data symbol is
+// IP size == pmtu_mtu_ (payload_max + overheads cancel), so a refusal above
+// the bound is a probe-sized datagram and only the ledger learns; a refusal
+// at or below it is bulk, and the send bound descends one kPmtuMaxDiffMtu
+// step below the smaller of the two -- repeated refusals each take a further
+// step, so the descent converges under the kernel's cache within a handful
+// of datagrams. The ledger and the black-hole clamp (pmtud on) keep the
+// search out of the refused rungs; when the kernel's cache ages back up, the
+// clamp expiry lets the ladder re-probe and EMSGSIZE simply stops.
+void Session::on_kernel_send_too_big(size_t udp_len, int64_t now_ms) {
+  if (limits_.payload_max == 0) {
+    return;
+  }
+  const int refused_ip =
+      static_cast<int>(udp_len) + static_cast<int>(cfg_.ip_hdr_len) + 8;
+  const int cur = static_cast<int>(pmtu_mtu_);
+  if (refused_ip > cur) {
+    // Probe-sized refusal: the bulk bound still stands. Ledger the rung,
+    // bias the next candidate downward, and skip the in-flight probe's
+    // resolve deadline -- it never left the machine.
+    if (pmtu_probe_mtu_ != 0 && refused_ip >= pmtu_probe_mtu_) {
+      pmtu_probe_mtu_ = 0;
+      pmtu_token_ = 0;
+      ++pmtu_probes_lost_;
+    }
+    pmtu_ledger_insert(refused_ip);
+    pmtu_probe_was_lost_ = true;
+    char line[128];
+    std::snprintf(line, sizeof(line),
+                  "FCP PMTUD: kernel refused IP size %d (EMSGSIZE), probing "
+                  "below it (send bound %u stands)",
+                  refused_ip, static_cast<unsigned>(pmtu_mtu_));
+    log(std::string(kTagDebug) + line);
+    return;
+  }
+  const int target = std::min(refused_ip, cur) - kPmtuMaxDiffMtu;
+  const MtuLimits next = compute_mtu_limits(target, cfg_.ip_hdr_len);
+  if (!next.valid || next.payload_max >= limits_.payload_max) {
+    return;
+  }
+  pmtu_ledger_insert(cur);
+  limits_ = next;
+  pmtu_mtu_ = static_cast<uint16_t>(target);
+  if (tx_) {
+    tx_->lower_limits(next);
+  }
+  if (pmtu_probe_mtu_ != 0 && pmtu_probe_mtu_ > target) {
+    pmtu_probe_mtu_ = 0;
+    pmtu_token_ = 0;
+    ++pmtu_probes_lost_;
+    pmtu_probe_was_lost_ = true;
+  }
+  if (pmtud_on_) {
+    pmtu_clamp_ = static_cast<uint16_t>(target);
+    pmtu_clamp_until_ms_ = now_ms + kPmtuBlackholeHoldMs;
+    pmtu_probe_was_lost_ = true;
+  }
+  pmtu_last_probe_ms_ = now_ms;
+  char line[160];
+  std::snprintf(line, sizeof(line),
+                "FCP PMTUD: kernel refused IP size %d (EMSGSIZE), send bound "
+                "%d -> %d; re-climb after the hold",
+                refused_ip, cur, target);
+  log(std::string(kTagWarn) + line);
+}
+
 void Session::sync_report_counters() {
   if (reporter_ == nullptr) {
     return;

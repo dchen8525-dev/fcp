@@ -172,12 +172,20 @@ class Session {
   const MtuLimits& mtu_limits() const { return limits_; }
   bool config_valid() const { return limits_.valid; }
 
-  // PMTUD: the proven send MTU (starts at the configured value and increases
-  // only, on an ack -- quic-go semantics: never lowered) and the payload size
-  // the stream layer must arm itself with. The host polls payload_max() and
-  // re-arms the stream when it moves (only upward now).
+  // PMTUD: the proven send MTU (starts at the configured value, climbs on an
+  // ack, and steps below the configured floor only on kernel EMSGSIZE
+  // evidence, see on_kernel_send_too_big) and the payload size the stream
+  // layer must arm itself with. The host polls payload_max() and re-arms the
+  // stream when it moves, either way.
   uint16_t path_mtu() const { return pmtu_mtu_; }
   size_t payload_max() const { return limits_.payload_max; }
+  // The kernel refused an outbound datagram of udp_len bytes with EMSGSIZE:
+  // its ICMP-learned path-MTU cache sits below the refused IP size, so every
+  // datagram of that size dies inside send() without reaching the wire.
+  // Authoritative, immediate evidence -- lower the send bound at once (see
+  // session.cc) instead of waiting out the reachability watchdog. Safe to
+  // call at any rate; each call descends at most one kPmtuMaxDiffMtu step.
+  void on_kernel_send_too_big(size_t udp_len, int64_t now_ms);
   // Largest symbol the receive side has proven (the peer's probes, capped by
   // our own ceiling). Diagnostics and tests: the host never polls this for
   // sizing, because only the sender learns the bound from the peer's ack.

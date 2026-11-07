@@ -1528,34 +1528,44 @@ void Reactor::app_close(uint64_t conn) {
 
 // A UDP send that fails permanently used to be indistinguishable from a full
 // socket: wire_send returned 0 and the tunnel stalled with no diagnostic. The
-// one that matters is EMSGSIZE -- an --mtu larger than the path is exactly the
-// "handshake works, data vanishes" failure the deployment guide warns about,
-// and the kernel knows the real number. Count every failure, say the first one
-// per second on stderr.
-void Reactor::note_udp_send_error(int err, size_t len) {
+// one that matters is EMSGSIZE -- the kernel's own ICMP-learned path-MTU cache
+// can sit BELOW the configured --mtu (an intermediate tunnel or firewall sent
+// "fragmentation needed", the kernel cached it, and every datagram of that
+// size now dies inside send() without reaching the wire). That is immediate,
+// authoritative path evidence: feed it straight into the engine's sessions
+// (on_wire_send_too_big, not rate-limited -- each refusal is one bounded
+// descent step) so the send bound moves the moment the kernel says so, then
+// still count the failure and say the first one per second on stderr.
+void Reactor::note_udp_send_error(int err, size_t len, uint64_t peer) {
   if (WouldBlock(err) || Interrupted(err)) {
     return;  // transient: the engine retries on the next tick
   }
   ++udp_send_errors_;
-  const int64_t now = NowMs();
-  if (last_udp_send_error_ms_ != 0 && now - last_udp_send_error_ms_ < 1000) {
-    return;
-  }
-  last_udp_send_error_ms_ = now;
 #ifdef _WIN32
   const bool too_big = err == WSAEMSGSIZE;
 #else
   const bool too_big = err == EMSGSIZE;
 #endif
   if (too_big) {
+    engine_.on_wire_send_too_big(peer, len, NowMs());
+    const int64_t now = NowMs();
+    if (last_udp_send_error_ms_ != 0 && now - last_udp_send_error_ms_ < 1000) {
+      return;
+    }
+    last_udp_send_error_ms_ = now;
     char msg[512];
     std::snprintf(msg, sizeof(msg),
                   "UDP send rejected a %zu-byte datagram (EMSGSIZE) at --mtu=%u: "
-                  "the path's MTU is smaller, so no data reaches the peer. Lower --mtu "
-                  "(1472 is safe on Ethernet/Wi-Fi paths, 1400 through tunnels).",
+                  "the kernel's path MTU cache is below it; sessions lowered "
+                  "their send bound",
                   len, static_cast<unsigned>(base_config_.mtu));
     note(msg, Severity(LogLevel::kError));
   } else {
+    const int64_t now = NowMs();
+    if (last_udp_send_error_ms_ != 0 && now - last_udp_send_error_ms_ < 1000) {
+      return;
+    }
+    last_udp_send_error_ms_ = now;
     note(std::string("UDP send failed: ") + ErrText(err),
          Severity(LogLevel::kError));
   }
@@ -1657,7 +1667,7 @@ size_t Reactor::emit_wire(uint64_t peer, const uint8_t* wire, size_t len,
     const int n =
         ::send(udp_, reinterpret_cast<const char*>(wire), static_cast<int>(len), 0);
     if (n < 0) {
-      note_udp_send_error(SockErr(), len);
+      note_udp_send_error(SockErr(), len, peer);
       return 0;
     }
     return n > 0 ? static_cast<size_t>(n) : 0;
@@ -1665,7 +1675,7 @@ size_t Reactor::emit_wire(uint64_t peer, const uint8_t* wire, size_t len,
   const int n = ::sendto(udp_, reinterpret_cast<const char*>(wire), static_cast<int>(len), 0,
                          reinterpret_cast<const sockaddr*>(to), sizeof(*to));
   if (n < 0) {
-    note_udp_send_error(SockErr(), len);
+    note_udp_send_error(SockErr(), len, peer);
     return 0;
   }
   return n > 0 ? static_cast<size_t>(n) : 0;
@@ -1944,7 +1954,7 @@ void Reactor::flush_udp_batch() {
       gso_ok_ = false;
       gso_reprieve_ = 16;
     } else if (err != EINTR) {
-      note_udp_send_error(err, seg_len);
+      note_udp_send_error(err, seg_len, gso_peer_);
       return;
     }
   }
@@ -1958,7 +1968,7 @@ void Reactor::flush_udp_batch() {
                             : ::send(udp_, reinterpret_cast<const char*>(p),
                                      static_cast<int>(seg_len), 0);
     if (n < 0) {
-      note_udp_send_error(SockErr(), seg_len);
+      note_udp_send_error(SockErr(), seg_len, gso_peer_);
       return;
     }
   }

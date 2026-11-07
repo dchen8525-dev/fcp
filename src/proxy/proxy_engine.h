@@ -196,6 +196,16 @@ class ProxyEngine {
   // Both: one inbound datagram from `peer`. Routes by the plaintext salt.
   void on_wire(uint64_t peer, const uint8_t* data, size_t len, int64_t now_ms);
 
+  // The kernel refused an outbound datagram of wire_len bytes to `peer` with
+  // EMSGSIZE: its own ICMP-learned path-MTU cache is below the refused IP
+  // size, and datagrams that size die inside send() without reaching the
+  // wire. Authoritative, immediate evidence -- the host's sessions sharing
+  // that peer lower their send bound at once (session.cc
+  // on_kernel_send_too_big) instead of waiting out the reachability
+  // watchdog. Client role has a single remote, so the peer id is matched
+  // loosely there; the server routes by peer exactly.
+  void on_wire_send_too_big(uint64_t peer, size_t wire_len, int64_t now_ms);
+
   // Timer pump: handshake retries, stream retransmission, dial and flush
   // deadlines, idle reaping. 25ms (kSessionTickMs) is the intended period.
   void on_tick(int64_t now_ms);

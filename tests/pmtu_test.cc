@@ -385,6 +385,41 @@ void TestFullSizeDataDropFallsBackToBase() {
   CHECK(warns == 1u);
 }
 
+// The kernel's EMSGSIZE is authoritative path evidence below the configured
+// floor (an ICMP-learned path-MTU cache that outruns --mtu): a refusal at the
+// bulk bound steps it down 20 bytes per refusal until sends succeed, a
+// refusal above the bound is a probe-sized datagram and only feeds the
+// ledger, and the descent follows the bound's own value, so queued stale
+// datagrams of the pre-descent size cannot stall it.
+void TestKernelSendTooBigStepsDown() {
+  Harness h;
+  CHECK(h.Init(PmtuConfig(fcp::Direction::kC2S, fcp::Direction::kS2C),
+               PmtuConfig(fcp::Direction::kS2C, fcp::Direction::kC2S)));
+  CHECK(h.Handshake());
+  CHECK_EQ(h.a->path_mtu(), 1400u);
+
+  // Full data datagram refused: wire 1372 -> IP 1400 == the bound, one step.
+  h.a->on_kernel_send_too_big(1372, 5000);
+  CHECK_EQ(h.a->path_mtu(), 1380u);
+  CHECK_EQ(h.a->payload_max(), fcp::compute_mtu_limits(1380, 20).payload_max);
+
+  // The kernel's cache is at 1352 here: every rung keeps refusing, and each
+  // refusal at the CURRENT bound takes a further step.
+  h.a->on_kernel_send_too_big(1352, 5025);  // IP 1380 == the bound
+  CHECK_EQ(h.a->path_mtu(), 1360u);
+  h.a->on_kernel_send_too_big(1332, 5050);  // IP 1360
+  CHECK_EQ(h.a->path_mtu(), 1340u);
+  h.a->on_kernel_send_too_big(1312, 5075);  // IP 1340
+  CHECK_EQ(h.a->path_mtu(), 1320u);
+
+  // A refusal above the bound is probe-sized: ledger only, the bulk bound
+  // and the payload it arms stay put.
+  const size_t payload_before = h.a->payload_max();
+  h.a->on_kernel_send_too_big(1462, 5100);  // IP 1490 > 1340
+  CHECK_EQ(h.a->path_mtu(), 1320u);
+  CHECK_EQ(h.a->payload_max(), payload_before);
+}
+
 }  // namespace
 
 int main() {
@@ -398,5 +433,6 @@ int main() {
   TestPeerCeilingDoesNotRaiseOurs();
   TestCeilingAtConfiguredMtuIsInert();
   TestFullSizeDataDropFallsBackToBase();
+  TestKernelSendTooBigStepsDown();
   return fcp_test::finish();
 }

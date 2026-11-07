@@ -17,8 +17,11 @@ namespace fcp {
 
 // Hard bounds from the wire format: k occupies 3 bits, so 7 is absolute —
 // the value's definition moved to limits.h (单一 home，rs.h 的 assert 钉着).
-// M1 default; raising it to 5..7 is a config change, not a protocol change.
-constexpr uint8_t kDefaultPmax = 4;
+// WAN calibration 2026-11-07 (see docs/决策记录.md): the international path
+// runs a constant ~12% loss with evening bursts to 50%+; k=1..3 parity could
+// not cover it and the ceiling capped the controller below the binomial
+// target. 6 lets the adaptive machine reach k_for(15%, d=10) without --p-max.
+constexpr uint8_t kDefaultPmax = 6;
 // Target probability that a group needs no KCP retransmission (§8).
 constexpr double kTargetRecovery = 0.80;
 // P(X <= max_losses) for X ~ Binomial(trials, p).

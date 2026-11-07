@@ -502,7 +502,7 @@ QWidget* MainWindow::buildConnPage() {
   adv_toggle_ = new QPushButton;
   adv_toggle_->setObjectName(QStringLiteral("link"));
   adv_toggle_->setCursor(Qt::PointingHandCursor);
-  adv_toggle_->setText(QStringLiteral("▸  高级设置    MTU 1400 · FEC 0.5 · k 自适应 · 127.0.0.1"));
+  adv_toggle_->setText(QStringLiteral("▸  高级设置    MTU 1400 · FEC 0.8 · k 自适应 · 127.0.0.1"));
   form_layout->addWidget(adv_toggle_);
 
   adv_body_ = new QFrame;
@@ -513,10 +513,9 @@ QWidget* MainWindow::buildConnPage() {
   adv_layout->setVerticalSpacing(10);
   listen_ = new QLineEdit(QStringLiteral("127.0.0.1"));
   mtu_ = new QLineEdit(QStringLiteral("1400"));
-  budget_ = new QLineEdit(QStringLiteral("0.5"));
+  budget_ = new QLineEdit(QStringLiteral("0.8"));
   k_ = new QLineEdit(QStringLiteral("-1"));
   rate_ = new QLineEdit(QStringLiteral("0"));
-  pmtu_max_ = new QLineEdit(QStringLiteral("1500"));
   pmtud_ = new QCheckBox(QStringLiteral("启用路径 MTU 探测（关闭后固定用上面的 MTU）"));
   pmtud_->setChecked(true);
   adv_layout->addWidget(makeField(QStringLiteral("本地监听地址"), listen_), 0, 0);
@@ -527,9 +526,7 @@ QWidget* MainWindow::buildConnPage() {
       makeField(QStringLiteral("固定 k"), k_, QStringLiteral("-1 为自适应")), 1, 1);
   adv_layout->addWidget(
       makeField(QStringLiteral("上行限速 (Mbps)"), rate_, QStringLiteral("0 为不限")), 2, 0);
-  adv_layout->addWidget(
-      makeField(QStringLiteral("探测上限 MTU"), pmtu_max_, QStringLiteral("≤9000")), 2, 1);
-  adv_layout->addWidget(pmtud_, 3, 0, 1, 2);
+  adv_layout->addWidget(pmtud_, 2, 1, 1, 1);
   auto* adv_note = makeLabel(
       QStringLiteral("不展开时按默认值提交，与显式填写效果相同。"),
       "fieldNote");
@@ -589,7 +586,6 @@ QWidget* MainWindow::buildConnPage() {
   connect(mtu_, &QLineEdit::textChanged, this, [this] { saveSettings(); });
   connect(budget_, &QLineEdit::textChanged, this, [this] { saveSettings(); });
   connect(k_, &QLineEdit::textChanged, this, [this] { saveSettings(); });
-  connect(pmtu_max_, &QLineEdit::textChanged, this, [this] { saveSettings(); });
   connect(pmtud_, &QCheckBox::toggled, this, [this] { saveSettings(); });
   connect(remember_, &QCheckBox::toggled, this, [this] { saveSettings(); });
   return card;
@@ -904,11 +900,9 @@ MainWindow::Collected MainWindow::collect() const {
   const bool open = advanced_;
   const QString mtu_text = open ? mtu_->text().trimmed() : QStringLiteral("1400");
   const QString k_text = open ? k_->text().trimmed() : QStringLiteral("-1");
-  const QString budget_text = open ? budget_->text().trimmed() : QStringLiteral("0.5");
+  const QString budget_text = open ? budget_->text().trimmed() : QStringLiteral("0.8");
   const QString rate_text = open ? rate_->text().trimmed() : QStringLiteral("0");
   const bool pmtud = open ? pmtud_->isChecked() : true;
-  const QString pmtu_max_text =
-      open ? pmtu_max_->text().trimmed() : QStringLiteral("1500");
   const QString listen_text =
       open ? listen_->text().trimmed() : QStringLiteral("127.0.0.1");
 
@@ -938,14 +932,6 @@ MainWindow::Collected MainWindow::collect() const {
     result.error = QStringLiteral("上行限速太小无法整形，请用 ≥0.1 Mbps 或 0（不限）");
     return result;
   }
-  const int pmtu_max = pmtu_max_text.toInt(&ok);
-  // 与 CLI 同一条界（1280..9000）：GUI 放行而 CLI 拒绝，会让 sidecar 启动时
-  // 才报参数错误，用户还以为是别的问题。低于 mtu 时 CLI 会下钳到 mtu（等于
-  // 不探测），这里不额外报错。
-  if (!ok || pmtu_max < 1280 || pmtu_max > 9000) {
-    result.error = QStringLiteral("PMTUD 上限应在 1280..9000");
-    return result;
-  }
   if (listen_text.isEmpty()) {
     result.error = QStringLiteral("本地监听地址不能为空");
     return result;
@@ -958,7 +944,6 @@ MainWindow::Collected MainWindow::collect() const {
   result.config.listen_port = static_cast<quint16>(listen_port);
   result.config.mtu = mtu;
   result.config.pmtud = pmtud;
-  result.config.pmtu_max_mtu = pmtu_max;
   result.config.k = k;
   result.config.fec_budget = budget;
   result.config.rate_up_mbps = rate;
@@ -977,7 +962,7 @@ void MainWindow::setRunning(bool running, const QString& hint) {
         static_cast<QWidget*>(remember_), static_cast<QWidget*>(listen_),
         static_cast<QWidget*>(mtu_), static_cast<QWidget*>(budget_),
         static_cast<QWidget*>(k_), static_cast<QWidget*>(rate_),
-        static_cast<QWidget*>(pmtud_), static_cast<QWidget*>(pmtu_max_),
+        static_cast<QWidget*>(pmtud_),
         static_cast<QWidget*>(adv_toggle_), static_cast<QWidget*>(key_toggle_)}) {
     widget->setEnabled(!running);
   }
@@ -1163,7 +1148,6 @@ void MainWindow::onSpeedStart() {
   config.seconds = seconds;
   config.mtu = collected.config.mtu;
   config.pmtud = collected.config.pmtud;
-  config.pmtu_max_mtu = collected.config.pmtu_max_mtu;
   QString error;
   if (!sidecar_->startSpeedTest(config, &error)) {
     speed_running_ = false;
@@ -1427,11 +1411,9 @@ void MainWindow::loadSettings() {
         settings.value(QStringLiteral("listen"), QStringLiteral("127.0.0.1")).toString());
     mtu_->setText(settings.value(QStringLiteral("mtu"), QStringLiteral("1400")).toString());
     budget_->setText(
-        settings.value(QStringLiteral("budget"), QStringLiteral("0.5")).toString());
+        settings.value(QStringLiteral("budget"), QStringLiteral("0.8")).toString());
     k_->setText(settings.value(QStringLiteral("k"), QStringLiteral("-1")).toString());
     rate_->setText(settings.value(QStringLiteral("rate"), QStringLiteral("0")).toString());
-    pmtu_max_->setText(settings.value(QStringLiteral("pmtuMax"), QStringLiteral("1500"))
-                           .toString());
     pmtud_->setChecked(settings.value(QStringLiteral("pmtud"), true).toBool());
     key_->setText(settings.value(QStringLiteral("key")).toString());
     const int seconds = settings.value(QStringLiteral("speedSeconds"), 8).toInt();
@@ -1467,7 +1449,6 @@ void MainWindow::saveSettings() {
   settings.setValue(QStringLiteral("budget"), budget_->text());
   settings.setValue(QStringLiteral("k"), k_->text());
   settings.setValue(QStringLiteral("rate"), rate_->text());
-  settings.setValue(QStringLiteral("pmtuMax"), pmtu_max_->text());
   settings.setValue(QStringLiteral("pmtud"), pmtud_->isChecked());
   settings.setValue(QStringLiteral("key"), key_->text());
   settings.setValue(QStringLiteral("advanced"), advanced_);

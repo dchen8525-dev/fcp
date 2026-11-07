@@ -66,9 +66,10 @@ uint16_t MtuForInterface(uint16_t configured, size_t interface_mtu);
 // tested: a smaller interface lowers both the configured MTU and the PMTUD
 // ceiling (probing above the local interface can only produce EMSGSIZE). A
 // larger interface changes nothing -- the ladder from the configured MTU up
-// to --pmtu-max is exactly what upward PMTUD is for. An *explicit* --mtu above
-// the interface is kept but disables PMTUD: DF would reject every datagram at
-// that size, while without it the kernel still fragments and the tunnel works.
+// to the built-in ceiling is exactly what upward PMTUD is for. An *explicit*
+// --mtu above the interface is kept but disables PMTUD: DF would reject every
+// datagram at that size, while without it the kernel still fragments and the
+// tunnel works.
 void ApplyInterfaceMtu(size_t interface_mtu, ProxyArgs* args);
 
 // Pure argv parsing: no I/O, no engine construction, no process exit. Returns

@@ -28,12 +28,17 @@ constexpr uint8_t kDefaultP = 3;
 constexpr uint16_t kDefaultMtu = 1400;
 constexpr size_t kDefaultIpHeaderLen = 20;
 // PMTUD ceiling (pmtu.h): the largest IP packet a probe will try. 1500 is the
-// Ethernet path every deployment can be expected to have; jumbo frames are
-// opt-in (--pmtu-max) because they are a LAN property, not an internet one.
+// Ethernet path every deployment can be expected to have; there is no operator
+// knob for it (quic-go hard-codes its equivalent as MaxPacketBufferSize too),
+// and ApplyInterfaceMtu may still lower it below 1500 when the interface says
+// so. Nothing configures it above 1500.
 constexpr uint16_t kDefaultPmtuMaxMtu = 1500;
 
 // M3 byte budget (M3控制设计.md §2): parity/data bytes for one interval.
-constexpr double kDefaultFecBudget = 0.50;
+// 0.80 pairs with kDefaultPmax=6 (WAN calibration 2026-11-07): k=6 on d=10
+// is a 0.6 wire ratio, and the ceiling must not clamp the recovery target
+// the controller just proved it needs.
+constexpr double kDefaultFecBudget = 0.80;
 
 // RTT / flush timing defaults. srtt seeds every engine until the first sample
 // arrives; T_flush is the frame layer's flush retransmit deadline. Same number

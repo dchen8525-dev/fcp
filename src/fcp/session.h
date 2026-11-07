@@ -27,6 +27,7 @@
 #include "fcp/frame_tx.h"
 #include "fcp/handshake.h"
 #include "fcp/hdr.h"
+#include "fcp/pmtu.h"
 #include "fcp/reporter.h"
 #include "fcp/settle.h"
 #include "fcp/strategy.h"
@@ -171,10 +172,10 @@ class Session {
   const MtuLimits& mtu_limits() const { return limits_; }
   bool config_valid() const { return limits_.valid; }
 
-  // PMTUD: the proven send MTU (starts at the configured value, grows when an
-  // ack comes back, and drops back to the configured value on a black hole)
-  // and the payload size the stream layer must arm itself with. The host polls
-  // payload_max() and re-arms the stream when it moves in either direction.
+  // PMTUD: the proven send MTU (starts at the configured value and increases
+  // only, on an ack -- quic-go semantics: never lowered) and the payload size
+  // the stream layer must arm itself with. The host polls payload_max() and
+  // re-arms the stream when it moves (only upward now).
   uint16_t path_mtu() const { return pmtu_mtu_; }
   size_t payload_max() const { return limits_.payload_max; }
   // Largest symbol the receive side has proven (the peer's probes, capped by
@@ -184,12 +185,10 @@ class Session {
   uint32_t pmtu_probes_sent() const { return pmtu_probes_sent_; }
   uint32_t pmtu_probes_acked() const { return pmtu_probes_acked_; }
   uint32_t pmtu_probes_lost() const { return pmtu_probes_lost_; }
-  // Black-hole fallback (pmtu.h): how many times this session dropped back to
-  // the configured MTU after a raised size proved lossy, and whether it did.
-  // Once true, upward probing is closed for the rest of the session: a probe
-  // that was answered while the path dropped the data must not re-raise it.
-  uint32_t pmtu_fallbacks() const { return pmtu_fallbacks_; }
-  bool pmtu_blackholed() const { return pmtu_blackhole_; }
+  // True once the search interval has narrowed inside kPmtuMaxDiffMtu: no
+  // further probing this session (the size is within 20 bytes of the path's
+  // ceiling on the evidence available). Diagnostics and tests.
+  bool pmtu_search_done() const { return pmtu_done(); }
 
   size_t cached_segments() const { return hs_.cached_segments(); }
   int64_t srtt_ms() const { return srtt_ms_; }
@@ -244,23 +243,26 @@ class Session {
   bool on_wire_bootstrap(const std::vector<uint8_t>& plain, int64_t now_ms);
   bool on_wire_data(const std::vector<uint8_t>& plain, size_t wire_len, int64_t now_ms);
 
-  // PMTUD (pmtu.h): the ladder, the probe/ack codec, and the two bounds it
-  // moves. All of it is inert until configure() sees the peer's capability.
+  // PMTUD (pmtu.h): the binary search over [min, lost-ledger max], the probe/
+  // ack codec, and the two bounds it moves. All of it is inert until
+  // configure() sees the peer's capability. Structure mirrors quic-go's
+  // mtuFinder one-to-one; see the pmtu.h header for the mapping.
   void pmtu_tick(int64_t now_ms);
   void pmtu_send(uint8_t type, uint16_t mtu, uint32_t token);
   bool pmtu_handle(const std::vector<uint8_t>& plain, size_t wire_len, int64_t now_ms);
   bool is_pmtu_frame(const std::vector<uint8_t>& plain) const;
-  uint16_t pmtu_next_candidate() const;
+  uint16_t pmtu_search_max() const;  // mtuFinder.max(): ledger-derived ceiling
+  bool pmtu_done() const;            // mtuFinder.done(): interval <= maxMTUDiff
+  uint16_t pmtu_next_size() const;   // mtuFinder.GetPing(): candidate size
+  // mtuFinder's OnLost / OnAcked for the single in-flight probe.
+  void pmtu_probe_lost(int64_t now_ms);
+  void pmtu_probe_acked(uint16_t size, int64_t now_ms);
+  // Probe pacing: one probe every kPmtuProbeDelayRtt x srtt, and an
+  // unacknowledged probe is resolved as lost after 2 x srtt (see pmtu.h).
+  int64_t pmtu_spacing_ms() const;
+  int64_t pmtu_resolve_ms() const;
   void pmtu_raise_recv(uint16_t mtu);
   void pmtu_raise_send(uint16_t mtu);
-  // Black-hole detection. `pmtu_note_loss` is fed by every accepted peer
-  // FECSTAT with that report's *outbound* loss (what the peer says it lost of
-  // ours and FEC could not recover): that is the direction pmtu_mtu_ governs,
-  // and it is also the direction a download-shaped flow stresses. Two
-  // consecutive reports over kPmtuBlackholeLossPpm, or one over
-  // kPmtuBlackholeSeverePpm, latch `pmtu_blackhole_` and call pmtu_fallback.
-  void pmtu_note_loss(uint64_t expected, uint64_t lost);
-  void pmtu_fallback(uint32_t loss_ppm);
 
   void emit_symbol(const TxSymbol& symbol, bool bootstrap = false);
   // `bootstrap` routes the frame through the handshake envelope instead of the
@@ -340,40 +342,37 @@ class Session {
   uint32_t struct_fail_synced_ = 0;
   bool nonce_exhausted_logged_ = false;
 
-  // PMTUD state. `pmtu_mtu_` is the largest size the *send* direction has
-  // proven (it starts at the configured MTU); `recv_symbol_max_` is the
+  // PMTUD state, quic-go mtuFinder shape. `pmtu_mtu_` (their `min`) is the
+  // largest size the *send* direction has proven -- it starts at the
+  // configured MTU and only an ack moves it. `recv_symbol_max_` is the
   // largest symbol the *receive* direction has proven. They are separate
   // because a path can be asymmetric, and each side's probe proves only its
-  // own direction.
-  bool pmtud_on_ = false;        // capability negotiated (accept/answer probes)
-  uint16_t pmtu_mtu_ = 0;        // proven send MTU
-  uint16_t pmtu_max_mtu_ = 0;    // configured ceiling, clamped to the hard cap
-  uint16_t pmtu_probe_mtu_ = 0;  // outstanding probe size, 0 = none
-  // pmtu_next_ms_ < 0 means this side stopped probing (ceiling reached, or
-  // the size never answered). It is -1 rather than 0 because time 0 is a
-  // valid moment to start the ladder (the handshake may complete at t=0 in
-  // tests). It stays separate from pmtud_on_ because the peer may still be
-  // climbing its own ladder and must still get acks.
-  // Carried on the wire and echoed by the ack, but the ack is matched by size:
-  // the ladder is strictly increasing, so the outstanding size identifies the
-  // rung on its own, and requiring the token made an ack that arrived after the
-  // next retry (RTT above the retry interval) useless.
+  // own direction. `pmtu_lost_` (their `lost`) holds the sizes of resolved
+  // probe losses in ascending order; the configured ceiling occupies the
+  // first slot at start (= quic-go treating the maximum as the first "lost"
+  // packet), an ack removes every entry <= the proven size, and
+  // `pmtu_search_max()` reads the effective ceiling off the ledger.
+  bool pmtud_on_ = false;          // capability negotiated (accept/answer probes)
+  uint16_t pmtu_mtu_ = 0;          // proven send MTU (mtuFinder.min)
+  uint16_t pmtu_max_mtu_ = 0;      // configured ceiling, clamped to the hard cap
+  int16_t pmtu_lost_[kPmtuMaxLostProbes] = {-1, -1, -1};  // ascending, -1 = empty
+  bool pmtu_probe_was_lost_ = false;  // last probe resolved as lost
+  uint16_t pmtu_probe_mtu_ = 0;    // outstanding probe IP size, 0 = none
+  // Echoed by the ack; matched back by token. One probe is in flight at a
+  // time and there is no same-size resend (quic-go also does not resend the
+  // PING), so the token is unique meanwhile and a late ack from an earlier
+  // probe can never be mistaken for this one.
   uint32_t pmtu_token_ = 0;
-  int pmtu_attempts_ = 0;
-  int64_t pmtu_next_ms_ = -1;
+  int64_t pmtu_last_probe_ms_ = -1;      // spacing origin: last probe send
+  int64_t pmtu_probe_deadline_ms_ = 0;   // unacked-probe resolution deadline
+  // Raised-size reachability watchdog: one WARN per episode. Reset on any
+  // inbound FECSTAT (progress); re-arms if the path dies again while the
+  // session is still held at the raised size.
+  bool pmtu_unreachable_warned_ = false;
   size_t recv_symbol_max_ = 0;
   uint32_t pmtu_probes_sent_ = 0;
   uint32_t pmtu_probes_acked_ = 0;
   uint32_t pmtu_probes_lost_ = 0;
-  // Black-hole fallback state. `pmtu_bad_periods_` counts consecutive peer
-  // reports whose sample was credible and over the threshold; a good sample
-  // resets it. `pmtu_blackhole_` latches the fallback: once a raised size has
-  // been proven lossy the ladder is closed for the session, because the probe
-  // that raised us was answered before the data started being dropped and
-  // would otherwise raise us straight back.
-  int pmtu_bad_periods_ = 0;
-  bool pmtu_blackhole_ = false;
-  uint32_t pmtu_fallbacks_ = 0;
 };
 
 // Server-side salt lookup. Sessions are owned by the caller.

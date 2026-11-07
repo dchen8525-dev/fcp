@@ -1,4 +1,6 @@
-// Path-MTU discovery with a loss-triggered fallback (capability kCapPmtud).
+// Path-MTU discovery by binary search, a faithful port of quic-go's
+// mtuFinder (mtu_discoverer.go, DPLPMTUD per RFC 8899) (capability
+// kCapPmtud).
 //
 // The configured MTU is what the operator knows the path can carry, and a
 // session never sends anything larger until the path proves it can. A probe is
@@ -9,6 +11,23 @@
 // black-holed probe (the usual failure mode of an MTU that is one step too
 // large) simply never gets an ack.
 //
+// The search space is [min, max]. `min` is the proven send bound (raises only,
+// on an ack -- quic-go never lowers CurrentSize either). `max` is derived from
+// a small ledger of lost probe sizes: the ledger starts with the configured
+// ceiling in the first slot, every resolved probe loss inserts its size
+// (ascending), and the largest push-out is what max() reads back. With
+// kPmtuMaxLostProbes=3 slots the algorithm tolerates kPmtuMaxLostProbes-1
+// spurious losses before it shrinks the upper bound, where a loss-based
+// binary-search rung failure (first emit) is only ever (min+max)/2 sized. The
+// probe falls halfway into the remaining interval, so an acknowledged probe
+// raises min and clears its loss record. Search ends once max-min <=
+// kPmtuMaxDiffMtu; a session whose probes are unlucky still converges because
+// each unresolved probe halves the distance to the smallest known loss. Pace:
+// one probe every kPmtuProbeDelayRtt x SRTT (quic-go mtuProbeDelay), a single
+// probe in flight; an unanswered probe is resolved as lost after 2 x SRTT --
+// quic-go resolves it on the loss detector's per-packet timer, and 2 x SRTT
+// sits between a healthy ack (~1 RTT) and the next send slot.
+//
 // Two independent bounds move as a result:
 //   * receive: accepts data/parity symbols up to the probed size once the probe
 //     itself arrived. It must move first: its ack is what tells the peer to
@@ -16,17 +35,12 @@
 //   * send: raises payload_max when the matching ack comes back.
 // A path can be asymmetric, so each direction proves itself.
 //
-// Growth alone is not enough. The probe is small relative to the size it
-// proves: a path can carry a 1472-byte UDP datagram and still drop a
-// 1500-byte IP packet with DF set (PPPoE, some tunnels, a router that cannot
-// reassemble). The probe is answered, the ladder climbs, and then the
-// full-size data disappears -- which is exactly the failure the probe was meant
-// to prevent, and no timer catches it because the ack did arrive. So the send
-// bound is also lowered: a peer report showing the raised size is being lost
-// (session.cc, pmtu_note_loss) drops the send bound back to the configured
-// MTU and closes the ladder for the session. The receive bound is not lowered
-// -- it is a permission, and the peer learns of the black hole from the same
-// loss reports.
+// A probe at a size the receiver's own ceiling cannot accept gets no answer.
+// That is quic-go's peer-advertised bound in implicit form: a QUIC datagram
+// larger than the peer's UDP read buffer is truncated away at the socket and
+// looks identical to the sender (silence), so "never acks above my cap" gives
+// the prober's max() the same information without adding a field to the
+// negotiation.
 //
 // For the ack to mean anything the socket must set DF (reactor.cc): without it
 // a router fragments the oversized probe instead of dropping it, the probe
@@ -54,6 +68,16 @@ constexpr uint8_t kPmtuAck = 1;
 // able to make the receive path accept (and buffer) a datagram beyond a jumbo
 // frame, whatever its own config says.
 constexpr uint16_t kPmtuAbsoluteMaxMtu = 9000;
+
+// Search constants, ported from quic-go mtu_discoverer.go. `maxMTUDiff`:
+// quic-go's "happy to send a packet that's 20 bytes smaller than the actual
+// MTU"; discovery ends once max-min is inside this. `kPmtuMaxLostProbes`:
+// the ledger that makes the search resilient to (kPmtuMaxLostProbes - 1)
+// spurious losses. `kPmtuProbeDelayRtt`: mtuProbeDelay, one probe every
+// N x SRTT.
+constexpr int kPmtuMaxDiffMtu = 20;
+constexpr int kPmtuMaxLostProbes = 3;
+constexpr int kPmtuProbeDelayRtt = 5;
 
 struct PmtuMessage {
   uint8_t type = 0;

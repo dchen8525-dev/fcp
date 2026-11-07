@@ -31,11 +31,10 @@ struct ProxyConfig {
   QString listen = QStringLiteral("127.0.0.1");
   quint16 listen_port = 1080;
   int mtu = 1400;
-  // PMTUD 向上探测（--no-pmtud 关闭）。默认开，和 CLI 一致；黑洞回退已经
-  // 在协议栈里做了，但链路上限极端（例如只回 ICMP 不回数据）时，关掉探测
-  // 是唯一的兜底。
+  // PMTUD 向上探测（--no-pmtud 关闭）。默认开，和 CLI 一致；探测上限是
+  // 引擎内建常量（kDefaultPmtuMaxMtu），不再暴露给用户，接口 MTU 更小
+  // 时由引擎自己收窄。
   bool pmtud = true;
-  int pmtu_max_mtu = 1500;
   int k = -1;
   double fec_budget = 0.5;
   double rate_up_mbps = 0.0;  // 上行限速（--rate-limit=UP[:DOWN]，客户端只发 UP）
@@ -49,7 +48,6 @@ struct SpeedTestConfig {
   int seconds = 8;
   int mtu = 1400;
   bool pmtud = true;
-  int pmtu_max_mtu = 1500;
 };
 
 class Sidecar : public QObject {

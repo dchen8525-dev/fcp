@@ -361,18 +361,18 @@ void TestFecAliases() {
   CHECK(!ok({"--fec=10:3", "--fec=10:4"}));
   CHECK(error.find("more than once") != std::string::npos);
 
-  // --p-max is the controller's ceiling, not dead config: the spec's 5..7
-  // range is unreachable at its default 4. A pinned k above either bound would
-  // be clamped by the local session before negotiation, so it is an error --
-  // the operator would otherwise measure a k they did not configure.
+  // --p-max is the controller's ceiling, not dead config: a pinned k above
+  // either bound would be clamped by the local session before negotiation, so
+  // it is an error -- the operator would otherwise measure a k they did not
+  // configure.
   CHECK(ok({"--p-max=7"}));
   CHECK_EQ(a.ec.p_max, 7);
   CHECK(!ok({"--p-max=8"}));
   CHECK(ok({"--p-max=7", "--fec=10:7", "--k=7"}));
   CHECK_EQ(a.ec.pinned_k, 7);
-  CHECK(!ok({"--k=4"}));  // default p=3 caps it even though --p-max is 4
+  CHECK(!ok({"--k=4"}));  // default p=3 caps it even though --p-max is 6
   CHECK(error.find("--k=4") != std::string::npos);
-  CHECK(!ok({"--fec=10:7", "--k=5"}));  // --p-max still 4
+  CHECK(!ok({"--fec=10:7", "--k=7"}));  // --p-max still the default 6
   CHECK(!ok({"--p-max=5", "--fec=10:5", "--k=6"}));
   CHECK(ok({"--p-max=5", "--fec=10:5", "--k=5"}));
   CHECK(ok({"--k=0"}));  // pinning OFF is always representable
@@ -607,7 +607,7 @@ void TestDefaultsSurvive() {
   CHECK_EQ(a.ec.d, 10);
   CHECK_EQ(a.ec.p, 3);
   CHECK_EQ(a.ec.pinned_k, -1);
-  CHECK_EQ(a.ec.fec_budget, 0.50);
+  CHECK_EQ(a.ec.fec_budget, 0.80);
   CHECK_EQ(a.ec.send_window_bytes, 256u * 1024);
   CHECK_EQ(a.ec.rcv_buf_bytes, 256u * 1024);
   CHECK(a.ec.auto_window);
@@ -641,23 +641,19 @@ void TestDefaultsSurvive() {
   CHECK_EQ(fixed.ec.window_ceiling_bytes, 0u);
   CHECK_EQ(static_cast<int>(fixed.ec.ack_every), 2);
 
-  // Upward PMTUD is on with a 1500 ceiling; --no-pmtud turns it off, and a
-  // ceiling at or below the configured MTU is clamped to "do not probe".
+  // Upward PMTUD is on with the built-in 1500 ceiling; --no-pmtud turns it
+  // off; the positive spelling never existed.
   CHECK(a.ec.pmtud);
   CHECK_EQ(a.ec.pmtu_max_mtu, 1500);
   ProxyArgs no_pmtu;
   CHECK(Ok(EngineRole::kClient, {"--no-pmtud"}, &no_pmtu, &error));
   CHECK(!no_pmtu.ec.pmtud);
-  ProxyArgs jumbo;
-  CHECK(Ok(EngineRole::kClient, {"--pmtu-max=9000"}, &jumbo, &error));
-  CHECK_EQ(jumbo.ec.pmtu_max_mtu, 9000);
-  ProxyArgs below;
-  CHECK(Ok(EngineRole::kClient, {"--mtu=1500", "--pmtu-max=1280"}, &below, &error));
-  CHECK_EQ(below.ec.pmtu_max_mtu, 1500u);  // clamped to the starting MTU
+  // The ladder only climbs, so an --mtu at or above the built-in ceiling
+  // leaves nothing to discover (the config clamps ceiling to the start).
   ProxyArgs big_mtu;
   CHECK(Ok(EngineRole::kClient, {"--mtu=2000"}, &big_mtu, &error));
-  CHECK_EQ(big_mtu.ec.pmtu_max_mtu, 2000u);  // default ceiling follows the start
-  CHECK(!Ok(EngineRole::kClient, {"--pmtu-max=1000"}, &no_pmtu, &error));
+  CHECK_EQ(big_mtu.ec.pmtu_max_mtu, 2000u);
+  CHECK(!Ok(EngineRole::kClient, {"--pmtu-max=1500"}, &no_pmtu, &error));
   // The positive spelling is gone: PMTUD is on unless told otherwise.
   CHECK(!Ok(EngineRole::kClient, {"--pmtud"}, &no_pmtu, &error));
   CHECK(error.find("unknown") != std::string::npos);

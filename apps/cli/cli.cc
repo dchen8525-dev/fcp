@@ -151,7 +151,6 @@ const std::vector<tools::Alias>& OptionAliases() {
       {"--listen", true},
       {"--local-port", true},
       {"--mtu", true},
-      {"--pmtu-max", true},
       {"--fec", true},
       {"--p-max", true},
       {"--k", true},
@@ -221,18 +220,16 @@ void Usage(EngineRole role, const char* argv0) {
       "  -m, --mtu=N          IP packet budget incl. IP+UDP headers (default 1400;\n"
       "                       lowered to fit the largest local interface MTU)\n"
       "  --no-pmtud           do not probe upward past --mtu (PMTUD is on by\n"
-      "                       default; both ends must support it)\n"
-      "  --pmtu-max=N         largest IP packet PMTUD may prove, 1280..9000\n"
-      "                       (default 1500; jumbo is a LAN property, ask for it)\n"
+      "                       default; both ends must support it; the ceiling is\n"
+      "                       built in, 1500, and follows a smaller interface MTU)\n"
       "  --no-udp-gro         disable kernel UDP GRO receive aggregation (Linux\n"
       "                       only; on by default, dropped quietly if the kernel\n"
       "                       cannot)\n"
       "  --fec=D:P            frame geometry (default 10:3)\n"
-      "  --p-max=N            controller parity ceiling 0..7 (default 4; the\n"
-      "                       documented 5..7 range needs this raised)\n"
+      "  --p-max=N            controller parity ceiling 0..7 (default 6)\n"
       "  --k=N                pinned parity per set, -1 = adaptive (default -1;\n"
       "                       must not exceed min(--fec P, --p-max))\n"
-      "  --fec-budget=R       redundancy ceiling parity/data per report, 0 = off (default 0.5)\n"
+      "  --fec-budget=R       redundancy ceiling parity/data per report, 0 = off (default 0.8)\n"
       "  --trace=PREFIX       per-session controller trace JSONL (calibration)\n"
       "  --window=START[:MAX] send window KiB; autotune start + ceiling\n"
       "                       (default 256:1024; START 64..4096 in autotune --\n"
@@ -361,7 +358,6 @@ struct ProxyFlags {
   SeenValue p_max;
   SeenValue k;
   SeenValue mtu;
-  SeenValue pmtu_max;
   bool pmtud_off = false;
   bool prewarm_off = false;
   bool no_auto_window = false;
@@ -430,8 +426,6 @@ bool ApplyValue(const tools::Match& m, ProxyFlags* f, ParsedWindows* windows, Pr
     f->k = {true, v};
   } else if (name == "--mtu") {
     f->mtu = {true, v};
-  } else if (name == "--pmtu-max") {
-    f->pmtu_max = {true, v};
   } else if (name == "--no-pmtud") {
     f->pmtud_off = true;
   } else if (name == "--no-prewarm") {
@@ -823,7 +817,7 @@ void ApplyInterfaceMtu(size_t interface_mtu, ProxyArgs* args) {
   const uint16_t adjusted = MtuForInterface(args->ec.mtu, interface_mtu);
   if (adjusted >= args->ec.mtu) {
     // A larger (or unqueryable) interface leaves both values alone: probing
-    // from the configured MTU up to --pmtu-max is exactly the point.
+    // from the configured MTU up to the built-in ceiling is exactly the point.
     return;
   }
   if (args->mtu_explicit) {
@@ -1108,16 +1102,8 @@ bool parse_proxy_args(EngineRole role, int argc, char** argv, ProxyArgs* out,
     out->ec.mtu = static_cast<uint16_t>(n);
     out->mtu_explicit = true;
   }
-  if (given.pmtu_max.given) {
-    long n = 0;
-    if (!tools::ParseLong("--pmtu-max", given.pmtu_max.value.c_str(), 1280, 9000, &n,
-                          error)) {
-      return false;
-    }
-    out->ec.pmtu_max_mtu = static_cast<uint16_t>(n);
-  }
   // A ceiling below the starting MTU means "never probe upward": the ladder
-  // only climbs. This also covers --mtu 9000 with the default 1500 ceiling.
+  // only climbs. This also covers --mtu 9000 with the built-in 1500 ceiling.
   if (out->ec.pmtu_max_mtu < out->ec.mtu) {
     out->ec.pmtu_max_mtu = out->ec.mtu;
   }

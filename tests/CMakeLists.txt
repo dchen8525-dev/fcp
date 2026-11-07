@@ -72,6 +72,20 @@ endif()
 add_test(NAME cli_test COMMAND fcp_cli_test)
 set_tests_properties(cli_test PROPERTIES TIMEOUT 300)
 
+# fuzz 冒烟（tests/fuzz_test.cc）：确定性种子的进程内变异，覆盖公网解析面
+# （会话 on_wire 全链 + bench/pmtu/fecstat 编解码 + 握手阶段）。不是 fuzzing
+# 战役，是 CI 门禁里的绊线；需要 bench.cc 的编解码器，链接方式同 cli_test。
+add_executable(fcp_fuzz_test fuzz_test.cc
+               ${CMAKE_CURRENT_SOURCE_DIR}/../apps/cli/bench.cc)
+target_include_directories(fcp_fuzz_test PRIVATE
+               ${CMAKE_CURRENT_SOURCE_DIR}/../apps/cli)
+target_link_libraries(fcp_fuzz_test PRIVATE fcp_proxy_core)
+if(WIN32)
+  target_link_libraries(fcp_fuzz_test PRIVATE ws2_32 iphlpapi winmm)
+endif()
+add_test(NAME fuzz_test COMMAND fcp_fuzz_test)
+set_tests_properties(fuzz_test PROPERTIES TIMEOUT 120)
+
 # Loopback UDP sockets need Winsock on Windows. The soak test runs for 8s of
 # simulated time in the default configuration; the C3 acceptance run uses
 # FCP_SOAK_MS=600000 FCP_SOAK_REALTIME=1 (see M1验收记录.md).

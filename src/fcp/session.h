@@ -358,6 +358,13 @@ class Session {
   uint32_t struct_fail_synced_ = 0;
   bool nonce_exhausted_logged_ = false;
 
+  // NAT keepalive bookkeeping (session.cc on_tick): cumulative sealed-wire
+  // bytes, the snapshot compared against them each tick, and the wall time
+  // the mapping was last refreshed by an outbound datagram.
+  uint64_t wire_out_bytes_ = 0;
+  uint64_t keepalive_snapshot_ = 0;
+  int64_t last_wire_out_ms_ = 0;
+
   // PMTUD state, quic-go mtuFinder shape. `pmtu_mtu_` (their `min`) is the
   // largest size the *send* direction has proven -- it starts at the
   // configured MTU and only an ack moves it. `recv_symbol_max_` is the

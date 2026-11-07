@@ -55,6 +55,21 @@ constexpr uint32_t kHandshakeSendBudget = 1u << 16;
 // from making every failing datagram cost a second AEAD attempt.
 constexpr uint32_t kBootstrapProbesPerSecond = 64;
 
+// NAT keepalive (on_tick): the process shares one UDP 5-tuple per peer across
+// all tunnels, and a home/carrier NAT drops the mapping after ~30-60s of
+// silence. A tunnel left open-but-idle would then stall on its first resumed
+// byte: the datagram egresses through a mapping the server no longer matches
+// (unknown salt, dropped, and the stream only finds out after its own RTO).
+// Any outbound datagram refreshes the mapping, so when nothing has gone out
+// for a while, spend the smallest oob we have. oob symbols carry no stream
+// bytes and do not reset the tunnel idle timer. 45s sits under the common
+// 30-60s+ UDP mapping timeouts with margin.
+constexpr int64_t kNatKeepAliveMs = 45000;
+// The smallest oob the peer recognizes and consumes: an 8-byte magic with no
+// fields (on_oob consumes it before the FECSTAT validator would count it).
+constexpr size_t kKeepAliveLen = 8;
+constexpr uint8_t kKeepAliveMagic[kKeepAliveLen] = {'F', 'C', 'P', 'K', 'A', 'L', '1', 0};
+
 // How long the §8 queue guardrail's min-RTT baseline stays valid. Mirrors Bbr's
 // min_rtt_expiry_ms; both controllers read the same "is this a standing queue"
 // question and must not disagree for long.
@@ -382,6 +397,20 @@ void Session::on_tick(int64_t now_ms) {
   reporter_->on_tick(now_ms);
   sync_report_counters();
 
+  // NAT keepalive (see the constants block): fire the smallest oob whenever
+  // the session has been established but silent for a while. Any real
+  // outbound datagram refreshes the silence clock instead.
+  if (hs_.established()) {
+    if (wire_out_bytes_ != keepalive_snapshot_) {
+      keepalive_snapshot_ = wire_out_bytes_;
+      last_wire_out_ms_ = now_ms;
+    } else if (now_ms - last_wire_out_ms_ >= kNatKeepAliveMs) {
+      send_oob(kKeepAliveMagic, kKeepAliveLen);
+      keepalive_snapshot_ = wire_out_bytes_;
+      last_wire_out_ms_ = now_ms;
+    }
+  }
+
   // §8 "无报告": three expected report periods without an inbound FECSTAT mean
   // the feedback path is dead. The peer reports every 2s only while it accounts
   // >= 256 packets per interval; below ~128 pkt/s it falls back to the 60s
@@ -602,6 +631,13 @@ void Session::configure(int64_t now_ms) {
 }
 
 void Session::on_oob(const uint8_t* payload, size_t len, int64_t now_ms) {
+  // The peer's NAT keepalive (see on_tick): an 8-byte magic with no fields.
+  // Nothing to learn from it -- consume before the FECSTAT validator would
+  // count it as a dropped report.
+  if (len == kKeepAliveLen &&
+      std::memcmp(payload, kKeepAliveMagic, kKeepAliveLen) == 0) {
+    return;
+  }
   if (dispatch_handshake(payload, len, now_ms)) {
     return;
   }
@@ -1180,6 +1216,7 @@ void Session::emit_symbol(const TxSymbol& symbol, bool bootstrap) {
     }
     return;
   }
+  wire_out_bytes_ += wire.size();
   send_(wire.data(), wire.size(), hdr_type(symbol.type_k));
 }
 

@@ -734,16 +734,21 @@ std::string BenchSampleJson(const bench::Sample& s) {
   // "wireMbps" is the sender's best one-second offered (framer) rate; "mbps"
   // is the receiver's best one-second delivered rate, post-FEC and post-dedup.
   // The gap between them is FEC redundancy plus whatever the direction lost.
+  // "adaptive" marks a run whose rate controller converged to a delivery
+  // ceiling: wireMbps then sits just above mbps, and the residual lostBytes is
+  // the climb's own overshoot rather than a path problem.
   const double wire_mbps = static_cast<double>(s.wire_bps) / 1e6;
-  char buf[320];
+  char buf[352];
   std::snprintf(buf, sizeof(buf),
                 "{\"mbps\":%.2f,\"wireMbps\":%.2f,\"bytes\":%llu,\"lostBytes\":%llu,"
-                "\"seconds\":%.2f,\"acked\":%s,\"lossPpm\":%u,\"lossN\":%u}",
+                "\"seconds\":%.2f,\"acked\":%s,\"lossPpm\":%u,\"lossN\":%u,"
+                "\"adaptive\":%s}",
                 std::isfinite(s.mbps) ? s.mbps : 0.0,
                 std::isfinite(wire_mbps) ? wire_mbps : 0.0,
                 static_cast<unsigned long long>(s.bytes),
                 static_cast<unsigned long long>(s.lost_bytes), s.seconds,
-                s.acked ? "true" : "false", s.loss_ppm, s.loss_n);
+                s.acked ? "true" : "false", s.loss_ppm, s.loss_n,
+                s.adaptive ? "true" : "false");
   return buf;
 }
 

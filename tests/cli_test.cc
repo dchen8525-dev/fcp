@@ -931,13 +931,17 @@ void TestBenchCodec() {
   CHECK_EQ(decoded.delivered, 0ull);
 
   uint8_t report[kReportPayloadLen] = {};
-  EncodeReport(7, 123456789ull, 987654321ull, 424242ull, report, sizeof(report));
+  EncodeReport(7, 123456789ull, 987654321ull, 424242ull, 555666ull, 987654u, true,
+               report, sizeof(report));
   CHECK(DecodePayload(report, sizeof(report), &decoded));
   CHECK(decoded.type == PayloadType::kReport);
   CHECK_EQ(decoded.sn, 7u);
   CHECK_EQ(decoded.delivered, 123456789ull);
   CHECK_EQ(decoded.best_bps, 987654321ull);
   CHECK_EQ(decoded.down_wire_bps, 424242ull);
+  CHECK_EQ(decoded.down_sent, 555666ull);
+  CHECK_EQ(decoded.capped_ratio_ppm, 987654u);
+  CHECK(decoded.capped);
   // Truncated report, truncated header, and a wrong version are all rejected.
   CHECK(!DecodePayload(report, kReportPayloadLen - 1, &decoded));
   CHECK(!DecodePayload(report, kHeaderLen + 4, &decoded));
@@ -946,6 +950,18 @@ void TestBenchCodec() {
   std::memcpy(bad_version, report, sizeof(report));
   bad_version[kMagicLen] = static_cast<uint8_t>(bad_version[kMagicLen] ^ 0xFF);
   CHECK(!DecodePayload(bad_version, sizeof(bad_version), &decoded));
+
+  // Down report: the client's delivery evidence for the server's controller.
+  uint8_t down_report[kDownReportPayloadLen] = {};
+  EncodeDownReport(11, 987654321ull, 123456ull, down_report, sizeof(down_report));
+  CHECK(DecodePayload(down_report, sizeof(down_report), &decoded));
+  CHECK(decoded.type == PayloadType::kDownReport);
+  CHECK_EQ(decoded.sn, 11u);
+  CHECK_EQ(decoded.delivered, 987654321ull);
+  CHECK_EQ(decoded.best_bps, 123456ull);
+  CHECK_EQ(decoded.down_sent, 0ull);
+  CHECK(!decoded.capped);
+  CHECK(!DecodePayload(down_report, kDownReportPayloadLen - 1, &decoded));
 
   // Ping payloads are kHeaderLen + ts; the echo flips only the type byte.
   uint8_t ping[kPingPayloadLen] = {};
@@ -962,15 +978,108 @@ void TestBenchCodec() {
   // A ping with only its header is rejected.
   CHECK(!DecodePayload(ping, kHeaderLen, &decoded));
 
-  // Ramp: x1.5 per interval, saturating at the ceiling.
-  Ramp ramp;
-  CHECK(ramp.bps() == kStartBps);
-  ramp.Advance();
-  CHECK(ramp.bps() == kStartBps * 1.5);
-  for (int i = 0; i < 100; ++i) {
-    ramp.Advance();
+  // RateController against a lagged capped path: arrivals answer the PREVIOUS
+  // epoch's offer (one RTT late), so the controller's lag-tolerant ratio
+  // (got / previous offer) must read a healthy climb as healthy, and converge
+  // exactly when the offered size first exceeds the path's cap. The naive
+  // current-epoch ratio would read the climb itself as loss and converge on
+  // the first ramp step.
+  struct LagPath {
+    double cap;       // bits/s the path can deliver
+    uint64_t sent = 0;
+    uint64_t got = 0;
+    uint64_t prev_offered = 0;  // bytes offered last epoch
+    int64_t now = 0;
+    double Feed(RateController& ctrl, double offered_bps) {
+      now += 250;
+      const uint64_t offered = static_cast<uint64_t>(offered_bps / 8.0 * 0.25);
+      const uint64_t deliverable = static_cast<uint64_t>(cap / 8.0 * 0.25);
+      const uint64_t arrive = std::min(prev_offered, deliverable);
+      prev_offered = offered;
+      sent += offered;
+      got += arrive;
+      return ctrl.Feed(now, sent, got);
+    }
+  };
+
+  // The real-shaped case: 52.5 Mbps uplink (measured on the WAN test path).
+  {
+    LagPath path{52.5e6};
+    RateController ctrl;
+    ctrl.Reset(0);
+    double rate = ctrl.rate();
+    double max_seen = 0.0;
+    double min_after_cap = 1e12;
+    bool saw_capped = false;
+    bool saw_healthy_window = false;
+    for (int i = 0; i < 24; ++i) {  // 6 seconds
+      rate = path.Feed(ctrl, rate);
+      max_seen = std::max(max_seen, rate);
+      if (saw_capped) {
+        min_after_cap = std::min(min_after_cap, rate);
+        // The hold windows read no alarm-worthy loss (backlog washes out);
+        // probe epochs dilute the ratio by design, so any healthy window
+        // counts, not the last one.
+        saw_healthy_window = saw_healthy_window || ctrl.capped_ratio_ppm() > 900000;
+      }
+      saw_capped = saw_capped || ctrl.state() == RateController::State::kCapped;
+    }
+    CHECK(saw_capped);
+    // After the first convergence the controller keeps returning to the cap
+    // (probes above it, re-converges on the loss it sees there).
+    CHECK(min_after_cap <= 52.5e6 * 1.06);
+    // And it does probe above the cap: the ceiling is re-checked, not frozen.
+    CHECK(max_seen > 52.5e6 * 1.2);
+    CHECK(max_seen <= kMaxBps);
+    CHECK(saw_healthy_window);
   }
-  CHECK(ramp.bps() == kMaxBps);
+
+  // An uncapped path climbs all the way and reports no ceiling.
+  {
+    LagPath path{1e10};
+    RateController ctrl;
+    ctrl.Reset(0);
+    double rate = ctrl.rate();
+    for (int i = 1; i <= 12; ++i) {
+      rate = path.Feed(ctrl, rate);
+      // During a pure healthy climb (no cap) the controller must never
+      // converge -- this is the premature-convergence regression.
+      if (i <= 8) {
+        CHECK(ctrl.state() == RateController::State::kProbing);
+      }
+    }
+    CHECK(ctrl.state() == RateController::State::kMaxed);
+    CHECK(ctrl.rate() == kMaxBps);
+    CHECK(ctrl.capped_ratio_ppm() == 0);
+  }
+
+  // No offering between reports: nothing learned, nothing changed.
+  {
+    LagPath path{52.5e6};
+    RateController ctrl;
+    ctrl.Reset(0);
+    path.Feed(ctrl, kStartBps);
+    const double frozen = ctrl.rate();
+    const uint32_t ppm = ctrl.capped_ratio_ppm();
+    ctrl.Feed(1750, path.sent, path.got);  // same totals: no delta
+    CHECK(ctrl.rate() == frozen);
+    CHECK(ctrl.capped_ratio_ppm() == ppm);
+  }
+
+  // A path that carries everything up to the probe ceiling ends kMaxed.
+  RateController maxed;
+  maxed.Reset(0);
+  uint64_t sent = 0;
+  uint64_t got = 0;
+  for (int i = 1; i <= 16; ++i) {
+    const double rate = maxed.rate();
+    sent += static_cast<uint64_t>(rate / 8.0 * 0.25);
+    got = sent;
+    maxed.Feed(i * 250, sent, got);
+  }
+  CHECK(maxed.state() == RateController::State::kMaxed);
+  CHECK(maxed.rate() == kMaxBps);
+  CHECK(maxed.capped_ratio_ppm() == 0);
 
   // RateWindow: 1000 bytes per 100ms for one second = 80000 bps. A single
   // burst narrower than half a window must not set a peak.

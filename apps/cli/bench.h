@@ -61,18 +61,26 @@ namespace bench {
 // client's key derivation; the magic alone authorizes nothing.
 constexpr size_t kMagicLen = 8;
 constexpr size_t kSaltLen = 8;
-constexpr uint16_t kVersion = 1;
+constexpr uint16_t kVersion = 2;
 constexpr size_t kRendezvousLen = kMagicLen + 2 + 2 + kSaltLen;  // 20
 
 constexpr size_t kHeaderLen = 16;
 constexpr size_t kDataPayloadLen = 1200;  // <= payload_max at the default MTU
-// magic[8] + version[2] + type[1] + reserved[1] + sn[4] + delivered[8] +
-// best_bps[8] + down_wire_bps[8]. down_wire_bps is the sender's best
-// one-second offered (framer) rate for the download direction -- the same side
-// and the same scale as the receiver's best_bps, so the desktop can put wire
-// and received side by side without an averaging-window mismatch. Reports are
-// fixed length; no version tolerance.
-constexpr size_t kReportPayloadLen = kHeaderLen + 24;
+// magic[8] + version[2] + type[1] + reserved[1] + sn[4] | body:
+//   delivered[8] | best_bps[8] | down_wire_bps[8] | down_sent[8] |
+//   capped_ratio_ppm[4] | capped[1] | reserved[3]
+// delivered/best_bps describe the server's *upload* accounting (it is the
+// receiver there); down_wire_bps is the server's best one-second offered
+// (framer) rate for the download direction; down_sent is the server's
+// cumulative offered download user bytes, against which the client computes
+// download.loss_bytes; capped/capped_ratio_ppm describe the server's rate
+// controller for the download direction (0/never-capped when the climb never
+// hit a ceiling). Reports are fixed length; no version tolerance.
+constexpr size_t kReportPayloadLen = kHeaderLen + 40;
+// magic[8] .. sn[4] | delivered[8] | best_bps[8]. The client's download-side
+// delivery report (client -> server), feeding the server's rate controller the
+// same way the server's kReport feeds the client's.
+constexpr size_t kDownReportPayloadLen = kHeaderLen + 16;
 // magic[8] .. sn[4] + ts[8]. The ts is the sender's NowMs; the echo carries it
 // back untouched, and whoever sent the ping turns the difference into an RTT
 // sample.
@@ -83,17 +91,20 @@ constexpr int kMinSeconds = 3;
 constexpr int kMaxSeconds = 30;
 constexpr int kDefaultSeconds = 8;
 
-// Offered-rate ramp. 20 Mbps -> 1 Gbps takes about eight seconds, which fits
-// the shortest phase; above 1 Gbps the probe stops growing and the reported
-// number becomes the link's ceiling under this test.
+// Offered-rate bounds shared by the rate controller. The climb starts at
+// kStartBps and stops growing at kMaxBps; a path that carries kMaxBps reports
+// no ceiling under this test.
 constexpr double kStartBps = 20e6;
 constexpr double kMaxBps = 1000e6;
-constexpr int64_t kRampMs = 500;
+// Floor for a converged rate: below this the test would measure nothing worth
+// reporting, and pathological feedback (a report racing a phase change) must
+// not collapse the offered rate to zero.
+constexpr double kMinBps = 4e6;
 
 // Receiver bookkeeping.
 constexpr int64_t kWindowMs = 1000;
 constexpr int64_t kSilenceMs = 700;   // no data for this long = direction done
-constexpr int64_t kReportMs = 250;    // server -> client upload progress
+constexpr int64_t kReportMs = 250;    // delivery-report cadence, both directions
 // The server goes silent once the upload stops, so the client has to outlast
 // the server's own silence detector (kSilenceMs) before it can judge the
 // result, on top of the last report still being in flight.
@@ -105,7 +116,14 @@ constexpr int64_t kSettleBeforePhaseMs = 300;
 // reactor's 25ms tick. Two seconds is far beyond any of those.
 constexpr int64_t kFinalReportsMs = 2000;
 
-enum class PayloadType : uint8_t { kData = 0, kReport = 1, kPing = 2, kPingEcho = 3 };
+enum class PayloadType : uint8_t {
+  kData = 0,
+  kReport = 1,      // server -> client: upload delivery + download wire/loss info
+  kPing = 2,
+  kPingEcho = 3,
+  kDownReport = 4,  // client -> server: download delivery, feeds the server's
+                    // rate controller the same way kReport feeds the client's
+};
 
 extern const uint8_t kMagic[kMagicLen];
 
@@ -125,7 +143,11 @@ bool IsMagicPrefix(const uint8_t* data, size_t len);
 // is zero. A unique `sn` per payload keeps the frame layer's dedup honest.
 void EncodeData(uint32_t sn, uint8_t* out, size_t len);
 void EncodeReport(uint32_t sn, uint64_t delivered, uint64_t best_bps,
-                  uint64_t down_wire_bps, uint8_t* out, size_t len);
+                  uint64_t down_wire_bps, uint64_t down_sent,
+                  uint32_t capped_ratio_ppm, bool capped, uint8_t* out,
+                  size_t len);
+void EncodeDownReport(uint32_t sn, uint64_t delivered, uint64_t best_bps,
+                      uint8_t* out, size_t len);
 // Ping bodies carry the sender's NowMs; the echo reverses only the type byte
 // and keeps the sn (already unique at the sender).
 void EncodePing(uint32_t sn, uint64_t timestamp, uint8_t* out, size_t len);
@@ -134,9 +156,12 @@ void EncodePingEcho(uint32_t sn, uint64_t timestamp, uint8_t* out, size_t len);
 struct DecodedPayload {
   PayloadType type = PayloadType::kData;
   uint32_t sn = 0;
-  uint64_t delivered = 0;  // kReport only: receiver's cumulative user bytes
-  uint64_t best_bps = 0;   // kReport only: receiver's best one-second goodput
+  uint64_t delivered = 0;      // kReport/kDownReport: receiver's cumulative user bytes
+  uint64_t best_bps = 0;       // kReport/kDownReport: receiver's best one-second goodput
   uint64_t down_wire_bps = 0;  // kReport only: sender's download wire rate
+  uint64_t down_sent = 0;      // kReport only: sender's cumulative offered download bytes
+  uint32_t capped_ratio_ppm = 0;  // kReport only: download controller steady ratio
+  bool capped = false;            // kReport only: download controller hit a ceiling
   uint64_t timestamp = 0;  // kPing / kPingEcho only
 };
 bool DecodePayload(const uint8_t* payload, size_t len, DecodedPayload* out);
@@ -146,18 +171,157 @@ inline uint64_t UserBytes(size_t payload_len) {
   return payload_len > kHeaderLen ? payload_len - kHeaderLen : 0;
 }
 
-// Exponential offered-rate schedule. Pure so the ramp is testable without a
-// socket.
-class Ramp {
+// Delivery-feedback rate controller for the bench. Neither direction has a
+// congestion controller of its own (see the header comment), so the offered
+// rate is steered by the receiver's periodic delivery reports instead of the
+// old open-loop ramp: climb while what is sent is what arrives, converge to
+// the measured delivery rate when arrivals fall well behind, hold for a
+// steady window, then probe gently above the ceiling again -- the controller
+// hugs the path's real cap instead of trusting one report.
+//
+// The delivery ratio is lag-tolerant by construction: bytes answering an
+// epoch's offer arrive about one RTT later, i.e. in the NEXT report on a
+// path whose RTT is at least one report period. So the ratio compares this
+// report's arrivals against the PREVIOUS report's offered size, not the
+// current one -- comparing against the current offer reads the normal climb
+// as loss and converges on the first ramp step (measured on a 273ms-RTT
+// path: the naive ratio converges at 1/1.5 of the ramp step).
+//
+// Feeding is once per delivery report; deltas are cumulative-counter
+// differences, both sides counted in user bytes, so they are
+// apples-to-apples. One ambiguous report (ratio between the thresholds)
+// decides nothing.
+class RateController {
  public:
-  explicit Ramp(double bps = kStartBps) : bps_(bps) {}
-  void Reset(double bps = kStartBps) { bps_ = bps; }
-  // One probe interval elapsed: multiply by 1.5, saturating at kMaxBps.
-  void Advance();
-  double bps() const { return bps_; }
+  enum class State : uint8_t { kProbing, kCapped, kMaxed };
+
+  void Reset(int64_t now_ms) {
+    state_ = State::kProbing;
+    rate_ = kStartBps;
+    now_ = now_ms;
+    prev_sent_ = 0;
+    prev_got_ = 0;
+    prev_sent_delta_ = 0;
+    have_prev_ = false;
+    converged_ = false;
+    capped_at_ms_ = 0;
+    cap_base_sent_ = 0;
+    cap_base_got_ = 0;
+    capped_ratio_ppm_ = 0;
+  }
+
+  // Returns the offered rate to use until the next feed. The first feed only
+  // sets the baseline (no delta yet, and no lag reference to compare against).
+  double Feed(int64_t now_ms, uint64_t sent_total, uint64_t got_total) {
+    if (!have_prev_) {
+      have_prev_ = true;
+      prev_sent_ = sent_total;
+      prev_got_ = got_total;
+      now_ = now_ms;
+      return rate_;
+    }
+    const uint64_t sent_delta = sent_total >= prev_sent_ ? sent_total - prev_sent_ : 0;
+    const uint64_t got_delta = got_total >= prev_got_ ? got_total - prev_got_ : 0;
+    const uint64_t ref_sent = prev_sent_delta_;  // last epoch's offer size
+    prev_sent_ = sent_total;
+    prev_got_ = got_total;
+    prev_sent_delta_ = sent_delta;
+    const int64_t dt = now_ms - now_;
+    now_ = now_ms;
+    if (sent_delta == 0 && got_delta == 0) {
+      return rate_;  // nothing moved since the last report: nothing to learn
+    }
+    const double ratio =
+        ref_sent > 0 ? static_cast<double>(got_delta) / static_cast<double>(ref_sent)
+                     : 1.0;  // first delta: no lag reference, assume healthy
+    // A converged rate re-opens for probing after the hold: one report epoch
+    // above the ceiling is the price of checking whether the cap moved.
+    if (converged_ && now_ms - capped_at_ms_ >= kCapHoldMs) {
+      converged_ = false;
+      rate_ = std::min(kMaxBps, rate_ * kResumeClimb);
+      prev_sent_delta_ = 0;  // the probe's size is new; skip one lag reference
+    }
+    if (!converged_) {
+      if (ratio < kProbeLossRatio && got_delta > 0 && sent_delta > 0) {
+        // The path has a ceiling below what we are offering. Converge to the
+        // delivered rate with a small margin.
+        Converge(now_ms, sent_total, got_total, GotBps(got_delta, dt));
+      } else if (ratio >= kProbeOkRatio) {
+        if (rate_ >= kMaxBps) {
+          state_ = State::kMaxed;
+        } else {
+          rate_ = std::min(kMaxBps, rate_ * kProbeClimb);
+        }
+      }
+      // Between the thresholds: hold -- the offer is in transition (in-flight
+      // backlog catching up), so one report must not conclude.
+    } else if (ratio < kProbeLossRatio && got_delta > 0 && ref_sent > 0) {
+      // The converged margin is still too generous: re-converge lower and
+      // restart the hold.
+      Converge(now_ms, sent_total, got_total, GotBps(got_delta, dt));
+    }
+    if (converged_ && sent_total >= cap_base_sent_) {
+      const uint64_t window_sent = sent_total - cap_base_sent_;
+      const uint64_t window_got = got_total >= cap_base_got_ ? got_total - cap_base_got_ : 0;
+      capped_ratio_ppm_ =
+          window_sent > 0
+              ? static_cast<uint32_t>((window_got * 1000000ull + window_sent / 2) /
+                                      window_sent)
+              : 0;
+    }
+    return rate_;
+  }
+
+  double rate() const { return rate_; }
+  State state() const { return state_; }
+  // Delivery ratio since the last convergence point, in ppm. Zero while
+  // never capped. Drives the result's acked/error semantics: the climb's
+  // overshoot is the probe's own cost, loss at the converged rate is the
+  // path's.
+  uint32_t capped_ratio_ppm() const { return capped_ratio_ppm_; }
 
  private:
-  double bps_;
+  static double GotBps(uint64_t got_delta, int64_t dt_ms) {
+    return static_cast<double>(got_delta) * 8.0 * 1000.0 / static_cast<double>(dt_ms);
+  }
+  void Converge(int64_t now_ms, uint64_t sent_total, uint64_t got_total,
+                double got_bps) {
+    rate_ = std::min(kMaxBps, std::max(kMinBps, got_bps * kCapMargin));
+    state_ = State::kCapped;
+    converged_ = true;
+    capped_at_ms_ = now_ms;
+    cap_base_sent_ = sent_total;
+    cap_base_got_ = got_total;
+    capped_ratio_ppm_ = 0;
+  }
+  // Climb while healthy; converge on sustained loss. The middle band is the
+  // in-flight transition, held for one more report before concluding. After a
+  // convergence the controller pauses (kCapHoldMs) and then re-probes gently
+  // (kResumeClimb), so a premature or stale ceiling gets re-checked within
+  // the same run.
+  static constexpr double kProbeClimb = 1.5;
+  static constexpr double kResumeClimb = 1.3;
+  static constexpr double kProbeOkRatio = 0.95;
+  static constexpr double kProbeLossRatio = 0.80;
+  static constexpr double kCapMargin = 1.05;
+  static constexpr int64_t kCapHoldMs = 1500;
+  // Floor for a converged rate: below this the test would measure nothing
+  // worth reporting, and pathological feedback must not collapse the offered
+  // rate to zero.
+  static constexpr double kMinBps = 4e6;
+
+  State state_ = State::kProbing;
+  double rate_ = kStartBps;
+  int64_t now_ = 0;
+  uint64_t prev_sent_ = 0;
+  uint64_t prev_got_ = 0;
+  uint64_t prev_sent_delta_ = 0;
+  bool have_prev_ = false;
+  bool converged_ = false;
+  int64_t capped_at_ms_ = 0;
+  uint64_t cap_base_sent_ = 0;
+  uint64_t cap_base_got_ = 0;
+  uint32_t capped_ratio_ppm_ = 0;
 };
 
 // Best one-second delivered-rate window seen so far. Buckets are 100ms of
@@ -220,6 +384,10 @@ struct Sample {
   // Pre-FEC raw loss of this direction's receive side, as last reported.
   uint32_t loss_ppm = 0;
   uint32_t loss_n = 0;
+  // The rate controller converged to a delivery ceiling (steady-state
+  // measurement). With it, wireMbps sits just above mbps and the residual
+  // "lostBytes" is the climb's own overshoot, not a path problem.
+  bool adaptive = false;
 };
 
 // RTT samples from the ping/echo exchange across the whole run.
@@ -321,8 +489,7 @@ class BenchServer {
   uint32_t sn_ = 1;
   double tokens_ = 0.0;
   int64_t token_ms_ = 0;
-  int64_t last_ramp_ms_ = 0;
-  bench::Ramp ramp_;
+  bench::RateController down_ctrl_;  // download offered-rate controller
 
   uint64_t upload_bytes_ = 0;
   bench::RateWindow upload_window_;

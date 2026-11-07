@@ -126,7 +126,8 @@ void EncodeData(uint32_t sn, uint8_t* out, size_t len) {
 }
 
 void EncodeReport(uint32_t sn, uint64_t delivered, uint64_t best_bps,
-                  uint64_t down_wire_bps, uint8_t* out, size_t len) {
+                  uint64_t down_wire_bps, uint64_t down_sent,
+                  uint32_t capped_ratio_ppm, bool capped, uint8_t* out, size_t len) {
   if (out == nullptr || len < kReportPayloadLen) {
     return;
   }
@@ -135,6 +136,20 @@ void EncodeReport(uint32_t sn, uint64_t delivered, uint64_t best_bps,
   put_le64(delivered, out + kHeaderLen);
   put_le64(best_bps, out + kHeaderLen + 8);
   put_le64(down_wire_bps, out + kHeaderLen + 16);
+  put_le64(down_sent, out + kHeaderLen + 24);
+  put_le32(capped_ratio_ppm, out + kHeaderLen + 32);
+  out[kHeaderLen + 36] = capped ? 1 : 0;
+}
+
+void EncodeDownReport(uint32_t sn, uint64_t delivered, uint64_t best_bps,
+                      uint8_t* out, size_t len) {
+  if (out == nullptr || len < kDownReportPayloadLen) {
+    return;
+  }
+  EncodeData(sn, out, len);
+  out[kMagicLen + 2] = static_cast<uint8_t>(PayloadType::kDownReport);
+  put_le64(delivered, out + kHeaderLen);
+  put_le64(best_bps, out + kHeaderLen + 8);
 }
 
 void EncodePing(uint32_t sn, uint64_t timestamp, uint8_t* out, size_t len) {
@@ -163,6 +178,7 @@ bool DecodePayload(const uint8_t* payload, size_t len, DecodedPayload* out) {
   const uint8_t type = payload[kMagicLen + 2];
   if (type != static_cast<uint8_t>(PayloadType::kData) &&
       type != static_cast<uint8_t>(PayloadType::kReport) &&
+      type != static_cast<uint8_t>(PayloadType::kDownReport) &&
       type != static_cast<uint8_t>(PayloadType::kPing) &&
       type != static_cast<uint8_t>(PayloadType::kPingEcho)) {
     return false;
@@ -172,6 +188,9 @@ bool DecodePayload(const uint8_t* payload, size_t len, DecodedPayload* out) {
   out->delivered = 0;
   out->best_bps = 0;
   out->down_wire_bps = 0;
+  out->down_sent = 0;
+  out->capped_ratio_ppm = 0;
+  out->capped = false;
   out->timestamp = 0;
   if (out->type == PayloadType::kReport) {
     if (len < kReportPayloadLen) {
@@ -180,6 +199,15 @@ bool DecodePayload(const uint8_t* payload, size_t len, DecodedPayload* out) {
     out->delivered = get_le64(payload + kHeaderLen);
     out->best_bps = get_le64(payload + kHeaderLen + 8);
     out->down_wire_bps = get_le64(payload + kHeaderLen + 16);
+    out->down_sent = get_le64(payload + kHeaderLen + 24);
+    out->capped_ratio_ppm = get_le32(payload + kHeaderLen + 32);
+    out->capped = payload[kHeaderLen + 36] != 0;
+  } else if (out->type == PayloadType::kDownReport) {
+    if (len < kDownReportPayloadLen) {
+      return false;
+    }
+    out->delivered = get_le64(payload + kHeaderLen);
+    out->best_bps = get_le64(payload + kHeaderLen + 8);
   } else if (out->type == PayloadType::kPing ||
              out->type == PayloadType::kPingEcho) {
     if (len < kPingPayloadLen) {
@@ -188,10 +216,6 @@ bool DecodePayload(const uint8_t* payload, size_t len, DecodedPayload* out) {
     out->timestamp = get_le64(payload + kHeaderLen);
   }
   return true;
-}
-
-void Ramp::Advance() {
-  bps_ = std::min(kMaxBps, bps_ * 1.5);
 }
 
 // One bench at a time per process: two sessions would interleave on the same
@@ -449,14 +473,21 @@ bool RunClient(const ClientOptions& opt, const ProgressFn& progress, Result* out
   uint64_t up_reported = 0;
   uint64_t up_best_bps = 0;
   uint64_t down_wire_bps = 0;
+  // The server's download-side accounting, carried by every kReport: against
+  // its cumulative offered bytes we compute download loss, and its rate
+  // controller's steady-state delivery ratio decides the alarm semantics.
+  uint64_t down_sent_reported = 0;
+  bool down_capped = false;
+  uint32_t down_capped_ratio_ppm = 0;
   bool have_report = false;
+  RateController up_ctrl;
   RttAcc rtt;
   RateWindow down_window;
   RateWindow up_offered_window;
   int64_t first_down_ms = 0;
   int64_t last_down_ms = 0;
   int64_t phase_start = 0;
-  int64_t next_ramp = 0;
+  int64_t next_down_report = 0;
   int64_t next_ping = 0;
 
   Session session(
@@ -500,6 +531,14 @@ bool RunClient(const ClientOptions& opt, const ProgressFn& progress, Result* out
             have_report = true;
           }
           down_wire_bps = std::max(down_wire_bps, decoded.down_wire_bps);
+          down_sent_reported = std::max(down_sent_reported, decoded.down_sent);
+          down_capped = down_capped || decoded.capped;
+          down_capped_ratio_ppm =
+              decoded.capped ? decoded.capped_ratio_ppm : down_capped_ratio_ppm;
+          // Steer the offered rate by what the server actually received.
+          if (phase == Phase::kUpload) {
+            up_ctrl.Feed(NowMs(), up_sent, up_reported);
+          }
         }
       },
       [](const std::string&) {});
@@ -518,7 +557,6 @@ bool RunClient(const ClientOptions& opt, const ProgressFn& progress, Result* out
   uint32_t sn = 1;
   double tokens = 0.0;
   int64_t token_ms = NowMs();
-  Ramp ramp;
   int64_t next_tick = 0;
   int64_t next_progress = NowMs() + 200;
   bool fatal = false;
@@ -573,7 +611,16 @@ bool RunClient(const ClientOptions& opt, const ProgressFn& progress, Result* out
           fatal = true;
         }
         break;
-      case Phase::kDownload:
+      case Phase::kDownload: {
+        // Feed the server's rate controller: what we received is its evidence,
+        // exactly like the server's reports steer our upload.
+        if (now >= next_down_report) {
+          uint8_t down_report[kDownReportPayloadLen];
+          EncodeDownReport(sn++, down_bytes, down_window.best_bps(), down_report,
+                           sizeof(down_report));
+          session.on_kcp_output(down_report, sizeof(down_report), now);
+          next_down_report = now + kReportMs;
+        }
         if (down_bytes > 0 && now - last_down_ms >= kSilenceMs) {
           phase = Phase::kWarmup;
           phase_start = now;
@@ -582,28 +629,26 @@ bool RunClient(const ClientOptions& opt, const ProgressFn& progress, Result* out
           fatal = true;
         }
         break;
+      }
       case Phase::kWarmup:
         if (now - phase_start >= kSettleBeforePhaseMs) {
           phase = Phase::kUpload;
           phase_start = now;
-          next_ramp = now + kRampMs;
+          up_ctrl.Reset(now);
           token_ms = now;
           tokens = 0.0;
         }
         break;
       case Phase::kUpload: {
-        if (now >= next_ramp) {
-          ramp.Advance();
-          next_ramp = now + kRampMs;
-        }
+        const double rate = up_ctrl.rate();
         const double dt = static_cast<double>(now - token_ms) / 1000.0;
         token_ms = now;
         // Tokens are bits; one segment costs its wire size in bits. The cap is
         // 50ms of budget, so a coarse tick (the reactor's 25ms) never throws
         // away offered rate before it can be spent.
         const double wire_per_seg = WireBytesPerSegment() * 8.0;
-        tokens = std::min(tokens + ramp.bps() * dt,
-                          std::max(ramp.bps() * 0.05, wire_per_seg));
+        tokens = std::min(tokens + rate * dt,
+                          std::max(rate * 0.05, wire_per_seg));
         int burst = 0;
         while (tokens >= wire_per_seg && burst < 4096) {
           put_le32(sn++, payload + 12);
@@ -664,10 +709,22 @@ bool RunClient(const ClientOptions& opt, const ProgressFn& progress, Result* out
     result.download.seconds =
         first_down_ms != 0 ? static_cast<double>(last_down_ms - first_down_ms) / 1000.0
                            : 0.0;
-    result.download.acked = true;
-    // The server's wire rate rides every report; reports stay cumulative-safe,
-    // the best window only grows.
     result.download.wire_bps = down_wire_bps;
+    result.download.adaptive = down_capped;
+    // The server reports what it offered; whatever we never received of that
+    // is download loss the FEC/ARQ could not recover.
+    if (down_sent_reported > down_bytes) {
+      result.download.lost_bytes = down_sent_reported - down_bytes;
+    }
+    // Alarm on delivery loss at the converged rate only: the climb's overshoot
+    // is the probe's own cost, not a path property.
+    result.download.acked = !down_capped || down_capped_ratio_ppm <= 10000;
+    if (down_capped && down_capped_ratio_ppm > 10000 && result.error.empty()) {
+      const double pct = (1000000ull - down_capped_ratio_ppm) / 10000.0;
+      char line[96];
+      std::snprintf(line, sizeof(line), "下行有 %.1f%% 未送达", pct);
+      result.error = line;
+    }
     if (session.reporter() != nullptr) {
       const uint32_t expected = session.reporter()->last_expected();
       const uint32_t lost = session.reporter()->last_lost();
@@ -688,25 +745,24 @@ bool RunClient(const ClientOptions& opt, const ProgressFn& progress, Result* out
     result.upload.bytes = up_reported;
     result.upload.mbps = static_cast<double>(up_best_bps) / 1e6;
     result.upload.seconds = static_cast<double>(opt.seconds);
-    result.upload.acked = true;
     // The client's own framer rate, best one-second window of what we poured.
     result.upload.wire_bps = up_offered_window.best_bps();
-    // The server counts what arrived, not what we handed to the framer. It
-    // can only report at least as much as we sent (we stop sending first and
-    // wait out the drain), so a smaller number is FEC/ARQ loss the upload
-    // could not recover -- never report that as confirmed.
+    result.upload.adaptive = up_ctrl.state() == RateController::State::kCapped;
+    // The server counts what arrived, not what we handed to the framer. With
+    // the controller converged, what is missing is the climb's own overshoot
+    // (a few packets in flight above the ceiling) plus any true loss at the
+    // converged rate -- only the latter is worth alarming about.
     if (up_reported < up_sent) {
-      result.upload.acked = false;
       result.upload.lost_bytes = up_sent - up_reported;
-      if (result.error.empty()) {
-        const double pct = up_sent > 0
-                               ? 100.0 * static_cast<double>(result.upload.lost_bytes) /
-                                     static_cast<double>(up_sent)
-                               : 0.0;
-        char line[96];
-        std::snprintf(line, sizeof(line), "上行有 %.1f%% 未到达服务端", pct);
-        result.error = line;
-      }
+    }
+    result.upload.acked =
+        !result.upload.adaptive || up_ctrl.capped_ratio_ppm() <= 10000;
+    if (result.upload.adaptive && up_ctrl.capped_ratio_ppm() > 10000 &&
+        result.error.empty()) {
+      const double pct = (1000000ull - up_ctrl.capped_ratio_ppm()) / 10000.0;
+      char line[96];
+      std::snprintf(line, sizeof(line), "上行有 %.1f%% 未到达服务端", pct);
+      result.error = line;
     }
     result.have_upload = true;
   } else if (result.error.empty()) {
@@ -753,7 +809,6 @@ void BenchServer::Reset() {
   upload_window_.Reset();
   tokens_ = 0.0;
   token_ms_ = 0;
-  last_ramp_ms_ = 0;
   // last_echo_ms_ is not reset: it throttles the "busy slot" echo path too,
   // and StartSession replies to its own rendezvous explicitly.
 }
@@ -889,8 +944,17 @@ void BenchServer::OnDelivered(const uint8_t* payload, size_t len, int64_t now_ms
     session_->on_kcp_output(echo, sizeof(echo), now_ms);
     return;
   }
+  if (decoded.type == bench::PayloadType::kDownReport) {
+    // The client's delivery evidence: feed the download controller exactly
+    // like the server's reports feed the client's upload controller. The
+    // offered total is this sender's own window sum (user bytes, cumulative).
+    if (phase_ == Phase::kDownload) {
+      down_ctrl_.Feed(now_ms, download_window_.total_bytes(), decoded.delivered);
+    }
+    return;
+  }
   if (decoded.type != bench::PayloadType::kData) {
-    return;  // the client does not send reports
+    return;  // the client sends no other traffic than data, pings and these reports
   }
   if (phase_ == Phase::kAwaitUpload) {
     phase_ = Phase::kUpload;
@@ -914,7 +978,10 @@ void BenchServer::SendReport(int64_t now_ms, bool final) {
   }
   uint8_t report[bench::kReportPayloadLen] = {};
   bench::EncodeReport(sn_++, upload_bytes_, upload_window_.best_bps(),
-                      download_window_.best_bps(), report, sizeof(report));
+                      download_window_.best_bps(), download_window_.total_bytes(),
+                      down_ctrl_.capped_ratio_ppm(),
+                      down_ctrl_.state() == bench::RateController::State::kCapped,
+                      report, sizeof(report));
   session_->on_kcp_output(report, sizeof(report), now_ms);
   last_report_ms_ = now_ms;
   // final is true for every repeat of the final report; log the outcome once.
@@ -932,22 +999,18 @@ void BenchServer::ApplyTokens(int64_t now_ms) {
   if (session_ == nullptr || now_ms < phase_start_ms_) {
     return;
   }
-  if (last_ramp_ms_ == 0) {
-    last_ramp_ms_ = now_ms;
+  if (token_ms_ == 0) {
     token_ms_ = now_ms;
-  }
-  if (now_ms - last_ramp_ms_ >= bench::kRampMs) {
-    ramp_.Advance();
-    last_ramp_ms_ = now_ms;
   }
   const double dt = static_cast<double>(now_ms - token_ms_) / 1000.0;
   token_ms_ = now_ms;
   // Bits in, bits out: one segment costs its wire size in bits (see the
   // client's bucket). The reactor ticks every 25ms, so the 50ms cap is what
-  // keeps the offered rate intact between ticks.
+  // keeps the offered rate intact between ticks. The rate is the download
+  // controller's: steered by the client's delivery reports, not an open ramp.
   const double wire_per_seg = bench::WireBytesPerSegment() * 8.0;
-  tokens_ = std::min(tokens_ + ramp_.bps() * dt,
-                     std::max(ramp_.bps() * 0.05, wire_per_seg));
+  tokens_ = std::min(tokens_ + down_ctrl_.rate() * dt,
+                     std::max(down_ctrl_.rate() * 0.05, wire_per_seg));
   const bool offering = phase_ == Phase::kDownload;
   int burst = 0;
   while (tokens_ >= wire_per_seg && burst < 4096) {
@@ -988,8 +1051,7 @@ void BenchServer::OnTick(int64_t now_ms) {
         download_end_ms_ = phase_start_ms_ + static_cast<int64_t>(seconds_) * 1000;
         tokens_ = 0.0;
         token_ms_ = phase_start_ms_;
-        last_ramp_ms_ = 0;
-        ramp_.Reset();
+        down_ctrl_.Reset(phase_start_ms_);
       }
       break;
     case Phase::kDownload:

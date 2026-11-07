@@ -1299,11 +1299,17 @@ void MainWindow::onSpeedDone(const QJsonObject& result) {
         acked ? QString()
               : QStringLiteral("%1 未到达").arg(fmtBytes(static_cast<quint64>(
                     sample.value(QStringLiteral("lostBytes")).toDouble())));
+    // 自适应测速：速率控制器已收敛到路径的交付上限，线速≈送达、余量损失
+    // 是爬升自身的开销。给用户一句解释，避免"发送速率怎么变小了"的疑惑。
+    const bool adaptive = sample.value(QStringLiteral("adaptive")).toBool();
     if (wire > 0) {
       text += QStringLiteral(" · 发送速率 %1 Mbps（含冗余%2）")
                   .arg(wire, 0, 'f', 1)
                   .arg(lost.isEmpty() ? QString()
                                       : QStringLiteral("，") + lost);
+      if (adaptive) {
+        text += QStringLiteral("，已按路径上限自适应");
+      }
     } else if (!lost.isEmpty()) {
       text += QStringLiteral("（%1）").arg(lost);
     }

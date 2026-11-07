@@ -1,4 +1,4 @@
-// Path-MTU discovery, upward only (protocol capability kCapPmtud).
+// Path-MTU discovery with a loss-triggered fallback (capability kCapPmtud).
 //
 // The configured MTU is what the operator knows the path can carry, and a
 // session never sends anything larger until the path proves it can. A probe is
@@ -14,8 +14,19 @@
 //     itself arrived. It must move first: its ack is what tells the peer to
 //     start sending larger symbols.
 //   * send: raises payload_max when the matching ack comes back.
-// A path can be asymmetric, so each direction proves itself. Sizes only ever
-// grow; a session never lowers a bound that is already in use.
+// A path can be asymmetric, so each direction proves itself.
+//
+// Growth alone is not enough. The probe is small relative to the size it
+// proves: a path can carry a 1472-byte UDP datagram and still drop a
+// 1500-byte IP packet with DF set (PPPoE, some tunnels, a router that cannot
+// reassemble). The probe is answered, the ladder climbs, and then the
+// full-size data disappears -- which is exactly the failure the probe was meant
+// to prevent, and no timer catches it because the ack did arrive. So the send
+// bound is also lowered: a peer report showing the raised size is being lost
+// (session.cc, pmtu_note_loss) drops the send bound back to the configured
+// MTU and closes the ladder for the session. The receive bound is not lowered
+// -- it is a permission, and the peer learns of the black hole from the same
+// loss reports.
 //
 // For the ack to mean anything the socket must set DF (reactor.cc): without it
 // a router fragments the oversized probe instead of dropping it, the probe

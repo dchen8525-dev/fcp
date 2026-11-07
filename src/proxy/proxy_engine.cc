@@ -554,10 +554,11 @@ void ProxyEngine::on_tick(int64_t now_ms) {
     }
     if (c->session) {
       c->session->on_tick(now_ms);
-      // PMTUD may have raised the proven payload size during that tick; the
-      // stream must adopt it before its next pump(), or the larger MTU would
-      // only ever benefit the next connection. set_max_segment() ignores a
-      // size that did not grow.
+      // PMTUD may have moved the proven payload size during that tick -- up on
+      // a successful climb, down on a black-hole fallback. The stream must
+      // adopt it either way before its next pump(): a raise would otherwise
+      // only benefit the next connection, and a fallback would keep re-sending
+      // segments carved at the size the path just dropped.
       if (c->stream) {
         c->stream->set_max_segment(c->session->payload_max());
       }

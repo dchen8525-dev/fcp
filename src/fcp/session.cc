@@ -76,6 +76,18 @@ const uint8_t* nonce_or_null(const uint8_t nonce[16]) {
 // never by the peer -- so the only signal is the missing ack.
 constexpr int64_t kPmtuRetryMs = 1000;
 constexpr int kPmtuAttempts = 3;
+// Black-hole detection thresholds. A raised size can be answered by the peer
+// (the probe is small enough, or the path's real limit sits between the two)
+// and then drop the full-size data; the only evidence is the loss the peer
+// reports. The thresholds are deliberately high: a lossy but working path
+// (a few percent) must never collapse the ladder, while the overshoot this
+// guards against shows up as 40%+ of the symbols never arriving.
+constexpr uint32_t kPmtuBlackholeLossPpm = 250000;    // 25%: two reports in a row
+constexpr uint32_t kPmtuBlackholeSeverePpm = 500000;  // 50%: one report
+constexpr int kPmtuBlackholePeriods = 2;
+// The sample floor: a report built from fewer symbols (the forced 60s interval,
+// or a link that just came up) says nothing about the path either way.
+constexpr uint32_t kPmtuBlackholeMinSamples = 64;
 
 uint8_t handshake_flags(const SessionConfig& cfg) {
   return static_cast<uint8_t>(kLocalFlagsM1 | (cfg.pmtud ? kCapPmtud : 0));
@@ -387,6 +399,14 @@ void Session::on_tick(int64_t now_ms) {
                     "FEC WARNING: no FECSTAT for 3 report periods, keeping k=%u",
                     strategy_->k());
       log(std::string(kTagWarn) + line);
+      // A raised size whose feedback has gone dark is the total black-hole
+      // case: the peer's reports never arrive because the peer is not
+      // receiving anything either. The partial case is caught in
+      // pmtu_note_loss(), but with nothing arriving there is no report to
+      // carry it, so the missing-feedback signal is what drops us back.
+      if (pmtud_on_ && !pmtu_blackhole_ && pmtu_mtu_ > cfg_.mtu) {
+        pmtu_fallback(0);
+      }
     }
   }
 }
@@ -513,8 +533,10 @@ void Session::configure(int64_t now_ms) {
 
   char line[192];
   std::snprintf(line, sizeof(line),
-                "FCP v6 negotiated: data=%u parity=%u pmax=%u flags=framed,stats (peer V3)",
-                np.d, np.p, cfg_.p_max);
+                "FCP v7 negotiated: data=%u parity=%u pmax=%u flags=framed,stats "
+                "(caps v%u, pmtud %s)",
+                np.d, np.p, cfg_.p_max, static_cast<unsigned>(kCapsVersion),
+                (np.flags & kCapPmtud) != 0 ? "on" : "off");
   log(std::string(kTagInfo) + line);
   if (strategy_config.pinned_k > 0) {
     std::snprintf(line, sizeof(line), "FEC pinned: k=%d (operator)", strategy_config.pinned_k);
@@ -594,6 +616,31 @@ void Session::handle_fecstat(const uint8_t* payload, size_t len, int64_t now_ms)
   last_peer_lost_ = stat.data_expected > stat.data_rx_orig
                         ? stat.data_expected - stat.data_rx_orig
                         : 0;
+  // PMTUD black-hole check. This report describes our *outbound* direction --
+  // exactly the one pmtu_mtu_ sizes -- so it is the right evidence for whether
+  // a raised size is surviving the path. Deliberately outbound only: a
+  // download-shaped flow has near-zero loss in the peer's inbound direction,
+  // and mixing the two would let a healthy direction cancel a broken one.
+  // Use the loss FEC could *not* recover, not the raw loss: a link that is
+  // genuinely 25% lossy but protected by parity is working, and collapsing its
+  // MTU for the rest of the session would cost payload for no reason. A size
+  // black hole drops the parity symbols too, so it still reads as near-total
+  // loss here.
+  const uint64_t arrived = static_cast<uint64_t>(stat.data_rx_orig) +
+                           stat.data_recovered_dl + stat.data_late_rx;
+  const uint64_t unrecovered =
+      stat.data_expected > arrived ? stat.data_expected - arrived : 0;
+  // A set whose every symbol vanished contributes nothing to data_expected
+  // (settle.h counts it as sets_k_unknown), so the more complete the black
+  // hole, the smaller the reported sample looks -- the opposite of what the
+  // detector needs. Count each such set as `d` fully lost symbols, clamped to
+  // the number of accounted sets so a forged counter cannot make the sample
+  // arbitrarily large.
+  const uint64_t lost_sets =
+      std::min<uint64_t>(stat.sets_k_unknown, stat.sets_expected);
+  const uint64_t d = params().d != 0 ? params().d : 1;
+  pmtu_note_loss(static_cast<uint64_t>(stat.data_expected) + lost_sets * d,
+                 unrecovered + lost_sets * d);
   if (cfg_.trace) {
     TraceEntry entry;
     entry.now_ms = now_ms;
@@ -685,20 +732,32 @@ uint16_t Session::pmtu_next_candidate() const {
   if (pmtu_mtu_ >= pmtu_max_mtu_) {
     return 0;
   }
-  // Two rungs cover the useful cases without spending RTTs on sizes nothing
-  // uses: the standard Ethernet size first, then the configured ceiling
-  // (jumbo is a LAN property and has to be asked for).
-  if (pmtu_mtu_ < 1500 && pmtu_max_mtu_ >= 1500) {
-    return 1500;
+  // Step through the useful Ethernet sizes rather than jumping 1400 straight
+  // to 1500. A path whose real limit is 1480 (PPPoE, a tunnel, a firewall
+  // that reassembles nothing) answers a 1500 probe only if the probe is small
+  // enough to survive, and then black-holes the full-size data; the two
+  // intermediate rungs let the ladder stop at a size that actually works.
+  static constexpr uint16_t kRungs[] = {1440, 1480, 1500};
+  for (uint16_t rung : kRungs) {
+    if (rung > pmtu_mtu_ && rung <= pmtu_max_mtu_) {
+      return rung;
+    }
   }
-  return pmtu_max_mtu_;
+  // Above 1500 is jumbo, a LAN property the operator has to ask for: try the
+  // configured ceiling in one step.
+  return pmtu_max_mtu_ > pmtu_mtu_ ? pmtu_max_mtu_ : 0;
 }
 
 void Session::pmtu_tick(int64_t now_ms) {
-  if (!pmtud_on_ || pmtu_next_ms_ < 0 || now_ms < pmtu_next_ms_) {
+  if (!pmtud_on_ || pmtu_blackhole_ || pmtu_next_ms_ < 0 || now_ms < pmtu_next_ms_) {
     return;
   }
   if (pmtu_probe_mtu_ != 0) {
+    // Report the size that went unanswered, not the configured ceiling: with
+    // the ladder the failing rung is usually an intermediate one, and a log
+    // claiming "1500-byte path did not answer" while the session sits at 1440
+    // sent the reader looking at the wrong number.
+    const uint16_t failed = pmtu_probe_mtu_;
     pmtu_probe_mtu_ = 0;
     if (++pmtu_attempts_ >= kPmtuAttempts) {
       ++pmtu_probes_lost_;
@@ -706,7 +765,7 @@ void Session::pmtu_tick(int64_t now_ms) {
       char line[112];
       std::snprintf(line, sizeof(line),
                     "FCP PMTUD: %u-byte path did not answer, staying at %u",
-                    static_cast<unsigned>(pmtu_max_mtu_),
+                    static_cast<unsigned>(failed),
                     static_cast<unsigned>(pmtu_mtu_));
       log(std::string(kTagWarn) + line);
       return;
@@ -748,6 +807,13 @@ bool Session::pmtu_handle(const std::vector<uint8_t>& plain, size_t wire_len,
   PmtuMessage msg;
   if (!pmtu_parse(plain.data() + kFecHdrLen, plain.size() - kFecHdrLen, &msg)) {
     return false;
+  }
+  // A size that has been proven to black-hole must not be re-raised by a late
+  // probe ack or by answering a peer probe above the base: the ladder is
+  // closed for this session, and a probe that was answered before the data
+  // started dropping would otherwise raise us straight back into the hole.
+  if (pmtu_blackhole_) {
+    return true;
   }
   // Above the configured base and below the local ceiling is the only range
   // that can move anything; everything else is a stale or misconfigured probe
@@ -815,6 +881,76 @@ void Session::pmtu_raise_send(uint16_t mtu) {
   std::snprintf(line, sizeof(line), "FCP PMTUD: path MTU %u -> %u",
                 static_cast<unsigned>(before), static_cast<unsigned>(mtu));
   log(std::string(kTagDebug) + line);
+}
+
+// A raised size that the peer reports as mostly lost is a black hole: the path
+// accepted the probe (so the handshake and the probe ack both succeeded) but
+// drops the full-size data. Because the probe was answered, no timer can catch
+// this -- the only evidence is the loss report, and the only cure is to drop
+// back to the size that was proven before probing began.
+void Session::pmtu_note_loss(uint64_t expected, uint64_t lost) {
+  if (!pmtud_on_ || pmtu_blackhole_ || pmtu_mtu_ <= cfg_.mtu) {
+    return;
+  }
+  // A tiny sample says nothing about the path either way, so it neither starts
+  // nor breaks a streak. `lost > expected` is a malformed report leaking
+  // through the validator's tolerant window; ignore it rather than let the
+  // unsigned subtraction wrap the ppm to max.
+  if (expected < kPmtuBlackholeMinSamples || lost > expected) {
+    return;
+  }
+  const uint32_t ppm = ppm_of(lost, expected);
+  if (ppm >= kPmtuBlackholeSeverePpm) {
+    pmtu_fallback(ppm);
+    return;
+  }
+  if (ppm < kPmtuBlackholeLossPpm) {
+    pmtu_bad_periods_ = 0;
+    return;
+  }
+  if (++pmtu_bad_periods_ >= kPmtuBlackholePeriods) {
+    pmtu_fallback(ppm);
+  }
+}
+
+void Session::pmtu_fallback(uint32_t loss_ppm) {
+  if (!pmtud_on_ || pmtu_blackhole_) {
+    return;
+  }
+  const MtuLimits base = compute_mtu_limits(cfg_.mtu, cfg_.ip_hdr_len);
+  if (!base.valid || base.payload_max >= limits_.payload_max) {
+    return;  // already at the base: a black hole there has no lower rung
+  }
+  const uint16_t before = pmtu_mtu_;
+  pmtu_blackhole_ = true;
+  ++pmtu_fallbacks_;
+  pmtu_bad_periods_ = 0;
+  pmtu_probe_mtu_ = 0;
+  pmtu_attempts_ = 0;
+  pmtu_next_ms_ = -1;
+  limits_ = base;
+  pmtu_mtu_ = cfg_.mtu;
+  // FrameTx's accept ceiling is deliberately left at the raised value. It only
+  // bounds what on_kcp_output() will accept, and lowering it here would make
+  // the next retransmission of a segment the stream carved at the larger size
+  // vanish in the tick gap as a silent mtu_drop. The host re-arms the stream
+  // from payload_max() (now the base) on its next tick, which re-cuts those
+  // segments; the receive bound is left alone too -- it is a permission, not a
+  // send size, and the peer learns the black hole from our own FECSTAT.
+  char line[192];
+  if (loss_ppm == 0) {
+    std::snprintf(line, sizeof(line),
+                  "FCP PMTUD: %u-byte path black-holed (feedback went dark), "
+                  "falling back to %u; probing closed for this session",
+                  static_cast<unsigned>(before), static_cast<unsigned>(cfg_.mtu));
+  } else {
+    std::snprintf(line, sizeof(line),
+                  "FCP PMTUD: %u-byte path black-holed (outbound loss %u ppm), "
+                  "falling back to %u; probing closed for this session",
+                  static_cast<unsigned>(before), static_cast<unsigned>(loss_ppm),
+                  static_cast<unsigned>(cfg_.mtu));
+  }
+  log(std::string(kTagWarn) + line);
 }
 
 void Session::sync_report_counters() {

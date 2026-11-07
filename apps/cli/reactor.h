@@ -111,6 +111,15 @@ constexpr size_t kGsoMaxSegs = 64;
 // must cover its gaps; truly idle tunnels freeze both directions and stay
 // silent on purpose).
 constexpr int64_t kStallLogMs = 30000;
+// High-loss warning. Separate from the stall watchdog: a tunnel can keep
+// moving small packets while every full-size datagram is dropped, which shows
+// up only as loss in the FECSTAT numbers (see session.cc pmtu_note_loss for
+// the same evidence acting on the MTU). Sampling is once a second, the
+// reminder repeats at the stall cadence, and the sample floor keeps a couple
+// of badly-timed reports from tripping it.
+constexpr uint32_t kHighLossWarnPpm = 200000;  // 20%
+constexpr uint64_t kHighLossMinExpected = 64;
+constexpr int64_t kHighLossSampleMs = 1000;
 // --log-file 的单文件上限：写满即轮转到 <名字>.1（保留上一份）。
 constexpr size_t kLogFileRotateBytes = 32u * 1024u * 1024u;
 constexpr int64_t kStallTxWindowMs = 10000;
@@ -273,6 +282,11 @@ class Reactor {
   // Dead-path watchdog (opt_.stall_ms): one counters snapshot per tick. Nothing
   // functional hangs on it -- the log line is its output.
   void check_stall(int64_t now_ms);
+  // High-loss warning (client): reads the FECSTAT loss sample once a second and
+  // warns when a direction is losing >= kHighLossWarnPpm of a credible sample.
+  // This is the only signal for the "small packets flow, full-size ones do not"
+  // failure -- the stall watchdog sees no stall there.
+  void check_high_loss(int64_t now_ms);
   // Connections whose application socket hit a fatal send error. The engine
   // must not be re-entered from a host callback, so they are queued and the
   // loop tells it once the call stack has unwound (M-05).
@@ -454,6 +468,11 @@ class Reactor {
   // print "recovered". A stall clears only after inbound moved on two
   // consecutive watchdog ticks.
   bool stall_rx_pending_ = false;
+  // High-loss warning state. `loss_warned_` latches so recovery is logged once,
+  // and the next-log deadline rate-limits the reminder while it persists.
+  int64_t loss_check_ms_ = 0;
+  int64_t loss_warn_next_ms_ = 0;
+  bool loss_warned_ = false;
   // --log-file 的落盘端：追加写 + 32 MiB 轮转（.1），改名失败降级继续
   // 追加（与 trace 的容错策略一致）。引擎 log 回调与关键内部行都经
   // emit()/写走文件；stderr 行为照旧。

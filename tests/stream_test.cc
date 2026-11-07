@@ -2350,6 +2350,38 @@ void TestSetMaxSegmentRefusesAStallingRaise() {
   CHECK_EQ(f.a().sent.size(), 6u);
 }
 
+// A PMTUD fallback lowers the session payload bound while segments carved at
+// the larger size are still in flight. Leaving them carved would keep emitting
+// datagrams the path has just been proven to drop, so set_max_segment() re-cuts
+// them in place: the byte offsets the ARQ works in do not change, and the next
+// tick re-sends the smaller pieces.
+void TestSetMaxSegmentShrinksInFlightSegments() {
+  StreamConfig cfg = DefaultCfg();
+  cfg.auto_window = false;
+  cfg.send_window_bytes = 4096;
+  Fixture f(cfg);
+  f.sa().set_max_segment(200);  // 194-byte payload pieces
+  f.cut_all();                  // nothing reaches B: the pieces stay in flight
+
+  const std::vector<uint8_t> src = MakeBytes(1000, 7);
+  CHECK_EQ(f.push(kA, src), src.size());
+  CHECK_EQ(f.b().delivered.size(), 0u);
+  CHECK_EQ(f.sa().in_flight(), src.size());  // every byte is outstanding
+  const size_t before = f.a().sent.size();
+
+  f.sa().set_max_segment(106);  // 100-byte payload pieces
+  CHECK_EQ(f.sa().in_flight(), src.size());  // same bytes, smaller carving
+  f.killer = nullptr;
+  f.drain();
+
+  CHECK(f.b().delivered == src);
+  // Every repair the fallback caused fits the new bound: no 200-byte segment
+  // may survive it.
+  for (size_t i = before; i < f.a().sent.size(); ++i) {
+    CHECK(f.a().sent[i].size() <= 106u);
+  }
+}
+
 // The send ceiling is the operator's MAX only when they pinned one. Otherwise a
 // session that keeps proving a larger BDP may grow past it, up to the ceiling
 // bound -- a 1 MiB ceiling is 40 Mbps at 200 ms however good the controller is.
@@ -2457,6 +2489,7 @@ int main() {
   TestAckCoalescingHalvesCleanPathAcks();
   TestAnyAckSettlesTheCoalescingDebt();
   TestSetMaxSegmentRefusesAStallingRaise();
+  TestSetMaxSegmentShrinksInFlightSegments();
   TestWindowCeilingFollowsMeasuredBdp();
   TestPacerReportsItsNextWake();
   return fcp_test::finish();

@@ -279,6 +279,12 @@ struct Harness {
   // discover -- the probe is the only packet large enough to be affected, so
   // the rest of the session keeps working while the ladder fails.
   size_t path_max_wire = 0;
+  // Simulated black hole at the raised size: data/parity datagrams larger than
+  // this are dropped, while oob (probes, acks, FECSTAT, keepalive) still flow
+  // in both directions. This is the failure mode upward PMTUD cannot see -- the
+  // probe is small enough to be answered, the full-size data is not -- so the
+  // only evidence left is the loss the peer reports.
+  size_t data_max_wire = 0;
 
   // Deterministic burst injection (task E2, spec #27②): every `burst_period`
   // outgoing data symbols from A, the first `burst_len` are dropped — e.g.
@@ -354,7 +360,9 @@ struct Harness {
       drop_next_data_a = false;
       return;
     }
-    if (drop(type) || (path_max_wire != 0 && len > path_max_wire)) {
+    if (drop(type) || (path_max_wire != 0 && len > path_max_wire) ||
+        (data_max_wire != 0 && len > data_max_wire &&
+         (type == fcp::SymbolType::kData || type == fcp::SymbolType::kParity))) {
       return;
     }
     sock_a.Send(wire, len);
@@ -370,7 +378,9 @@ struct Harness {
     } else {
       ++b_control;
     }
-    if (drop(type) || (path_max_wire != 0 && len > path_max_wire)) {
+    if (drop(type) || (path_max_wire != 0 && len > path_max_wire) ||
+        (data_max_wire != 0 && len > data_max_wire &&
+         (type == fcp::SymbolType::kData || type == fcp::SymbolType::kParity))) {
       return;
     }
     sock_b.Send(wire, len);

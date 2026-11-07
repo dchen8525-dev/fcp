@@ -214,6 +214,8 @@ bool Sidecar::startProxy(const ProxyConfig& config, QString* error) {
       QStringLiteral("--listen=%1").arg(config.listen),
       QStringLiteral("--local-port=%1").arg(config.listen_port),
       QStringLiteral("--mtu=%1").arg(config.mtu),
+      config.pmtud ? QStringLiteral("--pmtu-max=%1").arg(config.pmtu_max_mtu)
+                   : QStringLiteral("--no-pmtud"),
       QStringLiteral("--fec-budget=%1").arg(QString::number(config.fec_budget)),
       // Raise the autotune ceiling / advertised receive capacity to 4 MiB while
       // leaving START implicit, so the prewarm cache can still seed it.
@@ -403,6 +405,8 @@ bool Sidecar::startSpeedTest(const SpeedTestConfig& config, QString* error) {
       QStringLiteral("--host=%1").arg(config.host),
       QStringLiteral("--port=%1").arg(config.port),
       QStringLiteral("--mtu=%1").arg(config.mtu),
+      config.pmtud ? QStringLiteral("--pmtu-max=%1").arg(config.pmtu_max_mtu)
+                   : QStringLiteral("--no-pmtud"),
       QStringLiteral("--speedtest-seconds=%1").arg(config.seconds),
       QStringLiteral("--speedtest"),
       // 测速进程独立 pid → 独立文件（fcp-client-<pid>.log），看得清谁是谁。

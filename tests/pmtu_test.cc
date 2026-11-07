@@ -88,14 +88,21 @@ void TestProbeRaisesBothDirections() {
   CHECK_EQ(h.a->path_mtu(), 1400u);
   CHECK_EQ(h.b->path_mtu(), 1400u);
 
+  // Probe out, ack back, send bound raised by one rung; then the peer's own
+  // ladder. The intermediate rungs are the point: a path that answers 1440 but
+  // drops 1500 now stops at 1480 instead of jumping straight into the hole.
   h.TickAt(25);
-  // Probe out, ack back, send bound raised; then the peer's own ladder.
+  CHECK_EQ(h.a->path_mtu(), 1440u);
+  CHECK_EQ(h.b->path_mtu(), 1440u);
+  h.TickAt(1025);
+  CHECK_EQ(h.a->path_mtu(), 1480u);
+  h.TickAt(2025);
   CHECK_EQ(h.a->path_mtu(), 1500u);
   CHECK_EQ(h.b->path_mtu(), 1500u);
-  CHECK_EQ(h.a->pmtu_probes_acked(), 1u);
-  CHECK_EQ(h.b->pmtu_probes_acked(), 1u);
-  CHECK_EQ(h.a->pmtu_probes_sent(), 1u);
-  CHECK_EQ(h.b->pmtu_probes_sent(), 1u);
+  CHECK_EQ(h.a->pmtu_probes_acked(), 3u);
+  CHECK_EQ(h.b->pmtu_probes_acked(), 3u);
+  CHECK_EQ(h.a->pmtu_probes_sent(), 3u);
+  CHECK_EQ(h.b->pmtu_probes_sent(), 3u);
   CHECK_EQ(h.a->pmtu_probes_lost(), 0u);
   // 1500-byte IP packet, 20-byte IPv4 header: 1472 UDP, 1436 payload, 1412 mss.
   CHECK_EQ(h.a->mtu_limits().payload_max, 1436u);
@@ -158,6 +165,8 @@ void TestFullSizeSymbolAfterRaise() {
                PmtuConfig(fcp::Direction::kS2C, fcp::Direction::kC2S)));
   CHECK(h.Handshake());
   h.TickAt(25);
+  h.TickAt(1025);
+  h.TickAt(2025);
   CHECK_EQ(h.a->payload_max(), 1436u);
 
   Bytes seg(1436, 0);
@@ -194,21 +203,22 @@ void TestPeerCeilingDoesNotRaiseOurs() {
   CHECK(h.Init(a, b));
   CHECK(h.Handshake());
   h.TickAt(25);
-  // Both climb the first rung; A proves 1500, so B's receive bound is the
-  // 1500 geometry (1438-byte symbol) and a full-size symbol is accepted.
-  CHECK_EQ(h.a->path_mtu(), 1500u);
-  CHECK_EQ(h.a->payload_max(), 1436u);
-  CHECK_EQ(h.b->recv_symbol_max(), 1438u);
+  // Both climb the first rung; A proves 1440, so B's receive bound is the
+  // 1440 geometry (1412 UDP - 34 header/FEC = 1378-byte symbol).
+  CHECK_EQ(h.a->path_mtu(), 1440u);
+  CHECK_EQ(h.a->payload_max(), 1376u);
+  CHECK_EQ(h.b->recv_symbol_max(), 1378u);
 
-  // A's next rung is 9000; B ignores it and never acks, so A retries three
-  // times and stops at 1500 without moving anything on B's side.
-  for (int64_t t = 1025; t <= 4025; t += 1000) {
+  // A keeps climbing to 1500 through the intermediate rungs (B follows), then
+  // asks for 9000; B ignores that and never acks, so A retries three times and
+  // stops at 1500 without moving anything on B's side.
+  for (int64_t t = 1025; t <= 6025; t += 1000) {
     h.TickAt(t);
   }
   CHECK_EQ(h.a->path_mtu(), 1500u);
   CHECK_EQ(h.a->payload_max(), 1436u);
   CHECK_EQ(h.b->recv_symbol_max(), 1438u);
-  CHECK_EQ(h.a->pmtu_probes_sent(), 4u);  // 1 at 1500 + 3 at 9000
+  CHECK_EQ(h.a->pmtu_probes_sent(), 6u);  // 1440 + 1480 + 1500 + 3 at 9000
   CHECK_EQ(h.a->pmtu_probes_lost(), 1u);
 }
 
@@ -226,6 +236,68 @@ void TestCeilingAtConfiguredMtuIsInert() {
   CHECK_EQ(h.a->pmtu_probes_sent(), 0u);
 }
 
+// A raised size that the path then black-holes must be dropped back to the
+// configured MTU even though the probe itself was answered. This is the case
+// upward-only PMTUD cannot see: the probe is small enough to arrive, the
+// full-size data is not, and no timer fires because the ack did come back. The
+// only evidence is the loss the peer reports.
+void TestBlackHoleFallsBack() {
+  Harness h;
+  CHECK(h.Init(PmtuConfig(fcp::Direction::kC2S, fcp::Direction::kS2C),
+               PmtuConfig(fcp::Direction::kS2C, fcp::Direction::kC2S)));
+  CHECK(h.Handshake());
+  h.TickAt(25);
+  h.TickAt(1025);
+  h.TickAt(2025);
+  CHECK_EQ(h.a->path_mtu(), 1500u);
+  CHECK_EQ(h.b->path_mtu(), 1500u);
+
+  // The path now carries oob (probe acks, FECSTAT, keepalive) but drops any
+  // data/parity datagram above 1400 bytes -- what a 1480-byte path does to the
+  // 1472-byte UDP datagrams a 1500 MTU produces.
+  h.data_max_wire = 1400;
+
+  // Thirty sets of ten slots: nine full-size data symbols are dropped and the
+  // sixteenth-byte slot arrives, keeping each set from being wholly lost so B
+  // can account it and report a ~90% raw loss.
+  const int64_t t = 2100;
+  h.now = t;
+  for (uint32_t set = 0; set < 30; ++set) {
+    for (uint32_t i = 0; i < 9; ++i) {
+      Bytes seg(1436, 0);
+      const uint32_t sn = set * 10 + i;
+      seg[12] = static_cast<uint8_t>(sn);
+      seg[13] = static_cast<uint8_t>(sn >> 8);
+      seg[14] = static_cast<uint8_t>(sn >> 16);
+      seg[15] = static_cast<uint8_t>(sn >> 24);
+      h.a->on_kcp_output(seg.data(), seg.size(), t);
+    }
+    Bytes small(16, 0);
+    const uint32_t sn = set * 10 + 9;
+    small[12] = static_cast<uint8_t>(sn);
+    small[13] = static_cast<uint8_t>(sn >> 8);
+    small[14] = static_cast<uint8_t>(sn >> 16);
+    small[15] = static_cast<uint8_t>(sn >> 24);
+    h.a->on_kcp_output(small.data(), small.size(), t);
+  }
+  h.pump();
+  CHECK_EQ(h.a->path_mtu(), 1500u);  // nothing has reported yet
+
+  // B's FECSTAT carries the loss; A drops back and closes the ladder.
+  h.TickTo(2200, 6200);
+  CHECK_EQ(h.a->path_mtu(), 1400u);
+  CHECK_EQ(h.a->payload_max(), 1336u);
+  CHECK(h.a->pmtu_blackholed());
+  CHECK_EQ(h.a->pmtu_fallbacks(), 1u);
+  const uint32_t probes = h.a->pmtu_probes_sent();
+
+  // Closed for good: no later probe re-raises the bound.
+  h.TickTo(6300, 12000);
+  CHECK_EQ(h.a->path_mtu(), 1400u);
+  CHECK_EQ(h.a->pmtu_fallbacks(), 1u);
+  CHECK_EQ(h.a->pmtu_probes_sent(), probes);
+}
+
 }  // namespace
 
 int main() {
@@ -237,5 +309,6 @@ int main() {
   TestFullSizeSymbolAfterRaise();
   TestPeerCeilingDoesNotRaiseOurs();
   TestCeilingAtConfiguredMtuIsInert();
+  TestBlackHoleFallsBack();
   return fcp_test::finish();
 }

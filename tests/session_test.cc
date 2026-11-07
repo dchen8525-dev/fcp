@@ -253,9 +253,9 @@ void TestFullLoop() {
   CHECK_EQ(a.k(), 0);
   CHECK_EQ(a.cached_segments(), 0u);
   CHECK(HasLine(log_a,
-                "FCP v6 negotiated: data=10 parity=3 pmax=4 flags=framed,stats (peer V3)"));
+                "FCP v7 negotiated: data=10 parity=3 pmax=4 flags=framed,stats (caps v1, pmtud off)"));
   CHECK(HasLine(log_b,
-                "FCP v6 negotiated: data=10 parity=3 pmax=4 flags=framed,stats (peer V3)"));
+                "FCP v7 negotiated: data=10 parity=3 pmax=4 flags=framed,stats (caps v1, pmtud off)"));
 
   // Phase 1: 400 segments, k=0, 20% loss. Sets 0..38 account; set 39 is the
   // highest and never becomes eligible (no parity) -> tail drop at 1s.

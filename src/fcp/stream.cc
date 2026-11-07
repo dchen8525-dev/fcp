@@ -170,23 +170,83 @@ void Stream::on_segment(const uint8_t* seg, size_t len, int64_t now_ms) {
 }
 
 void Stream::set_max_segment(size_t bytes) {
-  if (bytes <= cfg_.max_segment) {
+  if (bytes == 0 || bytes == cfg_.max_segment) {
     return;
   }
-  // Upward PMTUD raises the session's payload_max while the stream is live. The
-  // new segment still has to fit the window pump() admits it against
-  // (in_flight + wire_len <= min(send_window_, peer_rwnd_)); the zero-window
-  // probe only covers a short *peer* window, so a local window smaller than one
-  // segment would send nothing at all, forever. That can happen with a fixed,
-  // deliberately small --window (the CLI only promises two segments at the
-  // *configured* MTU). Keep the old, smaller segment in that case: a few bytes
-  // of unused MTU beat a stall. bytes is the whole session payload bound, so
-  // the payload-only comparison below is conservative.
-  const size_t window = cfg_.auto_window ? window_min_ : send_window_;
-  if (bytes > window) {
+  if (bytes > cfg_.max_segment) {
+    // Upward PMTUD raises the session's payload_max while the stream is live.
+    // The new segment still has to fit the window pump() admits it against
+    // (in_flight + wire_len <= min(send_window_, peer_rwnd_)); the zero-window
+    // probe only covers a short *peer* window, so a local window smaller than
+    // one segment would send nothing at all, forever. That can happen with a
+    // fixed, deliberately small --window (the CLI only promises two segments at
+    // the *configured* MTU). Keep the old, smaller segment in that case: a few
+    // bytes of unused MTU beat a stall. bytes is the whole session payload
+    // bound, so the payload-only comparison below is conservative.
+    const size_t window = cfg_.auto_window ? window_min_ : send_window_;
+    if (bytes > window) {
+      return;
+    }
+    cfg_.max_segment = bytes;
     return;
+  }
+  // Downward: the session's PMTUD fallback dropped payload_max after a raised
+  // size black-holed. Segments already carved at the larger size must be re-cut
+  // here, or FrameTx (still accepting at its high-water mark) would keep
+  // retransmitting datagrams the session has just declared too large for the
+  // path. Stream ARQ is byte-offset based, so re-cutting is safe as long as the
+  // bytes and the offsets are preserved: snd_nxt_, snd_max_, fin_offset_ and
+  // the cumulative/SACK accounting all count bytes, not segments.
+  if (bytes <= kStreamDataHdrLen) {
+    return;  // cannot carry a payload at all; leave the old carving alone
   }
   cfg_.max_segment = bytes;
+  const size_t piece = bytes - kStreamDataHdrLen;
+
+  std::deque<PendingSeg> recut;
+  for (PendingSeg& seg : tx_) {
+    if (seg.bytes.size() <= piece) {
+      recut.push_back(std::move(seg));
+      continue;
+    }
+    // Already acknowledged (SACKed) bytes are not re-sent: their pieces keep
+    // the mark so neither the RTO pass nor fill_holes picks them up.
+    const bool sacked = seg.sacked_ms >= 0;
+    const int64_t sacked_ms = seg.sacked_ms;
+    const int64_t sent_ms = seg.sent_ms;
+    const uint32_t base = seg.offset;
+    const bool fin = seg.fin;
+    if (seg.sent) {
+      in_flight_ -= seg.wire_len();
+    }
+    std::vector<uint8_t> whole = std::move(seg.bytes);
+    for (size_t off = 0; off < whole.size(); off += piece) {
+      PendingSeg part;
+      part.offset = base + static_cast<uint32_t>(off);
+      const size_t n = std::min(piece, whole.size() - off);
+      part.bytes.assign(whole.begin() + off, whole.begin() + off + n);
+      part.fin = fin && off + n == whole.size();
+      // Keep every piece on the wire as far as the queue accounting is
+      // concerned. An unsent segment is a *stop* signal to the RTO pass
+      // ("nothing later can be older"), so clearing `sent` here would leave
+      // the whole re-cut range with no path that ever emits it. sent_ms = 0
+      // instead makes each piece immediately RTO-eligible (no real send ever
+      // happened at the new size, and 0 is not a valid timestamp so no bogus
+      // RTT sample can come out of it), and the next on_tick re-emits it.
+      part.sent = true;
+      part.retrans = sacked;  // a delivered piece is not a repair
+      part.sacked_ms = sacked ? sacked_ms : -1;
+      part.sent_ms = sacked ? sent_ms : 0;
+      in_flight_ += part.wire_len();
+      recut.push_back(std::move(part));
+    }
+  }
+  tx_.swap(recut);
+  // The fast-retransmit evidence counted the old carving; the holes it tracked
+  // no longer exist as segments.
+  dup_acks_ = 0;
+  fast_retx_armed_ = false;
+  tlp_probes_ = 0;
 }
 
 void Stream::on_tick(int64_t now_ms) {

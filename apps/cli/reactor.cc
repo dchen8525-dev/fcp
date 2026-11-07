@@ -720,6 +720,7 @@ void Reactor::run() {
         bench_->OnTick(now);
       }
       check_stall(now);
+      check_high_loss(now);
       // Anything the engine still owes an application socket gets another try
       // here, whether or not select reported it: the pending byte count is the
       // engine's, so this is the only place a stalled write can be retried.
@@ -1796,6 +1797,64 @@ void Reactor::check_stall(int64_t now_ms) {
   // Dark path with a retransmission engine that has also gone quiet: keep
   // watching without re-declaring (the idle timeout is the backstop that
   // closes the session, which routes through the closed branch above).
+}
+
+void Reactor::check_high_loss(int64_t now_ms) {
+  if (opt_.role != EngineRole::kClient) {
+    return;  // the server aggregates many sessions; the client owns this readout
+  }
+  if (loss_check_ms_ != 0 && now_ms - loss_check_ms_ < kHighLossSampleMs) {
+    return;
+  }
+  loss_check_ms_ = now_ms;
+  if (engine_.counters().live == 0) {
+    if (loss_warned_) {
+      loss_warned_ = false;
+      note("tunnel loss warning cleared (tunnel closed)", Severity(LogLevel::kWarn));
+    }
+    return;
+  }
+  const ProxyEngine::LossSample loss = engine_.loss_sample();
+  const uint64_t in_ppm = loss.in_expected >= kHighLossMinExpected
+                              ? loss.in_lost * 1000000ull / loss.in_expected
+                              : 0;
+  const uint64_t out_ppm = loss.out_expected >= kHighLossMinExpected
+                               ? loss.out_lost * 1000000ull / loss.out_expected
+                               : 0;
+  const uint64_t ppm = in_ppm > out_ppm ? in_ppm : out_ppm;
+  if (ppm < kHighLossWarnPpm) {
+    if (loss_warned_) {
+      loss_warned_ = false;
+      char msg[160];
+      std::snprintf(msg, sizeof(msg), "tunnel loss recovered (in=%u ppm, out=%u ppm)",
+                    static_cast<unsigned>(in_ppm), static_cast<unsigned>(out_ppm));
+      note(msg, Severity(LogLevel::kWarn));
+    }
+    return;
+  }
+  // The sample describes the traffic that was flowing when the report was made.
+  // A quiet tunnel keeps its last numbers; warning about stale loss would be
+  // noise, and the stall watchdog covers the "nothing moves" case.
+  if (stall_last_tx_ms_ + kStallTxWindowMs <= now_ms) {
+    return;
+  }
+  if (loss_warned_ && now_ms < loss_warn_next_ms_) {
+    return;
+  }
+  loss_warned_ = true;
+  loss_warn_next_ms_ = now_ms + kStallLogMs;
+  // Only point at --no-pmtud when it is actually on; with it already off the
+  // advice would send the operator in a circle.
+  const char* hint = base_config_.pmtud ? " (try --no-pmtud)" : "";
+  char msg[224];
+  std::snprintf(msg, sizeof(msg),
+                "high tunnel loss: in=%u ppm of %llu, out=%u ppm of %llu; full-size "
+                "datagrams may be dropped by the path%s",
+                static_cast<unsigned>(in_ppm),
+                static_cast<unsigned long long>(loss.in_expected),
+                static_cast<unsigned>(out_ppm),
+                static_cast<unsigned long long>(loss.out_expected), hint);
+  note(msg, Severity(LogLevel::kWarn));
 }
 
 #ifdef __linux__

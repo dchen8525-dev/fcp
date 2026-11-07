@@ -114,6 +114,9 @@ enum class CloseReason : uint8_t {
 
 struct StreamConfig {
   // Largest segment payload the session can carry: Session::mtu_limits().payload_max.
+  // Follows that bound both ways at run time (set_max_segment): up on PMTUD
+  // growth, down on a PMTUD black-hole fallback. A downward move re-cuts the
+  // in-flight segments, so the byte offsets the ARQ works in never change.
   size_t max_segment = 1336;
   // Send window. With auto_window off this is the constant window; with it on
   // it is only the starting value -- see below.
@@ -256,9 +259,11 @@ class Stream {
   // enough). The reactor folds this into its select() timeout, which is what
   // lets the pacer work at a finer granularity than the 25 ms tick.
   int64_t next_wake_ms(int64_t now_ms) const;
-  // PMTUD raised the session's payload size. Growth only: bytes already queued
-  // were cut at the old segment size, and shrinking would strand segments the
-  // path can still carry. The next pump() simply cuts larger ones.
+  // PMTUD moved the session's payload size. A raise only affects the next
+  // pump(); a lower moves re-cut every queued segment in place, preserving the
+  // byte offsets, because a fallback has declared the larger datagrams
+  // unsendable and leaving them carved at the old size would retransmit them
+  // forever on a path that drops them.
   void set_max_segment(size_t bytes);
 
   StreamState state() const { return state_; }

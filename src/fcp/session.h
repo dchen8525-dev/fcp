@@ -172,8 +172,9 @@ class Session {
   bool config_valid() const { return limits_.valid; }
 
   // PMTUD: the proven send MTU (starts at the configured value, grows when an
-  // ack comes back) and the payload size the stream layer must arm itself
-  // with. The host polls payload_max() and raises the stream when it moves.
+  // ack comes back, and drops back to the configured value on a black hole)
+  // and the payload size the stream layer must arm itself with. The host polls
+  // payload_max() and re-arms the stream when it moves in either direction.
   uint16_t path_mtu() const { return pmtu_mtu_; }
   size_t payload_max() const { return limits_.payload_max; }
   // Largest symbol the receive side has proven (the peer's probes, capped by
@@ -183,6 +184,12 @@ class Session {
   uint32_t pmtu_probes_sent() const { return pmtu_probes_sent_; }
   uint32_t pmtu_probes_acked() const { return pmtu_probes_acked_; }
   uint32_t pmtu_probes_lost() const { return pmtu_probes_lost_; }
+  // Black-hole fallback (pmtu.h): how many times this session dropped back to
+  // the configured MTU after a raised size proved lossy, and whether it did.
+  // Once true, upward probing is closed for the rest of the session: a probe
+  // that was answered while the path dropped the data must not re-raise it.
+  uint32_t pmtu_fallbacks() const { return pmtu_fallbacks_; }
+  bool pmtu_blackholed() const { return pmtu_blackhole_; }
 
   size_t cached_segments() const { return hs_.cached_segments(); }
   int64_t srtt_ms() const { return srtt_ms_; }
@@ -246,6 +253,14 @@ class Session {
   uint16_t pmtu_next_candidate() const;
   void pmtu_raise_recv(uint16_t mtu);
   void pmtu_raise_send(uint16_t mtu);
+  // Black-hole detection. `pmtu_note_loss` is fed by every accepted peer
+  // FECSTAT with that report's *outbound* loss (what the peer says it lost of
+  // ours and FEC could not recover): that is the direction pmtu_mtu_ governs,
+  // and it is also the direction a download-shaped flow stresses. Two
+  // consecutive reports over kPmtuBlackholeLossPpm, or one over
+  // kPmtuBlackholeSeverePpm, latch `pmtu_blackhole_` and call pmtu_fallback.
+  void pmtu_note_loss(uint64_t expected, uint64_t lost);
+  void pmtu_fallback(uint32_t loss_ppm);
 
   void emit_symbol(const TxSymbol& symbol, bool bootstrap = false);
   // `bootstrap` routes the frame through the handshake envelope instead of the
@@ -350,6 +365,15 @@ class Session {
   uint32_t pmtu_probes_sent_ = 0;
   uint32_t pmtu_probes_acked_ = 0;
   uint32_t pmtu_probes_lost_ = 0;
+  // Black-hole fallback state. `pmtu_bad_periods_` counts consecutive peer
+  // reports whose sample was credible and over the threshold; a good sample
+  // resets it. `pmtu_blackhole_` latches the fallback: once a raised size has
+  // been proven lossy the ladder is closed for the session, because the probe
+  // that raised us was answered before the data started being dropped and
+  // would otherwise raise us straight back.
+  int pmtu_bad_periods_ = 0;
+  bool pmtu_blackhole_ = false;
+  uint32_t pmtu_fallbacks_ = 0;
 };
 
 // Server-side salt lookup. Sessions are owned by the caller.

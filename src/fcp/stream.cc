@@ -158,6 +158,13 @@ void Stream::on_segment(const uint8_t* seg, size_t len, int64_t now_ms) {
         ++bad_segs_;
       }
       break;
+    case kStreamTypeAckV2:
+      if (len >= kStreamAckV2MinLen) {
+        handle_ack_v2(seg, len, now_ms);
+      } else {
+        ++bad_segs_;
+      }
+      break;
     case kStreamTypeRst:
       finish(now_ms, CloseReason::kReset);
       break;

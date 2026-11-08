@@ -414,8 +414,11 @@ void TestFullLoop() {
 // as ordinary data like any other.
 void TestHandshakeRidesOob() {
   std::vector<std::pair<Bytes, fcp::SymbolType>> sent;
+  fcp::SessionConfig cfg = MakeConfig(fcp::Direction::kC2S, fcp::Direction::kS2C);
+  // This test pins the fixed 36B v7 HELLO golden (#78): keep the TLV offer off.
+  cfg.stream_ack_v2 = false;
   fcp::Session s(
-      MakeConfig(fcp::Direction::kC2S, fcp::Direction::kS2C),
+      cfg,
       [&sent](const uint8_t* w, size_t n, fcp::SymbolType t) {
         sent.emplace_back(Bytes(w, w + n), t);
       },
@@ -1477,6 +1480,8 @@ void TestPinnedHandshakeNonce() {
 
   fcp::SessionConfig cfg = MakeConfig(fcp::Direction::kC2S, fcp::Direction::kS2C);
   std::memcpy(cfg.handshake_nonce, pinned, sizeof(pinned));
+  // #78: pin the fixed 36B v7 HELLO shape -- the TLV offer would append a block.
+  cfg.stream_ack_v2 = false;
   const Bytes h1 = hello_plain(cfg);
   const Bytes h2 = hello_plain(cfg);
   // The plaintext carries the FEC header in front of the HELLO.

@@ -166,6 +166,13 @@ Session::Session(const SessionConfig& config, SendFn send, DeliverFn deliver, Lo
   // far below 2^32. A failed draw is fatal: start() refuses the session rather
   // than falling back to a predictable start.
   bootstrap_seed_ok_ = hs_env_.init_bootstrap_nonce(kHandshakeSendBudget);
+  // #78: offer the stream capabilities that ride the handshake TLV extension.
+  // The feature activates only when the peer offers the same type
+  // (Handshake::tlv_agreed); a v7 peer never sees the bit -- its refusal of
+  // kCapTlv is what the client's downgrade probe is for.
+  if (cfg_.stream_ack_v2) {
+    hs_.set_local_tlvs({HandshakeTlv{kTlvTypeAckV2, {}}});
+  }
 }
 
 Session::StartStatus Session::start(int64_t now_ms) {

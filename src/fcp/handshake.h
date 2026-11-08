@@ -96,6 +96,10 @@ constexpr size_t kTlvBlockMaxLen = 1024;
 // peer parsed our handshake and refused it, so retrying cannot help and the
 // client fails immediately instead of running out the retry table.
 constexpr uint8_t kTlvTypeError = 1;
+// #78: FCP-STREAM ACK v2 support (empty value; the frame itself is
+// stream.h kStreamTypeAckV2). Offered by both ends when the host enables it;
+// active only when both offered (Handshake::tlv_agreed).
+constexpr uint8_t kTlvTypeAckV2 = 2;
 
 // Total sends before the handshake is declared dead (initial HELLO + retries).
 constexpr int kHandshakeMaxRetries = 9;
@@ -265,6 +269,23 @@ class Handshake {
   bool tlv_negotiated() const { return (params_.flags & kCapTlv) != 0; }
   const std::vector<HandshakeTlv>& peer_tlvs() const { return peer_tlvs_; }
   HandshakeError peer_error() const { return peer_error_; }
+  // #78: capability `type` was offered by BOTH ends -- the negotiated bit is
+  // on and the type appears in both TLV sets. The feature behind the type is
+  // then active for this session.
+  bool tlv_agreed(uint8_t type) const {
+    if (!tlv_negotiated()) {
+      return false;
+    }
+    const auto has = [type](const std::vector<HandshakeTlv>& v) {
+      for (const auto& t : v) {
+        if (t.type == type) {
+          return true;
+        }
+      }
+      return false;
+    };
+    return has(local_tlvs_) && has(peer_tlvs_);
+  }
 
   // This end's draw (the client nonce on the C2S side, the server nonce on the
   // S2C side). Valid from construction.

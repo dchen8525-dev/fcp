@@ -61,6 +61,41 @@ constexpr void put_le64(uint64_t v, uint8_t* p) {
   }
 }
 
+// LEB128 unsigned varint (#78): 7 bits per byte, high bit = continuation,
+// little-endian byte order. Used by the FCP-STREAM ACK v2 range fields, whose
+// magnitudes (byte gaps between hole blocks) span 1..4 GiB -- fixed-width
+// fields would tax the common small-gap case. `put_uvarint` returns the byte
+// count (<= 5 for u32); `get_uvarint` consumes at most 5 bytes from
+// [p, p + cap), advancing *off -- false on truncation or a 5-byte continuation
+// run (not a u32).
+constexpr size_t put_uvarint(uint32_t v, uint8_t* p) {
+  size_t n = 0;
+  while (v >= 0x80) {
+    p[n++] = static_cast<uint8_t>(v) | 0x80;
+    v >>= 7;
+  }
+  p[n++] = static_cast<uint8_t>(v);
+  return n;
+}
+
+constexpr bool get_uvarint(const uint8_t* p, size_t cap, size_t* off, uint32_t* out) {
+  uint32_t v = 0;
+  int shift = 0;
+  for (int i = 0; i < 5; ++i) {
+    if (*off >= cap) {
+      return false;
+    }
+    const uint8_t b = p[(*off)++];
+    v |= static_cast<uint32_t>(b & 0x7F) << shift;
+    if ((b & 0x80) == 0) {
+      *out = v;
+      return true;
+    }
+    shift += 7;
+  }
+  return false;
+}
+
 // Network order (RFC 1928 and every proxy message; proxy_proto.h §"字节序").
 constexpr uint16_t get_be16(const uint8_t* p) {
   return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);

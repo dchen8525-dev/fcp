@@ -954,6 +954,9 @@ void ProxyEngine::attach_stream(Conn& conn) {
   // window prior.
   StreamConfig sc = conn.stream_cfg;
   sc.max_segment = conn.session->mtu_limits().payload_max;
+  // #78: ACK v2 rides the handshake TLV negotiation, which resolves at
+  // establishment -- later than the pre-filled snapshot above.
+  sc.ack_v2 = conn.session->stream_ack_v2();
   conn.stream_cfg = sc;
 
   const uint64_t id = conn.id;

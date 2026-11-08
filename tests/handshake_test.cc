@@ -161,6 +161,25 @@ void TestTlvNegotiation() {
   CHECK(c2.hs.established());
   CHECK(c2.hs.tlv_negotiated());
   CHECK(c2.hs.peer_tlvs().empty());
+
+  // #78: tlv_agreed(type) requires the type on BOTH sides.
+  Peer c3(10, 3, HandshakeRole::kClient, 0x55);
+  Peer s3(10, 3, HandshakeRole::kServer, 0x66);
+  c3.hs.set_local_tlvs({{fcp::kTlvTypeAckV2, {}}});
+  s3.hs.set_local_tlvs({{fcp::kTlvTypeAckV2, {}}});
+  c3.hs.start(0);
+  s3.hs.start(0);
+  c3.hs.on_tick(0);
+  s3.hs.on_tick(0);
+  CHECK(s3.deliver(c3.sent[0]) == HandshakeStatus::kConsumed);
+  // s3 opened simultaneously: [0] is its own HELLO, the ACK is last.
+  c3.deliver(s3.sent.back());
+  CHECK(c3.hs.established() && s3.hs.established());
+  CHECK(c3.hs.tlv_agreed(fcp::kTlvTypeAckV2));
+  CHECK(s3.hs.tlv_agreed(fcp::kTlvTypeAckV2));
+  // The first pair negotiated TLV but never offered the ACK-v2 type.
+  CHECK(!c.hs.tlv_agreed(fcp::kTlvTypeAckV2));
+  CHECK(!c2.hs.tlv_agreed(fcp::kTlvTypeAckV2));
 }
 
 // #77: the downgrade probe -- a peer that predates the bit never answers the

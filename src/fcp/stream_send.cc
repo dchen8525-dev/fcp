@@ -71,6 +71,84 @@ void Stream::handle_ack(const uint8_t* seg, size_t /*len*/, int64_t now_ms) {
   pump(now_ms);
 }
 
+// FCP-STREAM ACK v2 (#78, R9 hardening): the range set is validated in full
+// before any of it is applied -- parse and act are separated so a malformed
+// tail cannot ride on already-marked state. A block must sit at/after the
+// cumulative point, end within snd_max_ (the A4 bound, same as v1), and the
+// blocks must be ordered and disjoint (each start strictly after the previous
+// end). Any violation discards the whole range set; the cumulative point and
+// the window stay -- the same rule v1 applies to a bad single block. A lying
+// cum stays fatal exactly as in v1.
+void Stream::handle_ack_v2(const uint8_t* seg, size_t len, int64_t now_ms) {
+  const uint32_t cum = get_le32(seg + 1);
+  if (seq_after(cum, snd_max_)) {
+    ++bad_segs_;
+    return;
+  }
+  peer_rwnd_ = get_le32(seg + 5);
+  peer_rwnd_seen_ = true;  // the autotune may now read a full window as path evidence
+  struct Block {
+    uint32_t start;
+    uint32_t end;
+  };
+  Block blocks[kStreamAckV2MaxRanges];
+  size_t n = 0;
+  bool ok = true;
+  size_t off = kStreamAckV2MinLen;  // ranges start after the 10-byte header
+  const size_t n_decl =
+      seg[9] > kStreamAckV2MaxRanges ? kStreamAckV2MaxRanges : seg[9];
+  uint32_t prev_end = cum;
+  for (size_t i = 0; ok && i < n_decl; ++i) {
+    uint32_t gap = 0;
+    uint32_t blen = 0;
+    if (!get_uvarint(seg, len, &off, &gap) || !get_uvarint(seg, len, &off, &blen) ||
+        blen == 0) {
+      ok = false;
+      break;
+    }
+    const uint32_t start = prev_end + gap;  // u32 wrap; validated via seq below
+    const uint32_t end = start + blen;
+    // i > 0 requires a strict gap: the sender emits disjoint ascending blocks.
+    if (!seq_at_or_after(start, cum) || !seq_after(end, start) ||
+        seq_after(end, snd_max_) ||
+        (i > 0 && !seq_after(start, blocks[n - 1].end))) {
+      ok = false;
+      break;
+    }
+    blocks[n++] = Block{start, end};
+    prev_end = end;
+  }
+  if (ok && off != len) {
+    ok = false;  // trailing bytes past the declared ranges: malformed
+  }
+  if (!ok) {
+    ++bad_segs_;
+  }
+
+  const uint32_t prior_una = snd_una_;
+  // Order matters and matches v1: the duplicate-ACK trigger runs before the
+  // SACK fill (its fresh-retransmission guard keeps one ACK from emitting the
+  // same segment twice), the cumulative advance before the fill (a block below
+  // the new snd_una_ is not re-filled).
+  ack_dup_burst(cum, now_ms);
+  ack_advance_cum(cum, now_ms);
+  if (ok) {
+    for (size_t i = 0; i < n; ++i) {
+      ack_fill_sack(blocks[i].start, blocks[i].end, now_ms);
+    }
+  }
+  if (snd_una_ == prior_una) {
+    return;  // nothing confirmed
+  }
+  if (fin_sent_ && seq_at_or_after(cum, fin_offset_ + 1)) {
+    if (eof_delivered_) {
+      finish(now_ms, CloseReason::kLocalEof);
+      return;
+    }
+  }
+  pump(now_ms);
+}
+
 // Path 1 of the ACK: the duplicate-ACK burst (#27 fast retransmit).
 void Stream::ack_dup_burst(uint32_t cum, int64_t now_ms) {
   // #27 fast retransmit: a repeated cumulative point with unacked data is the

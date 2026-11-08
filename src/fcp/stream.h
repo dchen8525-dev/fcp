@@ -35,9 +35,18 @@ namespace fcp {
 constexpr uint8_t kStreamTypeData = 1;
 constexpr uint8_t kStreamTypeAck = 2;
 constexpr uint8_t kStreamTypeRst = 3;
+// ACK v2 (#78, 施工单 step 3): multi-range ACK negotiated through the
+// handshake TLV extension (type kStreamTlvAckV2). Old peers never see the
+// type -- it is only sent to a peer that offered the capability.
+constexpr uint8_t kStreamTypeAckV2 = 4;
 
 constexpr size_t kStreamDataHdrLen = 6;  // type | seq(4) | flags
 constexpr size_t kStreamAckLen = 17;     // type | cum | rwnd | sack_start | sack_end
+// ACK v2 header: type | cum(4) | rwnd(4) | n_ranges(1); the ranges follow as
+// (gap, len) u32 varint byte pairs relative to cum. The capability is
+// advertised through the handshake TLV type kTlvTypeAckV2 (handshake.h).
+constexpr size_t kStreamAckV2MinLen = 10;
+constexpr size_t kStreamAckV2MaxRanges = 64;
 constexpr size_t kStreamRstLen = 2;      // type | code
 constexpr uint8_t kStreamFlagFin = 1u << 0;
 
@@ -118,6 +127,11 @@ struct StreamConfig {
   // growth, down on a PMTUD black-hole fallback. A downward move re-cuts the
   // in-flight segments, so the byte offsets the ARQ works in never change.
   size_t max_segment = 1336;
+  // Multi-range ACK (FCP-STREAM ACK v2, #78). Set by the host from the
+  // handshake TLV negotiation (Session::stream_ack_v2); default off keeps the
+  // 17-byte v1 frame for directly-constructed streams. Only a negotiated peer
+  // ever receives the v2 frame type.
+  bool ack_v2 = false;
   // Send window. With auto_window off this is the constant window; with it on
   // it is only the starting value -- see below.
   size_t send_window_bytes = kDefaultSendWindowBytes;
@@ -374,6 +388,8 @@ class Stream {
   // `now_ms` stamps the ACK so on_tick can keep the SACK rotation alive while
   // the receive buffer is stalled and no new data arrives.
   void emit_ack(int64_t now_ms);
+  // #78: the negotiated multi-range ACK (see stream_recv.cc).
+  void emit_ack_v2(int64_t now_ms);
   // Apply the ACK coalescing policy for one delivered data segment. `urgent`
   // covers the cases where the peer is provably waiting on this ACK (its fin,
   // a hole, a closed window).
@@ -385,6 +401,8 @@ class Stream {
   void pump(int64_t now_ms);
   void handle_data(const uint8_t* seg, size_t len, int64_t now_ms);
   void handle_ack(const uint8_t* seg, size_t len, int64_t now_ms);
+  // #78: parse and apply the multi-range ACK; validation rules in stream_send.cc.
+  void handle_ack_v2(const uint8_t* seg, size_t len, int64_t now_ms);
   // The three duties one ACK can carry, split out of handle_ack() but called
   // from it in a fixed order (see stream_send.cc).
   void ack_dup_burst(uint32_t cum, int64_t now_ms);

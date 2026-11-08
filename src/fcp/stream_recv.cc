@@ -269,6 +269,10 @@ void Stream::emit_ack(int64_t now_ms) {
   ack_pending_ = false;
   acks_owed_ = 0;
   last_ack_ms_ = now_ms;
+  if (cfg_.ack_v2) {
+    emit_ack_v2(now_ms);
+    return;
+  }
   uint8_t buf[kStreamAckLen];
   const uint32_t cum = cum_out();
   buf[0] = kStreamTypeAck;
@@ -296,6 +300,42 @@ void Stream::emit_ack(int64_t now_ms) {
     put_le32(cum, buf + 13);
   }
   send_(buf, kStreamAckLen);
+}
+
+// FCP-STREAM ACK v2 (#78, 施工单 step 3): type | cum(4) | rwnd(4) |
+// n_ranges(1) | (gap, len) varint pairs. Every out-of-order chunk is one
+// block, closest to cum first and capped at kStreamAckV2MaxRanges -- one ACK
+// names every hole, which is what retires the v1 single-block rotation for
+// negotiated peers. Blocks are byte ranges relative to cum: block_0 starts at
+// cum + gap_0, block_i starts at block_{i-1}.end + gap_i, so the encoding is
+// wrap-free even though the offsets themselves are u32.
+void Stream::emit_ack_v2(int64_t /*now_ms*/) {
+  // Worst case: 64 ranges x (5-byte gap + 5-byte len) + the 9-byte header.
+  uint8_t buf[kStreamAckV2MinLen + kStreamAckV2MaxRanges * 10];
+  const uint32_t cum = cum_out();
+  buf[0] = kStreamTypeAckV2;
+  put_le32(cum, buf + 1);
+  put_le32(static_cast<uint32_t>(rwnd_out()), buf + 5);
+  size_t off = kStreamAckV2MinLen;
+  size_t n = 0;
+  uint32_t prev_end = cum;
+  for (const RcvChunk& blk : oob_) {
+    if (n >= kStreamAckV2MaxRanges) {
+      break;
+    }
+    const int64_t gap = seq_dist(blk.offset, prev_end);  // blk.offset - prev_end
+    if (gap < 0) {
+      continue;  // below the cumulative point (fin pseudo byte); nothing to report
+    }
+    off += static_cast<size_t>(
+        put_uvarint(static_cast<uint32_t>(gap), buf + off));
+    off += static_cast<size_t>(
+        put_uvarint(static_cast<uint32_t>(blk.bytes.size()), buf + off));
+    prev_end = blk.offset + static_cast<uint32_t>(blk.bytes.size());
+    ++n;
+  }
+  buf[9] = static_cast<uint8_t>(n);  // n_ranges sits after cum+rwnd, at index 9
+  send_(buf, off);
 }
 
 size_t Stream::rwnd_out() const {

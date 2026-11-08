@@ -6,6 +6,8 @@
 
 #include "fcp/stream.h"
 
+#include "fcp/wire.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <deque>
@@ -48,6 +50,59 @@ std::vector<uint8_t> MakeAck(uint32_t cum, uint32_t rwnd, uint32_t sack_start, u
   wr32(b, 9, sack_start);
   wr32(b, 13, sack_end);
   return b;
+}
+
+// #78: hand-built ACK v2, blocks given as absolute [start, end) byte pairs
+// (encoded relative to cum, exactly like the real emitter).
+std::vector<uint8_t> MakeAckV2(uint32_t cum, uint32_t rwnd,
+                               std::vector<std::pair<uint32_t, uint32_t>> blocks) {
+  std::vector<uint8_t> b(fcp::kStreamAckV2MinLen, 0);
+  b[0] = fcp::kStreamTypeAckV2;
+  wr32(b, 1, cum);
+  wr32(b, 5, rwnd);
+  b[9] = static_cast<uint8_t>(blocks.size());
+  uint32_t prev_end = cum;
+  for (const auto& blk : blocks) {
+    uint8_t tmp[10];
+    const size_t g = fcp::put_uvarint(blk.first - prev_end, tmp);
+    b.insert(b.end(), tmp, tmp + g);
+    const size_t l = fcp::put_uvarint(blk.second - blk.first, tmp);
+    b.insert(b.end(), tmp, tmp + l);
+    prev_end = blk.second;
+  }
+  return b;
+}
+
+struct AckV2 {
+  uint32_t cum = 0;
+  uint32_t rwnd = 0;
+  std::vector<std::pair<uint32_t, uint32_t>> blocks;  // absolute [start, end)
+  bool ok = false;
+};
+
+AckV2 ParseAckV2(const std::vector<uint8_t>& seg) {
+  AckV2 out;
+  if (seg.size() < fcp::kStreamAckV2MinLen || seg[0] != fcp::kStreamTypeAckV2) {
+    return out;
+  }
+  out.cum = rd32(seg.data() + 1);
+  out.rwnd = rd32(seg.data() + 5);
+  out.ok = true;
+  size_t off = fcp::kStreamAckV2MinLen;  // ranges start after the 10-byte header
+  uint32_t prev_end = out.cum;
+  for (size_t i = 0; i < seg[9]; ++i) {
+    uint32_t gap = 0;
+    uint32_t len = 0;
+    if (!fcp::get_uvarint(seg.data(), seg.size(), &off, &gap) ||
+        !fcp::get_uvarint(seg.data(), seg.size(), &off, &len) || len == 0) {
+      out.ok = false;
+      break;
+    }
+    prev_end = prev_end + gap;
+    out.blocks.emplace_back(prev_end, prev_end + len);
+    prev_end = prev_end + len;
+  }
+  return out;
 }
 
 // DATA built by hand, so tests can inject overlaps, holes and lies.
@@ -224,6 +279,12 @@ class Fixture {
       }
     }
     return {};
+  }
+
+  // The last segment this endpoint emitted of any kind (#78 tests read the
+  // v2 ACK, which IsAck's 17-byte filter would skip).
+  std::vector<uint8_t> last_sent(int from) const {
+    return ends_[from].sent.empty() ? std::vector<uint8_t>() : ends_[from].sent.back();
   }
 
   std::vector<std::vector<uint8_t>> acks_of(int from) const {
@@ -2432,7 +2493,104 @@ void TestPacerReportsItsNextWake() {
   CHECK(f.sa().next_wake_ms(now) > now);
 }
 
+// #78 (R1 acceptance): one v2 ACK names every hole, and one ACK repairs all
+// of them -- no dup-ACK rotation, no per-RTT hole discovery.
+void TestAckV2ReportsAllHolesInOneAck() {
+  StreamConfig cfg = DefaultCfg();
+  cfg.ack_v2 = true;
+  Fixture f(cfg);
+  const size_t cap = 100;  // payload per segment under DefaultCfg
+  f.killer = [](const Packet&) { return true; };  // hold the wire
+  std::vector<uint8_t> payload = MakeBytes(10 * cap, 1);
+  CHECK_EQ(f.push(kA, payload), payload.size());
+  f.killer = nullptr;
+  const auto segs = f.data_of(kA);
+  CHECK_EQ(segs.size(), 10u);
+
+  // Deliver 0, 3, 6, 9: holes at [100,300), [400,600), [700,900).
+  f.feed(kB, segs[0]);
+  f.feed(kB, segs[3]);
+  f.feed(kB, segs[6]);
+  f.feed(kB, segs[9]);
+  const AckV2 ack = ParseAckV2(f.last_sent(kB));
+  CHECK(ack.ok);
+  CHECK_EQ(ack.cum, 100u);
+  CHECK_EQ(ack.blocks.size(), 3u);
+  CHECK_EQ(ack.blocks[0].first, 300u);
+  CHECK_EQ(ack.blocks[0].second, 400u);
+  CHECK_EQ(ack.blocks[1].first, 600u);
+  CHECK_EQ(ack.blocks[1].second, 700u);
+  CHECK_EQ(ack.blocks[2].first, 900u);
+  CHECK_EQ(ack.blocks[2].second, 1000u);
+
+  // One ACK repairs every hole: the six hole segments go out once, the three
+  // SACKed ones do not move.
+  const size_t before = f.data_of(kA).size();
+  f.feed(kA, f.last_sent(kB));
+  CHECK_EQ(f.data_of(kA).size(), before + 6);
+  for (const uint32_t off : {100u, 200u, 400u, 500u, 700u, 800u}) {
+    CHECK_EQ(f.data_with_offset(kA, off), 2u);  // original + one repair
+  }
+  for (const uint32_t off : {0u, 300u, 600u, 900u}) {
+    CHECK_EQ(f.data_with_offset(kA, off), 1u);  // SACKed, never resent
+  }
+}
+
+// #78 (R9): any malformed range set is discarded whole -- nothing is applied,
+// nothing is provoked; a valid set right after still works.
+void TestAckV2MalformedDiscardsWholeSet() {
+  StreamConfig cfg = DefaultCfg();
+  cfg.ack_v2 = true;
+  Fixture f(cfg);
+  f.killer = [](const Packet&) { return true; };
+  std::vector<uint8_t> payload = MakeBytes(4 * 100, 2);
+  CHECK_EQ(f.push(kA, payload), payload.size());
+  f.killer = nullptr;
+  const auto segs = f.data_of(kA);
+  CHECK_EQ(segs.size(), 4u);
+  const size_t before = f.data_of(kA).size();
+
+  // Vary the cumulative point per probe so none of them reads as a dup-ACK
+  // (the dup-burst path would retransmit on its own and muddy the assertion).
+  f.feed(kA, MakeAckV2(100, 4096, {{500, 600}}));  // block past snd_max_ (400)
+  CHECK_EQ(f.data_of(kA).size(), before);
+  f.feed(kA, MakeAckV2(150, 4096, {{150, 250}, {200, 400}}));  // overlap
+  CHECK_EQ(f.data_of(kA).size(), before);
+  {
+    std::vector<uint8_t> a = MakeAckV2(200, 4096, {{250, 350}});
+    a.push_back(0xEE);  // trailing byte past the declared ranges
+    f.feed(kA, a);
+    CHECK_EQ(f.data_of(kA).size(), before);
+  }
+  {
+    std::vector<uint8_t> a = MakeAckV2(250, 4096, {});
+    a[9] = 1;           // one range declared...
+    a.push_back(0x80);  // ...but the varint never terminates
+    f.feed(kA, a);
+    CHECK_EQ(f.data_of(kA).size(), before);
+  }
+  // A well-formed set right after the rejects still repairs its hole.
+  f.feed(kA, MakeAckV2(300, 4096, {{350, 400}}));
+  CHECK_EQ(f.data_with_offset(kA, 300), 2u);
+}
+
+// #78: without the negotiated capability the wire stays v1 (17B); the new
+// frame type never reaches a peer that did not offer the TLV.
+void TestAckV2RequiresNegotiation() {
+  Fixture f;  // DefaultCfg: ack_v2 off
+  std::vector<uint8_t> payload = MakeBytes(100, 3);
+  CHECK_EQ(f.push(kA, payload), payload.size());
+  CHECK(!f.acks_of(kB).empty());
+  for (const std::vector<uint8_t>& a : f.acks_of(kB)) {
+    CHECK(IsAck(a));
+    CHECK_EQ(a[0], fcp::kStreamTypeAck);
+  }
+}
+
 int main() {
+  TestAckV2ReportsAllHolesInOneAck();
+  TestAckV2MalformedDiscardsWholeSet();
+  TestAckV2RequiresNegotiation();
   TestOrderedFlow();
   TestBidirectional();
   TestOutOfOrderHeldAndSackBlock();

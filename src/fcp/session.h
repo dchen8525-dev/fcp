@@ -105,6 +105,11 @@ struct SessionConfig {
   // decision just made. Empty = no recording.
   using TraceFn = std::function<void(const TraceEntry&)>;
   TraceFn trace;
+  // #78: offer FCP-STREAM ACK v2 through the handshake TLV extension. On by
+  // default; a peer that predates the TLV bit costs one 750ms downgrade probe
+  // (two unanswered HELLOs) and then negotiates without it, so mixed-version
+  // deployments pay that once per connection while the roll-out crosses.
+  bool stream_ack_v2 = true;
 };
 
 class Session {
@@ -175,6 +180,11 @@ class Session {
   uint32_t nonce_mismatch() const { return hs_.nonce_mismatch(); }
   const MtuLimits& mtu_limits() const { return limits_; }
   bool config_valid() const { return limits_.valid; }
+  // #78: the negotiated result the host feeds into StreamConfig::ack_v2 --
+  // both ends had to offer the capability (Handshake::tlv_agreed).
+  bool stream_ack_v2() const {
+    return cfg_.stream_ack_v2 && hs_.tlv_agreed(kTlvTypeAckV2);
+  }
 
   // PMTUD: the proven send MTU (starts at the configured value, climbs on an
   // ack, and steps below the configured floor only on kernel EMSGSIZE

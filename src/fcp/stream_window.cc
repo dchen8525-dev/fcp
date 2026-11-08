@@ -278,7 +278,8 @@ bool Stream::pace_allow(size_t bytes, int64_t now_ms) {
   // kPaceBurstMs of credit at most: tokens accumulated while the app was idle
   // must not turn into a burst the path has to absorb all at once, and the
   // host can now wake before its 25 ms tick (next_wake_ms), so the bucket does
-  // not have to bank a whole tick's worth to keep the pipe full.
+  // not have to bank a whole tick's worth to keep the pipe full. (#81: this
+  // bucket also bounds the SACK-fill repair burst by design — see stream.h.)
   const double cap =
       std::max<double>(static_cast<double>(2 * seg), rate * kPaceBurstMs / 1000.0);
   pace_tokens_ = std::min(pace_tokens_, cap);

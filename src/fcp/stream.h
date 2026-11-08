@@ -84,6 +84,12 @@ constexpr int64_t kAckDelayMs = 4;
 // every tick released ~62 KB back-to-back, exactly the micro-burst a shallow
 // queue drops. With next_wake_ms() the host can wake mid-tick, so the allowance
 // only has to cover scheduling jitter, not a whole tick.
+// R6 note (#81): quic-go's 10-packet bucket was evaluated and NOT adopted —
+// with BBR on, this bucket is deliberately the burst limiter for SACK-fill
+// repairs (fill_holes: "the whole hole goes out in this one pass"); at ten
+// packets deep a 59-hole repair drains over ~6 RTTs instead of 1. The high-rate
+// burst growth the 10-packet floor would bound is real, but it must be solved
+// together with the repair semantics (A/B 定案①), not by the bucket alone.
 constexpr double kPaceBurstMs = 6.0;
 
 // Tail loss probe (RFC 8985 in shape, simplified here). With data outstanding

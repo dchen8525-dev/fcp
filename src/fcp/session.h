@@ -19,6 +19,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "fcp/defaults.h"
 #include "fcp/envelope.h"

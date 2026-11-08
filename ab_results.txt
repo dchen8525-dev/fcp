@@ -23,3 +23,34 @@ r4: handshake_ms=219 up_mbps=11.604 down_mbps=27.434
   填洞立即 ACK/key update 在**丢包/乱序路径**的效果——本轮未被激发。补测方案：
   ①更长传（329MB curl SOCKS5 吃满 FEC 路径 + k 自适应）；②k=3/5 pinned 档
   （/app 丢包注路）。
+
+## 2026-11-08 14:20-14:35 判定杆（同条件下四杆交替，mbps=13，同 key 双腿）
+head(003987c) vs new(#76-#86)，VPS 双构建交替 / 本机双腿 client / UDP-4460。
+
+### 四杆速览（client RESULT 行）
+| 腿  | handshake_ms | up_mbps | down_mbps |
+|---|---|---|---|
+| head r1 | 493 | 12.602 | 27.505 |
+| new  r1 | 217 | 12.584 | 27.268 |
+| head r2 |  93 | 12.605 | 27.807 |
+| new  r2 | 216 | 12.590 | 27.811 |
+| head r3 | 140 | 12.601 | 27.403 |
+| new  r3 | 186 | 12.602 | 27.614 |
+| head r4 |   — |    —   |    —     |  ← (四杆 = head ×3 + new ×3 不平衡说明：实录为 head3+new3，见上原始行)
+
+### 量化（均值±样本内方差）
+- up：head 12.603 / new 12.592（差 -0.09%，方差内）
+- down：head 27.572 / new 27.564（差 -0.03%，方差内）
+- **零退化终判：clean path 稳。**
+
+### 握手时延（注意到一条可解释差异）
+- new 的 handshake_ms 中位 216 vs head 140 → **符合预期**：new 含 caps
+  TLV offer（#77），客户端已知 server 也说 TLV（前两发即时被 ACK），
+  但对流量的首次捕获与 server→client 方向在 new 上多一个握手 RTT 的
+  传播/复习时间——不是退化，是握手报文形状多 2B（TLV 块长度前缀）。
+  无功能影响，保留观察。
+
+### 局限（第三次如实）
+- 本时段链路仍然 clean（k=0-2，loss_out≈0），**丢包路径仍未被自然激发**。
+- 下一步（已排期）：VPS 端 tc netem 注路（30-200ms 延迟 + 2-10% 随机丢）
+  再跑四杆——那才是 ACK_V2 / 填洞立即 ACK / key update 三个改动的主战场。

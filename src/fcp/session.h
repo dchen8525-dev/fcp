@@ -75,6 +75,10 @@ struct SessionConfig {
   // the cold M1 behaviour. initial_srtt_ms == 0 keeps the internal 200ms, so
   // T_flush, the settlement tombstones and the §8 queue guardrail all start
   // from the peer's history instead of from the first converged sample.
+  // It also seeds the handshake's first backoff gap to clamp(2*srtt, 250,
+  // 8000) ms (#76): the prewarm prior is the same link knowledge, so a
+  // known-fast path skips the 250ms base gap and a known-slow one retries
+  // patiently instead of dying early.
   int64_t initial_srtt_ms = 0;
   // >= 1 enters the FEC state machine already ON at this k (still clamped by
   // the negotiated P' and p_max). -1 starts OFF, which cannot pick a k until
@@ -202,6 +206,11 @@ class Session {
   int64_t srtt_ms() const { return srtt_ms_; }
 
   uint32_t auth_fail() const { return auth_fail_; }
+  // Amplification-bound drops (see the member comment): outbound datagrams
+  // suppressed by the 3x rule before the handshake confirmed. Zero on every
+  // legitimate deployment; non-zero means the peer (or the path) kept
+  // provoking replies without ever completing a handshake.
+  uint32_t amp_limited_drops() const { return amp_limited_drops_; }
   uint32_t struct_fail() const { return pre_struct_fail_ + (rx_ ? rx_->struct_fail() : 0); }
   // #31 (M4 trigger metric): FEC/ARQ waste — retransmissions that lost the
   // race to parity. Summed into the proxy stats line for the WAN calibration.
@@ -281,6 +290,8 @@ class Session {
   void pmtu_raise_send(uint16_t mtu);
 
   void emit_symbol(const TxSymbol& symbol, bool bootstrap = false);
+  // True when this datagram must not leave: the amplification bound above.
+  bool amp_limited(size_t wire_len) const;
   // `bootstrap` routes the frame through the handshake envelope instead of the
   // data envelope (HELLO/HELLO_ACK only).
   void send_oob(const uint8_t* msg, size_t len, bool bootstrap = false);
@@ -309,11 +320,24 @@ class Session {
   bool bootstrap_seed_ok_ = false;
   // Budget for AEAD attempts on the bootstrap envelope after negotiation. That
   // key can then only carry a retried HELLO/ACK, which the handshake sends at
-  // >=300ms intervals, so a handful per second is plenty. Without the budget
+  // >=250ms intervals, so a handful per second is plenty. Without the budget
   // every forged datagram that failed the data envelope bought a second
   // decrypt; the window caps that at kBootstrapProbesPerSecond per session.
   int64_t bootstrap_window_ms_ = -1;
   uint32_t bootstrap_probes_ = 0;
+  // Pre-establishment amplification bound (施工单 step 1 / #76, quic-go
+  // sent_packet_handler.go:1156): until the handshake confirms, this session
+  // may not have sent more than 3x the bytes it received. The initiator's
+  // unsolicited first HELLO is exempt (the QUIC client-Initial analogue), so
+  // the bound arms on the first inbound byte and lifts at establishment --
+  // the ACK that completed the handshake already proved the peer decrypts
+  // and reaches us. Legitimate traffic never trips it (a HELLO_ACK is 52B
+  // against a 36B HELLO, ratio 1.44); what it caps is a peer that answers
+  // nothing yet keeps provoking replies.
+  uint64_t amp_recv_bytes_ = 0;
+  uint64_t amp_sent_bytes_ = 0;
+  uint32_t amp_limited_drops_ = 0;
+  bool amp_limited_warned_ = false;
   SendFn send_;
   DeliverFn deliver_;
   LogFn log_;

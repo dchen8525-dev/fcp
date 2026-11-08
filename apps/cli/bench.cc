@@ -413,9 +413,10 @@ bool RunClient(const ClientOptions& opt, const ProgressFn& progress, Result* out
   uint8_t rendezvous[kRendezvousLen];
   EncodeRendezvous(salt, opt.seconds, rendezvous);
 
-  // Rendezvous before the session: the FCP handshake only retries for ~2.1s,
-  // so both ends must start within that window. The server echoes the magic
-  // once it has created the bench session.
+  // Rendezvous before the session: the FCP handshake now retries for ~39.7s
+  // (#76), but the bench still wants both ends started together so the
+  // measured window is clean. The server echoes the magic once it has
+  // created the bench session.
   bool met = false;
   int64_t meet_start = NowMs();
   int64_t next_meet = 0;

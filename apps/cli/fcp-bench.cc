@@ -391,10 +391,11 @@ constexpr size_t kSaltLen = 8;
 constexpr size_t kMeetLen = 8;
 constexpr int64_t kRendezvousTimeoutMs = 15000;
 
-// The V3 handshake gives each side only three HELLOs (~2.1s) before it fails,
-// so two processes started a few seconds apart can never establish. Rendezvous
-// outside the protocol first: both sides send a magic datagram every 50ms
-// until each has seen the peer's, then start their sessions together.
+// The FCP handshake retries for ~39.7s before it fails (#76; the old budget
+// was three HELLOs / ~2.1s), so two processes started a few seconds apart can
+// still establish. Rendezvous outside the protocol is kept anyway: both sides
+// send a magic datagram every 50ms until each has seen the peer's, then
+// start their sessions together.
 //
 // The client's datagram also carries the run's session salt (A2: a fresh salt
 // per run from the OS CSPRNG, with no constant fallback -- P2' N7, a fixed salt

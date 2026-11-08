@@ -56,7 +56,7 @@ const char* handshake_error_text(HandshakeError error) {
     case HandshakeError::kNone:
       return "none";
     case HandshakeError::kNoAck:
-      return "no ACK after 3 tries";
+      return "no ACK before the retry budget ran out";
     case HandshakeError::kBadCaps:
       return "invalid caps";
     case HandshakeError::kMissingCapability:
@@ -98,7 +98,7 @@ bool is_hello_ack(const uint8_t* data, size_t len) {
 Handshake::Handshake(uint8_t local_d, uint8_t local_p, SendFn send,
                      HandshakeRole role, const uint8_t* local_nonce,
                      uint8_t local_flags, size_t max_cached_segments,
-                     size_t max_cached_bytes)
+                     size_t max_cached_bytes, int64_t rtt_seed_ms)
     : local_d_(local_d),
       local_p_(local_p),
       local_flags_(local_flags),
@@ -108,6 +108,10 @@ Handshake::Handshake(uint8_t local_d, uint8_t local_p, SendFn send,
       max_cached_bytes_(max_cached_bytes),
       local_nonce_{},
       peer_nonce_{} {
+  if (rtt_seed_ms > 0) {
+    first_gap_ms_ = std::clamp(2 * rtt_seed_ms, kHandshakeRetryMs,
+                               kHandshakeRetryCapMs);
+  }
   if (local_nonce != nullptr) {
     std::memcpy(local_nonce_, local_nonce, kHandshakeNonceLen);
   } else if (!random_bytes(local_nonce_, kHandshakeNonceLen)) {
@@ -149,10 +153,14 @@ void Handshake::on_tick(int64_t now_ms) {
   }
   send_hello();
   ++retries_;
-  // Exponential backoff (#27①): the gap after send n is 300 << (n-1) ms, i.e.
-  // 300/600/1200ms. With the 3-HELLO cap the handshake fails at ~2.1s, which
-  // covers RTT <= ~700ms links; the old fixed 300ms budget failed at 900ms.
-  next_retry_ms_ = now_ms + (kHandshakeRetryMs << (retries_ - 1));
+  // Exponential backoff (#27①, #76): the gap after send n is
+  // min(first_gap_ms_ << (n-1), 8s). Base 250ms puts the 9 sends at
+  // 0/250/750/1750/.../31750 ms and the failure check one cap interval later
+  // (~39.7s of coverage), so a multi-second blackout (WiFi roaming, cellular
+  // handover) no longer kills an otherwise healthy handshake; a prewarm RTT
+  // prior seeds first_gap_ms_ instead of the base.
+  next_retry_ms_ =
+      now_ms + std::min(first_gap_ms_ << (retries_ - 1), kHandshakeRetryCapMs);
 }
 
 HandshakeStatus Handshake::on_oob(const uint8_t* data, size_t len) {

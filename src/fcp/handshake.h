@@ -4,7 +4,8 @@
 // Both messages travel as oob frames (type=2, erratum #25): the session wraps
 // them in the AEAD envelope and the receiver dispatches by their 16-byte magic.
 // Retransmission belongs to the handshake's own exponential-backoff timer
-// (300/600/1200ms, #27①), so there is no KCP-level retransmit window. Both
+// (250ms doubling, capped at 8s -- 9 sends over ~39.7s; #27①, extended by
+// 施工单 step 1 / #76), so there is no KCP-level retransmit window. Both
 // sides may send HELLO simultaneously: every
 // valid HELLO is ACKed, and the first side to receive either message negotiates
 // once.
@@ -71,16 +72,28 @@ constexpr size_t kHelloLen = kHelloMagicLen + kHandshakeNonceLen + kCapsLen;  //
 constexpr size_t kHelloAckLen =
     kHelloAckMagicLen + 2 * kHandshakeNonceLen + kCapsLen;  // 52
 
-constexpr int kHandshakeMaxRetries = 3;
-// Base timeout before the first retry. The gap doubles after every send, so
-// the three gaps are 300/600/1200ms and the handshake fails at ~2.1s total
-// (spec §6.2 #27①: a fixed 900ms budget falsely kills RTT > 450ms links).
-constexpr int64_t kHandshakeRetryMs = 300;
+// Total sends before the handshake is declared dead (initial HELLO + retries).
+constexpr int kHandshakeMaxRetries = 9;
+// Base gap before the first retry. The gap doubles after every send and caps
+// at kHandshakeRetryCapMs, so the sends land at 0/250/750/1750/3750/7750/
+// 15750/23750/31750 ms and the handshake fails at ~39.7s total -- the last
+// send gets one full cap interval of grace, matching the STUN request
+// lifecycle (spec §6.2 #27① fixed the false-fail on RTT > 450ms links; #76
+// extends it further: the old 3-send/2.1s budget declared death inside any
+// >2.1s blackout -- WiFi roaming, cellular handover -- on a link that was
+// fine). With a prewarm RTT prior (SessionConfig::initial_srtt_ms) the first
+// gap is seeded to clamp(2*srtt, base, cap) instead, so a known-fast path
+// does not wait out a 250ms first gap and a known-slow one does not give up
+// early.
+constexpr int64_t kHandshakeRetryMs = 250;
+constexpr int64_t kHandshakeRetryCapMs = 8000;
 // #28③ (F2): pre-negotiation cache limits, raised from 64 segs / 64 KiB and
-// made configurable. The 2.1s worst-case handshake at a sustained 8 Mbit/s
-// sender fills 64 segs in ~80ms and disconnected the session; 512 segs /
-// 512 KiB buffers ~0.5s of full-rate data and covers the RTT <= ~500ms
-// handshake class. Heavier BDP links override via SessionConfig.
+// made configurable. A sustained 8 Mbit/s sender fills 64 segs in ~80ms and
+// disconnected the session; 512 segs / 512 KiB buffers ~0.5s of full-rate
+// data and covers the RTT <= ~500ms handshake class (the cache bounds how
+// long a busy sender can wait out a blackout regardless of the retry table,
+// which is why the two budgets are documented apart). Heavier BDP links
+// override via SessionConfig.
 constexpr size_t kHandshakeMaxCachedSegments = 512;
 constexpr size_t kHandshakeMaxCachedBytes = 512 * 1024;
 
@@ -157,7 +170,8 @@ class Handshake {
             const uint8_t* local_nonce = nullptr,
             uint8_t local_flags = kLocalFlagsM1,
             size_t max_cached_segments = kHandshakeMaxCachedSegments,
-            size_t max_cached_bytes = kHandshakeMaxCachedBytes);
+            size_t max_cached_bytes = kHandshakeMaxCachedBytes,
+            int64_t rtt_seed_ms = 0);
   // 两侧 nonce 一旦生命周期结束就零化：它们绑定了 v7 会话密钥的派生输入。
   ~Handshake();
   Handshake(const Handshake&) = delete;
@@ -243,6 +257,9 @@ class Handshake {
 
   int retries_ = 0;
   int64_t next_retry_ms_ = 0;
+  // First backoff gap: kHandshakeRetryMs, or clamp(2*rtt_seed, base, cap)
+  // when a prewarm prior was passed in. Every later gap doubles this one.
+  int64_t first_gap_ms_ = kHandshakeRetryMs;
 
   std::vector<std::vector<uint8_t>> cached_;
   size_t cached_bytes_ = 0;

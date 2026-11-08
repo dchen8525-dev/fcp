@@ -50,9 +50,10 @@ bool mtu_fits_largest_oob(const SessionConfig& cfg) {
 constexpr uint32_t kHandshakeSendBudget = 1u << 16;
 
 // After negotiation, the bootstrap envelope is only worth trying for a retried
-// HELLO/HELLO_ACK. The handshake retries at 300/600/1200ms, so this ceiling is
-// far above what a real peer needs; it only stops an unauthenticated flood
-// from making every failing datagram cost a second AEAD attempt.
+// HELLO/HELLO_ACK. The handshake retries on a doubling schedule from 250ms
+// capped at 8s (#76), so this ceiling is far above what a real peer needs; it
+// only stops an unauthenticated flood from making every failing datagram cost
+// a second AEAD attempt.
 constexpr uint32_t kBootstrapProbesPerSecond = 64;
 
 // NAT keepalive (on_tick): the process shares one UDP 5-tuple per peer across
@@ -150,7 +151,8 @@ Session::Session(const SessionConfig& config, SendFn send, DeliverFn deliver, Lo
           config.send_direction == Direction::kC2S ? HandshakeRole::kClient
                                                    : HandshakeRole::kServer,
           nonce_or_null(config.handshake_nonce), handshake_flags(config),
-          config.handshake_cache_segments, config.handshake_cache_bytes),
+          config.handshake_cache_segments, config.handshake_cache_bytes,
+          config.initial_srtt_ms),
       srtt_ms_(config.initial_srtt_ms > 0 ? config.initial_srtt_ms : kDefaultSrttMs),
       pmtu_mtu_(config.mtu),
       pmtu_max_mtu_(pmtu_ceiling(config)),
@@ -196,6 +198,10 @@ Session::StartStatus Session::start(int64_t now_ms) {
 }
 
 bool Session::on_wire(const uint8_t* wire, size_t len, int64_t now_ms) {
+  // Amplification accounting (#76): every inbound byte counts toward the
+  // peer's reply allowance, valid or not -- an attacker must put bytes on the
+  // wire to earn bytes back, which is the whole point of the 3x rule.
+  amp_recv_bytes_ += len;
   // R3-1: two key epochs reach this entry point. Data symbols use the rekeyed
   // envelope; HELLO/HELLO_ACK still travel under the (PSK, salt) bootstrap key
   // so a retried handshake stays readable after the data epoch moved on. The
@@ -1216,8 +1222,27 @@ void Session::emit_symbol(const TxSymbol& symbol, bool bootstrap) {
     }
     return;
   }
+  if (amp_limited(wire.size())) {
+    ++amp_limited_drops_;
+    if (!amp_limited_warned_) {
+      amp_limited_warned_ = true;
+      log(std::string(kTagWarn) +
+          "FCP amplification bound hit: suppressing outbound until the "
+          "handshake confirms");
+    }
+    return;
+  }
+  // Only bytes that actually left count against the keepalive silence clock.
   wire_out_bytes_ += wire.size();
+  amp_sent_bytes_ += wire.size();
   send_(wire.data(), wire.size(), hdr_type(symbol.type_k));
+}
+
+bool Session::amp_limited(size_t wire_len) const {
+  if (hs_.established() || amp_recv_bytes_ == 0) {
+    return false;
+  }
+  return amp_sent_bytes_ + wire_len > 3 * amp_recv_bytes_;
 }
 
 void Session::send_oob(const uint8_t* msg, size_t len, bool bootstrap) {

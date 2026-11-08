@@ -396,70 +396,84 @@ void TestTimeout() {
   CHECK_EQ(p.hs.retries(), 0);
   p.hs.on_tick(0);
   CHECK_EQ(p.sent.size(), 1u);
-  // Backoff gaps are 300/600/1200ms (#27①), so the sends land at 0/300/900
-  // and the handshake fails at 2100ms total (was 0/300/600 → fail at 900).
-  p.hs.on_tick(299);
+  // Backoff gaps double from 250ms and cap at 8s (#27①, #76), so the sends
+  // land at 0/250/750/1750/3750/7750/15750/23750/31750 and the handshake
+  // fails one cap interval after the last send, at 39750ms total (the old
+  // 3-send budget failed at 2100ms). Each on_tick call fires at most one
+  // send, so the schedule is driven one stage per call.
+  p.hs.on_tick(249);
   CHECK_EQ(p.sent.size(), 1u);
-  p.hs.on_tick(300);
-  p.hs.on_tick(899);
+  p.hs.on_tick(250);
   CHECK_EQ(p.sent.size(), 2u);
-  p.hs.on_tick(900);
+  p.hs.on_tick(749);
+  CHECK_EQ(p.sent.size(), 2u);
+  p.hs.on_tick(750);
   CHECK_EQ(p.sent.size(), 3u);
   for (const Bytes& msg : p.sent) {
     CHECK(fcp::is_hello(msg.data(), msg.size()));
   }
+  p.hs.on_tick(1750);
+  p.hs.on_tick(3750);
+  p.hs.on_tick(7750);
+  p.hs.on_tick(15750);
+  p.hs.on_tick(23750);
+  CHECK_EQ(p.sent.size(), 8u);
   CHECK(p.hs.state() == fcp::HandshakeState::kHelloSent);
-  p.hs.on_tick(2099);
+  p.hs.on_tick(31750);
+  CHECK_EQ(p.sent.size(), 9u);
   CHECK(p.hs.state() == fcp::HandshakeState::kHelloSent);
-  p.hs.on_tick(2100);
+  p.hs.on_tick(39749);
+  CHECK(p.hs.state() == fcp::HandshakeState::kHelloSent);
+  p.hs.on_tick(39750);
   CHECK(p.hs.state() == fcp::HandshakeState::kFailed);
   CHECK(p.hs.error() == fcp::HandshakeError::kNoAck);
-  CHECK_EQ(p.sent.size(), 3u);
-  CHECK(std::string(fcp::handshake_error_text(p.hs.error())) == "no ACK after 3 tries");
+  CHECK_EQ(p.sent.size(), 9u);
+  CHECK(std::string(fcp::handshake_error_text(p.hs.error())) ==
+        "no ACK before the retry budget ran out");
 
   // A late tick after failure stays quiet.
-  p.hs.on_tick(5000);
-  CHECK_EQ(p.sent.size(), 3u);
+  p.hs.on_tick(50000);
+  CHECK_EQ(p.sent.size(), 9u);
 }
 
-// T26 (#27①): the retry timer backs off exponentially, an ACK at any stage
-// stops it, and an RTT=500ms link (fatal under the old fixed 900ms budget)
+// T26 (#27①, #76): the retry timer backs off exponentially, an ACK at any
+// stage stops it, and a lossy link (fatal under the old 3-send/2.1s budget)
 // now completes the handshake.
 void TestRetryBackoff() {
-  // Gap sequence: 300 after the first send, then 600, then failure check 1200
-  // after the third send (no 4th HELLO).
+  // Gap sequence: 250 after the first send, then 500, then 1000.
   Peer p(10, 3, HandshakeRole::kClient, 0x11);
   p.hs.start(0);
   p.hs.on_tick(0);
   CHECK_EQ(p.hs.retries(), 1);
-  CHECK_EQ(p.hs.next_retry_ms(), 300);
-  p.hs.on_tick(300);
+  CHECK_EQ(p.hs.next_retry_ms(), 250);
+  p.hs.on_tick(250);
   CHECK_EQ(p.hs.retries(), 2);
-  CHECK_EQ(p.hs.next_retry_ms(), 900);
-  p.hs.on_tick(900);
+  CHECK_EQ(p.hs.next_retry_ms(), 750);
+  p.hs.on_tick(750);
   CHECK_EQ(p.hs.retries(), 3);
-  CHECK_EQ(p.hs.next_retry_ms(), 2100);
+  CHECK_EQ(p.hs.next_retry_ms(), 1750);
   CHECK_EQ(p.sent.size(), 3u);
 
   // An ACK arriving during any backoff stage stops the timer permanently.
   const Bytes server_draw = Nonce(0x33);
   CHECK(p.deliver(MakeAck(p.nonce, server_draw)) == HandshakeStatus::kConsumed);
   CHECK(p.hs.established());
-  p.hs.on_tick(2100);
+  p.hs.on_tick(1750);
   p.hs.on_tick(100000);
   CHECK_EQ(p.sent.size(), 3u);
 
-  // RTT=500ms link, first two HELLOs lost: sends at 0 (lost) and 300 (lost);
-  // the third send at 900 gets its ACK at 1400 — established, no failure.
-  // The old fixed budget declared failure at 900ms before the ACK arrived.
+  // RTT=500ms link, first two HELLOs lost: sends at 0 (lost) and 250 (lost);
+  // the third send at 750 gets its ACK at 1250 — established, no failure.
+  // The old budget kept this scenario green as well, so this asserts the
+  // tighter 250ms base did not break the property #27① bought.
   Peer q(10, 3, HandshakeRole::kClient, 0x44);
   q.hs.start(0);
   q.hs.on_tick(0);    // lost
-  q.hs.on_tick(300);  // lost
-  q.hs.on_tick(900);  // delivered; ACK arrives at 1400
+  q.hs.on_tick(250);  // lost
+  q.hs.on_tick(750);  // delivered; ACK arrives at 1250
   CHECK(q.deliver(MakeAck(q.nonce, server_draw)) == HandshakeStatus::kConsumed);
   CHECK(q.hs.established());
-  q.hs.on_tick(2100);
+  q.hs.on_tick(1750);
   q.hs.on_tick(100000);
   CHECK_EQ(q.sent.size(), 3u);
 
@@ -468,6 +482,51 @@ void TestRetryBackoff() {
   CHECK(p.deliver(MakeHello(server_draw)) == HandshakeStatus::kConsumed);
   CHECK_EQ(p.sent.size(), 4u);
   CHECK(fcp::is_hello_ack(p.sent.back().data(), p.sent.back().size()));
+}
+
+// #76: a prewarm RTT prior seeds the first gap to clamp(2*srtt, 250, 8000)
+// instead of the 250ms base; later gaps double and keep the cap.
+void TestRetrySeededFromRtt() {
+  // 2*3000 = 6000 lands inside [250, 8000]: used as-is, then capped doubling.
+  {
+    fcp::Handshake hs(10, 3, [&](const uint8_t*, size_t) {},
+                      fcp::HandshakeRole::kClient, Nonce(0x77).data(),
+                      fcp::kLocalFlagsM1, fcp::kHandshakeMaxCachedSegments,
+                      fcp::kHandshakeMaxCachedBytes, 3000);
+    hs.start(0);
+    hs.on_tick(0);
+    CHECK_EQ(hs.next_retry_ms(), 6000);
+    hs.on_tick(6000);
+    CHECK_EQ(hs.next_retry_ms(), 14000);  // min(6000<<1, 8000)
+  }
+  // 2*50 = 100 floors at the 250ms base.
+  {
+    fcp::Handshake hs(10, 3, [&](const uint8_t*, size_t) {},
+                      fcp::HandshakeRole::kClient, Nonce(0x77).data(),
+                      fcp::kLocalFlagsM1, fcp::kHandshakeMaxCachedSegments,
+                      fcp::kHandshakeMaxCachedBytes, 50);
+    hs.start(0);
+    hs.on_tick(0);
+    CHECK_EQ(hs.next_retry_ms(), 250);
+  }
+  // 2*10000 caps at 8s immediately.
+  {
+    fcp::Handshake hs(10, 3, [&](const uint8_t*, size_t) {},
+                      fcp::HandshakeRole::kClient, Nonce(0x77).data(),
+                      fcp::kLocalFlagsM1, fcp::kHandshakeMaxCachedSegments,
+                      fcp::kHandshakeMaxCachedBytes, 10000);
+    hs.start(0);
+    hs.on_tick(0);
+    CHECK_EQ(hs.next_retry_ms(), 8000);
+  }
+  // No prior (the cold default) stays on the base gap.
+  {
+    fcp::Handshake hs(10, 3, [&](const uint8_t*, size_t) {},
+                      fcp::HandshakeRole::kClient, Nonce(0x77).data());
+    hs.start(0);
+    hs.on_tick(0);
+    CHECK_EQ(hs.next_retry_ms(), 250);
+  }
 }
 
 void TestAckStopsRetries() {
@@ -625,6 +684,7 @@ int main() {
   TestMissingCapability();
   TestTimeout();
   TestRetryBackoff();
+  TestRetrySeededFromRtt();
   TestAckStopsRetries();
   TestIdempotent();
   TestDataCache();

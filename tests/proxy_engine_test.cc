@@ -1200,7 +1200,7 @@ void unauthenticated_datagrams_do_not_create_sessions() {
 // The same table also has to survive an authenticated peer that never finishes
 // the handshake. Such a session can only be created by someone holding the
 // PSK, but it must still not live forever: the server's own HELLO retry clock
-// (300/600/1200ms, then failure) is what reaps it.
+// (250ms doubling capped at 8s, ~39.7s total, then failure) is what reaps it.
 void authenticated_non_hello_session_times_out() {
   Harness h{Options()};
   uint8_t key[16];
@@ -1216,7 +1216,7 @@ void authenticated_non_hello_session_times_out() {
   h.server->on_wire(kOtherPeer, wire.data(), wire.size(), h.now_ms);
   CHECK_EQ(h.server->counters().live, 1u);
 
-  CHECK(h.run_until([&] { return h.server->counters().live == 0; }, 120));
+  CHECK(h.run_until([&] { return h.server->counters().live == 0; }, 1650));
   CHECK_EQ(h.server->counters().handshake_failed, 1u);
   CHECK(logged(h.server_log, "handshake failed"));
 }

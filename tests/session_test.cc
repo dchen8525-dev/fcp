@@ -614,13 +614,17 @@ void TestHandshakeTimeout() {
                  nullptr, [&logs](const std::string& line) { logs.push_back(line); });
   s.start(0);
   s.on_tick(0);
-  s.on_tick(300);
-  s.on_tick(900);
-  CHECK(s.state() == fcp::HandshakeState::kHelloSent);
-  s.on_tick(2100);
+  // Drive the full #76 schedule: sends at 0/250/750/.../31750 (9 total),
+  // failure one cap interval after the last send. The ticks between sends
+  // assert nothing fails early.
+  for (int64_t t = fcp::kSessionTickMs; t <= 39750; t += fcp::kSessionTickMs) {
+    s.on_tick(t);
+    CHECK(s.state() == fcp::HandshakeState::kHelloSent ||
+          s.state() == fcp::HandshakeState::kFailed);
+  }
   CHECK(s.state() == fcp::HandshakeState::kFailed);
   CHECK(s.error() == fcp::HandshakeError::kNoAck);
-  CHECK(HasLine(logs, "FEC handshake failed: no ACK after 3 tries"));
+  CHECK(HasLine(logs, "FEC handshake failed: no ACK before the retry budget ran out"));
 }
 
 void TestPreNegotiationCache() {

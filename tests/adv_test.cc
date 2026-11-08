@@ -1446,8 +1446,9 @@ void ProbeR9Handshake() {
     CHECK(hs.state() == fcp::HandshakeState::kIdle);
   }
 
-  // R9.4 retry schedule (#27①): exponential backoff 300/600/1200ms — sends at
-  // 0/300/900, failure check on the tick at 2100 (no 4th HELLO).
+  // R9.4 retry schedule (#27①, #76): backoff doubles from 250ms, capped at
+  // 8s — sends at 0/250/750/.../31750 (9 total), failure check one cap
+  // interval after the last send (39750ms).
   {
     int sent = 0;
     Handshake hs(10, 3, [&](const uint8_t*, size_t) { ++sent; },
@@ -1455,18 +1456,26 @@ void ProbeR9Handshake() {
     hs.start(0);
     hs.on_tick(0);
     CHECK_EQ(sent, 1);
-    hs.on_tick(299);
+    hs.on_tick(249);
     CHECK_EQ(sent, 1);
-    hs.on_tick(300);
+    hs.on_tick(250);
     CHECK_EQ(sent, 2);
-    hs.on_tick(899);
+    hs.on_tick(749);
     CHECK_EQ(sent, 2);
-    hs.on_tick(900);
+    hs.on_tick(750);
     CHECK_EQ(sent, 3);
-    hs.on_tick(2099);
-    CHECK_EQ(sent, 3);
-    hs.on_tick(2100);
-    CHECK_EQ(sent, 3);  // 3 already sent -> fail, no 4th
+    hs.on_tick(1750);
+    hs.on_tick(3750);
+    hs.on_tick(7750);
+    hs.on_tick(15750);
+    hs.on_tick(23750);
+    CHECK_EQ(sent, 8);
+    hs.on_tick(31750);
+    CHECK_EQ(sent, 9);  // last send of the schedule
+    hs.on_tick(39749);
+    CHECK_EQ(sent, 9);
+    hs.on_tick(39750);
+    CHECK_EQ(sent, 9);  // 9 already sent -> fail, no 10th
     CHECK(hs.state() == fcp::HandshakeState::kFailed);
     CHECK(hs.error() == fcp::HandshakeError::kNoAck);
   }

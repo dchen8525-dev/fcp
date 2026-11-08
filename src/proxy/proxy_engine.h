@@ -26,6 +26,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <string>
@@ -127,6 +128,13 @@ struct EngineConfig {
   // Server only: ceiling on concurrent sessions, and on the pre-negotiation
   // cache a not-yet-established session may hold (§3 --max-sessions).
   size_t max_sessions = 256;
+  // Client only: ceiling on concurrent HANDSHAKES (sessions between start()
+  // and established). A browser retrying a failed download fires dozens of
+  // parallel SOCKS connections at once; on a lossy long-RTT path their
+  // HELLO/HELLO_ACK exchanges race each other and most fail. Excess
+  // connections queue (their SOCKS CONNECT just waits) and start one at a
+  // time as slots free. 0 = unlimited.
+  uint32_t hs_concurrency = 4;
   bool prewarm = true;
   int64_t prewarm_ttl_ms = kPrewarmTtlMs;
 };
@@ -350,6 +358,11 @@ class ProxyEngine {
     bool closing = false;
     bool want_fin = false;
     bool established_seen = false;
+    // 握手并发限流（EngineConfig::hs_concurrency，仅 client）：hs_slot_held =
+    // 会话已 start 且未建立（占一个槽位）；hs_queued = 在队列里等槽位
+    // （会话未 start，不注册 by_salt_——B-04：入站 HELLO 不得建立它）。
+    bool hs_slot_held = false;
+    bool hs_queued = false;
     // A1 follow-up: only a session that once presented a valid GCM tag may
     // leave a salt tombstone. Untagged traffic must not grow that table.
     bool authenticated_once = false;
@@ -431,6 +444,10 @@ class ProxyEngine {
   // write the peer profile back into the prewarm cache.
   void finish_conn(Conn& conn, int64_t now_ms, const char* why);
   void reap(int64_t now_ms);
+  // 握手并发限流（EngineConfig::hs_concurrency，仅 client）：释放连接持有的
+  // 槽位并按 FIFO 补位启动排队会话；未持有槽位的连接是 no-op。
+  void release_handshake_slot(Conn& conn);
+  void pump_handshake_queue(int64_t now_ms);
   void maybe_fin(Conn& conn);
   // Bytes moved so far, from whichever clocks are running: what the peer
   // acknowledged, what it delivered, and what the application socket accepted.
@@ -451,6 +468,10 @@ class ProxyEngine {
   PrewarmCache prewarm_;
   std::unordered_map<uint64_t, std::unique_ptr<Conn>> by_conn_;
   std::unordered_map<std::string, uint64_t> by_salt_;
+  // 握手并发限流状态（EngineConfig::hs_concurrency，仅 client）：在飞的
+  // HELLO/协商会话数，以及等待槽位的 conn id 队列（FIFO）。
+  uint32_t hs_in_flight_ = 0;
+  std::deque<uint64_t> hs_queue_;
   // #29a: salts of recently reaped sessions, expiry stamped. Their tail
   // retransmissions are dropped as `salt_tombstone` instead of counting as
   // unknown_salt (client) or rebirthing a phantom session (server).

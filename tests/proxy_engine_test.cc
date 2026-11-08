@@ -51,6 +51,9 @@ constexpr size_t kEntryReplyBytes = fcp::kSocks5GreetingReplyLen + fcp::kSocks5R
 struct Options {
   size_t client_max_sessions = 256;
   size_t server_max_sessions = 256;
+  // 握手并发上限（EngineConfig::hs_concurrency）。0 = 不限（默认）：既有
+  // 测试的多连接场景不排队；只有限流语义测试显式设值。
+  uint32_t hs_concurrency = 0;
   int64_t flush_grace_ms = 2000;
   int64_t dial_timeout_ms = 5000;
   size_t send_window_bytes = 64 * 1024;
@@ -107,6 +110,7 @@ class Harness {
     EngineConfig cc = base;
     cc.role = EngineRole::kClient;
     cc.max_sessions = opt.client_max_sessions;
+    cc.hs_concurrency = opt.hs_concurrency;
     cc.trace_prefix = opt.trace_prefix;
     cc.trace_rotate_bytes =
         opt.trace_rotate_bytes != 0 ? opt.trace_rotate_bytes : kTraceRotateBytes;
@@ -1442,6 +1446,34 @@ void prewarm_seeds_the_next_stream_window() {
   run(true);   // an explicit --window wins over the prior
 }
 
+// 握手并发上限（EngineConfig::hs_concurrency，仅 client）：先开两条占满槽位
+// （HELLO 出网），再开两条——它们的 HELLO 压在队列里不出网（server 只见到
+// 两条会话），直到前两条建立释放槽位、队头补位，四条最终全部协商成功。
+// wire_latency_ticks=2 让「建立晚于 HELLO 出网数拍」成为确定时序。
+void handshake_concurrency_queue() {
+  Options o;
+  o.hs_concurrency = 2;
+  o.wire_latency_ticks = 2;
+  Harness h{o};
+  post_socks5_entry(h, "203.0.113.7", 8080, 101);
+  post_socks5_entry(h, "203.0.113.7", 8081, 102);
+  h.step();
+  h.step();  // HELLO 101/102 已出网（t=50 到达服务端），ACK 还在路上
+  post_socks5_entry(h, "203.0.113.7", 8082, 103);  // 槽位满：排队
+  post_socks5_entry(h, "203.0.113.7", 8083, 104);  // 槽位满：排队
+  h.step();
+  h.step();
+  // 排队中的 103/104 没有出网握手：服务端只见到两条会话，客户端也还没建立。
+  CHECK_EQ(h.server->counters().live, 2u);
+  CHECK_EQ(h.client->counters().established, 0u);
+  // 目标拨号不排队：CONNECT 一到就交 host（四条全部拨出）。
+  CHECK(h.run_until([&] { return h.dials.size() >= 4; }, 40));
+  // 建立释放槽位、队头补位：四条最终全部协商成功（无饿死）。
+  CHECK(h.run_until([&] { return h.server->counters().live >= 4; }, 160));
+  CHECK(h.run_until([&] { return h.client->counters().established >= 4; }, 40));
+  CHECK_EQ(h.client->counters().established, 4u);
+}
+
 int main() {
   socks5_round_trip();
   slow_response_after_half_close_survives_the_grace_window();
@@ -1468,5 +1500,6 @@ malformed_local_requests();
   auto_window_grows_in_the_engine();
   prewarm_seeds_the_next_stream_window();
   peer_callbacks_balance_server_sessions();
+  handshake_concurrency_queue();
   return fcp_test::finish();
 }

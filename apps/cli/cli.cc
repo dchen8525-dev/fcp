@@ -168,6 +168,7 @@ const std::vector<tools::Alias>& OptionAliases() {
       {"--dial-timeout", true},
       {"--connect-timeout", true},
       {"--max-sessions", true},
+      {"--hs-concurrency", true},
       {"--speedtest", false},
       {"--speedtest-seconds", true},
       {"--stall-ms", true},
@@ -258,6 +259,10 @@ void Usage(EngineRole role, const char* argv0) {
       "  --connect-timeout=ms per-address TCP connect budget (default 5000)\n"
       "  --max-sessions=N     concurrent sessions (default 256; warns when the fd\n"
       "                       or address-space limit cannot cover the worst case)\n"
+      "  --hs-concurrency=N   client handshake concurrency cap (default 4; 0 =\n"
+      "                       unlimited): sessions between start and established;\n"
+      "                       excess SOCKS connections queue instead of racing\n"
+      "                       their HELLOs on a lossy path\n"
       "  --rate-limit=UP[:DOWN]  Mbps send shaping (0 = off); the client enforces\n"
       "                       UP, the server enforces DOWN -- each end shapes the\n"
       "                       direction it sends, inapplicable half is a setting\n"
@@ -346,6 +351,7 @@ struct ProxyFlags {
   SeenValue dial_timeout;
   SeenValue connect_timeout;
   SeenValue max_sessions;
+  SeenValue hs_concurrency;
   bool speedtest = false;
   SeenValue speedtest_seconds;
   SeenValue stall_ms;
@@ -402,6 +408,8 @@ bool ApplyValue(const tools::Match& m, ProxyFlags* f, ParsedWindows* windows, Pr
     f->connect_timeout = {true, v};
   } else if (name == "--max-sessions") {
     f->max_sessions = {true, v};
+  } else if (name == "--hs-concurrency") {
+    f->hs_concurrency = {true, v};
   } else if (name == "--speedtest") {
     f->speedtest = true;
   } else if (name == "--speedtest-seconds") {
@@ -1161,6 +1169,14 @@ bool parse_proxy_args(EngineRole role, int argc, char** argv, ProxyArgs* out,
       return false;
     }
     out->ec.max_sessions = static_cast<size_t>(n);
+  }
+  if (given.hs_concurrency.given) {
+    long n = 0;
+    if (!tools::ParseLong("--hs-concurrency", given.hs_concurrency.value.c_str(), 0, 1024,
+                          &n, error)) {
+      return false;
+    }
+    out->ec.hs_concurrency = static_cast<uint32_t>(n);
   }
   if (given.prewarm_off) {
     out->ec.prewarm = false;

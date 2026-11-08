@@ -827,6 +827,20 @@ ProxyEngine::CreateStatus ProxyEngine::create_client_conn(uint64_t id, uint64_t 
 
   size_handshake_cache(raw->stream_cfg, cfg_.mtu, cfg_.ip_hdr_len, &sc);
   raw->session = make_session(id, sc);
+  // 握手并发限流（EngineConfig::hs_concurrency，仅 client）：槽位满时本会话
+  // 不 start——HELLO 不出网，本地 stream 段进握手缓存（有界），槽位释放后
+  // 由 pump_handshake_queue 按序补位。未 start 的会话不注册 by_salt_
+  // （B-04：入站 HELLO 不得建立它）；本地 socket 照常活着，浏览器的
+  // SOCKS CONNECT 只是变慢（这正是排队想要的形状）。
+  if (cfg_.hs_concurrency != 0 && hs_in_flight_ >= cfg_.hs_concurrency) {
+    raw->hs_queued = true;
+    hs_queue_.push_back(id);
+    raw->salt_key = salt_key_of(sc.salt);
+    attach_stream(*raw);
+    by_conn_[id] = std::move(conn);
+    ++counters_.live;
+    return ProxyEngine::CreateStatus::kOk;
+  }
   // The refusal has to reach the caller: this used to log and return kOk, so
   // an unstarted session still sat in the tables and an inbound HELLO could
   // establish it (B-04).
@@ -843,6 +857,8 @@ ProxyEngine::CreateStatus ProxyEngine::create_client_conn(uint64_t id, uint64_t 
   by_conn_[id] = std::move(conn);
   by_salt_.emplace(raw->salt_key, id);
   ++counters_.live;
+  ++hs_in_flight_;
+  raw->hs_slot_held = true;
   return ProxyEngine::CreateStatus::kOk;
 }
 
@@ -1005,6 +1021,9 @@ void ProxyEngine::session_events(Conn& conn, int64_t now_ms) {
   if (!conn.established_seen && conn.session->established()) {
     conn.established_seen = true;
     ++counters_.established;
+    // 槽位随建立释放，队头补位（EngineConfig::hs_concurrency，仅 client）。
+    release_handshake_slot(conn);
+    pump_handshake_queue(now_ms);
     if (cfg_.role == EngineRole::kServer) {
       attach_stream(conn);
       conn.phase = Phase::kAwaitOpen;
@@ -1012,6 +1031,10 @@ void ProxyEngine::session_events(Conn& conn, int64_t now_ms) {
     }
   }
   if (conn.session->state() == HandshakeState::kFailed) {
+    // 握手失败的连接同样释放槽位（队头立即补位），否则一次失败会把
+    // 并发上限永久占掉一格。
+    release_handshake_slot(conn);
+    pump_handshake_queue(now_ms);
     ++counters_.handshake_failed;
     if (cfg_.role == EngineRole::kClient) {
       if (in_entry_phase(conn.phase)) {
@@ -1495,6 +1518,58 @@ void ProxyEngine::finish_conn(Conn& conn, int64_t now_ms, const char* why) {
   (void)now_ms;
 }
 
+// 握手并发限流（EngineConfig::hs_concurrency，仅 client）：释放连接持有的
+// 槽位；未持有者（server 角色连接、已建立的、排队中未 start 的）是 no-op。
+void ProxyEngine::release_handshake_slot(Conn& conn) {
+  if (!conn.hs_slot_held) {
+    return;
+  }
+  conn.hs_slot_held = false;
+  if (hs_in_flight_ > 0) {
+    --hs_in_flight_;
+  }
+}
+
+// 槽位空出后按 FIFO 补位：出队的会话此刻才真正 start（HELLO 出网），并
+// 补注册 by_salt_（排队期间不注册，B-04：入站 HELLO 不得建立它）。start
+// 失败的拒绝形状与 on_local_open 的拒绝路径一致：计数 + 关闭本地 socket。
+void ProxyEngine::pump_handshake_queue(int64_t now_ms) {
+  if (cfg_.role != EngineRole::kClient || cfg_.hs_concurrency == 0) {
+    return;
+  }
+  while (!hs_queue_.empty() && hs_in_flight_ < cfg_.hs_concurrency) {
+    const uint64_t id = hs_queue_.front();
+    hs_queue_.pop_front();
+    Conn* c = find(id);
+    if (c == nullptr || c->phase == Phase::kDone || c->session == nullptr ||
+        !c->hs_queued) {
+      continue;  // 排队期间本地已关闭：它没持有槽位，直接跳过
+    }
+    c->hs_queued = false;
+    switch (c->session->start(now_ms)) {
+      case Session::StartStatus::kOk:
+        break;
+      case Session::StartStatus::kNoEntropy:
+        ++counters_.no_entropy;
+        if (host_.app_close) {
+          host_.app_close(id);
+        }
+        continue;
+      case Session::StartStatus::kBadConfig:
+        ++counters_.bad_config;
+        log(std::string(kTagWarn) + label(*c) +
+            " refused: MTU leaves no room for a data symbol");
+        if (host_.app_close) {
+          host_.app_close(id);
+        }
+        continue;
+    }
+    by_salt_.emplace(c->salt_key, id);
+    ++hs_in_flight_;
+    c->hs_slot_held = true;
+  }
+}
+
 void ProxyEngine::reap(int64_t now_ms) {
   if (in_reap_) {
     return;  // the walk below drains what this pass queues
@@ -1566,6 +1641,10 @@ void ProxyEngine::reap(int64_t now_ms) {
       if (again == by_conn_.end()) {
         continue;  // a re-entrant path already released it; nothing left to do
       }
+      // 连接此刻真正消失：若还占着握手槽位（已 start 未建立），先释放并
+      // 补位，再从表里摘除。
+      release_handshake_slot(conn);
+      pump_handshake_queue(now_ms);
       by_conn_.erase(again);
       --counters_.live;
       if (cfg_.role == EngineRole::kServer && host_.peer_retired) {

@@ -182,13 +182,6 @@ Session::Session(const SessionConfig& config, SendFn send, DeliverFn deliver, Lo
   // far below 2^32. A failed draw is fatal: start() refuses the session rather
   // than falling back to a predictable start.
   bootstrap_seed_ok_ = hs_env_.init_bootstrap_nonce(kHandshakeSendBudget);
-  // #78: offer the stream capabilities that ride the handshake TLV extension.
-  // The feature activates only when the peer offers the same type
-  // (Handshake::tlv_agreed); a v7 peer never sees the bit -- its refusal of
-  // kCapTlv is what the client's downgrade probe is for.
-  if (cfg_.stream_ack_v2) {
-    hs_.set_local_tlvs({HandshakeTlv{kTlvTypeAckV2, {}}});
-  }
 }
 
 Session::StartStatus Session::start(int64_t now_ms) {
@@ -215,6 +208,23 @@ Session::StartStatus Session::start(int64_t now_ms) {
   if (!local_caps_valid(cfg_)) {
     log(std::string(kTagError) + "FCP config invalid: local D/P out of range");
     return StartStatus::kBadConfig;
+  }
+  // #78/#87: offer the stream capabilities that ride the handshake TLV
+  // extension. The feature activates only when the peer offers the same type
+  // (Handshake::tlv_agreed); a v7 peer never sees the bit -- its refusal of
+  // kCapTlv is what the client's downgrade probe is for. The prewarm ticket
+  // (#87) rides the same block, and this is the last moment it can: the first
+  // HELLO leaves on the next on_tick(), so set_prewarm_tlv() has to have been
+  // called by now.
+  {
+    std::vector<HandshakeTlv> tlvs;
+    if (cfg_.stream_ack_v2) {
+      tlvs.push_back(HandshakeTlv{kTlvTypeAckV2, {}});
+    }
+    if (cfg_.prewarm_tlv && !prewarm_tlv_.empty()) {
+      tlvs.push_back(HandshakeTlv{kTlvTypePrewarm, std::move(prewarm_tlv_)});
+    }
+    hs_.set_local_tlvs(std::move(tlvs));
   }
   hs_.start(now_ms);
   return StartStatus::kOk;

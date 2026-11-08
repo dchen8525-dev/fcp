@@ -56,6 +56,28 @@ struct PeerProfile {
 // stays one colon-separated field pair.
 std::string peer_key(const std::string& host, uint16_t port);
 
+// H8 (#87): the handshake-service layer. A session's converged link parameters
+// travel to the PEER as an encrypted handshake-TLV (type kTlvTypePrewarm, in
+// both directions), so the next session to that peer starts warm on both ends
+// even when only one end keeps a prewarm cache file. Encoding is a fixed
+// little-endian packet; values are host-order in PeerProfile and clamped on
+// parse (a forged or truncated block degrades to zeros = "unknown", the cold
+// start — never to a huge value: srtt at 2 s or window at 4 GiB cannot poison
+// the controllers).
+constexpr uint8_t kPrewarmTlvVersion = 1;
+// ver(1) | initial_k(1) | srtt_ms(2 LE) | window_kb(3 LE) | bw_kbps(3 LE) |
+// min_rtt_ms(2 LE)
+constexpr size_t kPrewarmTlvLen = 12;
+
+// Encodes the profile into the on-wire TLV payload. Fields clamp to the wire
+// ranges (srtt/min_rtt 0..65535 ms, k 0..14 with 15 = unknown, window/bw
+// 0..2^24-1 in their units), so a value that does not fit saturates instead of
+// wrapping into a plausible-looking small number.
+std::vector<uint8_t> encode_prewarm_tlv(const PeerProfile& profile);
+// Strict inverse of encode: any length mismatch or reserved byte pattern is a
+// hard false (the caller ignores the peer's prewarm then — cold start).
+bool decode_prewarm_tlv(const std::vector<uint8_t>& value, PeerProfile* out);
+
 class PrewarmCache {
  public:
   explicit PrewarmCache(int64_t ttl_ms = kPrewarmTtlMs,

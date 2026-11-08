@@ -3,6 +3,11 @@
 #ifndef FCP_TESTS_TEST_UTIL_H_
 #define FCP_TESTS_TEST_UTIL_H_
 
+#ifdef _WIN32
+#include <crtdbg.h>
+#include <cstdlib>
+#endif
+
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -13,6 +18,25 @@
 #include <type_traits>
 
 namespace fcp_test {
+
+// The MSVC debug CRT answers a failed assert or an invalid parameter with a
+// modal dialog. Under ctest nobody is there to click it, so a defect shows up
+// as a 300s timeout instead of a failed check -- and a stale dialog left open
+// by one run then blocks the next one's binary (LNK1168). Every test program
+// includes this header, so the redirection happens once, before main().
+#ifdef _WIN32
+inline bool silence_crt_dialogs() {
+  _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+  _set_error_mode(_OUT_TO_STDERR);
+  _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+  _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+  _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
+  _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
+  return true;
+}
+
+inline const bool kCrtDialogsSilenced = silence_crt_dialogs();
+#endif
 
 inline int& failures() {
   static int count = 0;

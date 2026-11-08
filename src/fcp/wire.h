@@ -55,6 +55,19 @@ constexpr void put_le32(uint32_t v, uint8_t* p) {
   p[3] = static_cast<uint8_t>(v >> 24);
 }
 
+// 24-bit field (#87 prewarm TLV): window/bw ranges fit 16 MB / 16 Mkbps and
+// the third byte would otherwise be dead padding.
+constexpr void put_le24(uint32_t v, uint8_t* p) {
+  p[0] = static_cast<uint8_t>(v);
+  p[1] = static_cast<uint8_t>(v >> 8);
+  p[2] = static_cast<uint8_t>(v >> 16);
+}
+
+constexpr uint32_t get_le24(const uint8_t* p) {
+  return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+         (static_cast<uint32_t>(p[2]) << 16);
+}
+
 constexpr void put_le64(uint64_t v, uint8_t* p) {
   for (size_t i = 0; i < kLe64Len; ++i) {
     p[i] = static_cast<uint8_t>(v >> (8 * i));

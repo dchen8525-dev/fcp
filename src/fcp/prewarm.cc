@@ -2,8 +2,51 @@
 
 #include "fcp/session.h"
 #include "fcp/stream.h"
+#include "fcp/wire.h"
 
 namespace fcp {
+
+// The field offsets below are written out by hand so the layout stays explicit
+// on the wire; this keeps the length constant from drifting away from them
+// (a 12-byte layout declared as 11 wrote one byte past the vector).
+static_assert(kPrewarmTlvLen == 1 + 1 + 2 + 3 + 3 + 2,
+              "kPrewarmTlvLen must match the field offsets in encode_prewarm_tlv");
+
+std::vector<uint8_t> encode_prewarm_tlv(const PeerProfile& profile) {
+  std::vector<uint8_t> out(kPrewarmTlvLen);
+  const auto clamp_u16 = [](int64_t v) -> uint16_t {
+    return v < 0 ? 0 : (v > 65535 ? 65535 : static_cast<uint16_t>(v));
+  };
+  // k: the P field maxes at 7 on the wire, but this form carries up to 14 (a
+  // stale seed past P' is truncated by the strategy anyway) and 15 for unknown,
+  // which is what the profile's -1 encodes to.
+  const uint8_t k_byte =
+      profile.initial_k < 0 ? 0x0F
+      : profile.initial_k > 14 ? 0x0E : static_cast<uint8_t>(profile.initial_k);
+  const auto clamp_k24 = [](uint64_t v) -> uint32_t {
+    return v > 0xFFFFFFull ? 0xFFFFFFu : static_cast<uint32_t>(v);
+  };
+  out[0] = kPrewarmTlvVersion;
+  out[1] = k_byte;
+  put_le16(clamp_u16(profile.srtt_ms), out.data() + 2);
+  put_le24(clamp_k24(profile.window_bytes / 1024), out.data() + 4);
+  put_le24(clamp_k24(profile.bw_bps / 1000), out.data() + 7);
+  put_le16(clamp_u16(profile.min_rtt_ms), out.data() + 10);
+  return out;
+}
+
+bool decode_prewarm_tlv(const std::vector<uint8_t>& value, PeerProfile* out) {
+  if (value.size() != kPrewarmTlvLen || value[0] != kPrewarmTlvVersion ||
+      (value[1] & 0xF0) != 0) {
+    return false;
+  }
+  out->initial_k = value[1] == 0x0F ? -1 : static_cast<int>(value[1]);
+  out->srtt_ms = get_le16(value.data() + 2);
+  out->window_bytes = static_cast<size_t>(get_le24(value.data() + 4)) * 1024;
+  out->bw_bps = static_cast<uint64_t>(get_le24(value.data() + 7)) * 1000;
+  out->min_rtt_ms = get_le16(value.data() + 10);
+  return true;
+}
 
 std::string peer_key(const std::string& host, uint16_t port) {
   std::string key;

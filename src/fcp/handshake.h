@@ -100,6 +100,14 @@ constexpr uint8_t kTlvTypeError = 1;
 // stream.h kStreamTypeAckV2). Offered by both ends when the host enables it;
 // active only when both offered (Handshake::tlv_agreed).
 constexpr uint8_t kTlvTypeAckV2 = 2;
+// #87 (H8): the converged link-parameter ticket — prewarm.h
+// encode_prewarm_tlv / decode_prewarm_tlv. Each end puts its last measured
+// profile into its own handshake message; the peer feeds it to
+// apply_prewarm()-shaped logic before the controller starts. Unauthenticated
+// poisoning is bounded by the wire clamps (bounded values, then zeroed =
+// "unknown" on any parse error — the cold start), so a value formed here
+// cannot make a controller do anything worse than a stale prewarm entry.
+constexpr uint8_t kTlvTypePrewarm = 3;
 
 // Total sends before the handshake is declared dead (initial HELLO + retries).
 constexpr int kHandshakeMaxRetries = 9;

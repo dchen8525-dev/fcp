@@ -383,6 +383,142 @@ void TestSessionColdStart() {
   CHECK_EQ(h.b->rx()->recovered(), 0u);
 }
 
+// H8 (#87): the ticket is a fixed 11-byte little-endian packet, so the
+// round trip has to be exact and every out-of-range value has to land on its
+// wire bound rather than wrap.
+void TestTicketRoundTrip() {
+  const fcp::PeerProfile in{45, 3, 256u * 1024u, 12u * 1000u * 1000u, 38};
+  const std::vector<uint8_t> tlv = fcp::encode_prewarm_tlv(in);
+  CHECK_EQ(tlv.size(), fcp::kPrewarmTlvLen);
+  CHECK_EQ(static_cast<int>(tlv[0]), static_cast<int>(fcp::kPrewarmTlvVersion));
+
+  fcp::PeerProfile out;
+  CHECK(fcp::decode_prewarm_tlv(tlv, &out));
+  CHECK_EQ(out.srtt_ms, 45);
+  CHECK_EQ(out.initial_k, 3);
+  CHECK_EQ(out.window_bytes, 256u * 1024u);
+  CHECK_EQ(out.bw_bps, 12u * 1000u * 1000u);
+  CHECK_EQ(out.min_rtt_ms, 38);
+}
+
+// A cold profile encodes as "unknown", and decodes back to the cold start --
+// this is what a peer that measured nothing sends.
+void TestTicketUnknownFields() {
+  const std::vector<uint8_t> tlv = fcp::encode_prewarm_tlv(fcp::PeerProfile{});
+  CHECK_EQ(tlv.size(), fcp::kPrewarmTlvLen);
+  CHECK_EQ(static_cast<int>(tlv[1]), 0x0F);  // k unknown
+
+  fcp::PeerProfile out;
+  CHECK(fcp::decode_prewarm_tlv(tlv, &out));
+  CHECK_EQ(out.srtt_ms, 0);
+  CHECK_EQ(out.initial_k, -1);
+  CHECK_EQ(out.window_bytes, 0u);
+  CHECK_EQ(out.bw_bps, 0u);
+  CHECK_EQ(out.min_rtt_ms, 0);
+}
+
+// Values past the wire ranges saturate; they never wrap into a small number
+// (a 4 GiB window must not come back as 0).
+void TestTicketClamps() {
+  fcp::PeerProfile big;
+  big.srtt_ms = 999999;
+  big.initial_k = 40;
+  big.window_bytes = 1ull << 40;
+  big.bw_bps = 1ull << 40;
+  big.min_rtt_ms = 999999;
+  const std::vector<uint8_t> tlv = fcp::encode_prewarm_tlv(big);
+  CHECK_EQ(tlv.size(), fcp::kPrewarmTlvLen);
+
+  fcp::PeerProfile out;
+  CHECK(fcp::decode_prewarm_tlv(tlv, &out));
+  CHECK_EQ(out.srtt_ms, 65535);
+  CHECK_EQ(out.initial_k, 14);  // the largest real k the field carries
+  CHECK_EQ(out.window_bytes, static_cast<size_t>(0xFFFFFF) * 1024);
+  CHECK_EQ(out.bw_bps, static_cast<uint64_t>(0xFFFFFF) * 1000);
+  CHECK_EQ(out.min_rtt_ms, 65535);
+
+  // Negative inputs are "unknown", not a huge unsigned value.
+  fcp::PeerProfile neg;
+  neg.srtt_ms = -5;
+  neg.min_rtt_ms = -1;
+  const std::vector<uint8_t> t = fcp::encode_prewarm_tlv(neg);
+  fcp::PeerProfile out2;
+  CHECK(fcp::decode_prewarm_tlv(t, &out2));
+  CHECK_EQ(out2.srtt_ms, 0);
+  CHECK_EQ(out2.min_rtt_ms, 0);
+}
+
+// Anything that is not exactly one well-formed ticket is a hard false, so the
+// caller falls back to the cold start instead of trusting a truncated block.
+void TestTicketRejectsMalformed() {
+  fcp::PeerProfile out;
+  CHECK(!fcp::decode_prewarm_tlv({}, &out));
+  CHECK(!fcp::decode_prewarm_tlv(std::vector<uint8_t>(fcp::kPrewarmTlvLen - 1, 0), &out));
+  CHECK(!fcp::decode_prewarm_tlv(std::vector<uint8_t>(fcp::kPrewarmTlvLen + 1, 0), &out));
+
+  std::vector<uint8_t> tlv = fcp::encode_prewarm_tlv(fcp::PeerProfile{45, 3, 0, 0, 0});
+  tlv[0] = 99;  // unknown version
+  CHECK(!fcp::decode_prewarm_tlv(tlv, &out));
+
+  tlv = fcp::encode_prewarm_tlv(fcp::PeerProfile{45, 3, 0, 0, 0});
+  tlv[1] = 0x81;  // reserved nibble set
+  CHECK(!fcp::decode_prewarm_tlv(tlv, &out));
+}
+
+// The point of the exercise: both sessions put their own view of the link in
+// the handshake, and each end can read the peer's ticket afterwards -- even
+// though neither was configured with a prewarm prior.
+void TestSessionTicketCrossesHandshake() {
+  Harness h;
+  CHECK(h.Init(MakeConfig(fcp::Direction::kC2S, fcp::Direction::kS2C, 3),
+               MakeConfig(fcp::Direction::kS2C, fcp::Direction::kC2S, 3)));
+  // What each end measured about the path to its peer, named for the end that
+  // sends it: A's view travels to B, and B's view travels to A.
+  const fcp::PeerProfile a_sends{77, 2, 512u * 1024u, 8u * 1000u * 1000u, 60};
+  const fcp::PeerProfile b_sends{33, 4, 128u * 1024u, 20u * 1000u * 1000u, 25};
+  h.a->set_prewarm_tlv(fcp::encode_prewarm_tlv(a_sends));
+  h.b->set_prewarm_tlv(fcp::encode_prewarm_tlv(b_sends));
+  CHECK(h.Handshake());
+
+  // B reads A's ticket: A's link profile is what B's next session to A uses.
+  fcp::PeerProfile seen_by_b;
+  CHECK(fcp::decode_prewarm_tlv(h.b->peer_prewarm_tlv(), &seen_by_b));
+  CHECK_EQ(seen_by_b.srtt_ms, 77);
+  CHECK_EQ(seen_by_b.initial_k, 2);
+  CHECK_EQ(seen_by_b.window_bytes, 512u * 1024u);
+
+  fcp::PeerProfile seen_by_a;
+  CHECK(fcp::decode_prewarm_tlv(h.a->peer_prewarm_tlv(), &seen_by_a));
+  CHECK_EQ(seen_by_a.srtt_ms, 33);
+  CHECK_EQ(seen_by_a.min_rtt_ms, 25);
+}
+
+// No ticket set means no ticket on the wire and nothing to read: the handshake
+// must not invent one.
+void TestSessionTicketAbsentByDefault() {
+  Harness h;
+  CHECK(h.Init(MakeConfig(fcp::Direction::kC2S, fcp::Direction::kS2C, 3),
+               MakeConfig(fcp::Direction::kS2C, fcp::Direction::kC2S, 3)));
+  CHECK(h.Handshake());
+  CHECK(h.a->peer_prewarm_tlv().empty());
+  CHECK(h.b->peer_prewarm_tlv().empty());
+}
+
+// A host that turns the capability off sends no ticket even if it staged one.
+void TestSessionTicketDisabledByConfig() {
+  fcp::SessionConfig cfg_a = MakeConfig(fcp::Direction::kC2S, fcp::Direction::kS2C, 3);
+  fcp::SessionConfig cfg_b = MakeConfig(fcp::Direction::kS2C, fcp::Direction::kC2S, 3);
+  cfg_a.prewarm_tlv = false;
+  cfg_b.prewarm_tlv = false;
+  Harness h;
+  CHECK(h.Init(cfg_a, cfg_b));
+  h.a->set_prewarm_tlv(fcp::encode_prewarm_tlv(fcp::PeerProfile{45, 3, 0, 0, 0}));
+  h.b->set_prewarm_tlv(fcp::encode_prewarm_tlv(fcp::PeerProfile{45, 3, 0, 0, 0}));
+  CHECK(h.Handshake());
+  CHECK(h.a->peer_prewarm_tlv().empty());
+  CHECK(h.b->peer_prewarm_tlv().empty());
+}
+
 }  // namespace
 
 int main() {
@@ -399,5 +535,12 @@ int main() {
   TestSessionWarmed();
   TestSessionSeedClampedByNegotiation();
   TestSessionColdStart();
+  TestTicketRoundTrip();
+  TestTicketUnknownFields();
+  TestTicketClamps();
+  TestTicketRejectsMalformed();
+  TestSessionTicketCrossesHandshake();
+  TestSessionTicketAbsentByDefault();
+  TestSessionTicketDisabledByConfig();
   return fcp_test::finish();
 }

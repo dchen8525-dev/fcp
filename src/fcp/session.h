@@ -115,6 +115,9 @@ struct SessionConfig {
   // semantics. With rolling on, one key never seals more than kEpochSpan
   // packets and the session never hits the counter ceiling.
   bool key_update = true;
+  // #87 (H8): the peer prewarm ticket rides the same TLV block; on by default
+  // (it costs 2 + 11 bytes in the HELLO/ACK, both directions).
+  bool prewarm_tlv = true;
 };
 
 class Session {
@@ -173,6 +176,17 @@ class Session {
   const NegotiatedParams& params() const { return hs_.params(); }
   SessionMode mode() const { return hs_.params().mode; }
   uint8_t k() const { return strategy_ ? strategy_->k() : 0; }
+  // #87 (H8): the local link profile this end wants the peer to see, encoded
+  // as a kTlvTypePrewarm TLV which the peer feeds to its own prewarm cache.
+  // Must be called before start(): the local TLV block is assembled there, so
+  // a ticket staged afterwards never leaves. Ignored once the handshake is
+  // under way rather than pretending it went out.
+  void set_prewarm_tlv(const std::vector<uint8_t>& value) {
+    if (hs_.state() != HandshakeState::kIdle) {
+      return;
+    }
+    prewarm_tlv_ = value;
+  }
 
   const uint8_t* salt() const { return cfg_.salt; }
   // R3-1: this end's handshake draw. Diagnostics, and the handle a test needs
@@ -185,10 +199,23 @@ class Session {
   uint32_t nonce_mismatch() const { return hs_.nonce_mismatch(); }
   const MtuLimits& mtu_limits() const { return limits_; }
   bool config_valid() const { return limits_.valid; }
-  // #78: the negotiated result the host feeds into StreamConfig::ack_v2 --
+  // #87 (H8) the negotiated result the host feeds into StreamConfig::ack_v2 --
   // both ends had to offer the capability (Handshake::tlv_agreed).
   bool stream_ack_v2() const {
     return cfg_.stream_ack_v2 && hs_.tlv_agreed(kTlvTypeAckV2);
+  }
+  // #87 (H8): the peer's prewarm ticket from the handshake TLV, if any (empty
+  // when the peer sent none or did not speak TLV).
+  std::vector<uint8_t> peer_prewarm_tlv() const {
+    if (!hs_.tlv_negotiated()) {
+      return {};
+    }
+    for (const auto& t : hs_.peer_tlvs()) {
+      if (t.type == kTlvTypePrewarm) {
+        return t.value;
+      }
+    }
+    return {};
   }
 
   // PMTUD: the proven send MTU (starts at the configured value, climbs on an
@@ -369,6 +396,8 @@ class Session {
   DeliverFn deliver_;
   LogFn log_;
   Handshake hs_;
+  // #87 (H8): the ticket payload staged by set_prewarm_tlv() before start().
+  std::vector<uint8_t> prewarm_tlv_;
 
   // Seeded from SessionConfig::initial_srtt_ms (0 = kDefaultSrttMs), then
   // replaced by every on_rtt_sample(). Only srtt_ms_ is warmed: min_srtt_ms_

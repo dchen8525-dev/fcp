@@ -863,6 +863,10 @@ ProxyEngine::CreateStatus ProxyEngine::create_client_conn(uint64_t id, uint64_t 
 
   size_handshake_cache(raw->stream_cfg, cfg_.mtu, cfg_.ip_hdr_len, &sc);
   raw->session = make_session(id, sc);
+  // H8 (#87): send side — both roles.
+  if (cfg_.prewarm) {
+    raw->session->set_prewarm_tlv(encode_prewarm_tlv(profile_for(peer, now_ms)));
+  }
   // 握手并发限流（EngineConfig::hs_concurrency，仅 client）：槽位满时本会话
   // 不 start——HELLO 不出网，本地 stream 段进握手缓存（有界），槽位释放后
   // 由 pump_handshake_queue 按序补位。未 start 的会话不注册 by_salt_
@@ -954,6 +958,10 @@ ProxyEngine::Conn* ProxyEngine::create_server_conn(uint64_t peer, const uint8_t*
 
   size_handshake_cache(raw->stream_cfg, cfg_.mtu, cfg_.ip_hdr_len, &sc);
   raw->session = make_session(id, sc);
+  // H8 (#87): same ticket on the server side — our view of that client's link.
+  if (cfg_.prewarm) {
+    raw->session->set_prewarm_tlv(encode_prewarm_tlv(profile_for(peer, now_ms)));
+  }
   // B-09: a config refusal used to return nullptr with no log and no counter,
   // so the server looked like it ignored every HELLO while bad_config stayed 0.
   switch (raw->session->start(now_ms)) {
@@ -1060,6 +1068,16 @@ void ProxyEngine::session_events(Conn& conn, int64_t now_ms) {
   if (!conn.established_seen && conn.session->established()) {
     conn.established_seen = true;
     ++counters_.established;
+    // H8 (#87): the peer's link-parameter ticket arrived in its handshake TLV —
+    // feed it into our prewarm cache so the NEXT session to this peer starts
+    // warm even though this one began cold on our side. Freshest wins, same
+    // policy as save_profile().
+    const std::vector<uint8_t> ticket = conn.session->peer_prewarm_tlv();
+    PeerProfile from_peer;
+    if (host_.peer_key && !ticket.empty() &&
+        decode_prewarm_tlv(ticket, &from_peer)) {
+      prewarm_.put(host_.peer_key(conn.peer), from_peer, now_ms);
+    }
     // 槽位随建立释放，队头补位（EngineConfig::hs_concurrency，仅 client）。
     release_handshake_slot(conn);
     pump_handshake_queue(now_ms);

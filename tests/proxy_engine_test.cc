@@ -1474,6 +1474,64 @@ void handshake_concurrency_queue() {
   CHECK_EQ(h.client->counters().established, 4u);
 }
 
+// H8 (#87): the profile a session carries in its handshake lands in the PEER's
+// prewarm cache the moment the handshake completes -- that is how a link only
+// one end has measured still warms the other end's next connection. The two
+// directions here converge to different send windows (only the server pushes
+// target bytes), so which write path produced an entry is visible in its value.
+void prewarm_ticket_lands_in_the_peer_cache() {
+  const size_t kMax = 128 * 1024;
+  Options opt;
+  opt.auto_window = true;
+  opt.window_min_bytes = 16 * 1024;
+  opt.window_max_bytes = kMax;
+  opt.send_window_bytes = 16 * 1024;
+  opt.rcv_buf_bytes = 16 * 1024;
+  opt.wire_latency_ticks = 4;
+  Harness h{opt};
+
+  post_socks5_entry(h, "192.0.2.1", 80, kLocalConn);
+  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, kTunnelSteps));
+  const uint64_t first_target = h.first_dial_conn();
+  const std::vector<uint8_t> chunk(2048, 0x5A);
+  for (int i = 0; i < 200; ++i) {
+    h.step();
+    for (int q = 0; q < 8; ++q) {
+      if (h.target_send(first_target, chunk) == 0) {
+        break;
+      }
+    }
+  }
+  h.local_close(kLocalConn);
+  CHECK(h.run_until([&] {
+    return h.client->counters().live == 0 && h.server->counters().live == 0;
+  }, 200));
+
+  // Both caches now hold the teardown snapshot each end took of its own send
+  // direction. The client never pushed payload, so its window stayed at the
+  // start value while the server's grew -- the ticket and the self-measurement
+  // cannot be the same number.
+  const std::string client_key = "server:peer" + std::to_string(kServerPeer);
+  const std::string server_key = "client:peer" + std::to_string(kClientPeer);
+  fcp::PeerProfile client_self;  // what the client's next ticket encodes
+  CHECK(h.client->prewarm_cache().get(client_key, h.now_ms, &client_self));
+  fcp::PeerProfile server_self;  // what the server measured on its own
+  CHECK(h.server->prewarm_cache().get(server_key, h.now_ms, &server_self));
+  CHECK(client_self.window_bytes != server_self.window_bytes);
+
+  // Session 2: at establishment the client's ticket overwrites the server's
+  // entry, before the server has measured anything under this key itself.
+  post_socks5_entry(h, "192.0.2.2", 80, kLocalConn + 1);
+  CHECK(h.run_until([&] { return h.dials.size() == 2; }, kTunnelSteps));
+  fcp::PeerProfile after;
+  CHECK(h.server->prewarm_cache().get(server_key, h.now_ms, &after));
+  CHECK_EQ(after.window_bytes, client_self.window_bytes);
+  CHECK_EQ(after.srtt_ms, client_self.srtt_ms);
+  // The mirror direction: the server's ticket reaches the client's cache.
+  fcp::PeerProfile at_client;
+  CHECK(h.client->prewarm_cache().get(client_key, h.now_ms, &at_client));
+}
+
 int main() {
   socks5_round_trip();
   slow_response_after_half_close_survives_the_grace_window();
@@ -1501,5 +1559,6 @@ malformed_local_requests();
   prewarm_seeds_the_next_stream_window();
   peer_callbacks_balance_server_sessions();
   handshake_concurrency_queue();
+  prewarm_ticket_lands_in_the_peer_cache();
   return fcp_test::finish();
 }

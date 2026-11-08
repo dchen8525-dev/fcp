@@ -9,3 +9,4 @@ vcpkg_installed/
 /replay_trace_test/
 __pycache__/
 *.pyc
+/build-alt.bat

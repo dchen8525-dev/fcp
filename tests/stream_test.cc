@@ -2587,10 +2587,37 @@ void TestAckV2RequiresNegotiation() {
   }
 }
 
+// #79 (R2): a segment that fills a hole ACKs immediately -- the buffer may
+// have emptied and coalescing would otherwise park the cumulative advance for
+// kAckDelayMs, but the peer is waiting on exactly that advance. A clean
+// in-order segment still coalesces.
+void TestHoleFillAcksImmediately() {
+  StreamConfig cfg = DefaultCfg();
+  cfg.ack_every = 2;  // coalescing on, so the delayed path exists
+  Fixture f(cfg);
+  f.killer = [](const Packet&) { return true; };
+  std::vector<uint8_t> payload = MakeBytes(3 * 100, 4);
+  CHECK_EQ(f.push(kA, payload), payload.size());
+  f.killer = nullptr;
+  const auto segs = f.data_of(kA);
+  CHECK_EQ(segs.size(), 3u);
+  // Clean in-order: coalesced, nothing on the wire yet.
+  f.feed(kB, segs[0]);
+  CHECK(f.acks_of(kB).empty());
+  // A new hole reports immediately (the !oob_.empty() branch).
+  f.feed(kB, segs[2]);
+  CHECK_EQ(f.acks_of(kB).size(), 1u);
+  // Filling that hole is urgent too (#79): buffer emptied, cum advanced.
+  f.feed(kB, segs[1]);
+  CHECK_EQ(f.acks_of(kB).size(), 2u);
+  CHECK_EQ(rd32(f.acks_of(kB).back().data() + 1), 300u);
+}
+
 int main() {
   TestAckV2ReportsAllHolesInOneAck();
   TestAckV2MalformedDiscardsWholeSet();
   TestAckV2RequiresNegotiation();
+  TestHoleFillAcksImmediately();
   TestOrderedFlow();
   TestBidirectional();
   TestOutOfOrderHeldAndSackBlock();

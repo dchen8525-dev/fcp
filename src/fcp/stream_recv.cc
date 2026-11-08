@@ -58,6 +58,15 @@ void Stream::handle_data(const uint8_t* seg, size_t len, int64_t now_ms) {
     }
   }
 
+  // R2 (#79): remember whether a hole was open and where the cumulative point
+  // sat before this segment landed -- a segment that FILLS a hole (buffer
+  // empties or shrinks, cumulative advances) is the wasMissing case: the peer
+  // is waiting on exactly this advance (fast-retransmit exit, window unlock,
+  // RTT sample), so its ACK must not sit out the coalescing delay. A brand-new
+  // hole already ACKs immediately through the !oob_.empty() branch of
+  // maybe_ack(); a clean in-order segment keeps coalescing.
+  const bool had_oob = !oob_.empty();
+  const uint32_t cum_before = rcv_nxt_;
   const uint8_t* payload = seg + kStreamDataHdrLen;
   size_t keep = n;
   uint32_t at = offset;
@@ -84,8 +93,9 @@ void Stream::handle_data(const uint8_t* seg, size_t len, int64_t now_ms) {
   // Even when deliver_prefix just closed the stream, this ACK still has to go
   // out: it is the one that acknowledges the peer's fin, and without it the peer
   // can only finish via its idle timer (kIdle instead of kLocalEof). A fin is
-  // always urgent, which is what makes this call emit unconditionally.
-  maybe_ack(now_ms, /*urgent=*/fin);
+  // always urgent, which is what makes this call emit unconditionally. A
+  // hole-fill is urgent for the same reason (R2/#79 above).
+  maybe_ack(now_ms, /*urgent=*/fin || (had_oob && seq_after(rcv_nxt_, cum_before)));
 }
 
 // ACK coalescing (StreamConfig::ack_every). Every data segment used to produce

@@ -859,9 +859,12 @@ ProxyEngine::CreateStatus ProxyEngine::create_client_conn(uint64_t id, uint64_t 
   // StreamConfig::send_window_explicit, so those flags have to be real values,
   // not the default-constructed false/false.
   fill_stream_config(&raw->stream_cfg);
-  apply_prewarm(profile_for(peer, now_ms), &sc, &raw->stream_cfg);
-
+  // H8 (#87): the handshake cache is sized from the CONFIGURED window, before
+  // any prior can move it. A cached entry can come from the peer's ticket, and
+  // that cache is per connection: sizing it from a prior would let one 12-byte
+  // ticket from the peer multiply every later connection's allocation.
   size_handshake_cache(raw->stream_cfg, cfg_.mtu, cfg_.ip_hdr_len, &sc);
+  apply_prewarm(profile_for(peer, now_ms), &sc, &raw->stream_cfg);
   raw->session = make_session(id, sc);
   // H8 (#87): send side — both roles.
   if (cfg_.prewarm) {
@@ -954,9 +957,12 @@ ProxyEngine::Conn* ProxyEngine::create_server_conn(uint64_t peer, const uint8_t*
   // configured ones. The stream is attached later, when the handshake
   // completes, so this is also the only point where conn.stream_cfg is filled.
   fill_stream_config(&raw->stream_cfg);
-  apply_prewarm(profile_for(peer, now_ms), &sc, &raw->stream_cfg);
-
+  // H8 (#87): the handshake cache is sized from the CONFIGURED window, before
+  // any prior can move it. A cached entry can come from the peer's ticket, and
+  // that cache is per connection: sizing it from a prior would let one 12-byte
+  // ticket from the peer multiply every later connection's allocation.
   size_handshake_cache(raw->stream_cfg, cfg_.mtu, cfg_.ip_hdr_len, &sc);
+  apply_prewarm(profile_for(peer, now_ms), &sc, &raw->stream_cfg);
   raw->session = make_session(id, sc);
   // H8 (#87): same ticket on the server side — our view of that client's link.
   if (cfg_.prewarm) {
@@ -1070,13 +1076,14 @@ void ProxyEngine::session_events(Conn& conn, int64_t now_ms) {
     ++counters_.established;
     // H8 (#87): the peer's link-parameter ticket arrived in its handshake TLV —
     // feed it into our prewarm cache so the NEXT session to this peer starts
-    // warm even though this one began cold on our side. Freshest wins, same
-    // policy as save_profile().
+    // warm even though this one began cold on our side. It is tagged as the
+    // peer's measurement, so save_profile()'s own snapshot (this end's evidence)
+    // is what an established key keeps.
     const std::vector<uint8_t> ticket = conn.session->peer_prewarm_tlv();
     PeerProfile from_peer;
     if (host_.peer_key && !ticket.empty() &&
         decode_prewarm_tlv(ticket, &from_peer)) {
-      prewarm_.put(host_.peer_key(conn.peer), from_peer, now_ms);
+      prewarm_.put(host_.peer_key(conn.peer), from_peer, now_ms, PrewarmSource::kTicket);
     }
     // 槽位随建立释放，队头补位（EngineConfig::hs_concurrency，仅 client）。
     release_handshake_slot(conn);

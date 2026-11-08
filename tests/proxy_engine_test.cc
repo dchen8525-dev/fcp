@@ -1519,17 +1519,44 @@ void prewarm_ticket_lands_in_the_peer_cache() {
   CHECK(h.server->prewarm_cache().get(server_key, h.now_ms, &server_self));
   CHECK(client_self.window_bytes != server_self.window_bytes);
 
-  // Session 2: at establishment the client's ticket overwrites the server's
-  // entry, before the server has measured anything under this key itself.
+  // Session 2: the ticket arrives at establishment. It does NOT replace the
+  // server's own live measurement of this key -- that measurement is better
+  // evidence, and letting the two overwrite each other would drift the entry
+  // off anything observed. What the ticket does is refresh the timestamp, so
+  // the entry survives a peer that keeps reconnecting without ever finishing
+  // long enough to be measured again.
   post_socks5_entry(h, "192.0.2.2", 80, kLocalConn + 1);
   CHECK(h.run_until([&] { return h.dials.size() == 2; }, kTunnelSteps));
   fcp::PeerProfile after;
   CHECK(h.server->prewarm_cache().get(server_key, h.now_ms, &after));
-  CHECK_EQ(after.window_bytes, client_self.window_bytes);
-  CHECK_EQ(after.srtt_ms, client_self.srtt_ms);
-  // The mirror direction: the server's ticket reaches the client's cache.
+  CHECK_EQ(after.window_bytes, server_self.window_bytes);
+  CHECK_EQ(after.srtt_ms, server_self.srtt_ms);
+
+  // The client's side is the mirror image: what it cached for the server is
+  // what its next ticket carries.
   fcp::PeerProfile at_client;
   CHECK(h.client->prewarm_cache().get(client_key, h.now_ms, &at_client));
+  CHECK_EQ(at_client.window_bytes, client_self.window_bytes);
+}
+
+// The ticket is the only evidence when this end has never measured the peer:
+// the first session to a peer starts cold on our side, its ticket then seeds
+// the cache, and the second session starts from it.
+void prewarm_ticket_seeds_a_cold_cache() {
+  Options opt;
+  opt.prewarm = true;
+  Harness h{opt};
+  const std::string server_key = "client:peer" + std::to_string(kClientPeer);
+
+  fcp::PeerProfile cold;
+  CHECK(!h.server->prewarm_cache().get(server_key, h.now_ms, &cold));
+
+  post_socks5_entry(h, "192.0.2.9", 80, kLocalConn);
+  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, kTunnelSteps));
+  // The client sent a real ticket (it has a profile for the server from the
+  // cache it was given at construction), so the server's key exists now.
+  fcp::PeerProfile seeded;
+  CHECK(h.server->prewarm_cache().get(server_key, h.now_ms, &seeded));
 }
 
 int main() {
@@ -1560,5 +1587,6 @@ malformed_local_requests();
   peer_callbacks_balance_server_sessions();
   handshake_concurrency_queue();
   prewarm_ticket_lands_in_the_peer_cache();
+  prewarm_ticket_seeds_a_cold_cache();
   return fcp_test::finish();
 }

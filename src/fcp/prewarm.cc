@@ -1,5 +1,8 @@
 #include "fcp/prewarm.h"
 
+#include <algorithm>
+
+#include "fcp/limits.h"
 #include "fcp/session.h"
 #include "fcp/stream.h"
 #include "fcp/wire.h"
@@ -17,12 +20,13 @@ std::vector<uint8_t> encode_prewarm_tlv(const PeerProfile& profile) {
   const auto clamp_u16 = [](int64_t v) -> uint16_t {
     return v < 0 ? 0 : (v > 65535 ? 65535 : static_cast<uint16_t>(v));
   };
-  // k: the P field maxes at 7 on the wire, but this form carries up to 14 (a
-  // stale seed past P' is truncated by the strategy anyway) and 15 for unknown,
-  // which is what the profile's -1 encodes to.
+  // k is a 3-bit field on the wire (kMaxParity == 7), so nothing above 7 is a
+  // real value this protocol can produce; the field's spare 8..14 range carries
+  // nothing, and 15 stays the "unknown" marker the profile's -1 encodes to.
   const uint8_t k_byte =
-      profile.initial_k < 0 ? 0x0F
-      : profile.initial_k > 14 ? 0x0E : static_cast<uint8_t>(profile.initial_k);
+      profile.initial_k < 0
+          ? kPrewarmTlvKUnknown
+          : static_cast<uint8_t>(std::min<int64_t>(profile.initial_k, kMaxParity));
   const auto clamp_k24 = [](uint64_t v) -> uint32_t {
     return v > 0xFFFFFFull ? 0xFFFFFFu : static_cast<uint32_t>(v);
   };
@@ -37,13 +41,21 @@ std::vector<uint8_t> encode_prewarm_tlv(const PeerProfile& profile) {
 
 bool decode_prewarm_tlv(const std::vector<uint8_t>& value, PeerProfile* out) {
   if (value.size() != kPrewarmTlvLen || value[0] != kPrewarmTlvVersion ||
-      (value[1] & 0xF0) != 0) {
+      value[1] > kPrewarmTlvKUnknown) {
     return false;
   }
-  out->initial_k = value[1] == 0x0F ? -1 : static_cast<int>(value[1]);
+  // k above kMaxParity is not something this protocol can produce (it is a
+  // 3-bit field), and the spare bytes stay rejected: a value that cannot be a
+  // measurement is a malformed ticket, not a seed worth honouring.
+  if (value[1] != kPrewarmTlvKUnknown && value[1] > kMaxParity) {
+    return false;
+  }
+  out->initial_k = value[1] == kPrewarmTlvKUnknown ? -1 : static_cast<int>(value[1]);
   out->srtt_ms = get_le16(value.data() + 2);
-  out->window_bytes = static_cast<size_t>(get_le24(value.data() + 4)) * 1024;
-  out->bw_bps = static_cast<uint64_t>(get_le24(value.data() + 7)) * 1000;
+  // Both products are bounded by the 24-bit field times its unit; the casts are
+  // widened first so a 32-bit size_t platform cannot truncate the 16 GiB form.
+  out->window_bytes = static_cast<size_t>(static_cast<uint64_t>(get_le24(value.data() + 4)) * 1024u);
+  out->bw_bps = static_cast<uint64_t>(get_le24(value.data() + 7)) * 1000u;
   out->min_rtt_ms = get_le16(value.data() + 10);
   return true;
 }
@@ -67,7 +79,8 @@ PrewarmCache::PrewarmCache(int64_t ttl_ms, size_t max_entries)
     : ttl_ms_(ttl_ms > 0 ? ttl_ms : kPrewarmTtlMs),
       max_entries_(max_entries > 0 ? max_entries : kPrewarmMaxEntries) {}
 
-bool PrewarmCache::put(const std::string& key, const PeerProfile& profile, int64_t now_ms) {
+bool PrewarmCache::put(const std::string& key, const PeerProfile& profile, int64_t now_ms,
+                       PrewarmSource source) {
   if (by_key_.find(key) == by_key_.end() && by_key_.size() >= max_entries_) {
     // Expire what is already dead first, then refuse outright. Evicting a live
     // entry would throw away the freshest snapshots exactly when a peer set is
@@ -78,7 +91,17 @@ bool PrewarmCache::put(const std::string& key, const PeerProfile& profile, int64
       return false;
     }
   }
-  by_key_[key] = Entry{profile, now_ms};
+  const auto it = by_key_.find(key);
+  // A ticket describes a path the peer's controller measured. Where this end
+  // has its own live measurement, that measurement stays: otherwise the two
+  // sides would keep overwriting each other with each other's view and the
+  // entry would drift away from anything actually observed.
+  if (it != by_key_.end() && source == PrewarmSource::kTicket &&
+      !expired(it->second, now_ms, ttl_ms_) &&
+      it->second.source == PrewarmSource::kMeasured) {
+    return true;
+  }
+  by_key_[key] = Entry{profile, now_ms, source};
   return true;
 }
 
@@ -134,10 +157,14 @@ void apply_prewarm(const PeerProfile& profile, SessionConfig* session, StreamCon
     }
     // Only seed the autotuner's start. A fixed window is the operator's choice
     // and an explicit --window overrides even the prior: precedence is
-    // explicit CLI > prewarm > default.
+    // explicit CLI > prewarm > default. The prior is also capped at this end's
+    // own ceiling (#87): the wire clamp admits up to 16 GiB, which describes no
+    // link this end is willing to buffer for, and the entry may have come from
+    // the peer's ticket rather than from a local measurement.
     if (profile.window_bytes > 0 && stream->auto_window &&
         !stream->send_window_explicit) {
-      stream->send_window_bytes = profile.window_bytes;
+      stream->send_window_bytes =
+          std::min(profile.window_bytes, stream->window_max_bytes);
     }
     // The controller priors are only meaningful for the controller they came
     // from, and only when the operator did not pin the start.

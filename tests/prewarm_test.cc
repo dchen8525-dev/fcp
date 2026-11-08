@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "e2e_link.h"
+#include "fcp/limits.h"
 #include "fcp/session.h"
 #include "fcp/stream.h"
 #include "test_util.h"
@@ -432,7 +433,9 @@ void TestTicketClamps() {
   fcp::PeerProfile out;
   CHECK(fcp::decode_prewarm_tlv(tlv, &out));
   CHECK_EQ(out.srtt_ms, 65535);
-  CHECK_EQ(out.initial_k, 14);  // the largest real k the field carries
+  // k is a 3-bit wire field (kMaxParity == 7): saturating at 14 would put a
+  // value the protocol cannot produce into every ticket.
+  CHECK_EQ(out.initial_k, static_cast<int>(fcp::kMaxParity));
   CHECK_EQ(out.window_bytes, static_cast<size_t>(0xFFFFFF) * 1024);
   CHECK_EQ(out.bw_bps, static_cast<uint64_t>(0xFFFFFF) * 1000);
   CHECK_EQ(out.min_rtt_ms, 65535);
@@ -463,6 +466,71 @@ void TestTicketRejectsMalformed() {
   tlv = fcp::encode_prewarm_tlv(fcp::PeerProfile{45, 3, 0, 0, 0});
   tlv[1] = 0x81;  // reserved nibble set
   CHECK(!fcp::decode_prewarm_tlv(tlv, &out));
+
+  // k above the 3-bit wire ceiling is not a measurement this protocol can
+  // produce; the spare 8..14 bytes stay rejected rather than being honoured.
+  for (uint8_t k = fcp::kMaxParity + 1; k < 0x0F; ++k) {
+    tlv = fcp::encode_prewarm_tlv(fcp::PeerProfile{45, 3, 0, 0, 0});
+    tlv[1] = k;
+    CHECK(!fcp::decode_prewarm_tlv(tlv, &out));
+  }
+}
+
+// The window prior is a hint, and a ticket can carry one from the peer; neither
+// may hand this end a start above the ceiling it was configured with.
+void TestWindowPriorCappedByOwnCeiling() {
+  fcp::StreamConfig cfg;
+  cfg.auto_window = true;
+  cfg.window_max_bytes = 4096u * 1024u;
+  // 16 GiB is the widest value the ticket's 24-bit KiB field can carry. Written
+  // as a size_t literal: `16u * 1024 * 1024 * 1024` wraps to 0 in 32-bit
+  // unsigned arithmetic and the prior would look absent instead of extreme.
+  const size_t wild = static_cast<size_t>(16) * 1024 * 1024 * 1024;
+  fcp::apply_prewarm(fcp::PeerProfile{0, -1, wild, 0, 0}, nullptr, &cfg);
+  CHECK_EQ(cfg.send_window_bytes, 4096u * 1024u);
+
+  // Below the ceiling the prior is taken as-is.
+  fcp::StreamConfig small;
+  small.auto_window = true;
+  small.window_max_bytes = 4096u * 1024u;
+  fcp::apply_prewarm(fcp::PeerProfile{0, -1, 512u * 1024u, 0, 0}, nullptr, &small);
+  CHECK_EQ(small.send_window_bytes, 512u * 1024u);
+
+  // An explicit --window still wins outright.
+  fcp::StreamConfig pinned;
+  pinned.auto_window = true;
+  pinned.send_window_explicit = true;
+  pinned.send_window_bytes = 64u * 1024u;
+  pinned.window_max_bytes = 4096u * 1024u;
+  fcp::apply_prewarm(fcp::PeerProfile{0, -1, 14u * 1024u * 1024u, 0, 0}, nullptr, &pinned);
+  CHECK_EQ(pinned.send_window_bytes, 64u * 1024u);
+}
+
+// A ticket must never evict this end's own measurement: two sides that kept
+// overwriting each other's view would drift off anything actually observed.
+void TestTicketDoesNotDisplaceMeasurement() {
+  fcp::PrewarmCache cache;
+  const fcp::PeerProfile measured{45, 3, 256u * 1024u, 0, 0};
+  CHECK(cache.put("peer:1", measured, 1000));
+
+  const fcp::PeerProfile from_peer{900, 0, 8u * 1024u * 1024u, 0, 0};
+  CHECK(cache.put("peer:1", from_peer, 2000, fcp::PrewarmSource::kTicket));
+  fcp::PeerProfile got;
+  CHECK(cache.get("peer:1", 2100, &got));
+  CHECK_EQ(got.srtt_ms, 45);
+  CHECK_EQ(got.window_bytes, 256u * 1024u);
+
+  // A later measurement replaces it, as before.
+  const fcp::PeerProfile newer{60, 4, 512u * 1024u, 0, 0};
+  CHECK(cache.put("peer:1", newer, 3000));
+  CHECK(cache.get("peer:1", 3100, &got));
+  CHECK_EQ(got.srtt_ms, 60);
+  CHECK_EQ(got.window_bytes, 512u * 1024u);
+
+  // On an unknown key the ticket is the only evidence there is, so it is kept.
+  CHECK(cache.put("peer:2", from_peer, 2000, fcp::PrewarmSource::kTicket));
+  CHECK(cache.get("peer:2", 2100, &got));
+  CHECK_EQ(got.srtt_ms, 900);
 }
 
 // The point of the exercise: both sessions put their own view of the link in
@@ -539,6 +607,8 @@ int main() {
   TestTicketUnknownFields();
   TestTicketClamps();
   TestTicketRejectsMalformed();
+  TestWindowPriorCappedByOwnCeiling();
+  TestTicketDoesNotDisplaceMeasurement();
   TestSessionTicketCrossesHandshake();
   TestSessionTicketAbsentByDefault();
   TestSessionTicketDisabledByConfig();

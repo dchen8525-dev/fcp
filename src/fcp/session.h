@@ -29,6 +29,7 @@
 #include "fcp/handshake.h"
 #include "fcp/hdr.h"
 #include "fcp/pmtu.h"
+#include "fcp/prewarm.h"
 #include "fcp/reporter.h"
 #include "fcp/settle.h"
 #include "fcp/strategy.h"
@@ -182,8 +183,12 @@ class Session {
   // Must be called before start(): the local TLV block is assembled there, so
   // a ticket staged afterwards never leaves. Ignored once the handshake is
   // under way rather than pretending it went out.
+  //
+  // Accepts the encoder's fixed 12-byte form only. Staging anything else would
+  // put a TLV the peer is guaranteed to discard into every HELLO and ACK, and
+  // it would be this end's own bug hidden inside a valid handshake.
   void set_prewarm_tlv(const std::vector<uint8_t>& value) {
-    if (hs_.state() != HandshakeState::kIdle) {
+    if (hs_.state() != HandshakeState::kIdle || value.size() != kPrewarmTlvLen) {
       return;
     }
     prewarm_tlv_ = value;

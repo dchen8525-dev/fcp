@@ -61,34 +61,54 @@ std::string peer_key(const std::string& host, uint16_t port);
 // travel to the PEER as an encrypted handshake-TLV (type kTlvTypePrewarm, in
 // both directions), so the next session to that peer starts warm on both ends
 // even when only one end keeps a prewarm cache file. Encoding is a fixed
-// little-endian packet; values are host-order in PeerProfile and clamped on
-// parse (a forged or truncated block degrades to zeros = "unknown", the cold
-// start — never to a huge value: srtt at 2 s or window at 4 GiB cannot poison
-// the controllers).
+// little-endian packet; values are host-order in PeerProfile, saturated at the
+// wire bounds on the way out and rejected (not reinterpreted) on the way in.
+//
+// What a ticket is NOT: authenticated proof about the future. It rides the
+// handshake, so a peer must hold the PSK to send one, but a holder can send
+// anything -- and the numbers then become a prior for THIS end's controller.
+// Two defences keep that bounded: every field lands inside a range this end
+// could itself have produced, and apply_prewarm() still caps what it accepts at
+// the local configuration (the window prior cannot exceed window_max_bytes).
 constexpr uint8_t kPrewarmTlvVersion = 1;
 // ver(1) | initial_k(1) | srtt_ms(2 LE) | window_kb(3 LE) | bw_kbps(3 LE) |
 // min_rtt_ms(2 LE)
 constexpr size_t kPrewarmTlvLen = 12;
+// The k byte's "no measurement" marker. Every other value in 0..kMaxParity is
+// a real one; 8..14 are unused and rejected by the decoder rather than being
+// reinterpreted, so a future k ceiling can claim them without ambiguity.
+constexpr uint8_t kPrewarmTlvKUnknown = 0x0F;
 
-// Encodes the profile into the on-wire TLV payload. Fields clamp to the wire
-// ranges (srtt/min_rtt 0..65535 ms, k 0..14 with 15 = unknown, window/bw
-// 0..2^24-1 in their units), so a value that does not fit saturates instead of
-// wrapping into a plausible-looking small number.
+// Encodes the profile into the on-wire TLV payload. Fields saturate at the wire
+// ranges (srtt/min_rtt 0..65535 ms, k 0..kMaxParity with 15 = unknown, window/bw
+// 0..2^24-1 in their units), so a value that does not fit never wraps into a
+// plausible-looking small number.
 std::vector<uint8_t> encode_prewarm_tlv(const PeerProfile& profile);
 // Strict inverse of encode: any length mismatch or reserved byte pattern is a
 // hard false (the caller ignores the peer's prewarm then — cold start).
 bool decode_prewarm_tlv(const std::vector<uint8_t>& value, PeerProfile* out);
+
+// Which end produced an entry. A value this end measured closes the loop on
+// this end's own controller; a value that arrived in the peer's handshake
+// ticket describes the same path but was measured by the peer's algorithms
+// (#87). Both are priors, but a measurement is better evidence, so it is not
+// displaced by a ticket.
+enum class PrewarmSource : uint8_t { kMeasured = 0, kTicket = 1 };
 
 class PrewarmCache {
  public:
   explicit PrewarmCache(int64_t ttl_ms = kPrewarmTtlMs,
                         size_t max_entries = kPrewarmMaxEntries);
 
-  // Stores a snapshot and stamps it with now_ms; last write wins, because a
-  // finished session describes the link as it is now and there is nothing to
-  // average across generations. Returns false -- without touching the cache --
-  // when the table is full and nothing had expired.
-  bool put(const std::string& key, const PeerProfile& profile, int64_t now_ms);
+  // Stores a snapshot and stamps it with now_ms; the newest measurement wins,
+  // because a finished session describes the link as it is now and there is
+  // nothing to average across generations. A ticket never displaces a newer
+  // measurement of the same key (the measurement is this end's own evidence);
+  // it refreshes its timestamp instead, so the entry does not expire out from
+  // under a peer that keeps reconnecting. Returns false -- without touching
+  // the cache -- when the table is full and nothing had expired.
+  bool put(const std::string& key, const PeerProfile& profile, int64_t now_ms,
+           PrewarmSource source = PrewarmSource::kMeasured);
 
   // False for an unknown or expired key, which is how a session ends up
   // cold-starting. Expired entries are not erased here (get() stays const);
@@ -107,6 +127,7 @@ class PrewarmCache {
   struct Entry {
     PeerProfile profile;
     int64_t seen_ms = 0;
+    PrewarmSource source = PrewarmSource::kMeasured;
   };
 
   static bool expired(const Entry& entry, int64_t now_ms, int64_t ttl_ms);

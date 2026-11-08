@@ -222,7 +222,10 @@ Session::StartStatus Session::start(int64_t now_ms) {
       tlvs.push_back(HandshakeTlv{kTlvTypeAckV2, {}});
     }
     if (cfg_.prewarm_tlv && !prewarm_tlv_.empty()) {
-      tlvs.push_back(HandshakeTlv{kTlvTypePrewarm, std::move(prewarm_tlv_)});
+      // A copy, not a move: start() stays callable twice (a host that retries a
+      // refused start, a test that re-arms a session) and the second call would
+      // otherwise send the block with an empty ticket.
+      tlvs.push_back(HandshakeTlv{kTlvTypePrewarm, prewarm_tlv_});
     }
     hs_.set_local_tlvs(std::move(tlvs));
   }

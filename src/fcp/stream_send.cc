@@ -511,7 +511,9 @@ int64_t Stream::tlp_pto_ms() const {
   // ~1.5 RTT plus a little slack, floored above the host's 25 ms tick (delivery
   // is quantized to it, so a lossless round trip can look like a tick and a
   // half) and capped just below the base RTO, which takes over when the probe
-  // itself is lost.
+  // itself is lost. #80 kept this shape: the probe interval is a tail probe,
+  // not the retransmission timer — the variance term lives in the RTO base
+  // (update_srtt), and #74's jitter tests pin this timing.
   const int64_t pto =
       std::max<int64_t>(kTlpMinPtoMs, rtt + std::max<int64_t>(kTlpSlackMs, rtt / 2));
   return std::min<int64_t>(pto, std::max<int64_t>(rto_ms_ - 1, 1));

@@ -134,6 +134,9 @@ struct Link {
   uint32_t ge_b2g = 20;
   bool ge_bad = false;
   bool drop_oob_from_b = false;
+  // H5/H6 (#85/#86): a black hole in both directions — the peer stops
+  // answering entirely (process gone, path dead). Everything is dropped.
+  bool blackhole = false;
   uint32_t rng = 0x9E3779B9u;
   int64_t now = 0;
 
@@ -190,7 +193,7 @@ struct Link {
     } else {
       ++a_control;
     }
-    if (drop(type)) {
+    if (blackhole || drop(type)) {
       return;
     }
     b->on_wire(wire, len, now);
@@ -210,7 +213,7 @@ struct Link {
     if (type == fcp::SymbolType::kOob && drop_oob_from_b) {
       return;
     }
-    if (drop(type)) {
+    if (blackhole || drop(type)) {
       return;
     }
     a->on_wire(wire, len, now);
@@ -609,6 +612,137 @@ void TestPinnedKClampedToNegotiatedP() {
   }
   CHECK_EQ(link.a_parity, 3u);  // one full set, k_eff = pinned (clamped) k
   CHECK_EQ(delivered_b.size(), 10u);
+}
+
+// H5 (#85): an established session whose peer goes completely silent is
+// declared dead after three keepalive probe periods — deterministic, instead
+// of hanging until the 300s stream idle clock or an app write failure.
+void TestPeerSilenceIsDetected() {
+  Link link;
+  std::vector<std::string> log_a;
+  fcp::Session a(
+      MakeConfig(fcp::Direction::kC2S, fcp::Direction::kS2C),
+      [&link](const uint8_t* w, size_t n, fcp::SymbolType t) { link.from_a(w, n, t); },
+      [](const uint8_t*, size_t) {}, [&log_a](const std::string& s) { log_a.push_back(s); });
+  fcp::Session b(
+      MakeConfig(fcp::Direction::kS2C, fcp::Direction::kC2S),
+      [&link](const uint8_t* w, size_t n, fcp::SymbolType t) { link.from_b(w, n, t); },
+      [](const uint8_t*, size_t) {}, [](const std::string&) {});
+  link.a = &a;
+  link.b = &b;
+  a.start(0);
+  b.start(0);
+  a.on_tick(0);
+  b.on_tick(0);
+  CHECK(a.established());
+  CHECK(!a.peer_dead());
+  // One data symbol each way at a sane clock, so both sides have an
+  // authenticated inbound sample: the liveness clock only runs after the peer
+  // has been heard (a silent peer that was never heard is the handshake's
+  // business, not H5's). Segments are only emitted by a session whose frame
+  // layer exists, so the tick that installs it comes first.
+  a.on_tick(100);
+  b.on_tick(100);
+  link.now = 150;
+  const Bytes seg = Segment(1234);
+  a.on_kcp_output(seg.data(), seg.size(), 150);
+  b.on_kcp_output(seg.data(), seg.size(), 150);
+  CHECK(a.last_peer_in_ms() > 0);
+  CHECK(b.last_peer_in_ms() > 0);
+
+  // The peer's process dies here: nothing from b reaches a any more.
+  link.blackhole = true;
+  // Keepalive probes go out every 45s of inbound silence; the verdict needs
+  // three of those periods.
+  for (int64_t t = fcp::kSessionTickMs; t <= 140000; t += fcp::kSessionTickMs) {
+    link.now = t;
+    a.on_tick(t);
+    if (a.peer_dead()) {
+      break;
+    }
+  }
+  for (const std::string& line : log_a) {
+    std::fprintf(stderr, "LOGA: %s\n", line.c_str());
+  }
+  CHECK(a.peer_dead());
+  CHECK(HasLine(log_a, "FCP peer silent for 3 probe periods: session marked dead"));
+
+  // A live session is never pronounced dead while traffic keeps arriving.
+  Link live;
+  fcp::Session c(
+      MakeConfig(fcp::Direction::kC2S, fcp::Direction::kS2C),
+      [&live](const uint8_t* w, size_t n, fcp::SymbolType t) { live.from_a(w, n, t); },
+      [](const uint8_t*, size_t) {}, [](const std::string&) {});
+  fcp::Session d(
+      MakeConfig(fcp::Direction::kS2C, fcp::Direction::kC2S),
+      [&live](const uint8_t* w, size_t n, fcp::SymbolType t) { live.from_b(w, n, t); },
+      [](const uint8_t*, size_t) {}, [](const std::string&) {});
+  live.a = &c;
+  live.b = &d;
+  c.start(0);
+  d.start(0);
+  c.on_tick(0);
+  d.on_tick(0);
+  for (int64_t t = fcp::kSessionTickMs; t <= 400000; t += fcp::kSessionTickMs) {
+    live.now = t;
+    c.on_tick(t);
+    d.on_tick(t);
+  }
+  CHECK(!c.peer_dead());
+  CHECK(!d.peer_dead());
+}
+
+// H6 (#86): the bootstrap-key reset magic marks the session dead on the spot
+// (the peer holds the PSK but lost the session), and only the client side
+// acts on it.
+void TestStatelessResetKillsTheSession() {
+  Link link;
+  std::vector<std::string> log_a;
+  fcp::SessionConfig cfg_a = MakeConfig(fcp::Direction::kC2S, fcp::Direction::kS2C);
+  fcp::Session client(
+      cfg_a,
+      [&link](const uint8_t* w, size_t n, fcp::SymbolType t) { link.from_a(w, n, t); },
+      [](const uint8_t*, size_t) {}, [&log_a](const std::string& s) { log_a.push_back(s); });
+  fcp::Session server(
+      MakeConfig(fcp::Direction::kS2C, fcp::Direction::kC2S),
+      [&link](const uint8_t* w, size_t n, fcp::SymbolType t) { link.from_b(w, n, t); },
+      [](const uint8_t*, size_t) {}, [](const std::string&) {});
+  link.a = &client;
+  link.b = &server;
+  client.start(0);
+  server.start(0);
+  client.on_tick(0);
+  server.on_tick(0);
+  CHECK(client.established());
+  CHECK(!client.peer_dead());
+
+  // The restarted peer's reset: an 8-byte magic sealed under the BOOTSTRAP
+  // envelope (key = PSK+salt, exactly what a process that lost its session
+  // state can still derive) with the salt the client is using.
+  const uint8_t reset[8] = {'F', 'C', 'P', 'R', 'S', 'T', '1', 0};
+  fcp::Envelope env(cfg_a.key, cfg_a.salt, fcp::Direction::kS2C,
+                    fcp::Direction::kC2S);
+  std::vector<uint8_t> wire;
+  CHECK(env.seal(reset, sizeof(reset), &wire));
+  // The client must be past negotiation to read the bootstrap fallback (that
+  // path is budgeted, not free); one data symbol from the real peer ticks its
+  // frame layer into place first.
+  client.on_tick(50);
+  server.on_tick(50);
+  const Bytes seg = Segment(4321);
+  server.on_kcp_output(seg.data(), seg.size(), 75);
+  // One delivery is enough: open_reset verifies and flags once; a replay (the
+  // second datagram here) is refused — the flag gate turns every later reset
+  // into a plain auth_fail, which covers the anti-echo behavior too.
+  CHECK(client.on_wire(wire.data(), wire.size(), 100));
+  CHECK(!client.on_wire(wire.data(), wire.size(), 110));
+  CHECK(client.peer_dead());
+  CHECK(HasLine(log_a,
+                "FCP stateless reset: the peer has no session for this salt"));
+
+  // The server side ignores it (it never probes with data, so a reset aimed at
+  // it is meaningless and must not tear anything down).
+  CHECK(!server.peer_dead());
 }
 
 void TestHandshakeTimeout() {
@@ -1669,6 +1803,8 @@ int main() {
   TestBootstrapNonHandshakeIsCounted();
   TestInvalidLocalCaps();
   TestPinnedKClampedToNegotiatedP();
+  TestPeerSilenceIsDetected();
+  TestStatelessResetKillsTheSession();
   TestHandshakeTimeout();
   TestPreNegotiationCache();
   TestPreNegotiationInboundDropped();

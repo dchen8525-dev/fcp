@@ -86,6 +86,10 @@ class Envelope {
   static constexpr size_t kNonceLen = 8;
   static constexpr size_t kTagLen = 12;
   static constexpr size_t kOverhead = kSaltLen + kNonceLen + kTagLen;  // 28
+  // H6 (#86): the stateless-reset payload — an 8-byte magic a peer sends under
+  // the bootstrap envelope when it holds the PSK but has no session for the
+  // salt (it restarted). Shared with the proxy engine, which emits it.
+  static constexpr size_t kResetMagicLen = 8;
   // #26①: GCM block budget caps a direction at 2^32 packets (was 2^48).
   static constexpr uint64_t kNonceLimit = 1ull << 32;
   // #26③: per-direction anti-replay window (was 64; 256 covered ~13-19 Mbps x
@@ -159,6 +163,16 @@ class Envelope {
   // prepared after negotiation and handshake traffic has its own envelope).
   // Restarting the counter is safe here only because the key changes with it.
   void rekey(const uint8_t session_key[16]);
+
+  // H6 (#86): sealed_reset accepts a valid sealed reset with an arbitrary
+  // nonce without touching the replay window. The bootstrap receive window has
+  // converged on the peer's random counter start by the time a reset arrives,
+  // so a reset sealed by a fresh Envelope (counter 0 or any small draw) is
+  // guaranteed to land outside that window — opening it must not go through
+  // accept_nonce. Security: a key-holder can forge resets, but a reset only
+  // makes the receiver declare ITS OWN session dead — a peer with the PSK can
+  // already do that by dropping traffic or forging data; nothing usable crosses.
+  bool open_reset(const uint8_t* wire, size_t len, std::vector<uint8_t>* plain);
 
   // #84: enables epoch rolling (send side) and multi-epoch receive keys. Only
   // meaningful on the data envelope, only after rekey(), and only for a

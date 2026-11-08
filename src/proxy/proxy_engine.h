@@ -258,6 +258,12 @@ class ProxyEngine {
     uint32_t salt_clash = 0;
     uint32_t unknown_salt = 0;
     uint32_t salt_tombstone = 0;  // #29a: dropped as a dead session's tail
+    // #86 (H6): authenticated traffic arrived for a salt this server has no
+    // session for (it restarted, or the salt was reaped). Each one is answered
+    // with a stateless reset so the client tears its tunnel down at once.
+    // Non-zero is normal right after a server restart, and should settle to 0
+    // as clients reconnect.
+    uint32_t stateless_reset = 0;
     uint32_t over_limit = 0;  // refused: max_sessions reached
     // Refused before any traffic: the configured D/P'/MTU cannot carry a data
     // symbol (Session::config_valid()). Every connection is refused, so a
@@ -416,6 +422,9 @@ class ProxyEngine {
   };
   CreateStatus create_client_conn(uint64_t conn, uint64_t peer, int64_t now_ms);
   Conn* create_server_conn(uint64_t peer, const uint8_t* salt, int64_t now_ms);
+  // #86 (H6): answer authenticated traffic for an unknown salt with an 8-byte
+  // reset under the bootstrap envelope. Server side only.
+  void send_stateless_reset(const uint8_t salt[Envelope::kSaltLen], uint64_t peer);
   void attach_stream(Conn& conn);
   // Handshake completion and failure, watched after every inbound pump.
   void session_events(Conn& conn, int64_t now_ms);

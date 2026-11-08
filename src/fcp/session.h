@@ -226,6 +226,18 @@ class Session {
   // legitimate deployment; non-zero means the peer (or the path) kept
   // provoking replies without ever completing a handshake.
   uint32_t amp_limited_drops() const { return amp_limited_drops_; }
+  // Tests only: the liveness clock's raw stamp (0 = no authenticated inbound
+  // datagram ever).
+  int64_t last_peer_in_ms() const { return last_peer_in_ms_; }
+  // H5 (#85): session-level liveness. True once the peer has been
+  // authenticated-traffic silent for kPeerAliveGraceMs (three keepalive probe
+  // periods) on an established session; the keepalive probe doubles as the
+  // ping, so the answer window is the probe period itself. The host polls
+  // this from its tick and tears the session down — deterministic dead-peer
+  // discovery instead of waiting out the stream idle clock.
+  // H6 (#86): a stateless reset (the peer holds the PSK but lost the session)
+  // sets it immediately.
+  bool peer_dead() const { return peer_dead_ || reset_by_peer_; }
   uint32_t struct_fail() const { return pre_struct_fail_ + (rx_ ? rx_->struct_fail() : 0); }
   // #31 (M4 trigger metric): FEC/ARQ waste — retransmissions that lost the
   // race to parity. Summed into the proxy stats line for the WAN calibration.
@@ -403,6 +415,14 @@ class Session {
   uint64_t wire_out_bytes_ = 0;
   uint64_t keepalive_snapshot_ = 0;
   int64_t last_wire_out_ms_ = 0;
+  // Session liveness (H5, #85): the last authenticated inbound datagram and
+  // the verdict it feeds. The host tears the session down via peer_dead().
+  int64_t last_peer_in_ms_ = 0;
+  bool peer_dead_ = false;
+  bool peer_dead_logged_ = false;
+  // H6 (#86): a stateless reset arrived — the peer holds the PSK but has no
+  // session for this salt (it restarted). Immediate teardown signal.
+  bool reset_by_peer_ = false;
 
   // PMTUD state, quic-go mtuFinder shape. `pmtu_mtu_` (their `min`) is the
   // largest size the *send* direction has proven -- it starts at the

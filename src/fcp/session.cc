@@ -66,10 +66,26 @@ constexpr uint32_t kBootstrapProbesPerSecond = 64;
 // bytes and do not reset the tunnel idle timer. 45s sits under the common
 // 30-60s+ UDP mapping timeouts with margin.
 constexpr int64_t kNatKeepAliveMs = 45000;
+// Session-level liveness (H5, 施工单 step 10 / #85): an established session
+// whose peer has been INBOUND-silent for this long is dead — the keepalive
+// probes below go out every 45s (outbound-silent OR inbound-silent triggers),
+// so three probe periods without a single authenticated datagram back means
+// two probes went unanswered. Deterministic teardown instead of waiting out
+// the stream idle clock (300s) or hanging until an app write fails.
+constexpr int64_t kPeerAliveGraceMs = 3 * 45000;
 // The smallest oob the peer recognizes and consumes: an 8-byte magic with no
 // fields (on_oob consumes it before the FECSTAT validator would count it).
 constexpr size_t kKeepAliveLen = 8;
 constexpr uint8_t kKeepAliveMagic[kKeepAliveLen] = {'F', 'C', 'P', 'K', 'A', 'L', '1', 0};
+// Stateless reset (H6, 施工单 step 10 / #86): a server that holds the PSK but
+// no session for this salt (a restart wiped its state, or the salt was
+// tombstoned away) answers authenticated non-handshake traffic with this
+// 8-byte magic under the bootstrap envelope. The client consumes it and marks
+// the session dead — sub-second discovery instead of waiting out the
+// liveness window. Reflected-amplification safe: only a PSK holder can elicit
+// the reply, it is sent once per born-then-reset session, and the reply is
+// smaller than the datagram that provoked it.
+constexpr uint8_t kResetMagic[Envelope::kResetMagicLen] = {'F', 'C', 'P', 'R', 'S', 'T', '1', 0};
 
 // How long the §8 queue guardrail's min-RTT baseline stays valid. Mirrors Bbr's
 // min_rtt_expiry_ms; both controllers read the same "is this a standing queue"
@@ -240,10 +256,28 @@ bool Session::on_wire(const uint8_t* wire, size_t len, int64_t now_ms) {
     bootstrap = opened;
   }
   if (!opened) {
+    // H6 (#86): before counting the failure, a reset attempt — the peer holds
+    // the PSK but has no session for this salt and answers with the reset
+    // magic under its bootstrap envelope. open_reset verifies the tag without
+    // touching the replay window (see envelope.h for the threat reasoning);
+    // the reset flags only on the client side (the server never sends data to
+    // provoke one).
+    std::vector<uint8_t> reset_plain;
+    if (hs_.role() == HandshakeRole::kClient && !reset_by_peer_ &&
+        hs_.established() && hs_env_.open_reset(wire, len, &reset_plain)) {
+      reset_by_peer_ = true;
+      log(std::string(kTagWarn) +
+          "FCP stateless reset: the peer has no session for this salt");
+      return true;
+    }
     ++auth_fail_;
     sync_report_counters();
     return false;
   }
+  // H5 (#85): an authenticated datagram is the peer-alive evidence. Only
+  // tag-verified traffic counts -- an attacker able to spam unauthenticated
+  // bytes must not be able to keep a dying session on the books.
+  last_peer_in_ms_ = now_ms;
 
   // Authenticated but outside the MTU budget every conforming peer obeys
   // (§4.5): reject before it can inflate a set's symbol_max, the decode
@@ -410,17 +444,36 @@ void Session::on_tick(int64_t now_ms) {
   reporter_->on_tick(now_ms);
   sync_report_counters();
 
-  // NAT keepalive (see the constants block): fire the smallest oob whenever
-  // the session has been established but silent for a while. Any real
-  // outbound datagram refreshes the silence clock instead.
+  // NAT keepalive + liveness probe (see the constants block): fire the
+  // smallest oob when the session is established and either direction has
+  // been silent — outbound silence means the NAT mapping may rot, inbound
+  // silence means the peer may be gone and this datagram doubles as the
+  // probe whose (lack of) answer the liveness clock reads.
   if (hs_.established()) {
-    if (wire_out_bytes_ != keepalive_snapshot_) {
+    const bool out_silent = wire_out_bytes_ == keepalive_snapshot_;
+    const bool in_silent =
+        last_peer_in_ms_ > 0 && now_ms - last_peer_in_ms_ >= kNatKeepAliveMs;
+    if (!out_silent) {
       keepalive_snapshot_ = wire_out_bytes_;
       last_wire_out_ms_ = now_ms;
-    } else if (now_ms - last_wire_out_ms_ >= kNatKeepAliveMs) {
-      send_oob(kKeepAliveMagic, kKeepAliveLen);
-      keepalive_snapshot_ = wire_out_bytes_;
-      last_wire_out_ms_ = now_ms;
+    }
+    if (out_silent || in_silent) {
+      if (out_silent ? now_ms - last_wire_out_ms_ >= kNatKeepAliveMs : true) {
+        send_oob(kKeepAliveMagic, kKeepAliveLen);
+        keepalive_snapshot_ = wire_out_bytes_;
+        last_wire_out_ms_ = now_ms;
+      }
+    }
+    // H5: the liveness verdict. Any authenticated inbound datagram refreshes
+    // last_peer_in_ms_ (on_wire); three probe periods of total silence is the
+    // deterministic dead call.
+    if (!peer_dead_ && last_peer_in_ms_ > 0 &&
+        now_ms - last_peer_in_ms_ >= kPeerAliveGraceMs) {
+      peer_dead_ = true;
+      if (!peer_dead_logged_) {
+        peer_dead_logged_ = true;
+        log(std::string(kTagWarn) + "FCP peer silent for 3 probe periods: session marked dead");
+      }
     }
   }
 
@@ -654,6 +707,20 @@ void Session::on_oob(const uint8_t* payload, size_t len, int64_t now_ms) {
   // count it as a dropped report.
   if (len == kKeepAliveLen &&
       std::memcmp(payload, kKeepAliveMagic, kKeepAliveLen) == 0) {
+    return;
+  }
+  // H6 (#86): the peer holds the PSK but has no session for this salt — it
+  // answered our authenticated traffic with a stateless reset under the
+  // bootstrap envelope. Only the client acts on it (the server never probes
+  // with data); the host tears the tunnel down via peer_dead() and the SOCKS
+  // client reconnects with a fresh salt.
+  if (len == kKeepAliveLen &&
+      std::memcmp(payload, kResetMagic, Envelope::kResetMagicLen) == 0) {
+    if (hs_.role() == HandshakeRole::kClient && !reset_by_peer_) {
+      reset_by_peer_ = true;
+      log(std::string(kTagWarn) +
+          "FCP stateless reset: the peer has no session for this salt");
+    }
     return;
   }
   if (dispatch_handshake(payload, len, now_ms)) {

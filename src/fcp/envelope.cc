@@ -455,6 +455,30 @@ bool Envelope::epoch_accept(RecvEpoch& win, uint64_t counter) {
   return true;
 }
 
+bool Envelope::open_reset(const uint8_t* wire, size_t len,
+                          std::vector<uint8_t>* plain) {
+  if (wire == nullptr || plain == nullptr || len != kOverhead + kResetMagicLen) {
+    return false;
+  }
+  if (std::memcmp(wire, salt_, kSaltLen) != 0) {
+    return false;
+  }
+  uint8_t iv[kGcmIvLen];
+  make_iv(get_le64(wire + kSaltLen), recv_direction_, iv);
+  static const uint8_t kReset[kResetMagicLen] = {'F', 'C', 'P', 'R', 'S', 'T', '1', 0};
+  uint8_t decoded[kResetMagicLen];
+  if (!gcm_open_keyed(recv_key_, iv, nullptr, 0, wire + kSaltLen + kNonceLen,
+                      kResetMagicLen, wire + kSaltLen + kNonceLen + kResetMagicLen,
+                      decoded)) {
+    return false;
+  }
+  if (std::memcmp(decoded, kReset, kResetMagicLen) != 0) {
+    return false;
+  }
+  plain->assign(kReset, kReset + kResetMagicLen);
+  return true;
+}
+
 bool Envelope::set_send_nonce(uint64_t value) {
   if (value >= counter_ceiling_ || value >= send_limit_) {
     return false;

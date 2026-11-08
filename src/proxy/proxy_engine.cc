@@ -509,6 +509,19 @@ void ProxyEngine::on_wire(uint64_t peer, const uint8_t* data, size_t len, int64_
       reap(now_ms);
       return;
     }
+    // H6 (#86): an authenticated first datagram that is NOT a handshake means
+    // the peer believes in a session this process does not have (it restarted,
+    // or the salt was reaped). Answer with a stateless reset under the
+    // bootstrap envelope — the client consumes it and tears its tunnel down
+    // immediately, instead of both sides waiting out the liveness/idle clocks
+    // (minutes). Amplification-safe: only a PSK holder got here, one reset per
+    // born session, and the reset is smaller than the datagram that provoked it.
+    if (c->session->state() == fcp::HandshakeState::kIdle) {
+      send_stateless_reset(c->session->salt(), peer);
+      finish_conn(*c, now_ms, "stale session data: stateless reset sent");
+      reap(now_ms);
+      return;
+    }
   }
   session_events(*c, now_ms);
   if (c->phase != Phase::kDone) {
@@ -748,6 +761,29 @@ void ProxyEngine::fill_stream_config(StreamConfig* sc) const {
   sc->window_ceiling_bytes = cfg_.window_ceiling_bytes;
   sc->ack_every = cfg_.ack_every;
   sc->idle_timeout_ms = cfg_.idle_timeout_ms;
+}
+
+// H6 (#86): the stateless reset — an 8-byte magic under the bootstrap
+// envelope (the (PSK, salt) key both ends can always derive, unlike the
+// session key a restarted server has lost). Sent server-side to authenticated
+// traffic for a salt this process has no live session for.
+void ProxyEngine::send_stateless_reset(const uint8_t salt[Envelope::kSaltLen],
+                                       uint64_t peer) {
+  // The reset rides the BOOTSTRAP envelope with an arbitrary nonce; the peer's
+  // receiver opens it through Envelope::open_reset, which verifies the tag but
+  // deliberately does not touch the replay window — by the time a reset
+  // arrives, that window has converged on the server's random counter start,
+  // and no fresh envelope's draw could ever land inside it. Flood door: the
+  // sender needs the PSK to make the tag check, and the client acts on the
+  // reset once (its own session's death, which a PSK-holder could force anyway).
+  static const uint8_t kReset[Envelope::kResetMagicLen] = {'F', 'C', 'P', 'R', 'S', 'T', '1', 0};
+  Envelope env(cfg_.key, salt, Direction::kS2C, Direction::kC2S);
+  std::vector<uint8_t> wire;
+  if (!env.seal(kReset, Envelope::kResetMagicLen, &wire)) {
+    return;
+  }
+  host_.wire_send(peer, wire.data(), wire.size());
+  ++counters_.stateless_reset;
 }
 
 // The Session's three host hooks: every one of them re-resolves the Conn by id
@@ -1061,6 +1097,14 @@ void ProxyEngine::session_events(Conn& conn, int64_t now_ms) {
     // No reply can be sent -- the budget that would carry it is exactly what
     // ran out -- so the application socket is simply closed.
     finish_conn(conn, now_ms, "send nonce space exhausted");
+    return;
+  }
+  // H5 (#85): the liveness clock ran out — three keepalive probe periods
+  // without a single authenticated datagram. Deterministic teardown beats the
+  // stream idle clock by minutes and turns "tunnel hangs" into a clean
+  // reconnect.
+  if (conn.session->peer_dead()) {
+    finish_conn(conn, now_ms, "peer silent: liveness window expired");
   }
 }
 

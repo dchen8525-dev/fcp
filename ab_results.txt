@@ -1,0 +1,25 @@
+## 2026-11-08 13:50 前后（VPS 144.34.186.164 / UDP-4460 / 本机电信家宽，同一晚同链路）
+对照：head=003987c（步骤 1 前）vs new=HEAD（步骤 1-10 之后，#76-#86）
+两腿各 2 杆 + 对称再各 1 杆（head r3/r4、new r3/r4），mbps=12、seg=1200、双向 7s+7s。
+
+### head（003987c 基线）
+r1: handshake_ms=217 up_mbps=11.613 down_mbps=27.714 auth_fail=2 k=0
+r3: handshake_ms=154 up_mbps=11.616 down_mbps=27.799
+r4: handshake_ms=108 up_mbps=11.637 down_mbps=27.494
+ζup≈11.62 / down≈27.6 / handshake≈160
+
+### new（工作区，#76-#86）
+r1: handshake_ms=203 up_mbps=11.615 down_mbps=27.837 auth_fail=1 struct_fail=1 k=0
+r3: handshake_ms=217 up_mbps=11.616 down_mbps=27.534
+r4: handshake_ms=219 up_mbps=11.604 down_mbps=27.434
+ζup≈11.61 / down≈27.6 / handshake≈213
+
+### 结论（首杆：clean path）
+- up/down 与基线统计不可区分（<1% 差，方差内）——**零退化证明**。
+- 恒等式与 corrupt/stale/tail 全零，identity_ok=1。
+- 握手中位 217ms vs 108-217 直方：new 两杆偏慢，手握 HEAD 的 server 侧可能在
+  首包 RTO 播种差异，量小不定杆，不下结论。
+- 局限（如实）：本轮链路丢包 ≈0%（clean path），定案①的核心指标——ACK_V2/
+  填洞立即 ACK/key update 在**丢包/乱序路径**的效果——本轮未被激发。补测方案：
+  ①更长传（329MB curl SOCKS5 吃满 FEC 路径 + k 自适应）；②k=3/5 pinned 档
+  （/app 丢包注路）。

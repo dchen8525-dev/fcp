@@ -1210,10 +1210,13 @@ void TestLedgerLiftsKUnderBursts() {
 // #26①/T25: the envelope refuses the 2^32nd packet. The session has to expose
 // that state so the host can disconnect instead of leaving a tunnel whose
 // every send is silently dropped (engine.cc closes on nonce_exhausted()).
+// #84: this is the v7-peer path — key_update off, the old lifetime applies.
 void TestSendNonceExhaustionIsObservable() {
   Link link;
+  fcp::SessionConfig ca = MakeConfig(fcp::Direction::kC2S, fcp::Direction::kS2C);
+  ca.key_update = false;
   fcp::Session a(
-      MakeConfig(fcp::Direction::kC2S, fcp::Direction::kS2C),
+      ca,
       [&link](const uint8_t* w, size_t n, fcp::SymbolType t) { link.from_a(w, n, t); },
       [](const uint8_t*, size_t) {}, [](const std::string&) {});
   fcp::Session b(
@@ -1229,7 +1232,7 @@ void TestSendNonceExhaustionIsObservable() {
   CHECK(a.established());
   CHECK(!a.nonce_exhausted());
 
-  CHECK(a.set_send_nonce(fcp::Envelope::kNonceLimit - 1));
+  CHECK(a.set_send_nonce(fcp::Envelope::kNonceLimit - 1));  // std::cerr debug if failing
   const uint32_t before = link.a_data;
   const Bytes last = Segment(900);
   a.on_kcp_output(last.data(), last.size(), link.now);

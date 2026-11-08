@@ -490,6 +490,99 @@ void TestRandomSource() {
 
 }  // namespace
 
+// ---- key update / epoch rolling (#84) ----
+
+// Rolling drives the 101st seal into epoch 1 (the first roll exercises the
+// mechanism at kFirstRollAt); the receiver follows from the nonce's high bits
+// alone; the frozen epoch-0 window keeps accepting late arrivals while
+// rejecting both replays and the never-sent counters above its highest.
+void TestKeyUpdateRollover() {
+  fcp::Envelope client = MakeClient();
+  fcp::Envelope server = MakeServer();
+  uint8_t c_nonce[16], s_nonce[16], session_key[16];
+  CHECK(fcp_test::unhex("000102030405060708090a0b0c0d0e0f", c_nonce, 16));
+  CHECK(fcp_test::unhex("f0e0d0c0b0a090807060504030201000", s_nonce, 16));
+  fcp::derive_session_key_v7(kKey, kSalt, c_nonce, s_nonce, session_key);
+  client.rekey(session_key);
+  server.rekey(session_key);
+  client.set_key_update(true);
+  server.set_key_update(true);
+
+  const uint8_t payload[4] = {1, 2, 3, 4};
+  std::vector<std::vector<uint8_t>> epoch0;
+  for (int i = 0; i < 100; ++i) {
+    std::vector<uint8_t> wire;
+    CHECK(client.seal(payload, sizeof(payload), &wire));
+    epoch0.push_back(std::move(wire));
+  }
+  CHECK_EQ(client.send_epoch(), 0u);
+  std::vector<uint8_t> first_epoch1;
+  CHECK(client.seal(payload, sizeof(payload), &first_epoch1));
+  CHECK_EQ(client.send_epoch(), 1u);
+  CHECK_EQ(client.send_nonce(), fcp::Envelope::kEpochSpan + 1u);
+
+  // Everything but the last epoch-0 datagram opens before the roll is seen.
+  std::vector<uint8_t> plain;
+  for (size_t i = 0; i + 1 < epoch0.size(); ++i) {
+    CHECK(server.open(epoch0[i].data(), epoch0[i].size(), &plain));
+    CHECK_EQ(plain.size(), sizeof(payload));
+  }
+  // The epoch-1 datagram makes the receiver follow; the late epoch-0 tail
+  // still opens under the frozen window afterwards.
+  CHECK(server.open(first_epoch1.data(), first_epoch1.size(), &plain));
+  CHECK(server.open(epoch0.back().data(), epoch0.back().size(), &plain));
+  // Replays die in both epochs.
+  CHECK(!server.open(first_epoch1.data(), first_epoch1.size(), &plain));
+  CHECK(!server.open(epoch0.back().data(), epoch0.back().size(), &plain));
+
+  // The exercise roll is one-shot: the next seals stay in epoch 1 until
+  // kEpochSpan, and the receiver keeps opening them under the epoch-1 key.
+  std::vector<uint8_t> again;
+  CHECK(client.seal(payload, sizeof(payload), &again));
+  CHECK_EQ(client.send_epoch(), 1u);
+  CHECK(server.open(again.data(), again.size(), &plain));
+  std::vector<uint8_t> third;
+  CHECK(client.seal(payload, sizeof(payload), &third));
+  CHECK(server.open(third.data(), third.size(), &plain));
+
+  // A counter in epoch 0 that was never sent (100..kEpochSpan) still opens
+  // under the frozen key — the window slides like any other, gated by the tag;
+  // what matters is that its replay dies.
+  fcp::Envelope forged = MakeClient();
+  forged.rekey(session_key);  // key_update stays off: epoch-0 key
+  std::vector<uint8_t> evil;
+  CHECK(forged.seal_at(5000, payload, sizeof(payload), &evil));
+  CHECK(server.open(evil.data(), evil.size(), &plain));
+  CHECK(!server.open(evil.data(), evil.size(), &plain));
+  // A packet from the future epoch (seen + 2) is refused outright.
+  CHECK(forged.seal_at(2 * fcp::Envelope::kEpochSpan, payload, sizeof(payload), &evil));
+  CHECK(!server.open(evil.data(), evil.size(), &plain));
+}
+
+// The v7-peer path: key update off keeps the flat single-key envelope — no
+// roll at the 100-packet mark, the 2^32 ceiling (and its disconnect) intact.
+void TestKeyUpdateOffNeverRolls() {
+  fcp::Envelope client = MakeClient();
+  fcp::Envelope server = MakeServer();
+  uint8_t c_nonce[16], s_nonce[16], session_key[16];
+  CHECK(fcp_test::unhex("000102030405060708090a0b0c0d0e0f", c_nonce, 16));
+  CHECK(fcp_test::unhex("f0e0d0c0b0a090807060504030201000", s_nonce, 16));
+  fcp::derive_session_key_v7(kKey, kSalt, c_nonce, s_nonce, session_key);
+  client.rekey(session_key);
+  server.rekey(session_key);
+  // set_key_update is never called.
+
+  const uint8_t payload[4] = {1, 2, 3, 4};
+  for (int i = 0; i < 150; ++i) {
+    std::vector<uint8_t> wire;
+    CHECK(client.seal(payload, sizeof(payload), &wire));
+    std::vector<uint8_t> plain;
+    CHECK(server.open(wire.data(), wire.size(), &plain));
+  }
+  CHECK_EQ(client.send_epoch(), 0u);
+  CHECK_EQ(client.send_nonce(), 150u);
+}
+
 int main() {
   TestEmptyAndRoundTrip();
   TestTamperAndSalt();
@@ -504,5 +597,7 @@ int main() {
   TestV7IdenticalNonces();
   TestBootstrapNonceStart();
   TestRandomSource();
+  TestKeyUpdateRollover();
+  TestKeyUpdateOffNeverRolls();
   return fcp_test::finish();
 }

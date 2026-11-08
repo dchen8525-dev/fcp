@@ -550,6 +550,11 @@ void Session::configure(int64_t now_ms) {
   derive_session_key_v7(cfg_.key, cfg_.salt, hs_.client_nonce(), hs_.server_nonce(),
                         session_key);
   env_.rekey(session_key);
+  // #84: epoch rolling rides the TLV negotiation — a v7 peer keeps the
+  // byte-identical epoch-0 behavior (single key, 2^32 ceiling), while a
+  // TLV peer follows our rolls and lets us follow theirs. The capability
+  // resolves exactly here, where the negotiation result is in hand.
+  env_.set_key_update(cfg_.key_update && hs_.tlv_negotiated());
 
   tx_ = std::make_unique<FrameTx>(np.d, limits_,
                                   [this](const TxSymbol& symbol) { emit_symbol(symbol); });

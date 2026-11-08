@@ -110,6 +110,11 @@ struct SessionConfig {
   // (two unanswered HELLOs) and then negotiates without it, so mixed-version
   // deployments pay that once per connection while the roll-out crosses.
   bool stream_ack_v2 = true;
+  // #84: envelope key update (epoch rolling) — offered to TLV peers only; a
+  // v7 peer keeps the single-key 2^32-packet lifetime with its disconnect
+  // semantics. With rolling on, one key never seals more than kEpochSpan
+  // packets and the session never hits the counter ceiling.
+  bool key_update = true;
 };
 
 class Session {

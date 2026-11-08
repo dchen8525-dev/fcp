@@ -90,6 +90,27 @@ void derive_direction_keys(const uint8_t session_key[16],
   kdf_ctr_aes128(session_key, "fcp-s2", 6, key_s2c, 16);
 }
 
+void derive_epoch_direction_key(const uint8_t session_key[16], Direction dir,
+                                uint16_t epoch, uint8_t out[16]) {
+  // #84: epoch >= 1 keys live in a fresh domain so the #26② epoch-0 keys stay
+  // byte-identical (v7 golden vectors, v7 peers). The PRF is the AES-128 the
+  // envelope already relies on; the input block binds direction + epoch:
+  //   out = AES128(session_key, label(2) | epoch(2 LE) | 0x00 x 12)
+  // with "c2" / "s2" as the direction labels — same family as
+  // derive_session_key's AES(psk, salt || 0^8) construction.
+  Aes128Key aes_key;
+  aes128_expand_key(session_key, &aes_key);
+  uint8_t block[16];
+  block[0] = dir == Direction::kC2S ? 'c' : 's';
+  block[1] = dir == Direction::kC2S ? '2' : '2';
+  block[2] = static_cast<uint8_t>(epoch);
+  block[3] = static_cast<uint8_t>(epoch >> 8);
+  std::memset(block + 4, 0, 12);
+  aes128_encrypt_block(aes_key, block, out);
+  secure_zero(&aes_key, sizeof(aes_key));
+  secure_zero(block, sizeof(block));
+}
+
 // R3-1: see envelope.h. CBC-MAC over (salt || 0^8, client_nonce, server_nonce)
 // keyed by the PSK. Only the AES primitive is used -- no hash is pulled in, and
 // the chain is three fixed-size blocks so no padding rule exists to get wrong.
@@ -147,6 +168,9 @@ Envelope::~Envelope() {
   // wire 字段，无需抹除。
   secure_zero(&send_key_, sizeof(send_key_));
   secure_zero(&recv_key_, sizeof(recv_key_));
+  secure_zero(&prev_recv_key_, sizeof(prev_recv_key_));
+  // #84: 会话密钥是全部 epoch 派生的根，同样即弃。
+  secure_zero(session_key_, sizeof(session_key_));
 }
 
 void Envelope::install_keys(const uint8_t session_key[16]) {
@@ -173,6 +197,15 @@ void Envelope::install_keys(const uint8_t session_key[16]) {
   recv_has_nonce_ = false;
   recv_highest_ = 0;
   recv_seen_.reset();
+  // #84: keep the root for per-epoch re-derivation and reset the rolling
+  // state. set_key_update() is (re)applied by the session after rekey().
+  std::memcpy(session_key_, session_key, sizeof(session_key_));
+  send_epoch_ = 0;
+  rolled_once_ = false;
+  recv_epoch_seen_ = 0;
+  recv_cur_ = RecvEpoch{};
+  recv_prev_ = RecvEpoch{};
+  secure_zero(&prev_recv_key_, sizeof(prev_recv_key_));
 }
 
 void Envelope::rekey(const uint8_t session_key[16]) {
@@ -180,6 +213,18 @@ void Envelope::rekey(const uint8_t session_key[16]) {
 }
 
 bool Envelope::seal(const uint8_t* plain, size_t len, std::vector<uint8_t>* wire) {
+  // #84: roll the send key at the threshold. The first roll happens at
+  // kFirstRollAt so the rollover path is exercised in the first seconds of
+  // every session (quic-go's FirstKeyUpdateInterval rationale); afterwards
+  // once per kEpochSpan. The counter never reaches kNonceLimit while rolling
+  // is on, which is what retires the 2^32 disconnect.
+  if (key_update_) {
+    const uint64_t in_epoch = send_nonce_ - send_epoch_;
+    const uint64_t threshold = rolled_once_ ? kEpochSpan : kFirstRollAt;
+    if (in_epoch >= threshold && !roll_send_epoch()) {
+      return false;  // epoch space exhausted (~1.4 PB per direction)
+    }
+  }
   if (send_nonce_ >= send_limit_) {
     return false;
   }
@@ -187,6 +232,32 @@ bool Envelope::seal(const uint8_t* plain, size_t len, std::vector<uint8_t>* wire
     return false;
   }
   ++send_nonce_;
+  return true;
+}
+
+bool Envelope::roll_send_epoch() {
+  // #84: the epoch number rides the nonce's high bits and feeds the KDF as a
+  // u16; 65535 epochs x 2^24 packets ≈ 1.1 PB per direction. Past that the
+  // session must reconnect — seal() reports false and the host disconnects.
+  const uint64_t epoch_num = send_epoch_ / kEpochSpan + 1;
+  if (epoch_num > 65535) {
+    return false;
+  }
+  uint8_t out[16];
+  derive_epoch_direction_key(session_key_, send_direction_,
+                             static_cast<uint16_t>(epoch_num), out);
+  GcmKey k;
+  gcm_key_init(out, &k);
+  secure_zero(out, sizeof(out));
+  secure_zero(&send_key_, sizeof(send_key_));
+  send_key_ = k;
+  secure_zero(&k, sizeof(k));
+  // Jump the nonce to the new epoch's base: the fresh key has never sealed
+  // anything, so (key, IV) uniqueness holds with the counter restarting at 0
+  // within the epoch. The 64-bit wire counter stays monotonic overall.
+  send_epoch_ = epoch_num * kEpochSpan;
+  send_nonce_ = send_epoch_;
+  rolled_once_ = true;
   return true;
 }
 
@@ -244,6 +315,9 @@ bool Envelope::open(const uint8_t* wire, size_t len, std::vector<uint8_t>* plain
   if (nonce_ctr >= counter_ceiling_) {
     return false;
   }
+  if (key_update_) {
+    return open_epoch(nonce_ctr, wire, len, plain);
+  }
   // Replay pre-check, also before AES: a replay of an authentic datagram is
   // guaranteed to die at accept_nonce(), so it must not pay the full CTR +
   // GHASH bill first（重放洪泛的 CPU 放大就此关闭）。判定不落状态，窗口仍
@@ -268,6 +342,116 @@ bool Envelope::open(const uint8_t* wire, size_t len, std::vector<uint8_t>* plain
     return false;
   }
   *plain = std::move(decoded);
+  return true;
+}
+
+// #84 receive path: the epoch rides the nonce's high bits, so the peer's rolls
+// are followed without any extra negotiation — pick the key for the epoch,
+// then run the same pre-check / decrypt / accept sequence against that epoch's
+// window. At most two epochs are live (current + the frozen previous one): the
+// replay window is far smaller than an epoch, so a datagram older than one
+// epoch is unrecoverable by design.
+bool Envelope::open_epoch(uint64_t nonce_ctr, const uint8_t* wire, size_t len,
+                          std::vector<uint8_t>* plain) {
+  const uint64_t epoch = nonce_ctr / kEpochSpan;
+  const uint64_t counter = nonce_ctr % kEpochSpan;
+  const GcmKey* key = nullptr;
+  RecvEpoch* win = nullptr;
+  if (epoch == recv_epoch_seen_) {
+    key = &recv_key_;
+    win = &recv_cur_;
+  } else if (epoch + 1 == recv_epoch_seen_) {
+    // The frozen previous epoch (epoch 0 included — the guard is epoch arithmetic,
+    // not "epoch must be positive": with seen == 1 the previous epoch IS 0).
+    // "Frozen" refers to the key, not the window: the window slides exactly
+    // like the current one. A counter above the seen-highest from a key-holding
+    // peer is either a legal late tail (the roll happened before it arrived)
+    // or a misbehaving peer — both are safe to admit, because the tag gates
+    // every window update and the old key's nonce space is untouched by it.
+    key = &prev_recv_key_;
+    win = &recv_prev_;
+  } else if (epoch == recv_epoch_seen_ + 1) {
+    // The peer rolled: freeze the current window and key as "previous", then
+    // derive the new epoch's receive key. This runs before any AES, but the
+    // only thing it commits is bookkeeping — an attacker forcing the advance
+    // costs one failed GCM and cannot resurrect an old key (the previous
+    // epoch's window and key both stay live).
+    recv_prev_ = recv_cur_;
+    prev_recv_key_ = recv_key_;
+    recv_epoch_seen_ = epoch;
+    uint8_t out[16];
+    derive_epoch_direction_key(session_key_, recv_direction_,
+                               static_cast<uint16_t>(epoch), out);
+    GcmKey k;
+    gcm_key_init(out, &k);
+    secure_zero(out, sizeof(out));
+    recv_key_ = k;
+    secure_zero(&k, sizeof(k));
+    recv_cur_ = RecvEpoch{};
+    key = &recv_key_;
+    win = &recv_cur_;
+  } else {
+    return false;  // too old (below the frozen window) or from the future
+  }
+  if (counter >= counter_ceiling_) {
+    return false;
+  }
+  if (!epoch_window_may_accept(*win, counter)) {
+    return false;
+  }
+  uint8_t iv[kGcmIvLen];
+  make_iv(nonce_ctr, recv_direction_, iv);
+  const size_t cipher_len = len - kOverhead;
+  const uint8_t* cipher = wire + kSaltLen + kNonceLen;
+  const uint8_t* tag = cipher + cipher_len;
+  std::vector<uint8_t> decoded(cipher_len);
+  if (!gcm_open_keyed(*key, iv, nullptr, 0, cipher, cipher_len, tag, decoded.data())) {
+    plain->clear();
+    return false;
+  }
+  if (!epoch_accept(*win, counter)) {
+    plain->clear();
+    return false;
+  }
+  *plain = std::move(decoded);
+  return true;
+}
+
+bool Envelope::epoch_window_may_accept(RecvEpoch& win, uint64_t counter) const {
+  if (!win.has_nonce) {
+    return true;
+  }
+  if (counter > win.highest) {
+    return true;
+  }
+  const uint64_t delta = win.highest - counter;
+  return delta < win.seen.size() && !win.seen[static_cast<size_t>(delta)];
+}
+
+bool Envelope::epoch_accept(RecvEpoch& win, uint64_t counter) {
+  if (!win.has_nonce) {
+    win.has_nonce = true;
+    win.highest = counter;
+    win.seen.reset();
+    win.seen[0] = true;
+    return true;
+  }
+  if (counter > win.highest) {
+    const uint64_t delta = counter - win.highest;
+    if (delta >= win.seen.size()) {
+      win.seen.reset();
+    } else {
+      win.seen <<= static_cast<size_t>(delta);
+    }
+    win.seen[0] = true;
+    win.highest = counter;
+    return true;
+  }
+  const uint64_t delta = win.highest - counter;
+  if (delta >= win.seen.size() || win.seen[static_cast<size_t>(delta)]) {
+    return false;
+  }
+  win.seen[static_cast<size_t>(delta)] = true;
   return true;
 }
 

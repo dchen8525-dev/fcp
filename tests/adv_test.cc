@@ -1586,10 +1586,17 @@ void ProbeR10Session() {
   // (key, salt, direction) triple with A - i.e. it *is* the session as far as
   // crypto goes - so its explicit counters are placed just above A's real
   // traffic (~402 packets) instead of colliding with it.
+  // #84: this probe pins the *struct_fail accounting* semantics, which live
+  // under the flat single-key envelope — keep key update off so the rogue's
+  // explicit counters stay inside that one replay window. Rolling's own
+  // counter-domain rules are covered by envelope_test's key-update cases.
   {
     fcp_e2e::Harness h;
-    CHECK(h.Init(FuzzConfig(fcp::Direction::kC2S, fcp::Direction::kS2C),
-                 FuzzConfig(fcp::Direction::kS2C, fcp::Direction::kC2S)));
+    fcp::SessionConfig ca = FuzzConfig(fcp::Direction::kC2S, fcp::Direction::kS2C);
+    ca.key_update = false;
+    fcp::SessionConfig cb = FuzzConfig(fcp::Direction::kS2C, fcp::Direction::kC2S);
+    cb.key_update = false;
+    CHECK(h.Init(ca, cb));
     CHECK(h.Handshake());
 
     // a good stream first: 40 sets of 10 segments, delivered exactly once

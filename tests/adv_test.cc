@@ -1387,6 +1387,10 @@ void ProbeR9Handshake() {
     const bool want_ok = ver == fcp::kCapsVersion && data >= 1 && parity <= 7 &&
                          static_cast<unsigned>(data) + parity <= 256 &&
                          (flags & ~fcp::kCapKnownMask) == 0 &&
+                         // #77: this harness only builds the fixed 36B HELLO,
+                         // so a caps that claims a TLV block can never be
+                         // accepted here regardless of the other bits.
+                         (flags & fcp::kCapTlv) == 0 &&
                          (flags & (fcp::kCapFraming | fcp::kCapFecstat)) ==
                              (fcp::kCapFraming | fcp::kCapFecstat);
     CHECK_EQ(accepted, want_ok);
@@ -1402,7 +1406,7 @@ void ProbeR9Handshake() {
   check_caps(1, 0, 3, 0x03);    // data must be >= 1
   check_caps(1, 10, 8, 0x03);   // parity > 7
   check_caps(1, 10, 3, 0x17);   // M1 + PMTUD: valid
-  check_caps(1, 10, 3, 0x20);   // reserved bit 5 set (bit 4 is kCapPmtud)
+  check_caps(1, 10, 3, 0x20);   // kCapTlv without a block on the fixed-size HELLO (#77)
   check_caps(1, 10, 3, 0x80);   // reserved bit 7 set
   check_caps(1, 10, 3, 0x01);   // framing without FECSTAT -> ERROR
   check_caps(1, 10, 3, 0x02);   // FECSTAT without framing -> ERROR

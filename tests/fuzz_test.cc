@@ -225,6 +225,38 @@ void FuzzHandshakePhase() {
     p.forge_out.clear();
   }
   CHECK(!hellos.empty());
+  // #77: seed ext-shaped handshake messages too -- a valid TLV block, an
+  // empty one, a block/length mismatch that must bounce at dispatch, and a
+  // length-consistent block whose inner TLV is malformed (type 0). Mutate()
+  // then twists all of them through the on_wire -> on_oob parse path.
+  {
+    const fcp::HandshakeCaps caps{
+        1, 10, 3, static_cast<uint8_t>(fcp::kLocalFlagsM1 | fcp::kCapTlv)};
+    const std::vector<fcp::HandshakeTlv> tlvs = {{0x90, {1, 2, 3}}, {0xEE, {}}};
+    const uint8_t server_draw[fcp::kHandshakeNonceLen] = {9, 9, 9, 9, 9, 9, 9, 9,
+                                                          9, 9, 9, 9, 9, 9, 9, 9};
+    uint8_t buf[fcp::kHelloAckLen + fcp::kTlvBlockLenBytes + 64];
+    size_t n = fcp::build_hello_ext(caps, p.forge->handshake_nonce(), tlvs, buf,
+                                    sizeof(buf));
+    CHECK(n != 0);
+    hellos.emplace_back(buf, buf + n);
+    n = fcp::build_hello_ack_ext(caps, p.forge->handshake_nonce(), server_draw,
+                                 tlvs, buf, sizeof(buf));
+    CHECK(n != 0);
+    hellos.emplace_back(buf, buf + n);
+    n = fcp::build_hello_ack_ext(caps, p.forge->handshake_nonce(), server_draw,
+                                 {}, buf, sizeof(buf));
+    CHECK(n != 0);
+    hellos.emplace_back(buf, buf + n);
+    std::vector<uint8_t> mismatched = hellos.front();
+    mismatched[fcp::kHelloLen - 1] |= fcp::kCapTlv;  // bit5, no block follows
+    hellos.push_back(mismatched);
+    std::vector<uint8_t> bad_type = mismatched;
+    bad_type.push_back(0x00);  // block_len = 1
+    bad_type.push_back(0x01);
+    bad_type.push_back(0x00);  // TLV type 0: reserved, malformed
+    hellos.push_back(bad_type);
+  }
   auto target = MakeTarget(p);
   target->start(0);
   const int64_t fuzz_start = NowMs();
@@ -262,6 +294,15 @@ void FuzzCodecs() {
   uint8_t salt[kSaltLen] = {1, 2, 3, 4, 5, 6, 7, 8};
   EncodeRendezvous(salt, 8, rendezvous);
   seeds.emplace_back(rendezvous, rendezvous + sizeof(rendezvous));
+  // #77: handshake TLV block codec -- the parse surface the ext-shaped
+  // handshake messages feed.
+  {
+    std::vector<fcp::HandshakeTlv> tlvs = {{1, {1}}, {0x80, {9, 9, 9}}, {0xFF, {}}};
+    uint8_t tbuf[fcp::kTlvBlockLenBytes + 32];
+    const size_t tn = fcp::tlv_encode(tlvs, tbuf, sizeof(tbuf));
+    CHECK(tn != 0);
+    seeds.emplace_back(tbuf + fcp::kTlvBlockLenBytes, tbuf + tn);
+  }
 
   fcp::FecstatValidator validator;
   uint8_t salt8[8] = {};

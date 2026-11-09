@@ -258,6 +258,9 @@ class Reactor {
   size_t app_send(uint64_t conn, const uint8_t* data, size_t len);
   void app_shutdown(uint64_t conn);
   void app_close(uint64_t conn);
+  // Close with an RST (SO_LINGER 0) so a tunnel reset reaches the application
+  // as a reset rather than a clean EOF.
+  void app_abort(uint64_t conn);
   size_t wire_send(uint64_t peer, const uint8_t* wire, size_t len);
   // wire_send's send path under no shaping: the GSO batch on Linux, else the
   // plain ::send/::sendto. `to` is the destination captured at wire_send time

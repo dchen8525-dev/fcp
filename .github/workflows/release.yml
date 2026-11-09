@@ -11,8 +11,9 @@ name: release
 # 承载，所以两个客户端 job 先构建 FCP_BUILD_PROXY=ON 的 CLI。
 #
 # 门禁顺序是"测试在前、打包在后"：linux-deb 跑完整 ctest（Linux Release），
-# 测试红了就没有任何产物。客户端 job 另做冒烟：sidecar `--version` 与
-# AppImage 离屏启动 6 秒。
+# coverage 单独跑覆盖率门禁，windows-tests 在 MSVC 上编译并跑同一套 ctest；
+# 三条门禁红了都没有任何产物。客户端 job 另做冒烟：sidecar `--version` 与
+# VERSION 比对、AppImage 离屏启动 6 秒。
 #
 # 手工触发（workflow_dispatch）：只产出 artifacts、不发 Release，
 # 用来在打 tag 之前把整条流水线跑通一遍。
@@ -218,6 +219,31 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # ---------------------------------------------------------------- Coverage
+  # The gate (line >= 90%, branch >= 80%) used to be documented as "runs in CI"
+  # while no job invoked scripts/coverage.sh; the only enforcement was a
+  # developer running it by hand (M-04). It lives in its own job so it is
+  # independent of the packaging jobs and visible as its own check.
+  coverage:
+    name: 覆盖率门禁（Linux）
+    needs: prep
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-vcpkg
+
+      - name: 构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build gcovr
+
+      # configure → build → ctest → gcovr；脚本自己先清 build/coverage，避免
+      # 上一次运行的 .gcda 把数字垫高。
+      - name: 覆盖率（行 ≥ 90% / 分支 ≥ 80%）
+        run: bash scripts/coverage.sh
+
   # ------------------------------------------------------- Linux client AppImage
   linux-appimage:
     name: Linux 客户端 AppImage
@@ -375,10 +401,48 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # ---------------------------------------------------------------- Release
+  # ------------------------------------------------------- Windows test gate
+  # The release job builds the sidecar with FCP_BUILD_TESTS=OFF
+  # FCP_BUILD_TOOLS=OFF, so the Windows-only code (select fd handling, Winsock
+  # init, iphlpapi/winmm linkage, the `sleep`/path branches of the tests) was
+  # never compiled or run on MSVC until a user or a tag hit it (M-06). This job
+  # compiles and runs the suite; it is deliberately separate from the packaging
+  # jobs so it cannot disturb their build cache.
+  windows-tests:
+    name: Windows 测试（MSVC，含 tools）
+    needs: prep
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-vcpkg
+
+      # Default Visual Studio generator (multi-config), same as the packing job:
+      # no vcvars needed.
+      - name: 构建 CLI + 测试 + 工具
+        shell: pwsh
+        run: |
+          cmake -S . -B build/test-win `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DFCP_BUILD_PROXY=ON -DFCP_BUILD_TESTS=ON -DFCP_BUILD_TOOLS=ON
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build/test-win --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: ctest
+        shell: pwsh
+        run: |
+          # test_baseline.sh uses dirname/awk; Git for Windows keeps them in
+          # usr\bin, which is only on PATH inside a bash subshell. Put it on
+          # PATH for ctest so the baseline guard actually runs instead of
+          # failing as "dirname: command not found".
+          $env:PATH = "$env:ProgramFiles\Git\usr\bin;" + $env:PATH
+          ctest --test-dir build/test-win -C Release --output-on-failure
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
   publish:
     name: 发布 GitHub Release
-    needs: [prep, linux-deb, linux-appimage, windows-client]
+    needs: [prep, coverage, linux-deb, linux-appimage, windows-client, windows-tests]
     if: needs.prep.outputs.publish == 'true'
     runs-on: ubuntu-latest
     steps:

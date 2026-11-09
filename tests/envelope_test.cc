@@ -559,6 +559,42 @@ void TestKeyUpdateRollover() {
   CHECK(!server.open(evil.data(), evil.size(), &plain));
 }
 
+// A forged datagram may claim the next epoch (salt and nonce are plaintext),
+// but it must not advance the receiver: two such datagrams used to move
+// recv_epoch_seen_ past the live epoch and black-hole every legitimate packet
+// until the sender completed a roll.
+void TestKeyUpdateForgedRollDoesNotCommit() {
+  fcp::Envelope client = MakeClient();
+  fcp::Envelope server = MakeServer();
+  uint8_t c_nonce[16], s_nonce[16], session_key[16];
+  CHECK(fcp_test::unhex("000102030405060708090a0b0c0d0e0f", c_nonce, 16));
+  CHECK(fcp_test::unhex("f0e0d0c0b0a090807060504030201000", s_nonce, 16));
+  fcp::derive_session_key_v7(kKey, kSalt, c_nonce, s_nonce, session_key);
+  client.rekey(session_key);
+  server.rekey(session_key);
+  client.set_key_update(true);
+  server.set_key_update(true);
+
+  const uint8_t payload[4] = {1, 2, 3, 4};
+  // One genuine epoch-0 packet, sealed before the attack.
+  std::vector<uint8_t> legit;
+  CHECK(client.seal(payload, sizeof(payload), &legit));
+
+  // Same salt, same nonce layout, wrong key: the tag must fail.
+  fcp::Envelope forger = MakeClient();
+  std::vector<uint8_t> forged1, forged2, plain;
+  CHECK(forger.seal_at(fcp::Envelope::kEpochSpan + 7, payload, sizeof(payload), &forged1));
+  CHECK(forger.seal_at(2 * fcp::Envelope::kEpochSpan + 7, payload, sizeof(payload),
+                       &forged2));
+  CHECK(!server.open(forged1.data(), forged1.size(), &plain));
+  CHECK(!server.open(forged2.data(), forged2.size(), &plain));
+
+  // The failed roll attempts committed nothing: epoch 0 still opens.
+  CHECK(server.open(legit.data(), legit.size(), &plain));
+  CHECK_EQ(fcp_test::hex(plain.data(), plain.size()),
+           fcp_test::hex(payload, sizeof(payload)));
+}
+
 // The v7-peer path: key update off keeps the flat single-key envelope — no
 // roll at the 100-packet mark, the 2^32 ceiling (and its disconnect) intact.
 void TestKeyUpdateOffNeverRolls() {
@@ -598,6 +634,7 @@ int main() {
   TestBootstrapNonceStart();
   TestRandomSource();
   TestKeyUpdateRollover();
+  TestKeyUpdateForgedRollDoesNotCommit();
   TestKeyUpdateOffNeverRolls();
   return fcp_test::finish();
 }

@@ -175,6 +175,7 @@ class Harness {
     local_send(conn, std::vector<uint8_t>(text.begin(), text.end()));
   }
   void local_close(uint64_t conn) { client->on_local_closed(conn, now_ms); }
+  void local_reset(uint64_t conn) { client->on_local_reset(conn, now_ms); }
 
   // ---- server side: the dialed target socket ----
 
@@ -188,6 +189,7 @@ class Harness {
     return bytes.size();
   }
   void target_close(uint64_t conn) { server->on_target_closed(conn, now_ms); }
+  void target_reset(uint64_t conn) { server->on_target_reset(conn, now_ms); }
 
   // ---- dialling ----
 
@@ -467,6 +469,48 @@ void socks5_round_trip() {
   CHECK(h.app_closed(kLocalConn));
   CHECK(h.target_closed(target_conn));
   CHECK_EQ(h.client->counters().idle_closed, 0u);
+}
+
+// A socket error/RST is not a clean EOF. The engine must abort the tunnel (send
+// a stream RST) and drop the connection at once instead of waiting out the idle
+// timeout for bytes the dead socket can never take.
+void local_reset_aborts_the_tunnel() {
+  Harness h{Options()};
+  post_socks5_entry(h);
+  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, kTunnelSteps));
+  const uint64_t target_conn = h.first_dial_conn();
+
+  h.target_send(target_conn, std::vector<uint8_t>{'2', '0', '0'});
+  CHECK(h.run_until([&] { return h.app_bytes(kLocalConn).size() == kEntryReplyBytes + 3; },
+                    40));
+
+  h.local_reset(kLocalConn);
+  CHECK(h.run_until([&] {
+    return h.client->counters().live == 0 && h.server->counters().live == 0;
+  }, 40));
+  CHECK(h.app_closed(kLocalConn));
+  CHECK(h.target_closed(target_conn));
+  // Both ends saw a reset, not a clean EOF.
+  CHECK(h.client->counters().reset >= 1u);
+  CHECK(h.server->counters().reset >= 1u);
+}
+
+// The same reset contract on the server's dialed socket: a target RST must
+// abort the tunnel, not look like a clean response EOF at the client.
+void target_reset_aborts_the_tunnel() {
+  Harness h{Options()};
+  post_socks5_entry(h);
+  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, kTunnelSteps));
+  const uint64_t target_conn = h.first_dial_conn();
+
+  h.target_reset(target_conn);
+  CHECK(h.run_until([&] {
+    return h.client->counters().live == 0 && h.server->counters().live == 0;
+  }, 40));
+  CHECK(h.app_closed(kLocalConn));
+  CHECK(h.target_closed(target_conn));
+  CHECK(h.client->counters().reset >= 1u);
+  CHECK(h.server->counters().reset >= 1u);
 }
 
 // A client that half-closes after its request is the normal shape of a
@@ -1561,6 +1605,8 @@ void prewarm_ticket_seeds_a_cold_cache() {
 
 int main() {
   socks5_round_trip();
+  local_reset_aborts_the_tunnel();
+  target_reset_aborts_the_tunnel();
   slow_response_after_half_close_survives_the_grace_window();
   half_close_keeps_the_response_flowing();
   socks5_request_corked_with_greeting();

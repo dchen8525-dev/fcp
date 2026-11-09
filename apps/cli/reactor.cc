@@ -228,6 +228,7 @@ EngineHost Reactor::make_host(Reactor* self) {
     return self->app_send(conn, data, len);
   };
   host.app_close = [self](uint64_t conn) { self->app_close(conn); };
+  host.app_abort = [self](uint64_t conn) { self->app_abort(conn); };
   host.app_shutdown = [self](uint64_t conn) { self->app_shutdown(conn); };
   host.wire_send = [self](uint64_t peer, const uint8_t* wire, size_t len) {
     return self->wire_send(peer, wire, len);
@@ -1089,14 +1090,14 @@ void Reactor::read_socket(Sock sock, uint64_t conn, bool target, int64_t now_ms)
           CloseSock(it->second);
           targets_.erase(it);
         }
-        engine_.on_target_closed(conn, now_ms);
+        engine_.on_target_reset(conn, now_ms);
       } else {
         const auto it = locals_.find(conn);
         if (it != locals_.end()) {
           CloseSock(it->second);
           locals_.erase(it);
         }
-        engine_.on_local_closed(conn, now_ms);
+        engine_.on_local_reset(conn, now_ms);
       }
     }
     return;
@@ -1247,7 +1248,7 @@ void Reactor::except_event(Sock sock, uint64_t conn, int64_t now_ms) {
   if (target != targets_.end() && target->second == sock) {
     targets_.erase(target);
     CloseSock(sock);
-    engine_.on_target_closed(conn, now_ms);
+    engine_.on_target_reset(conn, now_ms);
     return;
   }
   const auto local = locals_.find(conn);
@@ -1256,7 +1257,7 @@ void Reactor::except_event(Sock sock, uint64_t conn, int64_t now_ms) {
     CloseSock(sock);
     // The local half is gone, so the engine only needs to be told the app stopped
     // reading; app_close on an already-erased socket is a no-op.
-    engine_.on_local_closed(conn, now_ms);
+    engine_.on_local_reset(conn, now_ms);
   }
 }
 
@@ -1469,9 +1470,9 @@ void Reactor::flush_dead_apps(int64_t now_ms) {
       continue;
     }
     if (e.second) {
-      engine_.on_target_closed(e.first, now_ms);
+      engine_.on_target_reset(e.first, now_ms);
     } else {
-      engine_.on_local_closed(e.first, now_ms);
+      engine_.on_local_reset(e.first, now_ms);
     }
   }
 }
@@ -1520,6 +1521,45 @@ void Reactor::app_close(uint64_t conn) {
   if (pending != pending_.end()) {
     CloseSock(pending->second.sock);
     pending_.erase(pending);
+  }
+  // A resolver result may still be in flight; drain_resolves() finds that the
+  // engine no longer knows the conn and stops there.
+  dial_addrs_.erase(conn);
+}
+
+void Reactor::app_abort(uint64_t conn) {
+  Sock s = kBadSock;
+  const auto local = locals_.find(conn);
+  if (local != locals_.end()) {
+    s = local->second;
+    locals_.erase(local);
+  } else {
+    const auto target = targets_.find(conn);
+    if (target != targets_.end()) {
+      s = target->second;
+      targets_.erase(target);
+    } else {
+      const auto pending = pending_.find(conn);
+      if (pending != pending_.end()) {
+        s = pending->second.sock;
+        pending_.erase(pending);
+      }
+    }
+  }
+  if (s != kBadSock) {
+    // A zero linger makes close() emit RST instead of FIN, on POSIX and
+    // Winsock alike, so the application does not mistake a reset tunnel for a
+    // clean end of stream.
+    struct linger lg{};
+    lg.l_onoff = 1;
+    lg.l_linger = 0;
+#ifdef _WIN32
+    ::setsockopt(s, SOL_SOCKET, SO_LINGER,
+                 reinterpret_cast<const char*>(&lg), sizeof(lg));
+#else
+    ::setsockopt(s, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+#endif
+    CloseSock(s);
   }
   // A resolver result may still be in flight; drain_resolves() finds that the
   // engine no longer knows the conn and stops there.

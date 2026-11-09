@@ -42,6 +42,13 @@ fi
 
 BIN="$CLI_BUILD/apps/cli/fcp-client"
 [ -x "$BIN" ] || { echo "缺少可执行文件：$BIN"; exit 1; }
+# `--skip-fcp` trusts a previously built binary; make sure it is this repo's
+# release, not a stale or Debug one that only happens to be executable (M-05).
+reported="$("$BIN" --version | awk '{print $1, $2}')"
+if [ "$reported" != "fcp-client $VERSION" ]; then
+  echo "sidecar 版本不符：报告 '$reported'，期望 'fcp-client $VERSION'（先重建 Release sidecar）" >&2
+  exit 1
+fi
 
 # ---------------------------------------------------------------- Qt GUI
 echo "== CMake: Qt GUI${FCP_QT_PREFIX:+ (prefix=$FCP_QT_PREFIX)}"

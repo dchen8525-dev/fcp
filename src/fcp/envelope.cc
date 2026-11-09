@@ -1,6 +1,7 @@
 #include "fcp/envelope.h"
 
 #include <cstring>
+#include <optional>
 
 #include "fcp/aes.h"
 #include "fcp/gcm.h"
@@ -357,6 +358,14 @@ bool Envelope::open_epoch(uint64_t nonce_ctr, const uint8_t* wire, size_t len,
   const uint64_t counter = nonce_ctr % kEpochSpan;
   const GcmKey* key = nullptr;
   RecvEpoch* win = nullptr;
+  // A packet from the next epoch may be the peer's roll. Derive that epoch's
+  // key locally, but do not touch recv_prev_/recv_key_/recv_epoch_seen_ until
+  // the tag verifies: a forged salt+nonce must not be able to advance the
+  // receiver's epoch and black-hole the epoch that is still live. optional
+  // keeps this off the common path's cost: it is constructed only when the
+  // epoch really is the next one.
+  std::optional<GcmKey> next_key;
+  bool commit_next_epoch = false;
   if (epoch == recv_epoch_seen_) {
     key = &recv_key_;
     win = &recv_cur_;
@@ -371,32 +380,26 @@ bool Envelope::open_epoch(uint64_t nonce_ctr, const uint8_t* wire, size_t len,
     key = &prev_recv_key_;
     win = &recv_prev_;
   } else if (epoch == recv_epoch_seen_ + 1) {
-    // The peer rolled: freeze the current window and key as "previous", then
-    // derive the new epoch's receive key. This runs before any AES, but the
-    // only thing it commits is bookkeeping — an attacker forcing the advance
-    // costs one failed GCM and cannot resurrect an old key (the previous
-    // epoch's window and key both stay live).
-    recv_prev_ = recv_cur_;
-    prev_recv_key_ = recv_key_;
-    recv_epoch_seen_ = epoch;
     uint8_t out[16];
     derive_epoch_direction_key(session_key_, recv_direction_,
                                static_cast<uint16_t>(epoch), out);
-    GcmKey k;
-    gcm_key_init(out, &k);
+    next_key.emplace();
+    gcm_key_init(out, &next_key.value());
     secure_zero(out, sizeof(out));
-    recv_key_ = k;
-    secure_zero(&k, sizeof(k));
-    recv_cur_ = RecvEpoch{};
-    key = &recv_key_;
-    win = &recv_cur_;
+    key = &next_key.value();
+    // The new epoch's window is empty, so the may-accept pre-check always
+    // passes; it is run on the committed window below once the tag is good.
+    commit_next_epoch = true;
   } else {
     return false;  // too old (below the frozen window) or from the future
   }
   if (counter >= counter_ceiling_) {
+    if (next_key) {
+      secure_zero(&next_key.value(), sizeof(GcmKey));
+    }
     return false;
   }
-  if (!epoch_window_may_accept(*win, counter)) {
+  if (!commit_next_epoch && !epoch_window_may_accept(*win, counter)) {
     return false;
   }
   uint8_t iv[kGcmIvLen];
@@ -407,7 +410,21 @@ bool Envelope::open_epoch(uint64_t nonce_ctr, const uint8_t* wire, size_t len,
   std::vector<uint8_t> decoded(cipher_len);
   if (!gcm_open_keyed(*key, iv, nullptr, 0, cipher, cipher_len, tag, decoded.data())) {
     plain->clear();
+    if (next_key) {
+      secure_zero(&next_key.value(), sizeof(GcmKey));
+    }
     return false;
+  }
+  if (commit_next_epoch) {
+    // The tag is authentic: only now freeze the current epoch as previous and
+    // install the next epoch's key/window.
+    recv_prev_ = recv_cur_;
+    prev_recv_key_ = recv_key_;
+    recv_epoch_seen_ = epoch;
+    recv_key_ = next_key.value();
+    secure_zero(&next_key.value(), sizeof(GcmKey));
+    recv_cur_ = RecvEpoch{};
+    win = &recv_cur_;
   }
   if (!epoch_accept(*win, counter)) {
     plain->clear();

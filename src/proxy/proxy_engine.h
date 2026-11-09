@@ -157,6 +157,11 @@ struct EngineHost {
   // Optional: a host without half-close support leaves it unset and the engine
   // falls back to closing the tunnel here.
   std::function<void(uint64_t conn)> app_shutdown;
+  // The tunnel ended with a reset (RST or a persistent socket error), not a
+  // clean EOF: close the application socket so the peer sees a reset too
+  // instead of a normal FIN. Optional; a host that leaves it unset falls back
+  // to app_close.
+  std::function<void(uint64_t conn)> app_abort;
   // One sealed datagram for `peer`. On the client there is a single peer (the
   // server); on the server `peer` is the client address the reactor saw first.
   // Returns the bytes the transport accepted (0 = dropped/would-block). The
@@ -193,12 +198,19 @@ class ProxyEngine {
   // Server: not used -- its connections are born from an inbound HELLO.
   void on_local_open(uint64_t conn, uint64_t peer, int64_t now_ms);
   void on_local_bytes(uint64_t conn, const uint8_t* data, size_t len, int64_t now_ms);
-  // The local socket reached EOF or was reset. Nothing further arrives for it.
+  // The local socket reached a clean EOF (FIN). Nothing further arrives for it.
   void on_local_closed(uint64_t conn, int64_t now_ms);
+  // The local socket failed (RST or a persistent read/send error), which is
+  // not a clean EOF: abort the tunnel so the peer sees a reset instead of a
+  // truncated stream.
+  void on_local_reset(uint64_t conn, int64_t now_ms);
 
   // Server: the dialed socket. `conn` is the id the engine passed to dial().
   void on_target_bytes(uint64_t conn, const uint8_t* data, size_t len, int64_t now_ms);
   void on_target_closed(uint64_t conn, int64_t now_ms);
+  // The dialed socket failed (RST or a persistent error) after the tunnel was
+  // established.
+  void on_target_reset(uint64_t conn, int64_t now_ms);
   void on_dial_result(uint64_t conn, bool ok, OpenError err, int64_t now_ms);
 
   // Both: one inbound datagram from `peer`. Routes by the plaintext salt.
@@ -452,6 +464,9 @@ class ProxyEngine {
   // Close the application socket, drop the session and its table entries, and
   // write the peer profile back into the prewarm cache.
   void finish_conn(Conn& conn, int64_t now_ms, const char* why);
+  // Reset path: discard bytes the dead socket can never take, send a stream RST
+  // to the peer, then tear the connection down without waiting for a flush.
+  void abort_tunnel(Conn& conn, int64_t now_ms, const char* why);
   void reap(int64_t now_ms);
   // 握手并发限流（EngineConfig::hs_concurrency，仅 client）：释放连接持有的
   // 槽位并按 FIFO 补位启动排队会话；未持有槽位的连接是 no-op。

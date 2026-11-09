@@ -116,18 +116,23 @@ if(FCP_BUILD_PROXY OR FCP_BUILD_TESTS)
   target_link_libraries(fcp_proxy_core PUBLIC fcp)
 endif()
 
-if(FCP_BUILD_TESTS)
-  enable_testing()
-  add_subdirectory(tests)
-endif()
-
 # The CLI host (select reactor, argv parsing, the two mains) and the tools
 # (fcp-bench, fcp-replay) share one directory. The protocol half the host drives
 # is fcp_proxy_core above; only those executables are gated by FCP_BUILD_PROXY,
 # the tools by FCP_BUILD_TOOLS. tests/cli_test.cc compiles cli.cc and reactor.cc
 # directly so the argv guards stay under the default test gate.
+#
+# This has to come BEFORE add_subdirectory(tests): tests/CMakeLists.txt registers
+# the fcp-replay/fcp-bench argument guards behind `if(TARGET ...)`, which used to
+# be permanently false because the tool targets did not exist yet — five guard
+# tests silently never reached ctest (M-03).
 if(FCP_BUILD_PROXY OR FCP_BUILD_TOOLS)
   add_subdirectory(apps/cli)
+endif()
+
+if(FCP_BUILD_TESTS)
+  enable_testing()
+  add_subdirectory(tests)
 endif()
 
 # 桌面客户端是 Qt 6 Widgets 壳，默认不构建（Qt 不在 vcpkg manifest 里，装上

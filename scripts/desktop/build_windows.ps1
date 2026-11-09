@@ -28,19 +28,39 @@ if (-not $BuildDir) { $BuildDir = Join-Path $repo "build\gui-win" }
 if (-not $StageDir) { $StageDir = Join-Path $repo "build\gui-stage" }
 
 if (-not $ProxyBin) {
+  # Release only. A Debug sidecar needs the Debug CRT (VCRUNTIME140D.dll /
+  # ucrtbased.dll), which this script never collects, and it prints the same
+  # --version as Release, so the packaging smoke test cannot catch it. Listing
+  # the Debug path as a candidate shipped a GUI whose sidecar silently failed to
+  # start (M-05).
   $candidates = @(
     (Join-Path $repo "build\release-win\apps\cli\Release\fcp-client.exe"),
     (Join-Path $repo "build\proxy-check\apps\cli\Release\fcp-client.exe"),
-    (Join-Path $repo "build\windows-x64\apps\cli\Release\fcp-client.exe"),
-    (Join-Path $repo "build\windows-x64\apps\cli\Debug\fcp-client.exe")
+    (Join-Path $repo "build\windows-x64\apps\cli\Release\fcp-client.exe")
   )
   $ProxyBin = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
   if (-not $ProxyBin) {
-    throw "找不到 fcp-client.exe；用 -ProxyBin 指定，或先构建 FCP_BUILD_PROXY=ON"
+    throw "找不到 Release 的 fcp-client.exe；用 -ProxyBin 指定，或先构建 FCP_BUILD_PROXY=ON（Configuration=Release）"
   }
 }
 $ProxyBin = (Resolve-Path $ProxyBin).Path
+if ($ProxyBin -match '\\Debug\\') {
+  throw "-ProxyBin 指向 Debug 产物（$ProxyBin）：Debug sidecar 缺 Debug CRT，不能打进发布物"
+}
 Write-Host "== sidecar: $ProxyBin"
+
+# The sidecar must report the version this repo is publishing. A stale binary
+# left over from an older build has the same file name and would otherwise ship
+# with a --version that never gets compared (M-05).
+$expectedVersion = (Get-Content (Join-Path $repo "VERSION") -Raw).Trim()
+$reported = (& $ProxyBin --version | Out-String).Trim()
+if ($LASTEXITCODE -ne 0) {
+  throw "sidecar --version 退出码 $LASTEXITCODE（$ProxyBin）"
+}
+if ($reported -notmatch "fcp-client\s+$([regex]::Escape($expectedVersion))") {
+  throw "sidecar 版本不符：报告 '$reported'，期望 fcp-client $expectedVersion（先重建 Release sidecar）"
+}
+Write-Host "== sidecar version: $expectedVersion"
 
 # --- Qt 6 -------------------------------------------------------------------
 if (-not $QtPrefix) {

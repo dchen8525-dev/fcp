@@ -347,6 +347,37 @@ void ProxyEngine::on_local_closed(uint64_t conn, int64_t now_ms) {
   reap(now_ms);
 }
 
+void ProxyEngine::on_local_reset(uint64_t conn, int64_t now_ms) {
+  now_ms_ = now_ms;
+  Conn* c = find(conn);
+  if (c == nullptr || c->phase == Phase::kDone) {
+    return;
+  }
+  if (in_entry_phase(c->phase)) {
+    // The application died before finishing its request: there is nothing to
+    // tunnel, and no reply is owed.
+    finish_conn(*c, now_ms, "local reset before the request");
+  } else {
+    abort_tunnel(*c, now_ms, "local reset");
+  }
+  reap(now_ms);
+}
+
+void ProxyEngine::on_target_reset(uint64_t conn, int64_t now_ms) {
+  now_ms_ = now_ms;
+  Conn* c = find(conn);
+  if (c == nullptr || c->phase == Phase::kDone) {
+    return;
+  }
+  // During kDialing the connect result still decides; only an established
+  // tunnel has a stream to abort.
+  if (c->phase != Phase::kTunnel) {
+    return;
+  }
+  abort_tunnel(*c, now_ms, "target reset");
+  reap(now_ms);
+}
+
 void ProxyEngine::on_target_bytes(uint64_t conn, const uint8_t* data, size_t len,
                                   int64_t now_ms) {
   now_ms_ = now_ms;
@@ -1032,6 +1063,11 @@ void ProxyEngine::attach_stream(Conn& conn) {
         }
         if (reason == CloseReason::kReset) {
           ++counters_.reset;
+          // A reset must reach the application socket as a reset too: a normal
+          // close would turn a truncated response into a clean EOF.
+          if (host_.app_abort) {
+            host_.app_abort(id);
+          }
         } else if (reason == CloseReason::kIdle) {
           ++counters_.idle_closed;
         }
@@ -1524,6 +1560,22 @@ void ProxyEngine::arm_grace(Conn& conn, bool only_if_idle) {
 }
 
 // ---- teardown ----
+
+void ProxyEngine::abort_tunnel(Conn& conn, int64_t now_ms, const char* why) {
+  if (conn.phase == Phase::kDone) {
+    return;
+  }
+  // The host's socket is already gone: these bytes can never be delivered, and
+  // keeping them used to make maybe_fin() wait for the idle timeout. Send a
+  // stream RST so the far side aborts instead of reading a clean EOF.
+  conn.app_in.clear();
+  conn.to_stream.clear();
+  if (conn.stream != nullptr && !conn.stream->closed()) {
+    conn.stream->abort(now_ms);
+    return;
+  }
+  finish_conn(conn, now_ms, why);
+}
 
 void ProxyEngine::finish_conn(Conn& conn, int64_t now_ms, const char* why) {
   if (conn.phase == Phase::kDone) {

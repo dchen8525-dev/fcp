@@ -22,6 +22,7 @@ set(FCP_TEST_NAMES
   settle_test
   reporter_test
   log_test
+  defensive_test
   session_test
   replay_test
   bbr_test

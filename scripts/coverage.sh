@@ -41,9 +41,11 @@ ctest --test-dir "$BUILD_DIR" --output-on-failure
 # The blocking gate is the protocol core (src/fcp) — the T0 decision 3 scope.
 # tests/ is excluded: it is the instrument, not the product.
 #
-# Branch detail first: when the gate goes red, the "Missing" column names the
-# exact source lines that still need a test (line numbers, not percentages).
-gcovr --root . --filter 'src/fcp/' "$BUILD_DIR" --txt --txt-metric branch || true
+# Print the branch report first: gcovr's "Missing" column then names the
+# uncovered branch lines, so a red gate points straight at what needs a test
+# instead of at a percentage. (-b is the gcovr 5.0 spelling CI ships; newer
+# gcovr deprecates it in favour of --txt-metric, hence the `|| true`.)
+gcovr --root . --filter 'src/fcp/' "$BUILD_DIR" --txt -b || true
 gcovr --root . --filter 'src/fcp/' "$BUILD_DIR" \
   --txt \
   --fail-under-line "$LINE_MIN" \

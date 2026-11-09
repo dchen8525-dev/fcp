@@ -21,12 +21,21 @@ void TestWritesExactlyLen() {
   const size_t lens[] = {1, 4, 16, 64};
   for (size_t len : lens) {
     std::vector<uint8_t> buf(len + 2, 0xEE);
-    CHECK(fcp::random_bytes(buf.data() + 1, len));
-    CHECK_EQ(buf.front(), static_cast<uint8_t>(0xEE));
-    CHECK_EQ(buf.back(), static_cast<uint8_t>(0xEE));
+    // A CSPRNG may legitimately return an all-zero block on a single draw:
+    // for len == 1 that happens with probability 1/256. Asserting "acc != 0"
+    // on one draw is therefore a flaky gate (it red-blocked the v0.0.19
+    // release coverage job). Accumulate over 8 fresh draws instead: a false
+    // failure now needs 64+ consecutive zero bytes, i.e. 2^-64 for len == 1
+    // and far less for the longer lengths. Every round re-checks both
+    // sentinels so "writes exactly len bytes without overrun" stays pinned.
     uint8_t acc = 0;
-    for (size_t i = 1; i <= len; ++i) {
-      acc = static_cast<uint8_t>(acc | buf[i]);
+    for (int round = 0; round < 8; ++round) {
+      CHECK(fcp::random_bytes(buf.data() + 1, len));
+      CHECK_EQ(buf.front(), static_cast<uint8_t>(0xEE));
+      CHECK_EQ(buf.back(), static_cast<uint8_t>(0xEE));
+      for (size_t i = 1; i <= len; ++i) {
+        acc = static_cast<uint8_t>(acc | buf[i]);
+      }
     }
     CHECK(acc != 0);
   }

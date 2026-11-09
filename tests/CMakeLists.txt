@@ -23,6 +23,10 @@ set(FCP_TEST_NAMES
   reporter_test
   log_test
   defensive_test
+  session_edges_test
+  stream_edges_test
+  codec_edges_test
+  control_edges_test
   session_test
   replay_test
   bbr_test
@@ -157,9 +161,43 @@ if(BASH)
   add_test(NAME test_baseline
            COMMAND ${BASH}
                    ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/test_baseline.sh)
-  set_tests_properties(test_baseline PROPERTIES TIMEOUT 60)
+  if(WIN32)
+    # ctest 常从 PowerShell/CMD 启动，其 PATH 里没有 Git Bash 的 usr/bin：
+    # 脚本第 28 行的 dirname 和后面的 sort/comm/awk 会全部 command not found，
+    # 然后误报 baseline missing。从 ${BASH} 的绝对路径推导并前置到 PATH。
+    # 分号必须转义，否则 CMake 会把整条 PATH 拆成多个 ENVIRONMENT 项。
+    get_filename_component(FCP_BASH_BIN "${BASH}" DIRECTORY)
+    string(REPLACE ";" "\\;" FCP_TEST_PATH "${FCP_BASH_BIN};$ENV{PATH}")
+    set_tests_properties(test_baseline PROPERTIES
+                         TIMEOUT 60
+                         ENVIRONMENT "PATH=${FCP_TEST_PATH}")
+  else()
+    set_tests_properties(test_baseline PROPERTIES TIMEOUT 60)
+  endif()
 else()
   message(STATUS "bash 未找到；跳过 test_baseline 护栏")
+endif()
+
+# HTTP 正向代理的真实进程端到端：起 fcp-server / fcp-client / 本地 HTTP 与
+# HTTPS 源站，走真实 socket、真实 FIN 与完整 TLS 握手（M2代理设计.md §4.2.1）。
+# 需要 Python 3；缺解释器或没编 proxy CLI 时跳过而不是让门禁挂掉，口径与
+# 上面的 bash 护栏一致。Windows 上同样前置 Git usr/bin，让 openssl 可见。
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND AND TARGET fcp-client AND TARGET fcp-server)
+  add_test(NAME http_forward_e2e
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/http_forward_e2e.py"
+                   --client "$<TARGET_FILE:fcp-client>"
+                   --server "$<TARGET_FILE:fcp-server>")
+  if(WIN32 AND FCP_TEST_PATH)
+    set_tests_properties(http_forward_e2e PROPERTIES
+                         TIMEOUT 180
+                         ENVIRONMENT "PATH=${FCP_TEST_PATH}")
+  else()
+    set_tests_properties(http_forward_e2e PROPERTIES TIMEOUT 180)
+  endif()
+else()
+  message(STATUS "Python3 或 proxy CLI 未找到；跳过 http_forward_e2e")
 endif()
 
 # deb 打包器（scripts/build_deb.sh）只用 dpkg-deb，没有可跨平台跑的纯逻辑单测；

@@ -21,6 +21,7 @@ set(FCP_TEST_NAMES
   frame_rx_test
   settle_test
   reporter_test
+  log_test
   session_test
   replay_test
   bbr_test

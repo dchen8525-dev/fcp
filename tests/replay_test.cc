@@ -416,6 +416,100 @@ void MaybeWriteGolden(const std::vector<fcp::TraceEntry>& trace) {
   std::printf("golden written to %s (%zu entries)\n", path, trace.size());
 }
 
+// Branch sweep over the decoder's per-field validation. Each line is a
+// well-formed trace with exactly one field outside its wire width (or one
+// structural violation), so every short-circuit operand of the range-check
+// chains is exercised. All of them must be rejected, and none may leave a
+// half-parsed entry behind.
+void TestTraceRejectsEachFieldOutOfRange() {
+  const char* bad[] = {
+      // ver itself: non-integral, negative and past int32.
+      "{\"ver\":1.5}",
+      "{\"ver\":-1}",
+      "{\"ver\":2147483648}",
+      // u8: c_d, c_pmax, k, state, s_ver, s_flg.
+      "{\"ver\":1,\"c_d\":256}",
+      "{\"ver\":1,\"c_d\":-1}",
+      "{\"ver\":1,\"c_pmax\":256}",
+      "{\"ver\":1,\"k\":256}",
+      "{\"ver\":1,\"k\":-1}",
+      "{\"ver\":1,\"state\":9}",  // in the u8 range, outside the enum
+      "{\"ver\":1,\"state\":256}",
+      "{\"ver\":1,\"s_ver\":256}",
+      "{\"ver\":1,\"s_flg\":-1}",
+      // u16: s_ivl, s_lat50, s_lat95.
+      "{\"ver\":1,\"s_ivl\":65536}",
+      "{\"ver\":1,\"s_ivl\":-1}",
+      "{\"ver\":1,\"s_lat50\":65536}",
+      "{\"ver\":1,\"s_lat95\":-1}",
+      // u32: every counter field.
+      "{\"ver\":1,\"s_setid\":-1}",
+      "{\"ver\":1,\"s_sets\":4294967296}",
+      "{\"ver\":1,\"s_exp\":-1}",
+      "{\"ver\":1,\"s_rx\":4294967296}",
+      "{\"ver\":1,\"s_rec\":-1}",
+      "{\"ver\":1,\"s_reclate\":4294967296}",
+      "{\"ver\":1,\"s_deliv\":-1}",
+      "{\"ver\":1,\"s_prx\":4294967296}",
+      "{\"ver\":1,\"s_pexp\":-1}",
+      "{\"ver\":1,\"s_kunk\":4294967296}",
+      "{\"ver\":1,\"s_full\":-1}",
+      "{\"ver\":1,\"s_auth\":4294967296}",
+      "{\"ver\":1,\"s_dup\":-1}",
+      "{\"ver\":1,\"s_struct\":4294967296}",
+      "{\"ver\":1,\"s_dbytes\":-1}",
+      "{\"ver\":1,\"s_pbytes\":4294967296}",
+      "{\"ver\":1,\"s_tdrop\":-1}",
+      "{\"ver\":1,\"s_late\":4294967296}",
+      "{\"ver\":1,\"s_partial\":-1}",
+      "{\"ver\":1,\"s_lgroups\":4294967296}",
+      "{\"ver\":1,\"s_lfail\":-1}",
+      "{\"ver\":1,\"s_lmeta\":4294967296}",
+      // i32: c_ik, c_pin (both ends).
+      "{\"ver\":1,\"c_ik\":-2147483649}",
+      "{\"ver\":1,\"c_ik\":2147483648}",
+      "{\"ver\":1,\"c_pin\":-2147483649}",
+      "{\"ver\":1,\"c_pin\":2147483648}",
+  };
+  fcp::TraceEntry e;
+  for (const char* s : bad) {
+    if (fcp::decode_trace_line(s, &e)) {
+      std::fprintf(stderr, "accepted out-of-range line: %s\n", s);
+      CHECK(false);
+    }
+  }
+  // Boundary values on the accepted side must still decode.
+  CHECK(fcp::decode_trace_line(
+      "{\"ver\":1,\"c_d\":255,\"c_pmax\":255,\"k\":255,\"state\":2,"
+      "\"s_ver\":255,\"s_flg\":255,\"s_ivl\":65535,\"s_lat50\":65535,"
+      "\"s_lat95\":65535,\"s_setid\":4294967295,\"s_sets\":4294967295,"
+      "\"s_exp\":4294967295,\"s_rx\":4294967295,\"s_rec\":4294967295,"
+      "\"s_reclate\":4294967295,\"s_deliv\":4294967295,\"s_prx\":4294967295,"
+      "\"s_pexp\":4294967295,\"s_kunk\":4294967295,\"s_full\":4294967295,"
+      "\"s_auth\":4294967295,\"s_dup\":4294967295,\"s_struct\":4294967295,"
+      "\"s_dbytes\":4294967295,\"s_pbytes\":4294967295,\"s_tdrop\":4294967295,"
+      "\"s_late\":4294967295,\"s_partial\":4294967295,\"s_lgroups\":4294967295,"
+      "\"s_lfail\":4294967295,\"s_lmeta\":4294967295,"
+      "\"c_ik\":-2147483648,\"c_pin\":2147483647}",
+      &e));
+  CHECK_EQ(e.stat.ledger_meta, 4294967295u);
+  CHECK_EQ(e.snapshot.pinned, 2147483647);
+  // Structural violations the flat scanner has to reject on its own.
+  const char* broken[] = {
+      "{}",                       // no ver: rejected by the version check
+      "{\"ver\"}",                // key without ':'
+      "{\"ver",                   // unterminated key
+      "{\"ver\":1,\"k\":1 \"x\":2}",  // missing comma
+      "{\"ver\":1,\"k\":}",       // value missing
+  };
+  for (const char* s : broken) {
+    CHECK(!fcp::decode_trace_line(s, &e));
+  }
+  // A null entry pointer decodes into a scratch object (no crash, no leak of
+  // the previous entry).
+  CHECK(fcp::decode_trace_line("{\"ver\":1,\"now\":42}", nullptr));
+}
+
 }  // namespace
 
 int main() {
@@ -423,6 +517,7 @@ int main() {
   TestReplayReproducesRecorded();
   TestTraceCodecFuzz();
   TestTraceDoubleRoundTrip();
+  TestTraceRejectsEachFieldOutOfRange();
 
   // The 20% arm doubles as the golden source: deterministic seed, so the
   // checked-in file only moves when the format or controller changes.

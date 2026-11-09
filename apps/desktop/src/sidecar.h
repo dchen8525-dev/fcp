@@ -38,6 +38,9 @@ struct ProxyConfig {
   int k = -1;
   double fec_budget = 0.5;
   double rate_up_mbps = 0.0;  // 上行限速（--rate-limit=UP[:DOWN]，客户端只发 UP）
+  // --hs-concurrency=N，客户端同时在飞的握手数（0 = 不限）。默认 4 与 CLI 一致。
+  // HTTP 正向代理是每请求一条连接，浏览器并发加载会顶到这个闸门，故暴露给用户。
+  int hs_concurrency = 4;
   QString trace;
 };
 

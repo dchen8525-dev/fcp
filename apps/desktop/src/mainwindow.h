@@ -117,6 +117,7 @@ class MainWindow : public QMainWindow {
   QLineEdit* budget_ = nullptr;
   QLineEdit* k_ = nullptr;
   QLineEdit* rate_ = nullptr;
+  QLineEdit* hs_concurrency_ = nullptr;
   QCheckBox* pmtud_ = nullptr;
   QPushButton* start_ = nullptr;
   QLabel* hint_ = nullptr;

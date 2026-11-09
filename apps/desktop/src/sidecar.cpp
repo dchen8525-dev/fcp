@@ -245,6 +245,10 @@ bool Sidecar::startProxy(const ProxyConfig& config, QString* error) {
     args.append(QStringLiteral("--rate-limit=%1").arg(
         QString::number(config.rate_up_mbps, 'g', 15)));
   }
+  // 4 是 CLI 的默认值，不重复传；只有用户改了才需要显式覆盖。
+  if (config.hs_concurrency != 4) {
+    args.append(QStringLiteral("--hs-concurrency=%1").arg(config.hs_concurrency));
+  }
   if (!config.trace.trimmed().isEmpty()) {
     args.append(QStringLiteral("--trace=%1").arg(config.trace.trimmed()));
   }

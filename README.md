@@ -1,7 +1,7 @@
 # FCP
 
-**FEC Control Protocol**：跑在 UDP 上的隧道，把 TCP 应用（SOCKS5 / HTTP CONNECT）
-送过丢包、高 RTT 的链路。基于 KCP，叠加 Reed–Solomon 纠删与闭环自适应冗余——
+**FEC Control Protocol**：跑在 UDP 上的隧道，把 TCP 应用（SOCKS5 / HTTP CONNECT /
+HTTP 正向代理）送过丢包、高 RTT 的链路。基于 KCP，叠加 Reed–Solomon 纠删与闭环自适应冗余——
 默认不发 parity，接收端回传实测丢包率，发送端按需加冗余；拥塞控制用 BBR v2，
 路径 MTU 自动上探。
 
@@ -12,6 +12,8 @@
 - **自适应 FEC**：默认 `10:3` 集合几何，冗余随丢包率与字节预算闭环调整
 - **BBR v2**（默认，可切 v1 或退回 epoch 控制器），ACK 合并、亚节拍 pacing
 - **向上 PMTUD**：从 `--mtu` 探到 1500 或 `--pmtu-max`，依赖 DF
+- **一个本地端口三种入口**：SOCKS5、HTTP CONNECT（HTTPS）、absolute-form HTTP 正向代理，
+  按首字节/方法自动分流；系统代理的 HTTP 与 HTTPS 栏可填同一个地址
 - **免安装客户端**：Windows 单文件 exe、Linux AppImage；服务端是 deb + systemd
 - **可观测**：`--log=stats`、`--trace` 每会话控制器轨迹、桌面端实时曲线与链路测速
 
@@ -31,10 +33,15 @@
 # 服务端（PSK 是 32 位十六进制；-k 只把路径放进命令行）
 fcp-server -k /etc/fcp/psk -b :40000 --log=verbose
 
-# 客户端：本地 127.0.0.1:1080 起一个 SOCKS5 入口
+# 客户端：本地 127.0.0.1:1080 起一个三协议入口
 fcp-client -H <服务器IP>:40000 -k /etc/fcp/psk
-curl --socks5-hostname 127.0.0.1:1080 https://example.com
+curl --socks5-hostname 127.0.0.1:1080 https://example.com   # SOCKS5
+curl -x http://127.0.0.1:1080 https://example.com           # HTTPS 走 CONNECT
+curl -x http://127.0.0.1:1080 http://example.com/            # HTTP 走正向代理
 ```
+
+HTTP 正向代理是**每条请求一条 FCP 会话**（请求头强制 `Connection: close`，靠源站 FIN 收尾），
+浏览器并发加载会顶到 `--hs-concurrency`（默认 4，可在 GUI「高级设置 → 握手并发」调整）。
 
 参数以 `apps/cli/cli.cc` 的 Usage 为准，说明见 `docs/部署运维指南.md` §4–§5。
 
@@ -79,10 +86,10 @@ pwsh -File scripts/desktop/build_windows.ps1 `
 | 路径 | 内容 |
 |---|---|
 | `src/fcp` | 协议核心：信封、握手、FEC、流层与拥塞控制 |
-| `src/proxy` | 代理引擎（无 socket，宿主回调注入，可脱机测试） |
+| `src/proxy` | 代理引擎（无 socket，宿主回调注入，可脱机测试）与 SOCKS5 / HTTP CONNECT / HTTP 正向代理入口编解码 |
 | `apps/cli` | `fcp-server` / `fcp-client`、select 反应堆、`fcp-bench` 基准、`fcp-replay` 轨迹重放 |
 | `apps/desktop` | Qt 6 桌面客户端（GUI 壳 + Windows 单文件引导器） |
-| `scripts` | 构建与打包脚本（`desktop/` 下是 Qt GUI / AppImage / 引导器流水线） |
+| `scripts` | 构建与打包脚本（`desktop/` 下是 Qt GUI / AppImage / 引导器流水线）；`http_forward_e2e.py` 是 HTTP/HTTPS 代理真实进程 e2e，已注册进 ctest |
 | `tests` | ctest 用例（含链路模拟与对抗用例） |
 | `packaging` | deb / systemd / Windows 打包输入与安装落点（`FCPPackaging.cmake`） |
 | `docs` | 规格、设计、决策与运维文档 |

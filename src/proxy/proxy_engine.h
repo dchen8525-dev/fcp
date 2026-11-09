@@ -362,8 +362,14 @@ class ProxyEngine {
     StreamConfig stream_cfg;
     std::string salt_key;  // the 8-byte wire salt, as a map key
 
-    bool socks5 = true;     // client: entry protocol, sniffed from byte 0
+    bool socks5 = true;     // client: SOCKS5 vs HTTP, sniffed from byte 0
     bool sniffed = false;   // socks5 was decided from the first byte
+    // Client, HTTP entry: an absolute-form forward request rather than CONNECT.
+    // It still opens one FCP session, but its first tunnel bytes are a rewritten
+    // origin-form request and a successful OPEN_OK must NOT be answered locally
+    // with "200 Connection Established" -- that line is the origin server's job.
+    bool http_forward = false;
+    std::vector<uint8_t> forward_head;  // rewritten head, replaces the entry head
     bool local_eof = false;  // the application socket gave up
     // Two independent teardown paths, and the difference is load-bearing:
     //   closing  -- we refused the tunnel (OPEN_ERR). Inbound stream bytes are

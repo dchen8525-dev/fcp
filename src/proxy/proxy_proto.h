@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace fcp {
 
@@ -137,17 +138,20 @@ enum class HttpParse {
   kHeadTooLarge,
 };
 
-// The five bodies this proxy ever sends back on the HTTP listener. The first
-// four answer the request itself; 502 answers a tunnel the server refused,
-// which is the only thing that can fail after the head was already accepted.
-// Nothing in them is built from peer input, so a reply cannot become a
-// header-injection vector.
+// The bodies this proxy ever sends back on the HTTP listener. Everything but
+// kBadGateway answers the request itself; 502 answers a tunnel the server
+// refused, which is the only thing that can fail after the head was already
+// accepted. Nothing in them is built from peer input, so a reply cannot become
+// a header-injection vector. Values are internal tags, not wire status codes:
+// the two 405 replies need distinct tags (different Allow headers) and an enum
+// cannot hold two equal values without making them indistinguishable.
 enum class HttpReply : uint16_t {
-  kEstablished = 200,           // "HTTP/1.1 200 Connection Established"
+  kEstablished = 200,               // "HTTP/1.1 200 Connection Established"
   kBadRequest = 400,
-  kMethodNotAllowed = 405,
+  kMethodNotAllowed = 405,           // Allow: CONNECT
+  kForwardMethodNotAllowed = 1405,   // same 405 body, Allow lists relayed methods
   kRequestHeaderTooLarge = 431,
-  kBadGateway = 502,            // OPEN_ERR: the remote end refused the tunnel
+  kBadGateway = 502,                 // OPEN_ERR: the remote end refused the tunnel
 };
 
 // Parses `CONNECT host:port HTTP/1.x` plus headers up to CRLFCRLF. The target is
@@ -155,10 +159,36 @@ enum class HttpReply : uint16_t {
 // (§4.3), and getaddrinfo() short-circuits on literals, so tunneling the text
 // costs nothing and keeps this layer free of a hand-rolled inet_pton.
 // Brackets around an IPv6 literal are stripped; the bare address is what the
-// resolver needs.
+// resolver needs. A non-CONNECT method is reported kMethodNotAllowed; the host
+// then tries http_parse_forward() before deciding what to answer.
 HttpParse http_parse_connect(const uint8_t* buf, size_t len, size_t* consumed,
                              ProxyTarget* target);
 
+// ---- HTTP absolute-form forward request ----
+//
+// A browser pointed at an HTTP proxy sends `GET http://host[:port]/path HTTP/1.1`
+// instead of CONNECT. The target still travels in FCP OPEN, so this parser has
+// to produce two things: the dial target, and the request head rewritten into
+// origin-form for the target server. The body is never touched -- the host
+// forwards every byte behind the head unchanged.
+//
+// One local connection carries exactly one request (§3: one connection = one
+// session = one target), so the rewritten head forces `Connection: close` and
+// the target's FIN is what ends the exchange. No keep-alive, no request queue.
+constexpr uint16_t kHttpForwardDefaultPort = 80;
+
+struct HttpForward {
+  ProxyTarget target;          // kAtypDomain, host text + effective port
+  std::vector<uint8_t> head;   // rewritten request line + headers + CRLFCRLF
+};
+
+// Methods relayed in origin-form. Everything else is kMethodNotAllowed; an
+// `https://` absolute-form is kBadRequest, not a tunnel -- TLS is CONNECT's job.
+HttpParse http_parse_forward(const uint8_t* buf, size_t len, size_t* consumed,
+                             HttpForward* out);
+
+// Writes one of the constant replies above. The two 405 tags are distinct
+// values of the same status, so this is an if-chain rather than a switch.
 size_t http_write_response(uint8_t* out, size_t cap, HttpReply reply);
 
 // ---- FCP OPEN: the first bytes of the tunneled stream (not a framed message) ----

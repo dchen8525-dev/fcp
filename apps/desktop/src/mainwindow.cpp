@@ -458,7 +458,7 @@ QWidget* MainWindow::buildConnPage() {
   listen_port_ = new QLineEdit(QStringLiteral("1080"));
   row->addWidget(makeField(QStringLiteral("UDP 端口"), port_));
   row->addWidget(makeField(QStringLiteral("本地代理端口"), listen_port_,
-                           QStringLiteral("SOCKS5 / HTTP")));
+                           QStringLiteral("HTTP / HTTPS / SOCKS5")));
   form_layout->addLayout(row);
 
   auto* key_row = new QWidget;
@@ -516,6 +516,7 @@ QWidget* MainWindow::buildConnPage() {
   budget_ = new QLineEdit(QStringLiteral("0.8"));
   k_ = new QLineEdit(QStringLiteral("-1"));
   rate_ = new QLineEdit(QStringLiteral("0"));
+  hs_concurrency_ = new QLineEdit(QStringLiteral("4"));
   pmtud_ = new QCheckBox(QStringLiteral("启用路径 MTU 探测（关闭后固定用上面的 MTU）"));
   pmtud_->setChecked(true);
   adv_layout->addWidget(makeField(QStringLiteral("本地监听地址"), listen_), 0, 0);
@@ -527,6 +528,14 @@ QWidget* MainWindow::buildConnPage() {
   adv_layout->addWidget(
       makeField(QStringLiteral("上行限速 (Mbps)"), rate_, QStringLiteral("0 为不限")), 2, 0);
   adv_layout->addWidget(pmtud_, 2, 1, 1, 1);
+  adv_layout->addWidget(
+      makeField(QStringLiteral("握手并发"), hs_concurrency_,
+                QStringLiteral("0 为不限 · 默认 4")),
+      3, 0);
+  adv_layout->addWidget(
+      makeLabel(QStringLiteral("HTTP 正向代理每请求一条连接，并发页面加载可调大"),
+                "fieldNote"),
+      3, 1);
   auto* adv_note = makeLabel(
       QStringLiteral("不展开时按默认值提交，与显式填写效果相同。"),
       "fieldNote");
@@ -586,6 +595,7 @@ QWidget* MainWindow::buildConnPage() {
   connect(mtu_, &QLineEdit::textChanged, this, [this] { saveSettings(); });
   connect(budget_, &QLineEdit::textChanged, this, [this] { saveSettings(); });
   connect(k_, &QLineEdit::textChanged, this, [this] { saveSettings(); });
+  connect(hs_concurrency_, &QLineEdit::textChanged, this, [this] { saveSettings(); });
   connect(pmtud_, &QCheckBox::toggled, this, [this] { saveSettings(); });
   connect(remember_, &QCheckBox::toggled, this, [this] { saveSettings(); });
   return card;
@@ -902,6 +912,8 @@ MainWindow::Collected MainWindow::collect() const {
   const QString k_text = open ? k_->text().trimmed() : QStringLiteral("-1");
   const QString budget_text = open ? budget_->text().trimmed() : QStringLiteral("0.8");
   const QString rate_text = open ? rate_->text().trimmed() : QStringLiteral("0");
+  const QString hs_text =
+      open ? hs_concurrency_->text().trimmed() : QStringLiteral("4");
   const bool pmtud = open ? pmtud_->isChecked() : true;
   const QString listen_text =
       open ? listen_->text().trimmed() : QStringLiteral("127.0.0.1");
@@ -932,6 +944,12 @@ MainWindow::Collected MainWindow::collect() const {
     result.error = QStringLiteral("上行限速太小无法整形，请用 ≥0.1 Mbps 或 0（不限）");
     return result;
   }
+  const int hs_concurrency = hs_text.toInt(&ok);
+  // CLI 的 --hs-concurrency 接受 0..1024；0 表示不做并发限制。
+  if (!ok || hs_concurrency < 0 || hs_concurrency > 1024) {
+    result.error = QStringLiteral("握手并发应在 0..1024");
+    return result;
+  }
   if (listen_text.isEmpty()) {
     result.error = QStringLiteral("本地监听地址不能为空");
     return result;
@@ -947,6 +965,7 @@ MainWindow::Collected MainWindow::collect() const {
   result.config.k = k;
   result.config.fec_budget = budget;
   result.config.rate_up_mbps = rate;
+  result.config.hs_concurrency = hs_concurrency;
   result.ok = true;
   return result;
 }
@@ -962,7 +981,7 @@ void MainWindow::setRunning(bool running, const QString& hint) {
         static_cast<QWidget*>(remember_), static_cast<QWidget*>(listen_),
         static_cast<QWidget*>(mtu_), static_cast<QWidget*>(budget_),
         static_cast<QWidget*>(k_), static_cast<QWidget*>(rate_),
-        static_cast<QWidget*>(pmtud_),
+        static_cast<QWidget*>(hs_concurrency_), static_cast<QWidget*>(pmtud_),
         static_cast<QWidget*>(adv_toggle_), static_cast<QWidget*>(key_toggle_)}) {
     widget->setEnabled(!running);
   }
@@ -1051,12 +1070,12 @@ void MainWindow::syncAddr() {
   // 两行：用法一行，密钥保管一行（<br> 而不是靠自动换行，窗口宽度变了
   // 也不会把一句拆到两行里）。
   conn_addr_->setText(
-      QStringLiteral("启动后把浏览器或系统的 SOCKS5 / HTTP 代理指向 <b>%1</b>，"
+      QStringLiteral("启动后把浏览器或系统的 HTTP / HTTPS / SOCKS5 代理指向 <b>%1</b>，"
                      "流量即经隧道转发。<br>"
                      "密钥只保存在本机，不写入日志。")
           .arg(addr_html));
   status_note_->setText(
-      QStringLiteral("启动后这里显示实时吞吐与会话数；把系统的 SOCKS5 / HTTP 代理指向 "
+      QStringLiteral("启动后这里显示实时吞吐与会话数；把系统的 HTTP / HTTPS / SOCKS5 代理指向 "
                      "<b>%1</b> 即可走隧道。")
           .arg(addr_html));
 }
@@ -1420,6 +1439,8 @@ void MainWindow::loadSettings() {
         settings.value(QStringLiteral("budget"), QStringLiteral("0.8")).toString());
     k_->setText(settings.value(QStringLiteral("k"), QStringLiteral("-1")).toString());
     rate_->setText(settings.value(QStringLiteral("rate"), QStringLiteral("0")).toString());
+    hs_concurrency_->setText(
+        settings.value(QStringLiteral("hsConcurrency"), QStringLiteral("4")).toString());
     pmtud_->setChecked(settings.value(QStringLiteral("pmtud"), true).toBool());
     key_->setText(settings.value(QStringLiteral("key")).toString());
     const int seconds = settings.value(QStringLiteral("speedSeconds"), 8).toInt();
@@ -1455,6 +1476,7 @@ void MainWindow::saveSettings() {
   settings.setValue(QStringLiteral("budget"), budget_->text());
   settings.setValue(QStringLiteral("k"), k_->text());
   settings.setValue(QStringLiteral("rate"), rate_->text());
+  settings.setValue(QStringLiteral("hsConcurrency"), hs_concurrency_->text());
   settings.setValue(QStringLiteral("pmtud"), pmtud_->isChecked());
   settings.setValue(QStringLiteral("key"), key_->text());
   settings.setValue(QStringLiteral("advanced"), advanced_);

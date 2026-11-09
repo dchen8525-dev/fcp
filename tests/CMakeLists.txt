@@ -178,6 +178,29 @@ else()
   message(STATUS "bash 未找到；跳过 test_baseline 护栏")
 endif()
 
+# HTTP 正向代理的真实进程端到端：起 fcp-server / fcp-client / 本地 HTTP 与
+# HTTPS 源站，走真实 socket、真实 FIN 与完整 TLS 握手（M2代理设计.md §4.2.1）。
+# 需要 Python 3；缺解释器或没编 proxy CLI 时跳过而不是让门禁挂掉，口径与
+# 上面的 bash 护栏一致。Windows 上同样前置 Git usr/bin，让 openssl 可见。
+# 脚本 scripts/http_forward_e2e.py 与这段注册同批入库；分开会让 ctest 找不到文件。
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND AND TARGET fcp-client AND TARGET fcp-server)
+  add_test(NAME http_forward_e2e
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/http_forward_e2e.py"
+                   --client "$<TARGET_FILE:fcp-client>"
+                   --server "$<TARGET_FILE:fcp-server>")
+  if(WIN32 AND FCP_TEST_PATH)
+    set_tests_properties(http_forward_e2e PROPERTIES
+                         TIMEOUT 180
+                         ENVIRONMENT "PATH=${FCP_TEST_PATH}")
+  else()
+    set_tests_properties(http_forward_e2e PROPERTIES TIMEOUT 180)
+  endif()
+else()
+  message(STATUS "Python3 或 proxy CLI 未找到；跳过 http_forward_e2e")
+endif()
+
 # deb 打包器（scripts/build_deb.sh）只用 dpkg-deb，没有可跨平台跑的纯逻辑单测；
 # 这里在 Linux 上做语法检查，真正的出包与结构校验由 release_build_linux.sh
 # （CI 的 linux-deb job）在打包机上执行。

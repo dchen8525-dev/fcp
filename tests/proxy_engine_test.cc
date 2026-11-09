@@ -209,6 +209,10 @@ class Harness {
     return it == server_side.written.end() ? std::vector<uint8_t>() : it->second;
   }
   bool app_closed(uint64_t conn) const { return client_side.closed.count(conn) != 0; }
+  // Peer fin arrived: the local socket's write half was shut down. This is the
+  // observable end of a one-request HTTP forward connection -- the application
+  // closes its own socket afterwards.
+  bool app_shut_down(uint64_t conn) const { return client_side.shut_down.count(conn) != 0; }
   bool target_closed(uint64_t conn) const { return server_side.closed.count(conn) != 0; }
   bool target_shut_down(uint64_t conn) const {
     return server_side.shut_down.count(conn) != 0;
@@ -658,6 +662,112 @@ void open_error_maps_to_the_local_reply() {
   CHECK(h.run_until([&] { return starts_with(h.app_bytes(kLocalConn), "HTTP/1.1 502"); }, 40));
 }
 
+// §4.2 forward: an absolute-form request becomes one FCP OPEN to the URL's
+// host, the rewritten origin-form head plus body reaches the target, and the
+// origin's response is the FIRST thing the local socket sees -- no synthetic
+// "200 Connection Established" may be prepended to it.
+void http_forward_round_trip() {
+  Harness h{Options()};
+  h.local_open(kLocalConn);
+  const std::string request =
+      "GET http://example.com/index.html?q=1 HTTP/1.1\r\n"
+      "Host: example.com\r\n"
+      "Proxy-Authorization: Basic secret\r\n"
+      "User-Agent: fcp-test\r\n"
+      "\r\n";
+  const std::string body = "payload";
+  h.local_send(kLocalConn, request + body);
+
+  CHECK(h.run_until([&] { return !h.dials.empty(); }, 40));
+  CHECK_EQ(static_cast<int>(h.dials[0].target.atyp), static_cast<int>(kAtypDomain));
+  CHECK_EQ(h.dials[0].target.addr, std::string("example.com"));
+  CHECK_EQ(static_cast<int>(h.dials[0].target.port), 80);
+
+  const std::string want =
+      "GET /index.html?q=1 HTTP/1.1\r\n"
+      "User-Agent: fcp-test\r\n"
+      "Host: example.com\r\n"
+      "Connection: close\r\n\r\n" + body;
+  const uint64_t target_conn = h.dials[0].conn;
+  CHECK(h.run_until(
+      [&] { return h.target_bytes(target_conn).size() >= want.size(); }, 60));
+  CHECK_EQ(text_of(h.target_bytes(target_conn)), want);
+
+  // The local socket has seen nothing yet: OPEN_OK is an internal handshake on
+  // this path, not an HTTP response. This is the assertion that would catch a
+  // stray 200 being mixed into the origin's response stream.
+  CHECK_EQ(h.app_bytes(kLocalConn).size(), 0u);
+  CHECK(h.run_until([&] { return h.client->counters().tunnels == 1; }, 40));
+  CHECK_EQ(h.app_bytes(kLocalConn).size(), 0u);
+
+  const std::string response =
+      "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\npayload";
+  h.target_send(target_conn,
+                std::vector<uint8_t>(response.begin(), response.end()));
+  CHECK(h.run_until(
+      [&] { return h.app_bytes(kLocalConn).size() >= response.size(); }, 60));
+  CHECK_EQ(text_of(h.app_bytes(kLocalConn)), response);
+
+  // The origin's FIN is what ends a one-request connection: the local socket
+  // is half-closed, then the application closes it and the tunnel retires.
+  h.target_close(target_conn);
+  CHECK(h.run_until([&] { return h.app_shut_down(kLocalConn); }, 80));
+  h.local_close(kLocalConn);
+  CHECK(h.run_until([&] { return h.app_closed(kLocalConn); }, 80));
+  CHECK(h.run_until([&] {
+    return h.client->counters().live == 0 && h.server->counters().live == 0;
+  }, 80));
+}
+
+// §4.3: a refused forward tunnel is answered with 502, the same status a
+// CONNECT tunnel gets after its head was already accepted.
+void http_forward_open_error() {
+  Harness h{Options()};
+  h.auto_answer = false;
+  h.local_open(kLocalConn);
+  h.local_send(kLocalConn,
+               "POST http://api.example.com/upload HTTP/1.1\r\n"
+               "Host: api.example.com\r\nContent-Length: 0\r\n\r\n");
+  CHECK(h.run_until([&] { return !h.dials.empty(); }, 40));
+  CHECK_EQ(h.dials[0].target.addr, std::string("api.example.com"));
+  h.answer_dial(false, OpenError::kDns);
+  CHECK(h.run_until(
+      [&] { return starts_with(h.app_bytes(kLocalConn), "HTTP/1.1 502"); }, 40));
+  CHECK_EQ(h.client->counters().tunnels, 0u);
+}
+
+// §4.2: forward requests that must be refused locally, before a dial. The
+// Host check is the request-smuggling boundary, and https:// is CONNECT's job.
+void http_forward_refusals() {
+  struct Case {
+    const char* head;
+    const char* prefix;
+  };
+  const Case cases[] = {
+      {"GET https://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+       "HTTP/1.1 400"},
+      {"GET http://example.com/ HTTP/1.1\r\nHost: other.com\r\n\r\n", "HTTP/1.1 400"},
+      {"GET http://u:p@example.com/ HTTP/1.1\r\nHost: u:p@example.com\r\n\r\n",
+       "HTTP/1.1 400"},
+      {"TRACE http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+       "HTTP/1.1 405"},
+  };
+  for (const Case& c : cases) {
+    Harness h{Options()};
+    h.local_open(kLocalConn);
+    h.local_send(kLocalConn, c.head);
+    const std::string reply = text_of(h.app_bytes(kLocalConn));
+    CHECK(starts_with(h.app_bytes(kLocalConn), c.prefix));
+    if (std::string(c.prefix) == "HTTP/1.1 405") {
+      // The forward 405 lists what the entry actually relays.
+      CHECK(reply.find("Allow: CONNECT, GET") != std::string::npos);
+    }
+    CHECK_EQ(h.dials.size(), 0u);
+    CHECK_EQ(h.client->counters().bad_entry, 1u);
+    CHECK(h.run_until([&] { return h.app_closed(kLocalConn); }, 80));
+  }
+}
+
 // §4.1/§4.2: a local request the proxy will not carry is answered on the spot,
 // before the tunnel exists, and the session is dropped again.
 void malformed_local_requests() {
@@ -708,11 +818,12 @@ void malformed_local_requests() {
     CHECK_EQ(h.client->counters().bad_entry, 1u);
     CHECK_EQ(h.app_bytes(kLocalConn).size(), kEntryReplyBytes);
   }
-  {  // an HTTP request that is not CONNECT
+  {  // origin-form GET (a client treating the proxy as an origin server) is
+     // no longer a 405: it is an absolute-form forward request with a bad URI.
     Harness h{Options()};
     h.local_open(kLocalConn);
     h.local_send(kLocalConn, "GET /index.html HTTP/1.1\r\nHost: example.com\r\n\r\n");
-    CHECK(starts_with(h.app_bytes(kLocalConn), "HTTP/1.1 405"));
+    CHECK(starts_with(h.app_bytes(kLocalConn), "HTTP/1.1 400"));
     // The refusal now rides the grace clock (the reply has to be readable
     // before the socket goes), so the close event lands a few steps later.
     CHECK(h.run_until([&] { return h.app_closed(kLocalConn); }, 80));
@@ -1613,6 +1724,9 @@ int main() {
   socks5_greeting_without_request_waits();
   bad_mtu_refusal_closes_the_local_socket();
   http_connect_round_trip();
+  http_forward_round_trip();
+  http_forward_open_error();
+  http_forward_refusals();
   open_error_maps_to_the_local_reply();
 malformed_local_requests();
   backpressure_closes_the_window();

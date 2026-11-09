@@ -1184,10 +1184,23 @@ bool ProxyEngine::parse_entry(Conn& conn, int64_t now_ms) {
     if (!conn.socks5) {
       size_t consumed = 0;
       ProxyTarget target;
-      const HttpParse r =
+      HttpForward forward;
+      bool forward_tried = false;
+      HttpParse r =
           http_parse_connect(conn.entry.data(), conn.entry.size(), &consumed, &target);
+      if (r == HttpParse::kMethodNotAllowed) {
+        // The head is complete but the method is not CONNECT. A browser pointed
+        // at an HTTP proxy sends an absolute-form request instead; try that
+        // before answering 405. Both shapes still become exactly one FCP OPEN.
+        forward_tried = true;
+        r = http_parse_forward(conn.entry.data(), conn.entry.size(), &consumed, &forward);
+      }
       if (r == HttpParse::kOk) {
-        conn.target = target;
+        conn.target = forward_tried ? forward.target : target;
+        conn.http_forward = forward_tried;
+        if (forward_tried) {
+          conn.forward_head = std::move(forward.head);
+        }
         drop_front(&conn.entry, consumed);
         start_tunnel_client(conn, now_ms);
         return !in_entry_phase(conn.phase);
@@ -1201,13 +1214,17 @@ bool ProxyEngine::parse_entry(Conn& conn, int64_t now_ms) {
       }
       counters_.bad_entry++;
       // The SOCKS5 rep is irrelevant on the HTTP path: refuse_local picks
-      // the body by conn.socks5, which is false here.
-      refuse_local(conn, "rejected HTTP CONNECT", Socks5Rep::kGeneralFailure,
-                   r == HttpParse::kMethodNotAllowed
-                       ? HttpReply::kMethodNotAllowed
-                       : (r == HttpParse::kHeadTooLarge
-                              ? HttpReply::kRequestHeaderTooLarge
-                              : HttpReply::kBadRequest));
+      // the body by conn.socks5, which is false here. A forward request that
+      // named an unsupported method gets the Allow header listing the relayed
+      // methods, not the CONNECT-only one.
+      HttpReply reply = HttpReply::kBadRequest;
+      if (r == HttpParse::kMethodNotAllowed) {
+        reply = forward_tried ? HttpReply::kForwardMethodNotAllowed
+                              : HttpReply::kMethodNotAllowed;
+      } else if (r == HttpParse::kHeadTooLarge) {
+        reply = HttpReply::kRequestHeaderTooLarge;
+      }
+      refuse_local(conn, "rejected HTTP entry", Socks5Rep::kGeneralFailure, reply);
       return false;
     }
 
@@ -1291,7 +1308,14 @@ void ProxyEngine::start_tunnel_client(Conn& conn, int64_t now_ms) {
     return;
   }
   queue_stream(conn, buf, n);
-  // Everything the client wrote behind its request is tunnel payload.
+  // A forward request's first tunnel bytes are the rewritten origin-form head,
+  // not the absolute-form head the application sent. CONNECT and SOCKS5 have no
+  // such rewrite. In all three cases everything behind the entry head is
+  // payload -- for a forward request that is the request body, unchanged.
+  if (conn.http_forward) {
+    append_bytes(&conn.to_stream, conn.forward_head.data(), conn.forward_head.size());
+    conn.forward_head.clear();
+  }
   append_bytes(&conn.to_stream, conn.entry.data(), conn.entry.size());
   conn.entry.clear();
   conn.phase = Phase::kAwaitReply;
@@ -1327,7 +1351,9 @@ void ProxyEngine::queue_local_reply(Conn& conn, Socks5Rep rep, HttpReply http) {
     const size_t n = socks5_write_reply(buf, sizeof(buf), rep);
     append_bytes(&conn.app_in, buf, n);
   } else {
-    uint8_t buf[128] = {0};
+    // The forward 405 lists eight Allow methods and is the longest constant
+    // reply; 256 leaves headroom without letting this grow with peer input.
+    uint8_t buf[256] = {0};
     const size_t n = http_write_response(buf, sizeof(buf), http);
     append_bytes(&conn.app_in, buf, n);
   }
@@ -1375,7 +1401,13 @@ void ProxyEngine::parse_open_reply(Conn& conn) {
   }
   conn.phase = Phase::kTunnel;
   ++counters_.tunnels;
-  queue_local_reply(conn, Socks5Rep::kSucceeded, HttpReply::kEstablished);
+  // A forward request has no local handshake answer: the first bytes the
+  // application may see are the origin server's status line. Emitting
+  // "200 Connection Established" here would prepend a bogus response to a
+  // real one. SOCKS5 and HTTP CONNECT still need their local success reply.
+  if (!conn.http_forward) {
+    queue_local_reply(conn, Socks5Rep::kSucceeded, HttpReply::kEstablished);
+  }
   // queue_local_reply appends the handshake answer first, so the payload that
   // came behind OPEN_OK is already in stream_in and goes after it.
   append_bytes(&conn.app_in, conn.stream_in.data(), conn.stream_in.size());

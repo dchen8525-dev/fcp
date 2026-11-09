@@ -467,7 +467,7 @@ void TestHttpHeadCap() {
 }
 
 void TestHttpResponseBytes() {
-  uint8_t out[128] = {0};
+  uint8_t out[256] = {0};
   struct Case {
     HttpReply reply;
     const char* body;
@@ -477,6 +477,10 @@ void TestHttpResponseBytes() {
       {HttpReply::kBadRequest, "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n"},
       {HttpReply::kMethodNotAllowed,
        "HTTP/1.1 405 Method Not Allowed\r\nAllow: CONNECT\r\nConnection: close\r\n\r\n"},
+      {HttpReply::kForwardMethodNotAllowed,
+       "HTTP/1.1 405 Method Not Allowed\r\n"
+       "Allow: CONNECT, GET, HEAD, POST, PUT, DELETE, OPTIONS, PATCH\r\n"
+       "Connection: close\r\n\r\n"},
       {HttpReply::kRequestHeaderTooLarge,
        "HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\n\r\n"},
       // 502 is the answer to a tunnel the server refused, so it is the only
@@ -735,6 +739,177 @@ void TestTargetText() {
   CHECK_EQ(fcp::target_text(half), std::string("?:0"));
 }
 
+// ---- HTTP absolute-form forward requests ----
+
+void TestHttpForward() {
+  size_t consumed = 0;
+  fcp::HttpForward f;
+  const std::string head =
+      "GET http://example.com/index.html?q=1 HTTP/1.1\r\n"
+      "Host: example.com\r\n"
+      "User-Agent: fcp-test\r\n"
+      "\r\n";
+  const std::vector<uint8_t> buf = raw(head);
+  CHECK(fcp::http_parse_forward(ptr(buf), buf.size(), &consumed, &f) == HttpParse::kOk);
+  CHECK_EQ(consumed, buf.size());
+  CHECK_EQ(f.target.atyp, fcp::kAtypDomain);
+  CHECK_EQ(f.target.addr, std::string("example.com"));
+  CHECK_EQ(f.target.port, 80);
+  // The URL becomes origin-form, Host is rewritten last, and the forced close
+  // is what makes the origin's FIN end this one-request connection.
+  CHECK_EQ(text(f.head),
+           std::string("GET /index.html?q=1 HTTP/1.1\r\n"
+                       "User-Agent: fcp-test\r\n"
+                       "Host: example.com\r\n"
+                       "Connection: close\r\n\r\n"));
+
+  // The CONNECT parser still refuses that head; the host tries forward next.
+  ProxyTarget t;
+  CHECK(fcp::http_parse_connect(ptr(buf), buf.size(), &consumed, &t) ==
+        HttpParse::kMethodNotAllowed);
+  CHECK_EQ(consumed, 0u);
+
+  // A short read never consumes, and bytes behind the head are the body.
+  for (size_t n = 0; n < buf.size(); ++n) {
+    CHECK(fcp::http_parse_forward(ptr(buf), n, &consumed, &f) == HttpParse::kNeedMore);
+    CHECK_EQ(consumed, 0u);
+  }
+  const std::vector<uint8_t> corked = raw(head + "BODY");
+  CHECK(fcp::http_parse_forward(ptr(corked), corked.size(), &consumed, &f) ==
+        HttpParse::kOk);
+  CHECK_EQ(consumed, buf.size());
+
+  // Authorities: explicit port, :80 on a default-port URL, case-insensitive
+  // Host, a query with no slash, and a bracketed IPv6 literal.
+  struct OkCase {
+    const char* uri;
+    const char* host_header;
+    const char* host;
+    uint16_t port;
+    const char* origin;
+  };
+  const OkCase ok[] = {
+      {"http://example.com:8080/", "example.com:8080", "example.com", 8080, "/"},
+      {"http://example.com/", "example.com:80", "example.com", 80, "/"},
+      {"http://EXAMPLE.com/", "example.com", "EXAMPLE.com", 80, "/"},
+      {"http://a.b?x=1", "a.b", "a.b", 80, "/?x=1"},
+      {"http://[::1]:8443/a", "[::1]:8443", "::1", 8443, "/a"},
+      {"HTTP://example.com/", "example.com", "example.com", 80, "/"},
+  };
+  for (const OkCase& c : ok) {
+    const std::vector<uint8_t> b = raw(std::string("GET ") + c.uri +
+                                       " HTTP/1.1\r\nHost: " + c.host_header + "\r\n\r\n");
+    CHECK(fcp::http_parse_forward(ptr(b), b.size(), &consumed, &f) == HttpParse::kOk);
+    CHECK_EQ(consumed, b.size());
+    CHECK_EQ(f.target.addr, std::string(c.host));
+    CHECK_EQ(f.target.port, c.port);
+    CHECK(text(f.head).find(std::string("GET ") + c.origin + " HTTP/1.1\r\n") == 0);
+    CHECK(text(f.head).find(std::string("Host: ") + c.host_header + "\r\n") !=
+          std::string::npos);
+    CHECK(text(f.head).find("Connection: close\r\n\r\n") != std::string::npos);
+    CHECK(!f.head.empty());
+  }
+
+  // A missing Host (HTTP/1.0 shaped request) is filled from the URL.
+  const std::vector<uint8_t> no_host =
+      raw("GET http://example.com/x HTTP/1.0\r\n\r\n");
+  CHECK(fcp::http_parse_forward(ptr(no_host), no_host.size(), &consumed, &f) ==
+        HttpParse::kOk);
+  CHECK_EQ(text(f.head),
+           std::string("GET /x HTTP/1.0\r\nHost: example.com\r\n"
+                       "Connection: close\r\n\r\n"));
+
+  // Fragment is stripped, never sent to the origin server.
+  const std::vector<uint8_t> frag =
+      raw("GET http://example.com/a/b#frag HTTP/1.1\r\nHost: example.com\r\n\r\n");
+  CHECK(fcp::http_parse_forward(ptr(frag), frag.size(), &consumed, &f) == HttpParse::kOk);
+  CHECK_EQ(text(f.head),
+           std::string("GET /a/b HTTP/1.1\r\nHost: example.com\r\n"
+                       "Connection: close\r\n\r\n"));
+
+  // Hop-by-hop and proxy headers are dropped; body framing headers survive
+  // even when the Connection header names them (this proxy never decodes a body).
+  const std::vector<uint8_t> hops = raw(
+      "POST http://api.example.com/upload HTTP/1.1\r\n"
+      "Host: api.example.com\r\n"
+      "Proxy-Authorization: Basic secret\r\n"
+      "Proxy-Connection: keep-alive\r\n"
+      "Connection: keep-alive, X-Custom, Transfer-Encoding\r\n"
+      "X-Custom: drop-me\r\n"
+      "Upgrade: h2c\r\n"
+      "Keep-Alive: timeout=5\r\n"
+      "TE: trailers\r\n"
+      "X-Keep: yes\r\n"
+      "Content-Length: 5\r\n"
+      "Transfer-Encoding: chunked\r\n"
+      "\r\n");
+  CHECK(fcp::http_parse_forward(ptr(hops), hops.size(), &consumed, &f) == HttpParse::kOk);
+  CHECK_EQ(text(f.head),
+           std::string("POST /upload HTTP/1.1\r\n"
+                       "X-Keep: yes\r\n"
+                       "Content-Length: 5\r\n"
+                       "Transfer-Encoding: chunked\r\n"
+                       "Host: api.example.com\r\n"
+                       "Connection: close\r\n\r\n"));
+
+  struct BadCase {
+    const char* head_text;
+    HttpParse want;
+  };
+  const BadCase bad[] = {
+      // TLS is CONNECT's job, never an absolute-form forward request.
+      {"GET https://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+       HttpParse::kBadRequest},
+      {"GET /index.html HTTP/1.1\r\nHost: example.com\r\n\r\n", HttpParse::kBadRequest},
+      {"GET ftp://example.com/x HTTP/1.1\r\nHost: example.com\r\n\r\n",
+       HttpParse::kBadRequest},
+      {"GET http://u:p@example.com/ HTTP/1.1\r\nHost: u:p@example.com\r\n\r\n",
+       HttpParse::kBadRequest},
+      {"GET http://example.com/ HTTP/2.0\r\nHost: example.com\r\n\r\n",
+       HttpParse::kBadRequest},
+      {"TRACE http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+       HttpParse::kMethodNotAllowed},
+      // A disagreeing or duplicated Host is refused, never rewritten.
+      {"GET http://example.com/ HTTP/1.1\r\nHost: other.com\r\n\r\n",
+       HttpParse::kBadRequest},
+      {"GET http://example.com:8080/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+       HttpParse::kBadRequest},
+      {"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n"
+       "Host: example.com\r\n\r\n",
+       HttpParse::kBadRequest},
+      // obs-fold, control bytes in a value, a bad header name and no colon.
+      {"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n X-Fold: 1\r\n\r\n",
+       HttpParse::kBadRequest},
+      {"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nX: \x01\r\n\r\n",
+       HttpParse::kBadRequest},
+      {"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nBad Header: x\r\n\r\n",
+       HttpParse::kBadRequest},
+      {"GET http://example.com/ HTTP/1.1\r\nNoColon\r\n\r\n", HttpParse::kBadRequest},
+      {"GET http://example.com:0/ HTTP/1.1\r\nHost: example.com:0\r\n\r\n",
+       HttpParse::kBadRequest},
+      {"GET http://example.com:65536/ HTTP/1.1\r\nHost: example.com:65536\r\n\r\n",
+       HttpParse::kBadRequest},
+      {"GET http://[::1/ HTTP/1.1\r\nHost: [::1\r\n\r\n", HttpParse::kBadRequest},
+  };
+  for (const BadCase& c : bad) {
+    const std::vector<uint8_t> b = raw(c.head_text);
+    CHECK(fcp::http_parse_forward(ptr(b), b.size(), &consumed, &f) == c.want);
+    CHECK_EQ(consumed, 0u);
+  }
+
+  // Same 8 KiB head budget as CONNECT, and the same null/short-read contract.
+  std::vector<uint8_t> huge =
+      raw("GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nX: ");
+  huge.insert(huge.end(), fcp::kHttpHeadMaxBytes, 'a');
+  CHECK(fcp::http_parse_forward(ptr(huge), huge.size(), &consumed, &f) ==
+        HttpParse::kHeadTooLarge);
+  CHECK_EQ(consumed, 0u);
+  CHECK(fcp::http_parse_forward(nullptr, 100, &consumed, &f) == HttpParse::kBadRequest);
+  CHECK_EQ(consumed, 0u);
+  CHECK(fcp::http_parse_forward(ptr(buf), 0, &consumed, &f) == HttpParse::kNeedMore);
+  CHECK_EQ(consumed, 0u);
+}
+
 }  // namespace
 
 int main() {
@@ -750,6 +925,7 @@ int main() {
   TestHttpMalformedRequests();
   TestHttpHeadCap();
   TestHttpResponseBytes();
+  TestHttpForward();
   TestOpenRoundTrip();
   TestOpenWriteRejectsUnencodable();
   TestOpenRequestRejects();

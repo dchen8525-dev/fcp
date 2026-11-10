@@ -32,4 +32,5 @@ soak_test 0 32
 strategy_test 26 163
 stream_e2e_test 7 91
 stream_test 58 448
+udp_send_error_test 6 27
 wire_test 4 22

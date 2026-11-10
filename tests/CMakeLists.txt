@@ -38,6 +38,7 @@ set(FCP_TEST_NAMES
   e2e_test
   soak_test
   adv_test
+  udp_send_error_test
 )
 
 foreach(name IN LISTS FCP_TEST_NAMES)
@@ -45,6 +46,16 @@ foreach(name IN LISTS FCP_TEST_NAMES)
   target_link_libraries(fcp_${name} PRIVATE fcp)
   add_test(NAME ${name} COMMAND fcp_${name})
 endforeach()
+
+# #90: ClassifyUdpSendError() is a header-only free function in apps/cli.
+# Give this one test the CLI include path; it links no reactor/socket code, so
+# the classification contract is gated on both Windows and Linux CI.
+target_include_directories(fcp_udp_send_error_test PRIVATE
+               ${CMAKE_CURRENT_SOURCE_DIR}/../apps/cli)
+if(WIN32)
+  # The port-preserving rebind test calls Winsock directly.
+  target_link_libraries(fcp_udp_send_error_test PRIVATE ws2_32)
+endif()
 
 # P10' N16: without a timeout a hung loopback test blocks CI forever. The soak
 # test gets its own larger bound (the C3 acceptance run uses FCP_SOAK_MS).

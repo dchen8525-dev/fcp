@@ -14,6 +14,8 @@
 
 #include "bench.h"
 #include "fcp/session.h"
+#include "udp_rebind.h"
+#include "udp_send_error.h"
 
 #ifndef _WIN32
 #include <arpa/inet.h>
@@ -25,6 +27,7 @@
 #include <unistd.h>
 #else
 #include <timeapi.h>
+#include <windows.h>
 #endif
 
 #ifdef __linux__
@@ -42,6 +45,16 @@
 
 namespace fcp {
 namespace {
+
+// #90 UDP socket recovery thresholds. Three consecutive "socket dead" errors
+// guard against a single transient refusal; the exponential backoff keeps a
+// persistently failing host from rebuilding on every pacer burst. Even the
+// worst case (30 s) is far inside the server's 135 s liveness window, so a
+// successful rebuild always has time to resume the keepalive stream.
+constexpr uint32_t kSocketDeadStreakTrigger = 3;
+constexpr uint32_t kRebuildFailureLimit = 3;
+constexpr int64_t kRebuildBackoffBaseMs = 1000;
+constexpr int64_t kRebuildBackoffMaxMs = 30000;
 
 #ifdef _WIN32
 int SockErr() { return static_cast<int>(WSAGetLastError()); }
@@ -462,6 +475,15 @@ bool Reactor::start(std::string* error) {
     return false;
   }
   wsa_owner_ = true;
+  // Runtime kill switch for #90. An environment variable rather than a new
+  // CLI flag keeps the GUI/sidecar argument list, the deb unit and the stats
+  // row format untouched; FCP_UDP_REBUILD=0 restores the pre-#90 behaviour.
+  // GetEnvironmentVariableA avoids the MSVC C4996 getenv() deprecation.
+  char rebuild_flag[8] = {};
+  const DWORD got = GetEnvironmentVariableA("FCP_UDP_REBUILD", rebuild_flag,
+                                            static_cast<DWORD>(sizeof(rebuild_flag)));
+  udp_rebuild_enabled_ = !(got >= 1 && got < sizeof(rebuild_flag) &&
+                           std::strcmp(rebuild_flag, "0") == 0);
 #endif
   // Startup phase timing: the console/one-shot companions of the desktop
   // launcher (P-启动快照). Measured here, printed once below the endpoint echo.
@@ -603,6 +625,10 @@ void Reactor::run() {
   while (!g_signalled.load()) {
     int64_t now = NowMs();
 
+    // #90: swap a dead UDP descriptor before anything in this iteration can
+    // use it. Deferred from note_udp_send_error() so no host callback ever
+    // changes udp_ while an emit loop or an fd_set snapshot is in flight.
+    maybe_rebuild_udp(now);
     flush_dead_apps(now);
     flush_wire_deferred(now);
     drain_resolves(now);
@@ -1577,16 +1603,12 @@ void Reactor::app_abort(uint64_t conn) {
 // descent step) so the send bound moves the moment the kernel says so, then
 // still count the failure and say the first one per second on stderr.
 void Reactor::note_udp_send_error(int err, size_t len, uint64_t peer) {
-  if (WouldBlock(err) || Interrupted(err)) {
+  const UdpSendVerdict verdict = ClassifyUdpSendError(err);
+  if (verdict == UdpSendVerdict::kTransient) {
     return;  // transient: the engine retries on the next tick
   }
   ++udp_send_errors_;
-#ifdef _WIN32
-  const bool too_big = err == WSAEMSGSIZE;
-#else
-  const bool too_big = err == EMSGSIZE;
-#endif
-  if (too_big) {
+  if (verdict == UdpSendVerdict::kPathTooBig) {
     engine_.on_wire_send_too_big(peer, len, NowMs());
     const int64_t now = NowMs();
     if (last_udp_send_error_ms_ != 0 && now - last_udp_send_error_ms_ < 1000) {
@@ -1600,14 +1622,121 @@ void Reactor::note_udp_send_error(int err, size_t len, uint64_t peer) {
                   "their send bound",
                   len, static_cast<unsigned>(base_config_.mtu));
     note(msg, Severity(LogLevel::kError));
-  } else {
-    const int64_t now = NowMs();
-    if (last_udp_send_error_ms_ != 0 && now - last_udp_send_error_ms_ < 1000) {
-      return;
+    return;
+  }
+  if (verdict == UdpSendVerdict::kSocketDead && udp_rebuild_enabled_ &&
+      opt_.role == EngineRole::kClient) {
+    // A connected UDP socket Winsock has invalidated stays invalid: dropping
+    // datagrams forever also drops the NAT keepalive / liveness probe, so the
+    // server's 135 s window tears down every session. Arm a rebuild, but never
+    // swap the descriptor from inside this host callback (see #90 in
+    // maybe_rebuild_udp). Three consecutive verdicts filter a one-off hiccup.
+    if (++socket_dead_streak_ >= kSocketDeadStreakTrigger) {
+      rebuild_pending_ = true;
     }
-    last_udp_send_error_ms_ = now;
-    note(std::string("UDP send failed: ") + ErrText(err),
-         Severity(LogLevel::kError));
+  }
+  const int64_t now = NowMs();
+  if (last_udp_send_error_ms_ != 0 && now - last_udp_send_error_ms_ < 1000) {
+    return;
+  }
+  last_udp_send_error_ms_ = now;
+  note(std::string("UDP send failed: ") + ErrText(err),
+       Severity(LogLevel::kError));
+}
+
+void Reactor::maybe_rebuild_udp(int64_t now_ms) {
+#ifndef _WIN32
+  // The failure mode is Windows-specific (WSAEINVAL on a connected UDP
+  // socket). Linux keeps the pre-#90 path byte-for-byte: no rebuild, no new
+  // branches on the datagram fast path.
+  (void)now_ms;
+  rebuild_pending_ = false;
+  return;
+#else
+  if (!rebuild_pending_) {
+    return;
+  }
+  rebuild_pending_ = false;
+  if (!udp_rebuild_enabled_ || opt_.role != EngineRole::kClient) {
+    return;
+  }
+  if (now_ms < next_rebuild_allowed_ms_) {
+    return;
+  }
+  std::string error;
+  if (rebuild_udp_socket(&error)) {
+    ++udp_rebuilds_;
+    rebuild_failures_ = 0;
+    socket_dead_streak_ = 0;
+    last_rebuild_ms_ = now_ms;
+    next_rebuild_allowed_ms_ = now_ms + kRebuildBackoffBaseMs;
+    char msg[256];
+    std::snprintf(msg, sizeof(msg),
+                  "udp rebuilt #%u: local port preserved, sessions kept",
+                  udp_rebuilds_);
+    note(msg, Severity(LogLevel::kInfo));
+    return;
+  }
+  ++rebuild_failures_;
+  last_rebuild_ms_ = now_ms;
+  const int shift = rebuild_failures_ > 5 ? 5 : static_cast<int>(rebuild_failures_);
+  const int64_t backoff =
+      std::min<int64_t>(kRebuildBackoffBaseMs << shift, kRebuildBackoffMaxMs);
+  next_rebuild_allowed_ms_ = now_ms + backoff;
+  note(std::string("udp rebuild failed: ") + error, Severity(LogLevel::kError));
+  if (rebuild_failures_ >= kRebuildFailureLimit) {
+    // No usable descriptor and no prospect of one in this window: fail the
+    // applications now so they retry, rather than letting the server's
+    // liveness timer hold every tab in a spinner for 135 s.
+    fail_fast_locals(now_ms);
+  }
+#endif
+}
+
+#ifdef _WIN32
+bool Reactor::rebuild_udp_socket(std::string* error) {
+  if (udp_ == kBadSock) {
+    *error = "udp socket already closed";
+    return false;
+  }
+  if (peers_.empty() || !peers_[0].used) {
+    *error = "client peer 0 is missing";
+    return false;
+  }
+  bool df_ok = false;
+  if (!RebuildConnectedUdp(&udp_, peers_[0].addr, /*tune_buffers=*/true,
+                           base_config_.pmtud, &df_ok, error)) {
+    return false;
+  }
+  // open_udp() applied engine_.set_pmtud(false) once at startup when DF was
+  // unavailable. Do not replay that one-shot decision on every rebuild; just
+  // make a fresh failure visible. A working socket beats no tunnel at all.
+  if (base_config_.pmtud && !df_ok) {
+    note("udp rebuild: DF mode unavailable on the replacement socket",
+         Severity(LogLevel::kWarn));
+  }
+  return true;
+}
+#endif
+
+void Reactor::fail_fast_locals(int64_t now_ms) {
+  // on_local_reset() may synchronously reach app_close()/app_abort(), which
+  // look these ids up again. Walk a snapshot and re-find each entry, and erase
+  // before notifying -- app_close() on an already-erased socket is a no-op
+  // (same shape as except_event()).
+  scratch_local_ids_.clear();
+  scratch_local_ids_.reserve(locals_.size());
+  for (const auto& e : locals_) {
+    scratch_local_ids_.push_back(e.first);
+  }
+  for (uint64_t id : scratch_local_ids_) {
+    const auto it = locals_.find(id);
+    if (it == locals_.end()) {
+      continue;
+    }
+    CloseSock(it->second);
+    locals_.erase(it);
+    engine_.on_local_reset(id, now_ms);
   }
 }
 
@@ -1710,6 +1839,10 @@ size_t Reactor::emit_wire(uint64_t peer, const uint8_t* wire, size_t len,
       note_udp_send_error(SockErr(), len, peer);
       return 0;
     }
+    // A single accepted datagram proves the descriptor is usable again, so
+    // the "socket dead" streak must not survive a recovery (or a one-off
+    // error that the next tick already cleared).
+    socket_dead_streak_ = 0;
     return n > 0 ? static_cast<size_t>(n) : 0;
   }
   const int n = ::sendto(udp_, reinterpret_cast<const char*>(wire), static_cast<int>(len), 0,
@@ -1718,6 +1851,7 @@ size_t Reactor::emit_wire(uint64_t peer, const uint8_t* wire, size_t len,
     note_udp_send_error(SockErr(), len, peer);
     return 0;
   }
+  socket_dead_streak_ = 0;
   return n > 0 ? static_cast<size_t>(n) : 0;
 }
 

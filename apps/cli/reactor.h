@@ -282,6 +282,23 @@ class Reactor {
   // Count a permanent UDP send error and explain the first one per second on
   // stderr (EMSGSIZE is the "MTU larger than the path" case and names --mtu).
   void note_udp_send_error(int err, size_t len, uint64_t peer);
+  // #90: recover a Windows client UDP socket that Winsock put into an unusable
+  // state. note_udp_send_error() only sets a flag; the descriptor swap runs at
+  // the top of run(), never inside a host callback (flush_wire_deferred()
+  // calls emit_wire() in a loop, so changing udp_ mid-callback would leave the
+  // fd_set snapshot and the deferred queue pointing at different sockets).
+  void maybe_rebuild_udp(int64_t now_ms);
+#ifdef _WIN32
+  // Rebuild udp_ while keeping the original local port: the server keys peers
+  // by IP:port (addr_key), so a fresh ephemeral port would look like a new
+  // peer and lose every in-flight session. Returns false without touching the
+  // live descriptor, so the next attempt can retry.
+  bool rebuild_udp_socket(std::string* error);
+#endif
+  // Last resort when the descriptor cannot be rebuilt at all: reset every
+  // local connection so the browser retries immediately instead of waiting out
+  // the server's 135 s liveness window.
+  void fail_fast_locals(int64_t now_ms);
   // Dead-path watchdog (opt_.stall_ms): one counters snapshot per tick. Nothing
   // functional hangs on it -- the log line is its output.
   void check_stall(int64_t now_ms);
@@ -440,6 +457,19 @@ class Reactor {
   uint64_t skipped_total_ = 0;
   uint64_t udp_send_errors_ = 0;          // permanent send failures (stats/debug)
   int64_t last_udp_send_error_ms_ = 0;    // rate limit for the log line above
+  // #90 UDP socket recovery. A connected UDP socket on Windows can enter a
+  // state where every send() fails; counting and dropping (the old behaviour)
+  // also kills the keepalives, so the server's 135 s liveness window closes
+  // the whole session set. Three consecutive "socket dead" verdicts arm a
+  // rebuild; a successful send clears the streak. FCP_UDP_REBUILD=0 disables
+  // the whole mechanism at runtime (no CLI/GUI change, no stats row change).
+  uint32_t socket_dead_streak_ = 0;
+  uint32_t rebuild_failures_ = 0;
+  uint32_t udp_rebuilds_ = 0;
+  int64_t last_rebuild_ms_ = 0;
+  int64_t next_rebuild_allowed_ms_ = 0;
+  bool rebuild_pending_ = false;
+  bool udp_rebuild_enabled_ = true;
   int64_t next_skip_log_ms_ = 0;
   // Send shaper: the sliding window holds {ms, bytes} of what this host has
   // passed through in the trailing second; wire_deferred_ is the ordered hold

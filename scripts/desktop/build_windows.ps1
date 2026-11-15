@@ -54,9 +54,14 @@ Write-Host "== sidecar: $ProxyBin"
 # with a version line that never gets compared (M-05). --version was removed in
 # 0.0.20; -h prints "fcp-client <version>" on its first line and exits 0.
 $expectedVersion = (Get-Content (Join-Path $repo "VERSION") -Raw).Trim()
-$reported = ([string](& $ProxyBin -h | Select-Object -First 1)).Trim()
-if ($LASTEXITCODE -ne 0) {
-  throw "sidecar -h 退出码 $LASTEXITCODE（$ProxyBin）"
+# $LASTEXITCODE 只在下一条语句之前有效：一旦接了管道（| Select-Object）它就被
+# 覆盖，这里的检查会读到空值而在 CI 上误报（Windows 客户端 job 就是这样红的）。
+# 先取原始退出码，再解析首行。
+$rawOutput = & $ProxyBin -h
+$exitCode = $LASTEXITCODE
+$reported = ([string]($rawOutput | Select-Object -First 1)).Trim()
+if ($exitCode -ne 0) {
+  throw "sidecar -h 退出码 $exitCode（$ProxyBin）"
 }
 if ($reported -notmatch "fcp-client\s+$([regex]::Escape($expectedVersion))") {
   throw "sidecar 版本不符：报告 '$reported'，期望 fcp-client $expectedVersion（先重建 Release sidecar）"

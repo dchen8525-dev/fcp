@@ -277,10 +277,30 @@ void Bbr::update_bounds_at_round_start(size_t in_flight) {
     delivery_efficiency_ = std::clamp(eff, 0.25, 1.0);
   }
   // Loss that is always present is a property of the path, not a congestion
-  // signal. Learn its floor (immediately down, 1/64 per clean round back up)
-  // and require a margin above it before inflight_hi moves.
+  // signal. Learn its floor and require a margin above it before inflight_hi
+  // moves.
+  //
+  // Which rounds teach the floor (2026-11 调优; CN-VPS 268ms/22-30% 实测):
+  // only rounds that did NOT exceed the ceiling. A refused round is by
+  // definition the one where loss is the answer to this window, so letting it
+  // raise the floor makes the ceiling self-justifying — it lands at
+  // max(min_cwnd, 0.875 x peak), and every later round then checks its loss
+  // against a floor that was set by the same loss. That is how the measured
+  // session ended at hi=111579 with BBR's own bandwidth estimate at 24 Mbps:
+  // a 268ms path cannot fill a 111 KiB window, so the cut, not the path, was
+  // what kept the transfer near 1 MB/s.
+  //
+  // Two exceptions keep a floor-pinned path from deadlocking:
+  //   * the ceiling is already on its floor — no cut is available, so this loss
+  //     rate IS the path's steady state and has to be learned (the original
+  //     reason this branch existed);
+  //   * the ceiling is entirely above what was in flight, so no round under it
+  //     can exist — the peak is the working point and its loss is the floor
+  //     (the WAN near-idle pattern that used to ratchet hi down to min_cwnd).
   const uint64_t rate_ppm = sent > 0 ? lost * 1000000 / sent : 0;
   const bool enough = sent >= 4 * cfg_.mss;
+  const bool at_floor = inflight_hi_ <= min_cwnd_ + min_cwnd_ / 8;
+  const bool ceiling_unreachable = inflight_hi_ > peak;
   auto loss_base = [&](bool congested) {
     if (!enough) {
       return;
@@ -292,16 +312,16 @@ void Bbr::update_bounds_at_round_start(size_t in_flight) {
       loss_base_ppm_ = rate_ppm;
     } else if (!congested) {
       loss_base_ppm_ += (rate_ppm - loss_base_ppm_) / 64;
-    } else if (inflight_hi_ <= min_cwnd_ + min_cwnd_ / 8) {
-      // The ceiling is already on the floor: another cut is not available, so
-      // this loss rate is the path's steady state, not a response to the
-      // window. Learn it now. Without this the base could only rise on a round
-      // that was *not* congested, and a path with persistent loss above the
-      // 5-point threshold made every round congested -- inflight_hi stayed
-      // pinned at the floor for the whole session while the threshold stayed at
-      // the old, cleaner baseline.
+    } else if (at_floor) {
+      loss_base_ppm_ += (rate_ppm - loss_base_ppm_) / 2;
+    } else if (ceiling_unreachable) {
+      // Same loss rate, seen at a working point the ceiling never constrained:
+      // it is the path's, so it may bound the floor (fast, like the floor case,
+      // because the ceiling cannot be raised on evidence it is allowed to see).
       loss_base_ppm_ += (rate_ppm - loss_base_ppm_) / 2;
     }
+    // Otherwise: a refused round that the ceiling did constrain. It is
+    // congestion evidence, not floor evidence — leave the floor alone.
   };
   constexpr uint64_t kMarginPpm = 50000;  // 5 points above the path's own loss
   const uint64_t threshold_ppm = std::max<uint64_t>(

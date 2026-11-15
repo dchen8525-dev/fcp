@@ -7,11 +7,13 @@
 #ifndef FCP_TESTS_E2E_LINK_H_
 #define FCP_TESTS_E2E_LINK_H_
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef _WIN32
@@ -210,7 +212,11 @@ class UdpSocket {
 #else
     const ssize_t n = ::send(handle_, data, len, 0);
 #endif
-    return n >= 0 && static_cast<size_t>(n) == len;
+    if (n >= 0 && static_cast<size_t>(n) == len) {
+      ++sent_;
+      return true;
+    }
+    return false;
   }
 
   bool Recv(uint8_t* buf, size_t cap, size_t* len) {
@@ -224,6 +230,7 @@ class UdpSocket {
       return false;
     }
     *len = static_cast<size_t>(n);
+    ++recv_;
     return true;
   }
 
@@ -240,10 +247,19 @@ class UdpSocket {
   }
 
   uint16_t port() const { return port_; }
+  // Datagrams that actually entered / left this socket. The harness uses the
+  // pair to wait for loopback delivery: Windows completes a UDP send before the
+  // destination socket's queue has the datagram, so a pump that stops at the
+  // first empty recv can miss traffic that is still in flight (under CI load
+  // this made lossless handshakes and FECSTAT assertions fail intermittently).
+  uint64_t sent() const { return sent_; }
+  uint64_t recv() const { return recv_; }
 
  private:
   SocketHandle handle_ = kInvalidSocket;
   uint16_t port_ = 0;
+  uint64_t sent_ = 0;
+  uint64_t recv_ = 0;
 };
 
 // Loopback pair plus an application-layer loss injector. Control and OOB
@@ -296,6 +312,11 @@ struct Harness {
   uint32_t burst_period = 25;
   uint32_t burst_len = 5;
   uint32_t burst_data_seen = 0;
+
+  // Datagrams the kernel never delivered (only observable via the counters).
+  // Kept out of WaitForDelivery's target so one lost datagram does not make
+  // every later pump wait the full grace period.
+  uint64_t lost_debt_ = 0;
 
   uint32_t a_data = 0;
   uint32_t a_parity = 0;
@@ -441,12 +462,49 @@ struct Harness {
     // 对抗分析第十轮 P3：上限曾是静默 return——一个失控的投递回环（测试
     // bug 的典型症状）会在这里无声停泵，后面的断言互相错过，看起来只是
     // "正常"。跑满 1024 次仍没排空说明发送方在持续回环，直接失败定位。
+    //
+    // 第十一轮：Windows 的 UDP send 在目的 socket 入队之前就返回，单次
+    // "读到空" 不代表对端已经处理完。CI 并行度高时（ctest -j8）发送仍在
+    // 内核途中，pump() 提前返回，于是无丢包的 T3 握手、FECSTAT、尾集断言
+    // 随机失败。用发送/接收计数判断是否还有在途数据报，有就轮询等待一小段
+    // 墙钟时间。内核偶尔真丢一个（缓冲区溢出）时只记一次债务，避免之后
+    // 每次 pump 都白等。
     for (int guard = 0; guard < 1024; ++guard) {
-      if (!pump_once()) {
+      const bool moved = pump_once();
+      const uint64_t sent = sock_a.sent() + sock_b.sent();
+      const uint64_t recv = sock_a.recv() + sock_b.recv();
+      if (recv + lost_debt_ < sent) {
+        if (!WaitForDelivery(sent)) {
+          // 这个数据报被内核丢了（或它属于对端根本不会读的一侧）；把它
+          // 记成债务，后面的 pump 不再为同一笔反复等待。
+          lost_debt_ = sent - recv;
+          return;
+        }
+        continue;  // 有新数据到达，回到循环顶部读掉它
+      }
+      if (!moved) {
         return;
       }
     }
     fprintf(stderr, "pump(): still active after 1024 drain rounds\n");
+  }
+
+  // Waits until the peer queues everything that was sent, or the graceful
+  // bound expires. Returns true when at least one datagram arrived while
+  // waiting (the caller must drain it), false on timeout.
+  bool WaitForDelivery(uint64_t sent) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+    while (sock_a.recv() + sock_b.recv() + lost_debt_ < sent) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        return false;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      if (pump_once()) {
+        return true;
+      }
+    }
+    return true;
   }
 
   bool Handshake() {

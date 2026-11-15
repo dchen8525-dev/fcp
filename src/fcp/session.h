@@ -108,14 +108,11 @@ struct SessionConfig {
   using TraceFn = std::function<void(const TraceEntry&)>;
   TraceFn trace;
   // #78: offer FCP-STREAM ACK v2 through the handshake TLV extension. On by
-  // default; a peer that predates the TLV bit costs one 750ms downgrade probe
-  // (two unanswered HELLOs) and then negotiates without it, so mixed-version
-  // deployments pay that once per connection while the roll-out crosses.
+  // default; the feature is active only when the peer offers the same type.
   bool stream_ack_v2 = true;
-  // #84: envelope key update (epoch rolling) — offered to TLV peers only; a
-  // v7 peer keeps the single-key 2^32-packet lifetime with its disconnect
-  // semantics. With rolling on, one key never seals more than kEpochSpan
-  // packets and the session never hits the counter ceiling.
+  // #84: envelope key update (epoch rolling). With rolling on, one key never
+  // seals more than kEpochSpan packets and the session never hits the counter
+  // ceiling.
   bool key_update = true;
   // #87 (H8): the peer prewarm ticket rides the same TLV block; on by default
   // (it costs 2 + 11 bytes in the HELLO/ACK, both directions).
@@ -150,6 +147,16 @@ class Session {
   // except the auth_fail counter. Hosts that route by the plaintext salt use
   // this to keep unauthenticated traffic away from any peer binding (A1).
   bool on_wire(const uint8_t* wire, size_t len, int64_t now_ms);
+
+  // H6 (#86): a peer that restarted answers our data symbols with a stateless
+  // reset, and it does so from its *new* source address. The host's salt
+  // binding would drop that datagram before on_wire() ever verified it, so the
+  // host may offer a mismatched address here. Only the bootstrap-envelope tag
+  // (over the PSK and this session's salt) is authority: on success the
+  // session is marked dead so peer_dead() ends the tunnel, and the caller must
+  // still not move the peer binding. False means "not a valid reset", and
+  // nothing changed.
+  bool accept_stateless_reset(const uint8_t* wire, size_t len);
 
   // One KCP output segment; every segment is data (handshake traffic uses oob).
   void on_kcp_output(const uint8_t* seg, size_t len, int64_t now_ms);
@@ -210,12 +217,8 @@ class Session {
   bool stream_ack_v2() const {
     return cfg_.stream_ack_v2 && hs_.tlv_agreed(kTlvTypeAckV2);
   }
-  // #87 (H8): the peer's prewarm ticket from the handshake TLV, if any (empty
-  // when the peer sent none or did not speak TLV).
+  // #87 (H8): the peer's prewarm ticket from the handshake TLV, if any.
   std::vector<uint8_t> peer_prewarm_tlv() const {
-    if (!hs_.tlv_negotiated()) {
-      return {};
-    }
     for (const auto& t : hs_.peer_tlvs()) {
       if (t.type == kTlvTypePrewarm) {
         return t.value;
@@ -271,6 +274,11 @@ class Session {
   // H6 (#86): a stateless reset (the peer holds the PSK but lost the session)
   // sets it immediately.
   bool peer_dead() const { return peer_dead_ || reset_by_peer_; }
+  // Which of the two verdicts fired: a stateless reset is proof the peer is
+  // alive but has lost the session, while the grace clock means silence. The
+  // host reports them differently (one is a clean reconnect, the other a dead
+  // path), so the distinction must not be collapsed at teardown.
+  bool reset_by_peer() const { return reset_by_peer_; }
   uint32_t struct_fail() const { return pre_struct_fail_ + (rx_ ? rx_->struct_fail() : 0); }
   // #31 (M4 trigger metric): FEC/ARQ waste — retransmissions that lost the
   // race to parity. Summed into the proxy stats line for the WAN calibration.
@@ -305,6 +313,10 @@ class Session {
  private:
   bool ensure_configured(int64_t now_ms);
   void configure(int64_t now_ms);
+  // Every KCP output goes through here. Data joins the open repair set;
+  // ACK/RST close it immediately first, so control never waits for D symbols
+  // or T_flush (see FrameTx::flush).
+  void emit_stream_segment(const uint8_t* seg, size_t len, int64_t now_ms);
   // Oob dispatch: HELLO/HELLO_ACK magic -> handshake, else FECSTAT/KEEPALIVE.
   void on_oob(const uint8_t* payload, size_t len, int64_t now_ms);
   // Returns true when the payload was a handshake message and has been fed to

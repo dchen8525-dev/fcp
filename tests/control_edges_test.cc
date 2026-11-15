@@ -386,7 +386,7 @@ void TestTraceEncodeValueEdges() {
   fcp::TraceEntry e;
   e.stat = fcp::MakeFecstatPacket(kSalt);
   e.now_ms = -5;
-  e.snapshot.target_recovery = 1e300;  // > 2^53 and non-integral: %.17g arm
+  e.snapshot.initial_k = 7;  // integral arm still round-trips
   e.snapshot.budget = 9007199254740992.0;  // exactly 2^53: integral arm
   e.last_loss = 0.123456789;
   std::string line;
@@ -395,8 +395,8 @@ void TestTraceEncodeValueEdges() {
   fcp::TraceEntry back;
   CHECK(fcp::decode_trace_line(line, &back));
   CHECK_EQ(back.now_ms, static_cast<int64_t>(-5));
-  CHECK(back.snapshot.target_recovery == e.snapshot.target_recovery);
   CHECK(back.snapshot.budget == e.snapshot.budget);
+  CHECK(back.snapshot.initial_k == e.snapshot.initial_k);
   CHECK(back.last_loss == e.last_loss);
 }
 
@@ -664,7 +664,7 @@ void TestPrewarmCacheEdges() {
 
 void TestPrewarmApplyNullTargets() {
   fcp::StreamConfig fixed;
-  fixed.auto_window = false;
+  fixed.send_window_explicit = true;  // bw/rtt priors need an unpinned start
   fcp::apply_prewarm(fcp::PeerProfile{0, -1, 0, 1000000, 80}, nullptr, &fixed);
   CHECK_EQ(fixed.initial_bw_bps, 0u);
   CHECK_EQ(fixed.initial_min_rtt_ms, 0);
@@ -878,17 +878,21 @@ void TestStrategyPmaxZeroEarlyReturn() {
 void TestStrategyCappedWithoutBytes() {
   fcp::FecStrategyConfig cfg;
   cfg.budget_ratio = 0.20;
+  // 2026-11 调优：控制器目标从 §8 的 0.80 抬到 0.90（kControlTargetRecovery），
+  // 20% 丢包对应的稳态 k 因此是 5 而不是 4。这里钉的是 budget 的入/出逻辑，
+  // 与 k 的绝对值无关，用 k_for 的返回值表达，避免调优再次改动本用例。
+  const uint8_t k_at_20 = fcp::k_for(0.20, cfg.d, cfg.p_max);
   fcp::FecStrategy st(cfg);
   uint32_t id = 0;
   st.on_report(MakeLossReport(++id, 0.20), false);
-  CHECK_EQ(st.k(), 4u);
+  CHECK_EQ(st.k(), k_at_20);
 
   fcp::FecstatPacket over = MakeLossReport(++id, 0.20);
   over.data_bytes_rx = 140000;
   over.parity_bytes_rx = 40000;
   st.on_report(over, false);
   CHECK(st.state() == fcp::FecState::kCapped);
-  CHECK_EQ(st.k(), 3u);
+  CHECK_EQ(st.k(), static_cast<uint8_t>(k_at_20 - 1));
 
   // No byte evidence: a capped state cannot persist on a signal it cannot see,
   // so the "else" arm returns it to ON.
@@ -898,11 +902,13 @@ void TestStrategyCappedWithoutBytes() {
 
 void TestStrategyLedgerKZero() {
   fcp::FecStrategy st;
+  const fcp::FecStrategyConfig def;
+  const uint8_t k_at_10 = fcp::k_for(0.10, def.d, def.p_max);
   uint32_t id = 0;
   st.on_report(MakeLossReport(++id, 0.10), false);
-  CHECK_EQ(st.k(), 2u);
+  CHECK_EQ(st.k(), k_at_10);
   st.on_report(MakeLossReport(++id, 0.10), false);
-  CHECK_EQ(st.k(), 2u);
+  CHECK_EQ(st.k(), k_at_10);
 
   // Ledger present with enough groups but a dominant k of 0: unusable, and it
   // must be skipped rather than treated as a match or as hostile input.
@@ -914,7 +920,7 @@ void TestStrategyLedgerKZero() {
   st.on_report(p, false);
   CHECK(!st.ledger_active());
   CHECK_EQ(st.ledger_skipped(), 1u);
-  CHECK_EQ(st.k(), 2u);
+  CHECK_EQ(st.k(), k_at_10);
 }
 
 // ---------------------------------------------------------------------------

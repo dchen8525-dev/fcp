@@ -95,6 +95,11 @@ constexpr size_t kSaltTombstoneMax = 8192;
 // 预认证会话构筑预算（见 create_server_conn）：收费窗口宽度与窗口内配额。
 constexpr int64_t kNewConnWindowMs = 250;
 constexpr int32_t kMaxNewServerConnsPerWindow = 256;
+// #86: on-wire size of a stateless reset: salt(8) + nonce(8) + magic(8) +
+// tag(12). A reply is only sent for a datagram at least this large, so the
+// reset can never amplify.
+constexpr size_t kStatelessResetWireLen =
+    Envelope::kOverhead + Envelope::kResetMagicLen;
 
 std::string salt_key_of(const uint8_t* salt) {
   return std::string(reinterpret_cast<const char*>(salt), Envelope::kSaltLen);
@@ -102,7 +107,7 @@ std::string salt_key_of(const uint8_t* salt) {
 
 // #29a: one JSONL controller-trace sink per session, closed with the session
 // (the shared_ptr dies with the captured lambda). Empty prefix = disabled.
-// #33: the prefix may name a directory that does not exist yet (--trace=/run/
+// #33: the prefix may name a directory that does not exist yet (--metrics=/run/
 // fcp/cli before anyone created /run/fcp) — create the parent chain instead of
 // silently recording nothing, which is how the first WAN run lost every
 // client-side trace.
@@ -316,10 +321,16 @@ void ProxyEngine::on_local_bytes(uint64_t conn, const uint8_t* data, size_t len,
   if (c == nullptr || c->phase == Phase::kDone || len == 0) {
     return;
   }
+  if (c->closing) {
+    // Refused: the reply is already queued, local bytes have nowhere to go, and
+    // forwarding them would keep the stream's ack/delivery counters moving --
+    // which is the very evidence the grace clock uses to decide the peer is
+    // still making progress. Stop reading (wants_local_read is false too), so
+    // the application is backpressured instead of the refusal being extended by
+    // the whole upload.
+    return;
+  }
   if (in_entry_phase(c->phase)) {
-    if (c->closing) {
-      return;  // refused: the reply is out and the grace clock decides the rest
-    }
     append_bytes(&c->entry, data, len);
     parse_entry(*c, now_ms);
   } else {
@@ -506,6 +517,19 @@ void ProxyEngine::on_wire(uint64_t peer, const uint8_t* data, size_t len, int64_
   // the datagram before the envelope authenticates it (the born path below
   // destroys the session when the first datagram fails the tag).
   if (!born && c->peer != peer) {
+    // #86: the restarted peer comes back on a NEW source port, so its
+    // stateless reset lands here rather than on the bound-address path. Its
+    // authority is the bootstrap tag over (PSK, salt), not the address: an
+    // off-path attacker cannot forge it, and a PSK holder could end this
+    // session anyway. The binding is still never moved -- only the session the
+    // reset names is torn down.
+    if (c->session != nullptr &&
+        c->session->accept_stateless_reset(data, len)) {
+      log(std::string(kTagWarn) + label(*c) + " peer stateless reset from a new address");
+      finish_conn(*c, now_ms, "peer stateless reset");
+      reap(now_ms);
+      return;
+    }
     // salt_clash now counts unauthenticated mismatches too. The salt travels in
     // the clear, so a spoofed prefix could always have been aimed at this
     // table; the counter is a warning signal ("someone else is racing this
@@ -536,6 +560,27 @@ void ProxyEngine::on_wire(uint64_t peer, const uint8_t* data, size_t len, int64_
     // negotiate with. (The start() in create_server_conn bounds the same table
     // for an authenticated peer that never completes a handshake.)
     if (!authenticated) {
+      // H6 (#86): this is the server-restart / reaped-salt case. A v7 data
+      // symbol is sealed under the session key derived from BOTH handshake
+      // nonces, so a server that lost its state can never authenticate it --
+      // waiting for `authenticated` made the reset unreachable exactly when it
+      // was needed, and the client hung until its own timeout. Answer with the
+      // reset under the bootstrap (PSK, salt) envelope instead: the client
+      // verifies that tag with open_reset(), so only the holder of this salt's
+      // PSK acts on it (an off-path attacker cannot forge one).
+      //
+      // A first datagram that is not HELLO for a salt the server does not know
+      // has no other legitimate reading: a new peer always starts with HELLO.
+      // Reflection is bounded: the reply is only sent for a datagram at least
+      // as large as the reset, the born-connection budget above caps how many
+      // replies a flood can elicit, and a reset is smaller than the HELLO that
+      // the same born path already used to emit. Anything shorter gets no
+      // reply at all.
+      if (len >= kStatelessResetWireLen) {
+        send_stateless_reset(c->session->salt(), peer);
+        log(std::string(kTagWarn) + label(*c) +
+            " stale session data: stateless reset sent");
+      }
       finish_conn(*c, now_ms, "unauthenticated first datagram");
       reap(now_ms);
       return;
@@ -680,7 +725,7 @@ void ProxyEngine::on_tick(int64_t now_ms) {
 bool ProxyEngine::wants_local_read(uint64_t conn) const {
   const Conn* c = find(conn);
   if (c == nullptr || cfg_.role != EngineRole::kClient || c->phase == Phase::kDone ||
-      c->local_eof) {
+      c->local_eof || c->closing) {
     return false;
   }
   if (in_entry_phase(c->phase)) {
@@ -694,7 +739,7 @@ bool ProxyEngine::wants_local_read(uint64_t conn) const {
 bool ProxyEngine::wants_target_read(uint64_t conn) const {
   const Conn* c = find(conn);
   if (c == nullptr || cfg_.role != EngineRole::kServer || c->local_eof ||
-      c->phase != Phase::kTunnel) {
+      c->closing || c->phase != Phase::kTunnel) {
     return false;
   }
   return c->to_stream.empty() && c->stream && c->stream->can_write();
@@ -780,16 +825,10 @@ void ProxyEngine::fill_stream_config(StreamConfig* sc) const {
   // The loss floor is the configured start, captured before apply_prewarm()
   // may replace send_window_bytes with a prior (decision #33: only the
   // delay evidence may take the window below the operator's --window).
-  sc->loss_floor_bytes = cfg_.send_window_bytes;
   sc->send_window_explicit = cfg_.window_explicit;
   sc->rcv_buf_bytes = cfg_.rcv_buf_bytes;
-  sc->auto_window = cfg_.auto_window;
-  sc->bbr = cfg_.bbr;
   sc->bbr_version = cfg_.bbr_version;
-  sc->window_probe = cfg_.window_probe;
   sc->window_min_bytes = cfg_.window_min_bytes;
-  sc->window_max_bytes = cfg_.window_max_bytes;
-  sc->window_ceiling_bytes = cfg_.window_ceiling_bytes;
   sc->ack_every = cfg_.ack_every;
   sc->idle_timeout_ms = cfg_.idle_timeout_ms;
 }
@@ -886,7 +925,7 @@ ProxyEngine::CreateStatus ProxyEngine::create_client_conn(uint64_t id, uint64_t 
   sc.send_direction = Direction::kC2S;
   sc.recv_direction = Direction::kS2C;
   // Fill the engine-owned half first: apply_prewarm() decides whether the
-  // window prior may replace the start from StreamConfig::auto_window and
+  // window prior may replace the start from StreamConfig and
   // StreamConfig::send_window_explicit, so those flags have to be real values,
   // not the default-constructed false/false.
   fill_stream_config(&raw->stream_cfg);
@@ -1085,9 +1124,22 @@ void ProxyEngine::attach_stream(Conn& conn) {
         // bytes queued after the app's shutdown. Sending our own fin here, as
         // the symmetric counterpart of on_local_closed(), used to end the
         // tunnel the moment the peer stopped talking and drop that traffic.
+        //
+        // The shutdown itself is deferred until app_in is empty: the FIN is
+        // contiguous with all stream data (the Stream calls this after the
+        // delivery loop), but app_send may only have accepted part of the last
+        // chunk. Shutting the write half now makes the retry fail (EPIPE /
+        // WSAESHUTDOWN), which the hosts treat as fatal, so a slow reader lost
+        // the tail of the response.
+        p->peer_fin = true;
         if (host_.app_shutdown) {
-          host_.app_shutdown(id);
+          maybe_peer_shutdown(*p);
         } else {
+          // No half-close support: close the tunnel's send side once our own
+          // bytes are out. On the server the OPEN_OK has not even been queued
+          // while the dial is in flight, so maybe_fin() itself refuses to act
+          // before kTunnel (see there); otherwise the FIN overtook OPEN_OK and
+          // the client never learned the tunnel existed.
           p->want_fin = true;
           maybe_fin(*p);
         }
@@ -1128,6 +1180,10 @@ void ProxyEngine::session_events(Conn& conn, int64_t now_ms) {
       attach_stream(conn);
       conn.phase = Phase::kAwaitOpen;
       conn.phase_deadline_ms = now_ms + cfg_.dial_timeout_ms;
+    } else {
+      // The queue slot is free only now, so this is the earliest the server can
+      // begin its own OPEN wait: restart our clock from here.
+      arm_open_deadline(conn, now_ms);
     }
   }
   if (conn.session->state() == HandshakeState::kFailed) {
@@ -1165,7 +1221,10 @@ void ProxyEngine::session_events(Conn& conn, int64_t now_ms) {
   // stream idle clock by minutes and turns "tunnel hangs" into a clean
   // reconnect.
   if (conn.session->peer_dead()) {
-    finish_conn(conn, now_ms, "peer silent: liveness window expired");
+    finish_conn(conn, now_ms,
+                conn.session->reset_by_peer()
+                    ? "peer sent a stateless reset"
+                    : "peer silent: liveness window expired");
   }
 }
 
@@ -1322,7 +1381,10 @@ void ProxyEngine::start_tunnel_client(Conn& conn, int64_t now_ms) {
   // Strictly longer than the server's dial budget: the server's OPEN_ERR is
   // the answer this deadline must not race. Equal budgets made the client give
   // up locally in the same tick the server refused, losing the real reason.
-  conn.phase_deadline_ms = now_ms + cfg_.dial_timeout_ms + cfg_.flush_grace_ms;
+  // Armed here *and* on establishment (session_events): a request parsed
+  // before the handshake must not start a clock the handshake itself eats.
+  conn.phase_deadline_ms = 0;
+  arm_open_deadline(conn, now_ms);
   drain_stream(conn);
   log(std::string(kTagDebug) + label(conn) + " OPEN sent");
 }
@@ -1533,6 +1595,9 @@ void ProxyEngine::flush_app(Conn& conn) {
     // bound -- the exact bypass the rwnd exists to prevent.
     conn.stream->set_delivery_pending(conn.app_in.size() + conn.stream_in.size());
   }
+  // This pass may have just drained the last byte the peer's FIN was waiting
+  // for; deliver EOF now rather than leaving the local reader blocked.
+  maybe_peer_shutdown(conn);
   maybe_fin(conn);
 }
 
@@ -1551,6 +1616,15 @@ void ProxyEngine::on_stream_bytes(Conn& conn, const uint8_t* data, size_t len) {
 
 void ProxyEngine::maybe_fin(Conn& conn) {
   if (!conn.want_fin || conn.stream == nullptr || conn.phase == Phase::kDone) {
+    return;
+  }
+  // A peer FIN on a host without half-close support sets want_fin early. On the
+  // server the dial (and therefore OPEN_OK) can still be in flight, so closing
+  // the stream here would queue a FIN ahead of OPEN_OK: the client never sees
+  // the tunnel open and both ends discard the exchange. Wait for kTunnel;
+  // on_dial_result() drains OPEN_OK first and then calls back into this.
+  if (conn.peer_fin && !host_.app_shutdown && cfg_.role == EngineRole::kServer &&
+      conn.phase != Phase::kTunnel) {
     return;
   }
   // The grace clock belongs to the refusal path (refuse_local/send_open_error:
@@ -1574,6 +1648,41 @@ void ProxyEngine::maybe_fin(Conn& conn) {
   if (conn.closing) {
     // Slide on real progress only; re-arming every tick would never expire.
     arm_grace(conn, /*only_if_idle=*/true);
+  }
+}
+
+void ProxyEngine::maybe_peer_shutdown(Conn& conn) {
+  if (!conn.peer_fin || conn.peer_shutdown_done || !host_.app_shutdown ||
+      conn.phase == Phase::kDone) {
+    return;
+  }
+  // Never hand the host a shutdown while the flush bookkeeping is live, and
+  // never before the socket this shutdown targets exists: on the server the
+  // dialed target is only in the host's table once the dial succeeded, so a
+  // shutdown during kDialing would be a silent no-op that we then never repeat.
+  if (conn.in_flush_app || !conn.app_in.empty()) {
+    return;
+  }
+  if (cfg_.role == EngineRole::kServer && conn.phase != Phase::kTunnel) {
+    return;
+  }
+  host_.app_shutdown(conn.id);
+  conn.peer_shutdown_done = true;
+}
+
+void ProxyEngine::arm_open_deadline(Conn& conn, int64_t now_ms) {
+  if (cfg_.role != EngineRole::kClient || conn.phase != Phase::kAwaitReply) {
+    return;
+  }
+  // The server may spend dial_timeout_ms waiting for OPEN after the handshake
+  // and then another full dial_timeout_ms dialing, so the client has to allow
+  // both. Arming only the smaller amount at request-parse time (before the
+  // handshake, and possibly before a hs_concurrency queue slot) refused
+  // connections the server was still legitimately working on.
+  const int64_t want =
+      now_ms + 2 * cfg_.dial_timeout_ms + cfg_.flush_grace_ms;
+  if (conn.phase_deadline_ms == 0 || want > conn.phase_deadline_ms) {
+    conn.phase_deadline_ms = want;
   }
 }
 
@@ -1629,7 +1738,7 @@ void ProxyEngine::finish_conn(Conn& conn, int64_t now_ms, const char* why) {
   // Compare against the start this stream actually used, not the configured
   // default: apply_prewarm() may have seeded a prior, and a connection that
   // ended exactly at its prior has not "moved" relative to it.
-  const bool tuned = conn.stream != nullptr && cfg_.auto_window &&
+  const bool tuned = conn.stream != nullptr &&
                      conn.stream->send_window() != conn.stream_cfg.send_window_bytes;
   // A stall verdict is reported from whichever side stopped moving. The receive
   // side has no "stuck" send counter, so its oob/pending numbers only exist in
@@ -1697,8 +1806,8 @@ void ProxyEngine::pump_handshake_queue(int64_t now_ms) {
     const uint64_t id = hs_queue_.front();
     hs_queue_.pop_front();
     Conn* c = find(id);
-    if (c == nullptr || c->phase == Phase::kDone || c->session == nullptr ||
-        !c->hs_queued) {
+    if (c == nullptr || c->phase == Phase::kDone || c->closing ||
+        c->session == nullptr || !c->hs_queued) {
       continue;  // 排队期间本地已关闭：它没持有槽位，直接跳过
     }
     c->hs_queued = false;
@@ -1707,17 +1816,17 @@ void ProxyEngine::pump_handshake_queue(int64_t now_ms) {
         break;
       case Session::StartStatus::kNoEntropy:
         ++counters_.no_entropy;
-        if (host_.app_close) {
-          host_.app_close(id);
-        }
+        // finish_conn, not app_close: the Conn stays in by_conn_ until reap,
+        // and dropping only the host socket left it live forever (entry reads
+        // then fail every tick and the counters stay elevated). app_close is
+        // delivered by reap like every other finish.
+        finish_conn(*c, now_ms, "session start: entropy unavailable");
         continue;
       case Session::StartStatus::kBadConfig:
         ++counters_.bad_config;
         log(std::string(kTagWarn) + label(*c) +
             " refused: MTU leaves no room for a data symbol");
-        if (host_.app_close) {
-          host_.app_close(id);
-        }
+        finish_conn(*c, now_ms, "session start: bad config");
         continue;
     }
     by_salt_.emplace(c->salt_key, id);
@@ -1831,7 +1940,7 @@ void ProxyEngine::save_profile(Conn& conn, int64_t now_ms) {
   // Only the autotuner's result describes the link; a fixed window describes
   // the operator's configuration and must not become a prior for a later
   // adaptive session.
-  if (conn.stream_cfg.auto_window) {
+  if (true) {
     profile.window_bytes = conn.stream->send_window();
   }
   // BBR's model as a prior for the next connection to this peer. Both are kept

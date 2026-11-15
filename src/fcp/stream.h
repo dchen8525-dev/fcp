@@ -55,7 +55,10 @@ constexpr uint8_t kStreamFlagFin = 1u << 0;
 // force-retransmits the first unacked segment without waiting for the RTO or
 // the SACK-fill bookkeeping. The receiver rotates the single SACK block per
 // dup-ACK so every buffered hole gets reported within a few duplicates.
-constexpr uint32_t kDupAckThresh = 3;
+// 2 (not 3): the SACK ranges already carry the loss evidence, so the count only
+// filters reordered ACK arrivals, and each extra duplicate is one more ACK
+// cycle before a hole is repaired — ~40 ms on the 200-400 ms paths this runs on.
+constexpr uint32_t kDupAckThresh = 2;
 
 // Bound on the *number* of chunks in the out-of-order buffer, not just their
 // bytes. A chunk costs ~32 B of bookkeeping whatever it carries, so a peer that
@@ -138,21 +141,14 @@ struct StreamConfig {
   // 17-byte v1 frame for directly-constructed streams. Only a negotiated peer
   // ever receives the v2 frame type.
   bool ack_v2 = false;
-  // Send window. With auto_window off this is the constant window; with it on
-  // it is only the starting value -- see below.
+  // Starting send window. BBR owns the window from here; --window-min names
+  // the floor it never goes below, and the ceiling is twice that floor.
   size_t send_window_bytes = kDefaultSendWindowBytes;
   // Set when send_window_bytes came from an explicit choice (a CLI --window or
   // the GUI spinbox) rather than the default. The prewarm cache may replace a
   // default start with the peer's converged window; it never overrides an
   // explicit one.
   bool send_window_explicit = false;
-  // Floor for the loss-driven decrease in auto mode (decision #33). Normally
-  // the operator's --window, which is not necessarily the window the stream
-  // starts at: the prewarm prior may raise the start above it. Without this
-  // field the floor would be the seeded start, so a warm connection could
-  // never shrink back to the value the operator asked for. 0 means "use the
-  // start window", which is the behaviour when no prior was applied.
-  size_t loss_floor_bytes = 0;
   size_t rcv_buf_bytes = kDefaultRcvBufBytes;
   // Window autotune. The send window starts at send_window_bytes and grows
   // while the stream is its own bottleneck: doubling per RTT until ssthresh, then
@@ -173,50 +169,24 @@ struct StreamConfig {
   // minimum of one or two rounds on a jittery path says nothing about a queue.
   // Loss costs one 30% decrease per epoch.
   //
-  // window_max_bytes is the hard ceiling. In auto mode the receive capacity is
-  // raised to the same value so the peer's growth is not clamped by a buffer
-  // smaller than the window it is allowed to reach. This is NOT negotiated on
-  // the wire: auto/fixed mixes are safe (a fixed peer simply advertises its
-  // own buffer and the sender stays peer-limited) but the extra memory is
+  // window_max_bytes is the hard ceiling, and it is derived, not configured:
+  // twice window_min_bytes. BBR works between the two; the receive capacity is
+  // raised to the ceiling so the peer's growth is never clamped by a buffer
+  // smaller than the window it is allowed to reach. The extra memory is
   // committed per connection by arrivals, not reserved.
-  bool auto_window = false;
   size_t window_min_bytes = kDefaultWindowMinBytes;
-  size_t window_max_bytes = kDefaultWindowMaxBytes;
-  // Auto mode with BBR: let the ceiling follow the measured BDP instead of
-  // stopping at the configured window_max_bytes (which is then only the floor
-  // of the ceiling). A 1 MiB ceiling holds a 200 ms path to 40 Mbps however
-  // good the controller is, so a session that keeps proving a larger BDP is
-  // allowed to grow to this bound. 0 keeps the ceiling fixed (the old
-  // behaviour); the engine derives a value from the operator's configuration.
-  size_t window_ceiling_bytes = 0;
+  size_t window_max_bytes = 0;  // 0 = derive as 2 x window_min_bytes
   // Emit one ACK per this many in-order data segments while the receive buffer
   // has no hole; out-of-order bytes, a fin and a closed window still ACK
   // immediately (the peer is waiting on those), and a pending ACK is flushed
   // after kAckDelayMs. 1 = one ACK per segment (the old behaviour, kept as the
   // unit-test default so the protocol tests stay bit-precise).
   uint8_t ack_every = 1;
-  // Congestion controller for auto mode. BBR (bbr.h) is the default: it
-  // derives the window from a delivery-rate estimate and paces the stream, so
-  // loss is answered with retransmission rather than with a window cut. The
-  // epoch controller (auto_window + slow start / AIMD / window_probe) remains
-  // available with --no-bbr for comparison and for pinned regression tests.
-  bool bbr = true;
   // BBR generation: 1 = BBRv1 (loss only stops a probe), 2 = BBRv2 (learns
   // inflight_hi/inflight_lo from the stream-level loss residue). Default 2.
+  // BBR is the only congestion controller: the pre-#51 epoch controller
+  // (slow start / AIMD / delay brake / rate probe) was removed with --cc=epoch.
   int bbr_version = 2;
-  // Rate probe for the *epoch* controller only (auto mode, no BBR). A
-  // stream-level hole on a FEC-protected path is not clean congestion evidence:
-  // the parity already absorbed what it could, so the residue is a mix of
-  // contention and random loss. When a lossy epoch still delivered data, has
-  // no standing-queue evidence, and its delivery rate is still rising, the
-  // window grows 25% instead of cutting. Ignored when `bbr` is on.
-  bool window_probe = true;
-  // Standing-queue allowance: an epoch whose minimum RTT is this far above the
-  // historical minimum holds the window; two consecutive epochs at twice this
-  // shrink it. Sized against Session's §8 guardrail (kQueueGuardrailGapMs
-  // trims FEC k on the same evidence); half of it is short enough that the two
-  // controllers do not fight. 0 disables the delay brake.
-  int64_t window_queue_ms = kQueueGuardrailGapMs / 2;
   int64_t initial_srtt_ms = kDefaultSrttMs;
   // Prewarm priors for the controller (BBR only): the previous session's
   // delivery rate and minimum RTT. They let a new connection start at the
@@ -231,8 +201,13 @@ struct StreamConfig {
   // count, so a dead peer is detected by the idle clock, not by an empty log.
   int64_t idle_timeout_ms = kDefaultIdleTimeoutMs;
   // Zero-window probing: resend one segment this often while the peer advertises
-  // no room and we have nothing in flight to be acked.
-  int64_t probe_ms = 1000;
+  // no room and we have nothing in flight to be acked. 50 ms, fixed: the old
+  // 1000 ms base with a x16 persist backoff meant a peer that momentarily
+  // advertised rwnd=0 could sit unprobed for 16 s, which turned a transient
+  // stall (a full receive buffer, one lost window update) into a dead transfer.
+  // Probing costs one segment and the peer answers with the same closed window,
+  // so there is nothing to back off from.
+  int64_t probe_ms = 50;
 };
 
 class Stream {
@@ -337,13 +312,11 @@ class Stream {
   uint64_t bad_segs() const { return bad_segs_; }
   uint64_t oob_drops() const { return oob_drops_; }
   size_t oob_chunks() const { return oob_.size(); }
-  // Current send window (== send_window_bytes when auto_window is off) and the
+  // Current send window (BBR-managed between window_min_ and window_max_) and
   // autotune's state, for the teardown diagnostics and the unit tests.
   size_t send_window() const { return send_window_; }
-  size_t ssthresh() const { return ssthresh_; }
-  size_t loss_floor() const { return loss_floor_; }
-  // BBR diagnostics (auto mode with bbr on).
-  bool using_bbr() const { return cfg_.auto_window && cfg_.bbr; }
+  // BBR diagnostics.
+  bool using_bbr() const { return true; }
   Bbr::Mode bbr_mode() const { return bbr_.mode(); }
   uint64_t bbr_bandwidth_bps() const { return bbr_.bandwidth_bps(); }
   size_t bbr_bdp_bytes() const { return bbr_.bdp_bytes(); }
@@ -355,7 +328,6 @@ class Stream {
   // Loss attribution for the shrink terms above.
   uint64_t dup_loss_events() const { return dup_loss_events_; }
   uint64_t rto_loss_events() const { return rto_loss_events_; }
-  size_t last_target() const { return last_target_; }
   int64_t min_rtt_ms() const { return min_rtt_ms_; }
   size_t in_flight() const { return in_flight_; }
   size_t queued_bytes() const { return tx_pending_.size(); }
@@ -401,8 +373,6 @@ class Stream {
   // a hole, a closed window).
   void maybe_ack(int64_t now_ms, bool urgent);
   // Grow the send ceiling toward twice the BBR-measured BDP, bounded by
-  // cfg_.window_ceiling_bytes. No-op when the ceiling is fixed.
-  void refresh_window_ceiling();
   void emit_rst(uint8_t code);
   void pump(int64_t now_ms);
   void handle_data(const uint8_t* seg, size_t len, int64_t now_ms);
@@ -465,10 +435,6 @@ class Stream {
   size_t in_flight_ = 0;             // bytes of sent-and-unacked segments
   size_t peer_rwnd_ = 0;
   bool probe_credit_ = false;        // let one segment past a closed window
-  // F-3: persist-timer style backoff for zero-window probes. A peer that keeps
-  // answering with the same closed window would otherwise pull one full segment
-  // every probe_ms for as long as the ACKs keep coming.
-  int64_t probe_backoff_ = 1;
   // peer_rwnd_ starts as a guess copied from our own config; the autotune only
   // reads a full window as path evidence once an ACK has confirmed the peer's.
   bool peer_rwnd_seen_ = false;
@@ -494,50 +460,20 @@ class Stream {
 
   int64_t srtt_ms_ = 0;
   int64_t rto_ms_ = 0;
-  // Window autotune (see StreamConfig::auto_window). send_window_ is what
-  // send_space()/pump() read; the epoch counters turn "bytes acknowledged
-  // since the last sample" into a delivery rate.
+  // Window autotune (BBR). send_window_ is what send_space()/pump() read.
   size_t send_window_ = 0;
-  size_t ssthresh_ = 0;
   size_t window_min_ = 0;
   size_t window_max_ = 0;
-  // Hard bound for the BDP-following ceiling (cfg_.window_ceiling_bytes), or 0
-  // when the ceiling is fixed at the configured window_max_bytes.
-  size_t window_ceiling_ = 0;
   // ACK coalescing: segments delivered since the last ACK, and whether an ACK
   // is owed before the next kAckDelayMs deadline (see maybe_ack).
   uint32_t acks_owed_ = 0;
   bool ack_pending_ = false;
-  // The deepest the loss term alone may take the window: the window the stream
-  // started with. A stream-level hole on this stack is not clean congestion
-  // evidence -- the FEC layer already absorbed what it could, so the residue is
-  // a mix of contention and random loss the parity missed -- and a window below
-  // the operator's `--window` is strictly worse there (measured 2026-10-31: a
-  // 64 KiB window on a 160ms/17%-loss path ran at a third of the fixed 256 KiB
-  // rate and never climbed back). Cutting on queue evidence is still allowed to
-  // go all the way down to window_min_, because a standing queue of our own
-  // making is a real signal.
-  size_t loss_floor_ = 0;
   // Receive capacity backing the advertised window: rcv_buf_bytes, raised to
   // window_max_bytes in auto mode so the peer's growth is never clamped by a
   // buffer that is smaller than the window it is allowed to reach.
   size_t rcv_cap_ = 0;
   int64_t min_rtt_ms_ = 0;
   int64_t min_rtt_stamp_ms_ = 0;  // when min_rtt_ms_ was last refreshed
-  int64_t epoch_min_rtt_ms_ = 0;  // lowest sample inside the current epoch
-  int epoch_samples_ = 0;         // clean samples inside the current epoch
-  size_t last_target_ = 0;        // recovery reference, and the slow-start bound
-  // Delivery rate (bytes/s) at the last probe growth. The next growth has to
-  // beat it by 5%: that is what makes the probe stop at the path's knee.
-  uint64_t probe_rate_bps_ = 0;
-  int64_t win_epoch_ms_ = 0;
-  uint64_t epoch_acked_ = 0;
-  bool loss_epoch_ = false;
-  // True when this epoch's loss evidence was a dup-ACK hole (the peer is still
-  // acknowledging, so data is flowing), as opposed to an RTO blackout. The
-  // rate probe only trusts the former: a timeout is congestion/blackout
-  // evidence and keeps the AIMD cut.
-  bool loss_epoch_dup_ = false;
   // Which loss evidence showed up, counted separately because the two have
   // different remedies and a WAN log line cannot tell them apart afterwards:
   // `dup_loss_events` is a second duplicate-ACK burst with the first repair
@@ -545,10 +481,6 @@ class Stream {
   // timeout pass (nothing came back at all).
   uint64_t dup_loss_events_ = 0;
   uint64_t rto_loss_events_ = 0;
-  bool limited_epoch_ = false;
-  // Consecutive epochs whose minimum RTT sat over the queue allowance; the
-  // delay brake fires on the second one, so path jitter cannot fake a queue.
-  int queue_over_ = 0;
   // Exponential RTO backoff (Karn): doubled per timeout episode and reset by a
   // clean sample, so a silent peer is retransmitted at a decaying rate instead
   // of one full window every base RTO.
@@ -590,11 +522,14 @@ class Stream {
   int64_t dup_burst_ms_ = -1;
   uint64_t spur_bursts_ = 0;  // diagnostics: dup-bursts confirmed spurious
 
-  // BBR (auto mode when cfg_.bbr): the model, the round boundary used to tell
+  // BBR (auto mode): the model, the round boundary used to tell
   // "a new RTT has started" on a cumulative ACK, and the pacing token bucket.
   Bbr bbr_;
   uint32_t bbr_round_end_ = 0;
   double pace_tokens_ = 0.0;
+  // True until the opening burst has released bytes: the bucket may then hold
+  // a full start window instead of the steady-state 6 ms allowance.
+  bool pace_burst_left_ = true;
   int64_t pace_ms_ = 0;
 
   uint64_t bytes_queued_ = 0;

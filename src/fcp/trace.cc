@@ -21,7 +21,7 @@ void append_fields(std::string* out, const std::vector<Field>& fields) {
     char num[32];
     // Integral doubles print as integers for readability; everything else
     // needs %.17g, the shortest width that round-trips every double. %.9g
-    // used to drop the low bits of target_recovery/budget, so a replayed
+    // used to drop the low bits of budget, so a replayed
     // candidate could take a different branch than the recording did.
     // The integral branch is capped at 2^53 because casting a double outside
     // the exact-integer range (or int64) to int64 is undefined behavior.
@@ -152,7 +152,6 @@ void encode_trace_line(const TraceEntry& e, std::string* out) {
                     fld("loss", e.last_loss),
                     fld("c_d", c.d),
                     fld("c_pmax", c.p_max),
-                    fld("c_target", c.target_recovery),
                     fld("c_budget", c.budget),
                     fld("c_ik", c.initial_k),
                     fld("c_pin", c.pinned),
@@ -252,7 +251,6 @@ bool decode_trace_line(const std::string& line, TraceEntry* e) {
       !i32("c_ik", -1, &c.initial_k) || !i32("c_pin", -1, &c.pinned)) {
     return false;
   }
-  c.target_recovery = field_or(fields, "c_target", kTargetRecovery);
   c.budget = field_or(fields, "c_budget", kDefaultFecBudget);
 
   if (!field_in_range(fields, "now", -9007199254740992.0, 9007199254740992.0, 0.0, &v)) {
@@ -303,7 +301,6 @@ std::vector<ReplayStep> replay_trace(const std::vector<TraceEntry>& entries,
   FecStrategyConfig sc;
   sc.d = cfg.d;
   sc.p_max = cfg.p_max;
-  sc.target_recovery = cfg.target_recovery;
   sc.budget_ratio = cfg.budget;
   sc.initial_k = cfg.initial_k;
   sc.pinned_k = cfg.pinned;

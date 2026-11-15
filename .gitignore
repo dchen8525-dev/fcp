@@ -10,3 +10,7 @@ vcpkg_installed/
 __pycache__/
 *.pyc
 /build-alt.bat
+.baseline.floors.*
+.e2e/
+.e2e-vps/
+*.obj

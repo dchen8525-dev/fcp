@@ -2,35 +2,50 @@
 # 测试，不许减。降低某个数字的提交必须说明原因。格式：
 # <test> <functions> <checks>
 #
-adv_test 11 328
+# 2026-11-15：窗口参数改为 --window-min（默认 2 MiB，上限恒为 2x），删除
+# --window=START[:MAX] 与 --no-auto-window，固定窗口模式随之消失。
+#   cli_test     17/452 -> 17/402  --window 的 START/MAX 组合用例被 --window-min
+#                                  的边界用例替代（一个参数的空间比两个小）。
+#   其余测试数量持平；stream_test / stream_edges_test / proxy_engine_test 的
+#   断言按新语义重写（窗口落在 [下限, 2x下限]、接收容量跟随上限、首窗一次性
+#   放出），并新增"首窗不被令牌桶掐成两段"的回归。
+#
+adv_test 11 330
 aes_test 2 4
-bbr_test 11 43
+bbr_test 13 46
 cauchy_test 2 7
-cli_test 17 476
-e2e_test 6 143
-envelope_test 13 137
+cli_test 17 402
+codec_edges_test 24 171
+control_edges_test 34 221
+defensive_test 14 93
+e2e_test 6 144
+envelope_test 16 175
 fecstat_test 4 30
-frame_rx_test 21 210
+frame_rx_test 22 217
 frame_tx_test 10 116
+fuzz_test 3 7
 gcm_test 3 26
 gf256_test 2 20
 ghash_test 4 8
-handshake_test 18 201
+handshake_test 23 282
 hdr_test 3 37
 kfor_test 4 30
-pmtu_test 8 72
-prewarm_test 13 113
-proxy_engine_test 23 201
-proxy_proto_test 18 209
+log_test 6 48
+pmtu_test 11 108
+prewarm_test 22 176
+proxy_engine_test 38 325
+proxy_proto_test 19 243
 random_test 4 13
-replay_test 7 59
+replay_test 8 66
 reporter_test 7 85
-rs_test 4 12
-session_test 23 304
+rs_test 4 14
+session_edges_test 17 340
+session_test 26 336
 settle_test 18 197
 soak_test 0 32
-strategy_test 26 163
+strategy_test 28 171
 stream_e2e_test 7 91
-stream_test 58 448
-udp_send_error_test 6 27
+stream_edges_test 18 140
+stream_test 55 428
+udp_send_error_test 6 29
 wire_test 4 22

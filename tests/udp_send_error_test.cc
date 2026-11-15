@@ -98,14 +98,18 @@ void TestRebindPreservesLocalPort() {
 
   std::string error;
   bool df_ok = false;
+  bool source_changed = true;  // must be reset by a normal (non-fallback) bind
   CHECK(fcp::RebuildConnectedUdp(&s, remote, /*tune_buffers=*/false,
-                                 /*dont_fragment=*/false, &df_ok, &error));
+                                 /*dont_fragment=*/false, &df_ok, &error,
+                                 &source_changed));
   CHECK(s != INVALID_SOCKET);
   sockaddr_in after{};
   len = sizeof(after);
   CHECK(::getsockname(s, reinterpret_cast<sockaddr*>(&after), &len) == 0);
   CHECK(after.sin_port == before.sin_port);
   CHECK(after.sin_family == AF_INET);
+  CHECK(after.sin_addr.s_addr == before.sin_addr.s_addr);
+  CHECK(!source_changed);  // the original address still exists here
   ::closesocket(s);
 
   // A bad input must fail loudly without touching the caller's descriptor.

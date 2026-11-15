@@ -16,19 +16,23 @@ using fcp::HandshakeStatus;
 
 Bytes Nonce(uint8_t fill) { return Bytes(fcp::kHandshakeNonceLen, fill); }
 
+// Every handshake message carries the mandatory TLV block (empty here).
 Bytes MakeHello(const Bytes& sender_nonce, uint8_t ver = 1, uint8_t data = 10,
                 uint8_t parity = 3, uint8_t flags = 0x07) {
-  Bytes out(fcp::kHelloLen);
-  fcp::build_hello(fcp::HandshakeCaps{ver, data, parity, flags}, sender_nonce.data(),
-                   out.data());
+  Bytes out(fcp::kHelloLen + fcp::kTlvBlockLenBytes);
+  const uint8_t f = static_cast<uint8_t>(flags | fcp::kCapTlv);
+  CHECK(fcp::build_hello_ext(fcp::HandshakeCaps{ver, data, parity, f},
+                             sender_nonce.data(), {}, out.data(), out.size()) != 0);
   return out;
 }
 
 Bytes MakeAck(const Bytes& c_nonce, const Bytes& s_nonce, uint8_t ver = 1,
               uint8_t data = 10, uint8_t parity = 3, uint8_t flags = 0x07) {
-  Bytes out(fcp::kHelloAckLen);
-  fcp::build_hello_ack(fcp::HandshakeCaps{ver, data, parity, flags}, c_nonce.data(),
-                       s_nonce.data(), out.data());
+  Bytes out(fcp::kHelloAckLen + fcp::kTlvBlockLenBytes);
+  const uint8_t f = static_cast<uint8_t>(flags | fcp::kCapTlv);
+  CHECK(fcp::build_hello_ack_ext(fcp::HandshakeCaps{ver, data, parity, f},
+                                 c_nonce.data(), s_nonce.data(), {}, out.data(),
+                                 out.size()) != 0);
   return out;
 }
 
@@ -127,7 +131,7 @@ void TestTlvNegotiation() {
   CHECK(fcp::is_hello(c.sent[0].data(), c.sent[0].size()));
   CHECK(s.deliver(c.sent[0]) == HandshakeStatus::kConsumed);
   CHECK(s.hs.established());
-  CHECK(s.hs.tlv_negotiated());
+  CHECK((s.hs.params().flags & fcp::kCapTlv) != 0);
   CHECK_EQ(s.hs.peer_tlvs().size(), 1u);
   CHECK_EQ(s.hs.peer_tlvs()[0].type, 0x90);
   // s also opened simultaneously: its own HELLO went out first, the ACK is
@@ -137,7 +141,7 @@ void TestTlvNegotiation() {
   CHECK(fcp::is_hello_ack(s.sent[1].data(), s.sent[1].size()));
   CHECK(c.deliver(s.sent[1]) == HandshakeStatus::kConsumed);
   CHECK(c.hs.established());
-  CHECK(c.hs.tlv_negotiated());
+  CHECK((c.hs.params().flags & fcp::kCapTlv) != 0);
   // Keying is untouched by the extension: the nonce binding still holds.
   CHECK(std::memcmp(c.hs.client_nonce(), s.hs.client_nonce(),
                     fcp::kHandshakeNonceLen) == 0);
@@ -159,7 +163,7 @@ void TestTlvNegotiation() {
   CHECK(s2.sent[1].size() > fcp::kHelloAckLen);  // bit set, empty block
   CHECK(c2.deliver(s2.sent[1]) == HandshakeStatus::kConsumed);
   CHECK(c2.hs.established());
-  CHECK(c2.hs.tlv_negotiated());
+  CHECK((c2.hs.params().flags & fcp::kCapTlv) != 0);
   CHECK(c2.hs.peer_tlvs().empty());
 
   // #78: tlv_agreed(type) requires the type on BOTH sides.
@@ -182,28 +186,24 @@ void TestTlvNegotiation() {
   CHECK(!c2.hs.tlv_agreed(fcp::kTlvTypeAckV2));
 }
 
-// #77: the downgrade probe -- a peer that predates the bit never answers the
-// kCapTlv HELLOs, so the third send goes out in the plain v7 shape and a
-// plain ACK still establishes.
-void TestTlvDowngrade() {
+// Handshake messages without the TLV shape are not compatible peers: the
+// caps are rejected on both the HELLO and the ACK path.
+void TestPlainShapeRejected() {
+  Bytes plain_hello(fcp::kHelloLen);
+  fcp::build_hello(fcp::HandshakeCaps{1, 10, 3, 0x07}, Nonce(0x11).data(),
+                   plain_hello.data());
+  Peer s(10, 3, HandshakeRole::kServer, 0x22);
+  CHECK(s.deliver(plain_hello) == HandshakeStatus::kProtocolFailure);
+  CHECK(s.hs.error() == fcp::HandshakeError::kBadCaps);
+
   Peer c(10, 3, HandshakeRole::kClient, 0x11);
-  c.hs.set_local_tlvs({{0x90, {1}}});
   c.hs.start(0);
   c.hs.on_tick(0);
-  CHECK(c.sent[0].size() > fcp::kHelloLen);  // ext shape
-  c.hs.on_tick(250);
-  CHECK(c.sent[1].size() > fcp::kHelloLen);  // still probing
-  CHECK(!c.hs.tlv_downgraded());
-  c.hs.on_tick(750);
-  CHECK(c.hs.tlv_downgraded());
-  CHECK_EQ(c.sent[2].size(), fcp::kHelloLen);  // plain v7 shape
-  c.hs.on_tick(1750);
-  CHECK_EQ(c.sent[3].size(), fcp::kHelloLen);
-  // A plain ACK (what a v7-shaped server returns) establishes without TLVs.
-  const Bytes server_draw = Nonce(0x33);
-  CHECK(c.deliver(MakeAck(c.nonce, server_draw)) == HandshakeStatus::kConsumed);
-  CHECK(c.hs.established());
-  CHECK(!c.hs.tlv_negotiated());
+  Bytes plain_ack(fcp::kHelloAckLen);
+  fcp::build_hello_ack(fcp::HandshakeCaps{1, 10, 3, 0x07}, c.nonce.data(),
+                       Nonce(0x22).data(), plain_ack.data());
+  CHECK(c.deliver(plain_ack) == HandshakeStatus::kProtocolFailure);
+  CHECK(c.hs.error() == fcp::HandshakeError::kBadCaps);
 }
 
 // #77 (H2): a kCapTlv HELLO the server cannot accept is answered with an
@@ -213,8 +213,7 @@ void TestTlvErrorAck() {
   Peer s(10, 3, HandshakeRole::kServer, 0x22);
   s.hs.start(0);
   s.hs.on_tick(0);
-  // data < 1 is a caps error, and the fixed 36B message claims a TLV block it
-  // does not carry -- rejected either way, but through the error channel now.
+  // data < 1 is a caps error; the rejection rides the error TLV in the ACK.
   const Bytes bad = MakeHello(Nonce(0x11), 1, 0, 3,
                               static_cast<uint8_t>(0x07 | fcp::kCapTlv));
   CHECK(s.deliver(bad) == HandshakeStatus::kProtocolFailure);
@@ -244,12 +243,13 @@ void TestWireGolden() {
   CHECK_EQ(static_cast<int>(fcp::kLocalFlagsM1), 0x07);
 
   // "FCP_HELLO_V1" + 4 NUL padding (16-byte oob magic) |
-  // sender nonce (16) | caps (4).
+  // sender nonce (16) | caps (4) | empty TLV block (2).
   const Bytes hello = MakeHello(Nonce(0x11));
   CHECK_EQ(fcp_test::hex(hello.data(), hello.size()),
            "4643505f48454c4c4f5f563100000000"
            "11111111111111111111111111111111"
-           "010a0307");
+           "010a0327"
+           "0000");
 
   // ... and the ACK repeats the client's draw before its own.
   const Bytes ack = MakeAck(Nonce(0x11), Nonce(0x22));
@@ -257,7 +257,8 @@ void TestWireGolden() {
            "4643505f48454c4c4f5f41434b5f5631"
            "11111111111111111111111111111111"
            "22222222222222222222222222222222"
-           "010a0307");
+           "010a0327"
+           "0000");
 
   CHECK(fcp::is_hello(hello.data(), hello.size()));
   CHECK(!fcp::is_hello_ack(hello.data(), hello.size()));
@@ -451,7 +452,8 @@ void TestZeroNonceRejected() {
   CHECK(p.deliver(MakeHello(Nonce(0))) == HandshakeStatus::kProtocolFailure);
   CHECK(p.hs.state() == fcp::HandshakeState::kFailed);
   CHECK(p.hs.error() == fcp::HandshakeError::kBadNonce);
-  CHECK_EQ(p.sent.size(), 0u);  // never ACK an unusable HELLO
+  CHECK_EQ(p.sent.size(), 1u);  // the H2 error ACK, not a real ACK
+  CHECK(fcp::is_hello_ack(p.sent.back().data(), p.sent.back().size()));
 
   // Same on the ACK path: a zero server draw is unusable.
   Peer q(10, 3, HandshakeRole::kClient, 0x11);
@@ -472,7 +474,7 @@ void TestCapsNegotiation() {
   CHECK(b.deliver(a.sent[0]) == HandshakeStatus::kConsumed);
   CHECK_EQ(b.hs.params().d, 8);
   CHECK_EQ(b.hs.params().p, 2);
-  CHECK_EQ(static_cast<int>(b.hs.params().flags), 0x03);
+  CHECK_EQ(static_cast<int>(b.hs.params().flags), 0x03 | fcp::kCapTlv);
   CHECK(b.hs.params().mode == fcp::SessionMode::kFramedRepair);
 
   Peer c(10, 3, HandshakeRole::kClient, 0x33);
@@ -505,12 +507,11 @@ void TestInvalidCaps() {
     bool error_ack;
   };
   static const Case kCases[] = {
-      {2, 10, 3, 0x07, false},  // wrong caps version
-      {1, 0, 3, 0x07, false},   // data < 1
-      {1, 10, 8, 0x07, false},  // parity > 7
-      {1, 250, 7, 0x07, false}, // 257 > 256, u8 math would wrap to 1
-      {1, 10, 3, 0x20, true},   // kCapTlv claimed, block missing (#77)
-      {1, 10, 3, 0x87, false},  // reserved high bit
+      {2, 10, 3, 0x07, true},  // wrong caps version
+      {1, 0, 3, 0x07, true},   // data < 1
+      {1, 10, 8, 0x07, true},  // parity > 7
+      {1, 250, 7, 0x07, true}, // 257 > 256, u8 math would wrap to 1
+      {1, 10, 3, 0x87, true},  // reserved high bit
   };
   for (const Case& c : kCases) {
     Peer p(10, 3, HandshakeRole::kServer, 0x22);
@@ -522,14 +523,32 @@ void TestInvalidCaps() {
     CHECK(p.hs.state() == fcp::HandshakeState::kFailed);
     CHECK(p.hs.error() == fcp::HandshakeError::kBadCaps);
     if (c.error_ack) {
-      // #77 (H2): the peer set kCapTlv, so it gets the rejection channel --
-      // one ext-shaped error ACK ahead of the loud failure.
+      // #77 (H2): the rejection channel -- one error ACK ahead of the loud
+      // failure.
       CHECK_EQ(p.sent.size(), before + 1);
       CHECK(p.sent.back().size() > fcp::kHelloAckLen);
       CHECK(fcp::is_hello_ack(p.sent.back().data(), p.sent.back().size()));
     } else {
       CHECK_EQ(p.sent.size(), before);  // never ACK an invalid HELLO
     }
+  }
+
+  // kCapTlv claimed but block absent: the framing gate lets it reach the caps
+  // check, which rejects it through the error channel.
+  {
+    Peer p(10, 3, HandshakeRole::kServer, 0x22);
+    p.hs.start(0);
+    p.hs.on_tick(0);
+    const size_t before = p.sent.size();
+    Bytes missing(fcp::kHelloLen);
+    fcp::build_hello(
+        fcp::HandshakeCaps{1, 10, 3, static_cast<uint8_t>(0x07 | fcp::kCapTlv)},
+        Nonce(0x11).data(), missing.data());
+    CHECK(p.deliver(missing) == HandshakeStatus::kProtocolFailure);
+    CHECK(p.hs.error() == fcp::HandshakeError::kBadCaps);
+    CHECK_EQ(p.sent.size(), before + 1);
+    CHECK(p.sent.back().size() > fcp::kHelloAckLen);
+    CHECK(fcp::is_hello_ack(p.sent.back().data(), p.sent.back().size()));
   }
 
   // Bad caps also fail through the ACK path.
@@ -852,7 +871,7 @@ void TestNonceIsRandom() {
 int main() {
   TestTlvCodec();
   TestTlvNegotiation();
-  TestTlvDowngrade();
+  TestPlainShapeRejected();
   TestTlvErrorAck();
   TestWireGolden();
   TestMutualHandshake();

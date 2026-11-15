@@ -511,6 +511,57 @@ void TestSymbolBudgetBoundsMemory() {
   CHECK(f.rx.active_sets() <= fcp::kMaxActiveSets);
 }
 
+// A symbol the byte budget refused was marked received anyway, so the ARQ's
+// retransmission of that exact index was counted a "late duplicate" and
+// dropped without being stored: the set could never decode and the hole was
+// permanent. The retransmission is the only recovery path the budget leaves,
+// so it must be allowed to fill the slot.
+void TestBudgetDropRetryStoresOnRetransmit() {
+  Fixture f(200, 0);
+  std::vector<uint8_t> symbol(1332, 0x5A);
+  symbol[0] = static_cast<uint8_t>(symbol.size() & 0xFF);
+  symbol[1] = static_cast<uint8_t>(symbol.size() >> 8);
+
+  uint32_t sid = 0;
+  uint8_t index = 0;
+  uint32_t drop_sid = 0;
+  uint8_t drop_index = 0;
+  bool found = false;
+  for (uint32_t i = 0; i < 50000 && !found; ++i) {
+    const uint32_t before = f.rx.symbol_budget_drops();
+    f.feed(sid, index, fcp::pack_type_k(0, 0, 0), symbol, 1000);
+    if (f.rx.symbol_budget_drops() != before) {
+      drop_sid = sid;
+      drop_index = index;
+      found = true;
+    }
+    if (++index == 200) {
+      index = 0;
+      ++sid;
+    }
+  }
+  CHECK(found);
+
+  fcp::RxSetView v;
+  CHECK(f.rx.view(drop_sid, &v));
+  CHECK(v.orig_mask.test(drop_index));  // delivered even though not stored
+  const size_t stored_before = v.symbol_count;
+  const uint32_t late_before = f.rx.late_dup();
+
+  // Free the budget the way a settled/evicted set would.
+  for (uint32_t id : f.rx.active_set_ids()) {
+    if (id != drop_sid) {
+      CHECK(f.rx.release_set(id));
+    }
+  }
+
+  // The retransmission of the dropped index is stored now, not discarded.
+  f.feed(drop_sid, drop_index, fcp::pack_type_k(0, 0, 0), symbol, 1000);
+  CHECK(f.rx.view(drop_sid, &v));
+  CHECK_EQ(v.symbol_count, stored_before + 1);
+  CHECK_EQ(f.rx.late_dup(), late_before);
+}
+
 // A synchronous host delivers re-entrantly from inside the deliver callback.
 // With the table full, the eviction path used to pick the lowest id — which
 // could be the very set whose symbol was still on the stack — freeing the
@@ -843,6 +894,7 @@ int main() {
   TestMalformedDoesNotMoveAnchor();
   TestCapacityEviction();
   TestSymbolBudgetBoundsMemory();
+  TestBudgetDropRetryStoresOnRetransmit();
   TestReentrantDeliveryCannotEvictTheCurrentSet();
   TestZeroK();
   TestDupAfterRecovered();

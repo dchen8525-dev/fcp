@@ -52,6 +52,8 @@ class MainWindow : public QMainWindow {
   QWidget* buildSpeedPage();
   QWidget* buildLogPage();
   QFrame* makeCard();
+  // 给带投影的卡片四周留出效果半径的容器。
+  QWidget* pageHost(QWidget* card);
 
   // 状态与交互。
   struct Collected {
@@ -114,9 +116,6 @@ class MainWindow : public QMainWindow {
   QWidget* adv_body_ = nullptr;
   QLineEdit* listen_ = nullptr;
   QLineEdit* mtu_ = nullptr;
-  QLineEdit* budget_ = nullptr;
-  QLineEdit* k_ = nullptr;
-  QLineEdit* rate_ = nullptr;
   QLineEdit* hs_concurrency_ = nullptr;
   QCheckBox* pmtud_ = nullptr;
   QPushButton* start_ = nullptr;

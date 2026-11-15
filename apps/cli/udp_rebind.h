@@ -27,12 +27,19 @@ namespace fcp {
 // On failure: *inout is left untouched and the candidate socket is closed, so
 // the caller can retry from a consistent state. dont_fragment_ok reports
 // whether IP_DONTFRAGMENT could be set (a fresh failure must not silently
-// change the engine's one-shot PMTUD decision).
+// change the engine's one-shot PMTUD decision). source_ip_changed reports that
+// the original local address no longer exists and the INADDR_ANY fallback
+// bound a DIFFERENT source IP: the server keys peers by IP:port, so every
+// session on the old source is dead even though the port was preserved.
 inline bool RebuildConnectedUdp(SOCKET* inout, const sockaddr_in& remote,
                                 bool tune_buffers, bool dont_fragment,
-                                bool* dont_fragment_ok, std::string* error) {
+                                bool* dont_fragment_ok, std::string* error,
+                                bool* source_ip_changed = nullptr) {
   if (dont_fragment_ok != nullptr) {
     *dont_fragment_ok = false;
+  }
+  if (source_ip_changed != nullptr) {
+    *source_ip_changed = false;
   }
   if (inout == nullptr || *inout == INVALID_SOCKET) {
     *error = "udp socket already closed";
@@ -75,7 +82,9 @@ inline bool RebuildConnectedUdp(SOCKET* inout, const sockaddr_in& remote,
   }
   // Preferred: the exact original local address. Fallback: the same port on
   // INADDR_ANY, for when a VPN/interface change made the old source IP vanish.
-  // Both keep the port, which is the only part the server's peer key uses.
+  // Both keep the port, but the server keys peers by IP:port (addr_key), so a
+  // fallback that selects a different source IP silently invalidates every
+  // session. Report that instead of claiming "sessions kept".
   if (::bind(fresh, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) {
     sockaddr_in any = local;
     any.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -86,6 +95,13 @@ inline bool RebuildConnectedUdp(SOCKET* inout, const sockaddr_in& remote,
   if (::connect(fresh, reinterpret_cast<const sockaddr*>(&remote),
                 sizeof(sockaddr_in)) != 0) {
     return fail("connect");
+  }
+  if (source_ip_changed != nullptr) {
+    sockaddr_in bound{};
+    int bound_len = sizeof(bound);
+    if (::getsockname(fresh, reinterpret_cast<sockaddr*>(&bound), &bound_len) == 0) {
+      *source_ip_changed = bound.sin_addr.s_addr != local.sin_addr.s_addr;
+    }
   }
   u_long mode = 1;
   if (::ioctlsocket(fresh, FIONBIO, &mode) != 0) {

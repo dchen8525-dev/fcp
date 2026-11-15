@@ -73,9 +73,10 @@ done
   exit 1
 }
 
-# conffile 里有 FCP_PSK（postinst 首装自动生成）和运维填的 FCP_ARGS
-# （默认 --speedtest --log=debug --log-file=…），0600 起步；systemd 以
-# PID 1 读 EnvironmentFile 后注入，服务进程本身（DynamicUser）从不打开它。
+# conffile 里有 FCP_KEY_ARGS（postinst 首装自动生成 --key=HEX32）和运维
+# 填的 FCP_ARGS（默认 --speedtest --log-level=debug --log-file=…），0600
+# 起步；systemd 以 PID 1 读 EnvironmentFile 后注入，服务进程本身
+# （DynamicUser）从不打开它。密钥最终以 argv 出现在服务进程里。
 chmod 0600 "$STAGE/etc/fcp/fcp.env"
 
 # Installed-Size（KiB）。只算载荷，DEBIAN/ 不参与。

@@ -26,58 +26,33 @@ Stream::Stream(const StreamConfig& config, SegmentFn send, ReadFn read, ClosedFn
                                           : kDefaultSrttMs) {
   rto_ms_ = stream_detail::clamp_ms(2 * srtt_ms_, cfg_.rto_min_ms, cfg_.rto_max_ms);
 
-  // Autotune floor: two segments is the smallest window that can make
-  // progress at all, whatever the config says.
+  // Window bounds: the floor is two segments at this MTU, at least
+  // window_min_bytes; the ceiling is twice the floor. One knob, no operator
+  // ceiling: a configured MAX measured as a third value fighting the other two.
   const size_t seg = cfg_.max_segment > 0 ? cfg_.max_segment : 1;
   window_min_ = std::max(cfg_.window_min_bytes, 2 * seg);
-  window_max_ = std::max(cfg_.window_max_bytes, window_min_);
-  // The ceiling only follows the BDP in auto mode: a fixed window is the
-  // operator's decision, and the epoch controller has no rate model to derive a
-  // BDP from. Anything not strictly above the configured ceiling is ignored.
-  window_ceiling_ = (cfg_.auto_window && cfg_.bbr && cfg_.window_ceiling_bytes > window_max_)
-                        ? cfg_.window_ceiling_bytes
-                        : 0;
-  // A fixed window below two segments cannot make progress: pump() admits a
-  // segment only while in_flight + wire_len fits, and once a queue builds the
-  // window also has to cover the next one. `--no-auto-window --window=1` used
-  // to pass through and self-lock on the first write; the CLI rejects it, and
-  // this floor keeps every other caller (tests, embeds) safe too.
-  send_window_ = cfg_.auto_window
-                     ? std::clamp(cfg_.send_window_bytes, window_min_, window_max_)
-                     : std::max(cfg_.send_window_bytes, 2 * seg);
-  // The loss floor is the operator's start, which stays put when the prewarm
-  // prior raises the actual start. Clamp it into [window_min_, send_window_]:
-  // above the start it would pin the window above where the stream began, and
-  // below the minimum the stream could not make progress. In fixed mode the
-  // window is not clamped to window_min_, so skip the clamp there (the loss
-  // branch never runs; std::clamp would assert on a start below the minimum).
-  if (!cfg_.auto_window) {
-    loss_floor_ = send_window_;
-  } else {
-    loss_floor_ = cfg_.loss_floor_bytes == 0
-                      ? send_window_
-                      : std::clamp(cfg_.loss_floor_bytes, window_min_, send_window_);
-  }
-  ssthresh_ = window_max_;
-  // The peer's advertised window is clamped by our receive buffer, so in auto
-  // mode the floor of that buffer has to cover what the sender may grow into;
-  // otherwise the two ends tune against each other and neither moves.
-  rcv_cap_ = cfg_.auto_window ? std::max(cfg_.rcv_buf_bytes, window_max_)
-                              : cfg_.rcv_buf_bytes;
+  window_max_ = cfg_.window_max_bytes > 0 ? std::max(cfg_.window_max_bytes, window_min_)
+                                          : 2 * window_min_;
+  send_window_ = std::clamp(cfg_.send_window_bytes, window_min_, window_max_);
+  // The peer's advertised window is clamped by our receive buffer, so the
+  // buffer has to cover what the sender may grow into; otherwise the two ends
+  // tune against each other and neither moves.
+  rcv_cap_ = std::max(cfg_.rcv_buf_bytes, window_max_);
 
   Bbr::Config bbr_cfg;
   bbr_cfg.mss = seg;
   bbr_cfg.initial_cwnd = send_window_;
   bbr_cfg.min_cwnd = window_min_;
-  // BBR may grow to the ceiling even while the stream's own clamp follows the
-  // measured BDP; the stream is what decides which of the two binds.
-  bbr_cfg.max_cwnd = window_ceiling_ > 0 ? window_ceiling_ : window_max_;
+  bbr_cfg.max_cwnd = window_max_;
   bbr_cfg.initial_rtt_ms = srtt_ms_;
   bbr_cfg.version = cfg_.bbr_version;
   bbr_cfg.initial_bw_bps = cfg_.initial_bw_bps;
   bbr_cfg.initial_min_rtt_ms = cfg_.initial_min_rtt_ms;
   bbr_.configure(bbr_cfg);
-  pace_tokens_ = static_cast<double>(2 * seg);
+  // The opening burst goes out at once: the app queued it before the path had
+  // a chance to say anything, and banking only two segments here held every
+  // cold start to a two-segment trickle until the first tick banked more.
+  pace_tokens_ = static_cast<double>(send_window_);
 }
 
 size_t Stream::send_space() const {
@@ -190,7 +165,7 @@ void Stream::set_max_segment(size_t bytes) {
     // the *configured* MTU). Keep the old, smaller segment in that case: a few
     // bytes of unused MTU beat a stall. bytes is the whole session payload
     // bound, so the payload-only comparison below is conservative.
-    const size_t window = cfg_.auto_window ? window_min_ : send_window_;
+    const size_t window = window_min_;
     if (bytes > window) {
       return;
     }
@@ -408,7 +383,6 @@ void Stream::pump(int64_t now_ms) {
       // rather than the peer's receive buffer (see update_window). Until the
       // peer has actually advertised, its room is our guess, so a full local
       // window against that guess is not evidence about the path.
-      limited_epoch_ = cfg_.auto_window && peer_rwnd_seen_ && send_window_ <= peer_rwnd_;
       held = true;
       break;
     }
@@ -466,8 +440,7 @@ void Stream::pump(int64_t now_ms) {
   // window often has nothing left to hold back above; bytes on the wire up to
   // the window are the same "our window is the bottleneck" signal, and only
   // our own window can be that full (pump never passes the peer's rwnd).
-  if (cfg_.auto_window && peer_rwnd_seen_ && in_flight_ >= send_window_) {
-    limited_epoch_ = true;
+  if (peer_rwnd_seen_ && in_flight_ >= send_window_) {
   }
 }
 

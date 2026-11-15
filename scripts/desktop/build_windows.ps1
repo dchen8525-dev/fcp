@@ -30,7 +30,7 @@ if (-not $StageDir) { $StageDir = Join-Path $repo "build\gui-stage" }
 if (-not $ProxyBin) {
   # Release only. A Debug sidecar needs the Debug CRT (VCRUNTIME140D.dll /
   # ucrtbased.dll), which this script never collects, and it prints the same
-  # --version as Release, so the packaging smoke test cannot catch it. Listing
+  # -h version line as Release, so the packaging smoke test cannot catch it. Listing
   # the Debug path as a candidate shipped a GUI whose sidecar silently failed to
   # start (M-05).
   $candidates = @(
@@ -51,11 +51,12 @@ Write-Host "== sidecar: $ProxyBin"
 
 # The sidecar must report the version this repo is publishing. A stale binary
 # left over from an older build has the same file name and would otherwise ship
-# with a --version that never gets compared (M-05).
+# with a version line that never gets compared (M-05). --version was removed in
+# 0.0.20; -h prints "fcp-client <version>" on its first line and exits 0.
 $expectedVersion = (Get-Content (Join-Path $repo "VERSION") -Raw).Trim()
-$reported = (& $ProxyBin --version | Out-String).Trim()
+$reported = ([string](& $ProxyBin -h | Select-Object -First 1)).Trim()
 if ($LASTEXITCODE -ne 0) {
-  throw "sidecar --version 退出码 $LASTEXITCODE（$ProxyBin）"
+  throw "sidecar -h 退出码 $LASTEXITCODE（$ProxyBin）"
 }
 if ($reported -notmatch "fcp-client\s+$([regex]::Escape($expectedVersion))") {
   throw "sidecar 版本不符：报告 '$reported'，期望 fcp-client $expectedVersion（先重建 Release sidecar）"

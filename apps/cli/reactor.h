@@ -143,9 +143,9 @@ struct ReactorOptions {
   // than the interrupts they save. A kernel without the option (or a sandbox
   // refusing the setsockopt) degrades to the plain loop regardless.
   bool udp_gro = true;
-  // TCP connect budget for one resolved address. A name with several records
-  // may spend this per record; the engine's own dial_timeout_ms still bounds
-  // resolution plus all attempts from above.
+  // TCP connect budget for one resolved address. The CLI sets it to the
+  // engine's --dial-timeout, so one flag bounds resolution plus every attempt;
+  // tests may still drive the two independently.
   int64_t connect_timeout_ms = 5000;
   int64_t stats_ms = 0;  // 0 = no periodic stats line
   // 显示级别的下限：Debug 打开全部（默认），Off 全关。stderr 与 --log-file
@@ -163,16 +163,12 @@ struct ReactorOptions {
   // （以 / 或 \\ 结尾，或本身就是目录）时写 `<目录>/fcp-<角色>-<pid>.log`；
   // 否则按给定文件名追加写。写满 kLogFileRotateBytes（32 MiB）轮转到
   // `<名字>.1`。文件与 stderr 共用 log_level 阈值（日志等级是全局裁决
-  // 者）：默认 debug 下逐请求行都在，--log=off 时文件也安静。
+  // 者）：默认 debug 下逐请求行都在，--log-level=off 时文件也安静。
   std::string log_file;
-  // No --key* argument was given and the key came from the FCP_PSK variable
-  // (the packaged /etc/fcp/fcp.env shape: one line, unit injects it). Only
-  // marks the config echo; the key value itself is never printed anywhere.
-  bool psk_from_default_env = false;
   // Send shaping budget, bytes/s (0 = off; the CLI converts --rate-limit's
-  // Mbps). The tunnel has one upload end and one download end, so the halves
-  // never apply to the same host: the client shapes what it sends with UP, the
-  // server shapes what it sends down with DOWN. Applied at the socket send
+  // Mbps). The tunnel has one upload end and one download end: the client sets
+  // rate_up_bytes (it uploads), the server sets rate_down_bytes (it serves the
+  // download). Applied at the socket send
   // path: datagrams over the allowance are held in order for at most one
   // second's worth of budget, then dropped as a shaped link would drop them --
   // the FEC/ARQ layer is built to absorb exactly that loss.
@@ -360,7 +356,7 @@ class Reactor {
   void except_event(Sock sock, uint64_t conn, int64_t now_ms);
   void expire_connects(int64_t now_ms);
   void drain_resolves(int64_t now_ms);
-  int build_sets(fd_set* read_set, fd_set* write_set, fd_set* except_set,
+  int build_sets(int64_t now_ms, fd_set* read_set, fd_set* write_set, fd_set* except_set,
                  std::unordered_map<Sock, uint64_t>* read_conn,
                  std::unordered_map<Sock, uint64_t>* connect_conn,
                  std::unordered_map<Sock, uint64_t>* write_conn,
@@ -469,7 +465,17 @@ class Reactor {
   int64_t last_rebuild_ms_ = 0;
   int64_t next_rebuild_allowed_ms_ = 0;
   bool rebuild_pending_ = false;
+  // The last rebuild had to bind INADDR_ANY and picked a different source IP:
+  // the server keys peers by IP:port, so the old sessions are dead even though
+  // the port survived. maybe_rebuild_udp reports that instead of "sessions
+  // kept" and fails the local applications so they reconnect on the new path.
+  bool rebuild_source_changed_ = false;
   bool udp_rebuild_enabled_ = true;
+  // accept() resource-limit backoff (EMFILE & co): the listener is removed from
+  // the select set until this deadline so a full descriptor table cannot spin
+  // the loop; the error is logged at most once per 2 s.
+  int64_t accept_backoff_until_ms_ = 0;
+  int64_t accept_error_log_ms_ = 0;
   int64_t next_skip_log_ms_ = 0;
   // Send shaper: the sliding window holds {ms, bytes} of what this host has
   // passed through in the trailing second; wire_deferred_ is the ordered hold

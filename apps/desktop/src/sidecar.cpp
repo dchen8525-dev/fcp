@@ -209,19 +209,19 @@ bool Sidecar::startProxy(const ProxyConfig& config, QString* error) {
 #endif
 
   QStringList args{
-      QStringLiteral("--host=%1").arg(config.host),
-      QStringLiteral("--port=%1").arg(config.port),
-      QStringLiteral("--listen=%1").arg(config.listen),
-      QStringLiteral("--local-port=%1").arg(config.listen_port),
+      // 地址自带端口：--peer 是远端，-b/--bind 是本机代理监听（与 fcp-node
+      // 同一套语义，真正的重复拼写已在 CLI 层硬报错）。
+      QStringLiteral("--peer=%1:%2").arg(config.host).arg(config.port),
+      QStringLiteral("--bind=%1:%2").arg(config.listen).arg(config.listen_port),
+      // The walk starts here; the built-in ceiling (1500) is the default.
       QStringLiteral("--mtu=%1").arg(config.mtu),
-      QStringLiteral("--fec-budget=%1").arg(QString::number(config.fec_budget)),
-      // Raise the autotune ceiling / advertised receive capacity to 4 MiB while
-      // leaving START implicit, so the prewarm cache can still seed it.
-      QStringLiteral("--window=:4096"),
-      // PSK 只给环境变量 FCP_PSK：未给 --key* 参数时 CLI 默认读它，
-      // argv 里不再需要重复指路。
-      QStringLiteral("--log=debug"),
-      // stdout 上每 500ms 一行 stats（机器通道，与 --log 等级无关；
+      // No window argument: the CLI default (--window-min=2048, ceiling 2x)
+      // is what the GUI wants, and repeating a default only risks drift.
+      // The key is one inline value now (--key-file/--key-env/FCP_PSK are
+      // rejected by the CLI). argv is the only channel left.
+      QStringLiteral("--key=%1").arg(config.key_hex.toUpper()),
+      QStringLiteral("--log-level=debug"),
+      // stdout 上每 500ms 一行 stats（机器通道，与 --log-level 等级无关；
       // 采样图与连接时长就靠逐行解析它）。
       QStringLiteral("--stats=500"),
       // 每条请求的行落到用户数据目录的 log/ 子目录（Windows:
@@ -236,26 +236,16 @@ bool Sidecar::startProxy(const ProxyConfig& config, QString* error) {
   if (!config.pmtud) {
     args.append(QStringLiteral("--no-pmtud"));
   }
-  if (config.k >= 0) {
-    args.append(QStringLiteral("--k=%1").arg(config.k));
-  }
-  if (config.rate_up_mbps > 0.0) {
-    // 'g' 不定长（尾部零自动裁剪）：'f',1 会把 0.05 四舍五入成 0.1（限速翻倍）
-    // 或把 0.04 舍成 0.0（CLI 直接报错拒绝启动）。
-    args.append(QStringLiteral("--rate-limit=%1").arg(
-        QString::number(config.rate_up_mbps, 'g', 15)));
-  }
+  // Neither --k nor --fec-budget is passed: both were removed with the 0.0.20
+  // CLI cleanup, and the controller adapts parity/budget from measured loss.
   // 4 是 CLI 的默认值，不重复传；只有用户改了才需要显式覆盖。
   if (config.hs_concurrency != 4) {
     args.append(QStringLiteral("--hs-concurrency=%1").arg(config.hs_concurrency));
   }
-  if (!config.trace.trimmed().isEmpty()) {
-    args.append(QStringLiteral("--trace=%1").arg(config.trace.trimmed()));
+  if (!config.metrics.trimmed().isEmpty()) {
+    args.append(QStringLiteral("--metrics=%1").arg(config.metrics.trimmed()));
   }
 
-  QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-  env.insert(QStringLiteral("FCP_PSK"), config.key_hex.toUpper());
-  process->setProcessEnvironment(env);
   process->setProgram(binary);
   process->setArguments(args);
 
@@ -405,16 +395,12 @@ bool Sidecar::startSpeedTest(const SpeedTestConfig& config, QString* error) {
   });
 #endif
 
-  QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-  env.insert(QStringLiteral("FCP_PSK"), config.key_hex.toUpper());
-  process->setProcessEnvironment(env);
   process->setProgram(binary);
   QStringList args{
-      QStringLiteral("--host=%1").arg(config.host),
-      QStringLiteral("--port=%1").arg(config.port),
+      QStringLiteral("--peer=%1:%2").arg(config.host).arg(config.port),
+      QStringLiteral("--key=%1").arg(config.key_hex.toUpper()),
       QStringLiteral("--mtu=%1").arg(config.mtu),
-      QStringLiteral("--speedtest-seconds=%1").arg(config.seconds),
-      QStringLiteral("--speedtest"),
+      QStringLiteral("--speedtest=%1").arg(config.seconds),
       // 测速进程独立 pid → 独立文件（fcp-client-<pid>.log），看得清谁是谁。
       QStringLiteral("--log-file=%1/log/").arg(
           QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation)),

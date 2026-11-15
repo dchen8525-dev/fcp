@@ -288,14 +288,12 @@ def wait_port(port, timeout=12.0):
 
 
 def start_proc(path, args, log_path):
-    env = os.environ.copy()
-    env["FCP_PSK"] = PSK
     log = open(log_path, "w", encoding="utf-8", errors="replace")
     kwargs = {}
     if os.name == "nt":
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     proc = subprocess.Popen([path] + args, stdout=log,
-                            stderr=subprocess.STDOUT, env=env, **kwargs)
+                            stderr=subprocess.STDOUT, **kwargs)
     return proc, log
 
 
@@ -373,15 +371,18 @@ def main():
     server_log.parent.mkdir(exist_ok=True)
     procs, logs = [], []
     try:
+        # 0.0.20: address carries the port, --key is the only key channel, and
+        # the log threshold is --log-level.
         p, f = start_proc(args.server,
-                          ["--bind=127.0.0.1", "--port=%d" % udp_port, "--log=warn"],
+                          ["--bind=127.0.0.1:%d" % udp_port,
+                           "--key=%s" % PSK, "--log-level=warn"],
                           str(server_log))
         procs.append(p)
         logs.append(f)
         p, f = start_proc(args.client,
-                          ["--host=127.0.0.1", "--port=%d" % udp_port,
-                           "--listen=127.0.0.1", "--local-port=%d" % local_port,
-                           "--log=warn"],
+                          ["--peer=127.0.0.1:%d" % udp_port,
+                           "--bind=127.0.0.1:%d" % local_port,
+                           "--key=%s" % PSK, "--log-level=warn"],
                           str(client_log))
         procs.append(p)
         logs.append(f)

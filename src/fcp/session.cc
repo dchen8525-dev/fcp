@@ -11,6 +11,7 @@
 #include "fcp/pmtu.h"
 #include "fcp/random.h"
 #include "fcp/session_log.h"
+#include "fcp/stream.h"  // kStreamType*: emit_stream_segment classifies control segments
 #include "fcp/wire.h"
 
 namespace fcp {
@@ -211,11 +212,9 @@ Session::StartStatus Session::start(int64_t now_ms) {
   }
   // #78/#87: offer the stream capabilities that ride the handshake TLV
   // extension. The feature activates only when the peer offers the same type
-  // (Handshake::tlv_agreed); a v7 peer never sees the bit -- its refusal of
-  // kCapTlv is what the client's downgrade probe is for. The prewarm ticket
-  // (#87) rides the same block, and this is the last moment it can: the first
-  // HELLO leaves on the next on_tick(), so set_prewarm_tlv() has to have been
-  // called by now.
+  // (Handshake::tlv_agreed). The prewarm ticket (#87) rides the same block,
+  // and this is the last moment it can: the first HELLO leaves on the next
+  // on_tick(), so set_prewarm_tlv() has to have been called by now.
   {
     std::vector<HandshakeTlv> tlvs;
     if (cfg_.stream_ack_v2) {
@@ -275,12 +274,7 @@ bool Session::on_wire(const uint8_t* wire, size_t len, int64_t now_ms) {
     // touching the replay window (see envelope.h for the threat reasoning);
     // the reset flags only on the client side (the server never sends data to
     // provoke one).
-    std::vector<uint8_t> reset_plain;
-    if (hs_.role() == HandshakeRole::kClient && !reset_by_peer_ &&
-        hs_.established() && hs_env_.open_reset(wire, len, &reset_plain)) {
-      reset_by_peer_ = true;
-      log(std::string(kTagWarn) +
-          "FCP stateless reset: the peer has no session for this salt");
+    if (accept_stateless_reset(wire, len)) {
       return true;
     }
     ++auth_fail_;
@@ -367,6 +361,21 @@ bool Session::on_wire(const uint8_t* wire, size_t len, int64_t now_ms) {
   return true;
 }
 
+bool Session::accept_stateless_reset(const uint8_t* wire, size_t len) {
+  if (wire == nullptr || reset_by_peer_ ||
+      hs_.role() != HandshakeRole::kClient || !hs_.established()) {
+    return false;
+  }
+  std::vector<uint8_t> plain;
+  if (!hs_env_.open_reset(wire, len, &plain)) {
+    return false;
+  }
+  reset_by_peer_ = true;
+  log(std::string(kTagWarn) +
+      "FCP stateless reset: the peer has no session for this salt");
+  return true;
+}
+
 bool Session::on_wire_bootstrap(const std::vector<uint8_t>& plain, int64_t now_ms) {
   // Only handshake messages may travel under the bootstrap key. Anything
   // else that authenticates with it is a peer that never left the handshake
@@ -439,6 +448,21 @@ void Session::on_kcp_output(const uint8_t* seg, size_t len, int64_t now_ms) {
     }
     return;
   }
+  emit_stream_segment(seg, len, now_ms);
+}
+
+// Control segments must not sit in a repair group: a group only closes on a
+// full set or T_flush (≈srtt, capped at 200 ms), which caps acknowledgement at
+// D symbols per flush -- about 68 KB/s regardless of path capacity -- and
+// delays every SACK range by a whole round. Closing the set first puts the
+// ACK in the wire stream immediately.
+void Session::emit_stream_segment(const uint8_t* seg, size_t len, int64_t now_ms) {
+  if (len > 0 && seg != nullptr) {
+    const uint8_t type = seg[0];
+    if (type == kStreamTypeAck || type == kStreamTypeAckV2 || type == kStreamTypeRst) {
+      tx_->flush();
+    }
+  }
   tx_->on_kcp_output(seg, len, now_ms);
 }
 
@@ -462,6 +486,15 @@ void Session::on_tick(int64_t now_ms) {
   // been silent — outbound silence means the NAT mapping may rot, inbound
   // silence means the peer may be gone and this datagram doubles as the
   // probe whose (lack of) answer the liveness clock reads.
+  //
+  // The probe is paced on the last datagram that actually left, whichever
+  // silence triggered it. An inbound-silent tunnel that is still sending data
+  // is already refreshing the mapping AND asking the peer for feedback with
+  // every data datagram, so the old ""in_silent => send now"" arm put an oob on
+  // the wire every tick (~40/s) for the whole 135 s death window; the pacing
+  // gate makes it at most one probe per 45 s. A fully silent tunnel keeps the
+  // documented one-probe-per-period cadence because last_wire_out_ms_ is only
+  // refreshed here or by real outbound bytes.
   if (hs_.established()) {
     const bool out_silent = wire_out_bytes_ == keepalive_snapshot_;
     const bool in_silent =
@@ -470,12 +503,11 @@ void Session::on_tick(int64_t now_ms) {
       keepalive_snapshot_ = wire_out_bytes_;
       last_wire_out_ms_ = now_ms;
     }
-    if (out_silent || in_silent) {
-      if (out_silent ? now_ms - last_wire_out_ms_ >= kNatKeepAliveMs : true) {
-        send_oob(kKeepAliveMagic, kKeepAliveLen);
-        keepalive_snapshot_ = wire_out_bytes_;
-        last_wire_out_ms_ = now_ms;
-      }
+    if ((out_silent || in_silent) &&
+        now_ms - last_wire_out_ms_ >= kNatKeepAliveMs) {
+      send_oob(kKeepAliveMagic, kKeepAliveLen);
+      keepalive_snapshot_ = wire_out_bytes_;
+      last_wire_out_ms_ = now_ms;
     }
     // H5: the liveness verdict. Any authenticated inbound datagram refreshes
     // last_peer_in_ms_ (on_wire); three probe periods of total silence is the
@@ -506,14 +538,20 @@ void Session::on_tick(int64_t now_ms) {
     pmtu_unreachable_warned_ = false;
   }
   const int64_t since_fecstat_ms = now_ms - last_fecstat_ms_;
+  // The peer reports every 2s only while it accounts >= kFecstatMinSamples per
+  // interval; below that rate it falls back to the 60s forced door. Silence can
+  // only be judged against the cadence our own send rate implied: 256 symbols
+  // sent slowly (e.g. 43/s over 6s) never satisfied the peer's 2s door, so its
+  // first forced report may legitimately be a minute away.
+  const bool two_second_cadence =
+      data_tx_since_fecstat_ > 0 && since_fecstat_ms > 0 &&
+      static_cast<uint64_t>(data_tx_since_fecstat_) * kFecstatMinIntervalMs >=
+          static_cast<uint64_t>(kFecstatMinSamples) * static_cast<uint64_t>(since_fecstat_ms);
+  const int64_t report_period =
+      two_second_cadence ? kFecstatMinIntervalMs : kFecstatMaxIntervalMs;
   if (!fecstat_missing_warned_ && !strategy_->pinned() && data_tx_since_fecstat_ > 0 &&
       since_fecstat_ms > 0) {
-    const bool two_second_cadence =
-        static_cast<uint64_t>(data_tx_since_fecstat_) * kFecstatMinIntervalMs >=
-        static_cast<uint64_t>(kFecstatMinSamples) * static_cast<uint64_t>(since_fecstat_ms);
-    const int64_t period =
-        two_second_cadence ? kFecstatMinIntervalMs : kFecstatMaxIntervalMs;
-    if (since_fecstat_ms >= 3 * period) {
+    if (since_fecstat_ms >= 3 * report_period) {
       fecstat_missing_warned_ = true;
       char line[160];
       std::snprintf(line, sizeof(line),
@@ -529,12 +567,14 @@ void Session::on_tick(int64_t now_ms) {
   // policing case (a firewall that passes isolated probes but drops bulk at
   // the raised size, with ICMP can't-fragment suppressed) and the overload
   // case quic-go answers by recycling the whole connection. Here the
-  // evidence is quantified: >= kPmtuUnreachableSymbols data symbols sent over
-  // >= kPmtuUnreachableMs with zero feedback. Enough symbols for the peer's
-  // 2 s cadence door, and a peer that heard even one of them still reports
-  // (its forced 60 s door needs a single accounted symbol, and the report is
-  // a small oob datagram far below any probe size -- size-based path drops
-  // cannot explain the silence). Zero feedback over that window is also
+  // evidence is quantified: >= kPmtuUnreachableSymbols data symbols sent with
+  // zero feedback, held for the cadence the peer's own rules imply (6s at the
+  // 2s report cadence, the 60s forced door for a slow flow -- 256 symbols over
+  // 6s is only 43/s and would otherwise declare a healthy slow peer dead). A
+  // peer that heard even one symbol still reports: its forced 60 s door needs
+  // a single accounted symbol, and the report is a small oob datagram far
+  // below any probe size, so size-based path drops cannot explain the silence.
+  // Zero feedback over that window is also
   // unrecoverable by ARQ: retransmissions leave at the same dead size. The
   // pre-rewrite loss-report latch misfired on ordinary loss (it watched rates,
   // not silence), which is why it was removed; this condition is silence
@@ -546,7 +586,8 @@ void Session::on_tick(int64_t now_ms) {
   // costs one climb from the base; a missed one stalls the session forever.
   if (pmtud_on_ && !pmtu_unreachable_warned_ && pmtu_mtu_ > cfg_.mtu &&
       data_tx_since_fecstat_ >= kPmtuUnreachableSymbols &&
-      since_fecstat_ms >= kPmtuUnreachableMs) {
+      since_fecstat_ms >= (two_second_cadence ? kPmtuUnreachableMs
+                                              : kFecstatMaxIntervalMs)) {
     pmtu_unreachable_warned_ = true;
     char line[200];
     std::snprintf(line, sizeof(line),
@@ -616,11 +657,10 @@ void Session::configure(int64_t now_ms) {
   derive_session_key_v7(cfg_.key, cfg_.salt, hs_.client_nonce(), hs_.server_nonce(),
                         session_key);
   env_.rekey(session_key);
-  // #84: epoch rolling rides the TLV negotiation — a v7 peer keeps the
-  // byte-identical epoch-0 behavior (single key, 2^32 ceiling), while a
-  // TLV peer follows our rolls and lets us follow theirs. The capability
-  // resolves exactly here, where the negotiation result is in hand.
-  env_.set_key_update(cfg_.key_update && hs_.tlv_negotiated());
+  // #84: epoch rolling. Both ends speak the TLV handshake, so a peer follows
+  // our rolls and lets us follow theirs; epoch 0 remains the byte-identical
+  // single-key behavior.
+  env_.set_key_update(cfg_.key_update);
 
   tx_ = std::make_unique<FrameTx>(np.d, limits_,
                                   [this](const TxSymbol& symbol) { emit_symbol(symbol); });
@@ -673,8 +713,7 @@ void Session::configure(int64_t now_ms) {
   strategy_config.budget_ratio = cfg_.fec_budget;
   strategy_ = std::make_unique<FecStrategy>(strategy_config);
   tx_->set_k(strategy_->k());
-  trace_cfg_ = TraceConfigSnapshot{np.d, strategy_config.p_max,
-                                   strategy_->target_recovery(), cfg_.fec_budget,
+  trace_cfg_ = TraceConfigSnapshot{np.d, strategy_config.p_max, cfg_.fec_budget,
                                    cfg_.initial_k, pinned};
 
   // PMTUD: only when both ends advertised the capability and there is room
@@ -710,7 +749,7 @@ void Session::configure(int64_t now_ms) {
   reporter_->on_tick(now_ms);  // first tick only sets the interval baseline
   last_fecstat_ms_ = now_ms;
   for (auto& seg : hs_.take_cached_data()) {
-    tx_->on_kcp_output(seg.data(), seg.size(), now_ms);
+    emit_stream_segment(seg.data(), seg.size(), now_ms);
   }
 }
 

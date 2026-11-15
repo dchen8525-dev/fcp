@@ -72,13 +72,27 @@ const uint8_t* PeerDraw() {
 // set_id = index = 0 followed by the HELLO body. Every bootstrap-epoch test
 // starts from this, then seals it with its own envelope.
 Bytes OobHello(const uint8_t draw[fcp::kHandshakeNonceLen]) {
-  Bytes plain(fcp::kFecHdrLen + fcp::kHelloLen);
+  Bytes plain(fcp::kFecHdrLen + fcp::kHelloLen + fcp::kTlvBlockLenBytes);
   fcp::pack_hdr(
       fcp::FecHdr{0, 0, fcp::pack_type_k(0, 0, static_cast<uint8_t>(fcp::SymbolType::kOob))},
       plain.data());
-  fcp::build_hello(fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, fcp::kLocalFlagsM1}, draw,
-                   plain.data() + fcp::kFecHdrLen);
+  const uint8_t flags = static_cast<uint8_t>(fcp::kLocalFlagsM1 | fcp::kCapTlv);
+  CHECK(fcp::build_hello_ext(
+            fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, flags}, draw, {},
+            plain.data() + fcp::kFecHdrLen, plain.size() - fcp::kFecHdrLen) != 0);
   return plain;
+}
+
+// A hand-built HELLO_ACK with the mandatory empty TLV block.
+Bytes BuildAck(const uint8_t c_nonce[fcp::kHandshakeNonceLen],
+               const uint8_t s_nonce[fcp::kHandshakeNonceLen],
+               uint8_t flags = fcp::kLocalFlagsM1, uint8_t parity = 3) {
+  Bytes out(fcp::kHelloAckLen + fcp::kTlvBlockLenBytes);
+  const uint8_t f = static_cast<uint8_t>(flags | fcp::kCapTlv);
+  CHECK(fcp::build_hello_ack_ext(
+            fcp::HandshakeCaps{fcp::kCapsVersion, 10, parity, f}, c_nonce, s_nonce,
+            {}, out.data(), out.size()) != 0);
+  return out;
 }
 
 // R3-1: after the handshake the data envelope is keyed by both draws, so a
@@ -313,9 +327,16 @@ void TestFullLoop() {
     const Bytes seg = Segment(sn);
     a.on_kcp_output(seg.data(), seg.size(), link.now);
   }
-  CHECK_EQ(link.a_parity - parity_before, 40u * k1);
+  // Control segments now close the open set so an ACK never waits for a full
+  // group (Session::emit_stream_segment -> FrameTx::flush). Groups are
+  // therefore no longer guaranteed to be exactly D long, and a partial group
+  // carries ceil(k x n / D) parity instead of k. What still has to hold: every
+  // data symbol produced some parity, and no group carries more than k.
+  const uint32_t parity_delta = link.a_parity - parity_before;
+  CHECK(parity_delta > 0u);
+  CHECK(parity_delta <= 40u * k1);
   CHECK_EQ(a.tx()->data_symbols(), 800u);
-  CHECK_EQ(a.tx()->parity_symbols(), 40u * k1);
+  CHECK_EQ(a.tx()->parity_symbols(), link.a_parity);
 
   for (int64_t t = 2500; t <= 3000; t += fcp::kSessionTickMs) {
     link.now = t;
@@ -324,13 +345,19 @@ void TestFullLoop() {
   }
 
   const fcp::SettleCounters& c = b.settle()->counters();
-  CHECK_EQ(c.sets_expected, 40u);
+  // 400 segments still arrive in about 40 groups, but a partial close splits a
+  // few of them, so the count is a range rather than 40 exactly.
+  CHECK(c.sets_expected >= 40u);
+  CHECK(c.sets_expected <= 80u);
   // A set whose parity was fully lost undercounts n by at most its highest
   // data index (§4.5), so expected can trail 400 but never exceed it.
   CHECK(c.data_expected <= 400u);
   CHECK(c.data_expected > 0u);
   CHECK_EQ(c.data_rx_orig < 400u, true);
-  CHECK_EQ(c.parity_expected, 40u * k1);
+  // Planned parity sums k over every accounted set, and a partial close adds a
+  // set, so the bound is the split worst case (80 groups), not 40.
+  CHECK(c.parity_expected > 0u);
+  CHECK(c.parity_expected <= 80u * k1);
   CHECK(c.parity_rx > 0);
   CHECK(c.parity_rx < 40u * k1);
   CHECK(c.data_recovered_dl > 0);
@@ -370,10 +397,12 @@ void TestFullLoop() {
                             &pkt) == fcp::FecstatStatus::kOk);
   CHECK_EQ(pkt.flg & fcp::kFlgDirection, fcp::kFlgDirection);
   CHECK_EQ(pkt.interval_ms, 2000);
-  CHECK_EQ(pkt.sets_expected, 40u);
+  CHECK(pkt.sets_expected >= 40u);
+  CHECK(pkt.sets_expected <= 80u);
   CHECK(pkt.data_expected <= 400u);
   CHECK(pkt.data_expected > 0u);
-  CHECK_EQ(pkt.parity_expected, 40u * k1);
+  CHECK(pkt.parity_expected > 0u);
+  CHECK(pkt.parity_expected <= 80u * k1);
   CHECK(pkt.data_recovered_dl > 0);
   CHECK(pkt.repair_lat_p50_ms > 0);
   CHECK(pkt.repair_lat_p95_ms >= pkt.repair_lat_p50_ms);
@@ -443,7 +472,8 @@ void TestHandshakeRidesOob() {
   CHECK(fcp::hdr_type(hdr.type_k) == fcp::SymbolType::kOob);
   CHECK_EQ(hdr.set_id, 0u);
   CHECK_EQ(hdr.index, 0);
-  CHECK_EQ(plain.size() - fcp::kFecHdrLen, fcp::kHelloLen);
+  CHECK_EQ(plain.size() - fcp::kFecHdrLen,
+           fcp::kHelloLen + fcp::kTlvBlockLenBytes);
   CHECK(fcp::is_hello(plain.data() + fcp::kFecHdrLen, plain.size() - fcp::kFecHdrLen));
 
   // A KCP output segment that happens to start with the HELLO magic is data:
@@ -492,7 +522,9 @@ void TestHandshakeAckRidesOob() {
   CHECK(fcp::hdr_type(hdr.type_k) == fcp::SymbolType::kOob);
   CHECK_EQ(hdr.set_id, 0u);
   CHECK_EQ(hdr.index, 0);
-  CHECK_EQ(ack_plain.size() - fcp::kFecHdrLen, fcp::kHelloAckLen);
+  // BASE + block, plus whatever capability TLVs this end offered (AckV2).
+  CHECK(ack_plain.size() - fcp::kFecHdrLen >=
+        fcp::kHelloAckLen + fcp::kTlvBlockLenBytes);
   CHECK(fcp::is_hello_ack(ack_plain.data() + fcp::kFecHdrLen,
                           ack_plain.size() - fcp::kFecHdrLen));
 }
@@ -692,6 +724,105 @@ void TestPeerSilenceIsDetected() {
   CHECK(!d.peer_dead());
 }
 
+// The liveness probe has to stay paced while the tunnel is outbound-busy and
+// only the peer is silent. The old trigger sent one keepalive oob per tick for
+// the whole three-period death window (~40/s at the 25 ms tick), which is a
+// pointless flood: the data datagrams already refresh the NAT mapping and ask
+// the peer for feedback. What must survive the fix is the verdict itself --
+// the session is still declared dead on the same clock -- and the documented
+// 45 s cadence once the tunnel goes fully silent.
+void TestKeepaliveIsPacedWhileSending() {
+  Link link;
+  fcp::Session a(
+      MakeConfig(fcp::Direction::kC2S, fcp::Direction::kS2C),
+      [&link](const uint8_t* w, size_t n, fcp::SymbolType t) { link.from_a(w, n, t); },
+      [](const uint8_t*, size_t) {}, [](const std::string&) {});
+  fcp::Session b(
+      MakeConfig(fcp::Direction::kS2C, fcp::Direction::kC2S),
+      [&link](const uint8_t* w, size_t n, fcp::SymbolType t) { link.from_b(w, n, t); },
+      [](const uint8_t*, size_t) {}, [](const std::string&) {});
+  link.a = &a;
+  link.b = &b;
+  a.start(0);
+  b.start(0);
+  a.on_tick(0);
+  b.on_tick(0);
+  CHECK(a.established());
+  // Seed the liveness clock: it starts only once the peer has been heard on
+  // this session (the handshake itself runs at t=0, which is not a sample).
+  a.on_tick(100);
+  b.on_tick(100);
+  link.now = 150;
+  const Bytes seed = Segment(99);
+  a.on_kcp_output(seed.data(), seed.size(), 150);
+  b.on_kcp_output(seed.data(), seed.size(), 150);
+  CHECK(a.last_peer_in_ms() > 0);
+
+  // The peer stops answering, but this side keeps sending every tick.
+  link.blackhole = true;
+  const uint32_t oob_before = link.a_oob;
+  uint32_t sn = 1;
+  for (int64_t t = fcp::kSessionTickMs * 7; t <= 140000; t += fcp::kSessionTickMs) {
+    link.now = t;
+    const Bytes seg = Segment(sn++);
+    a.on_kcp_output(seg.data(), seg.size(), t);
+    a.on_tick(t);
+    if (a.peer_dead()) {
+      break;
+    }
+  }
+  CHECK(a.peer_dead());  // the paced probe does not blind the verdict
+  // 135 s / 25 ms ticks would be ~5400 oobs without pacing. The bound also
+  // leaves room for the forced FECSTAT reports, which share the same wire and
+  // are legitimate periodic traffic (not per-tick), so "a handful" is the
+  // property under test, not one exact sender.
+  CHECK(link.a_oob - oob_before <= 6u);
+
+  // Fully silent tunnel: outbound oob must still go out periodically. Two
+  // legitimate senders share the budget: the NAT keepalive on its 45 s cadence
+  // and the forced FECSTAT report (60 s when the flow is below the online
+  // cadence). A report refreshes the same outbound clock, so a keepalive is
+  // skipped when the report already kept the mapping alive; the total over
+  // 135 s stays small either way, while the unpaced bug emitted one per tick.
+  Link idle;
+  fcp::Session c(
+      MakeConfig(fcp::Direction::kC2S, fcp::Direction::kS2C),
+      [&idle](const uint8_t* w, size_t n, fcp::SymbolType t) { idle.from_a(w, n, t); },
+      [](const uint8_t*, size_t) {}, [](const std::string&) {});
+  fcp::Session d(
+      MakeConfig(fcp::Direction::kS2C, fcp::Direction::kC2S),
+      [&idle](const uint8_t* w, size_t n, fcp::SymbolType t) { idle.from_b(w, n, t); },
+      [](const uint8_t*, size_t) {}, [](const std::string&) {});
+  idle.a = &c;
+  idle.b = &d;
+  c.start(0);
+  d.start(0);
+  c.on_tick(0);
+  d.on_tick(0);
+  CHECK(c.established());
+  c.on_tick(100);
+  d.on_tick(100);
+  idle.now = 150;
+  c.on_kcp_output(seed.data(), seed.size(), 150);
+  d.on_kcp_output(seed.data(), seed.size(), 150);
+  CHECK(c.last_peer_in_ms() > 0);
+  idle.blackhole = true;
+  const uint32_t idle_oob_before = idle.a_oob;
+  for (int64_t t = fcp::kSessionTickMs * 7; t <= 140000; t += fcp::kSessionTickMs) {
+    idle.now = t;
+    c.on_tick(t);
+  }
+  CHECK(c.peer_dead());
+  // Every probe crosses the wire even though the peer never answers; count
+  // all oob emitted (keepalive + forced FECSTAT reports), not the ones the
+  // peer received.
+  const uint32_t probes = idle.a_oob - idle_oob_before;
+  CHECK(probes >= 1u);
+  // See the cadence note above: 3 keepalives + up to 3 forced reports in
+  // 135 s, minus the keepalives the reports make redundant.
+  CHECK(probes <= 6u);
+}
+
 // H6 (#86): the bootstrap-key reset magic marks the session dead on the spot
 // (the peer holds the PSK but lost the session), and only the client side
 // acts on it.
@@ -779,15 +910,12 @@ void TestPreNegotiationCache() {
   CHECK_EQ(s.cached_segments(), 1u);
   CHECK(sent.empty());
 
-  uint8_t ack[fcp::kHelloAckLen];
-  fcp::build_hello_ack(
-      fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, fcp::kLocalFlagsM1},
-      s.handshake_nonce(), PeerDraw(), ack);
-  Bytes plain(fcp::kFecHdrLen + sizeof(ack));
+  const Bytes ack = BuildAck(s.handshake_nonce(), PeerDraw());
+  Bytes plain(fcp::kFecHdrLen + ack.size());
   fcp::pack_hdr(
       fcp::FecHdr{0, 0, fcp::pack_type_k(0, 0, static_cast<uint8_t>(fcp::SymbolType::kOob))},
       plain.data());
-  std::memcpy(plain.data() + fcp::kFecHdrLen, ack, sizeof(ack));
+  std::memcpy(plain.data() + fcp::kFecHdrLen, ack.data(), ack.size());
 
   fcp::Envelope peer(kKey, kSalt, fcp::Direction::kS2C, fcp::Direction::kS2C);
   Bytes wire;
@@ -942,15 +1070,12 @@ void TestPreNegotiationInboundDropped() {
   s.on_kcp_output(seg.data(), seg.size(), 3);
   CHECK_EQ(s.cached_segments(), 1u);
 
-  uint8_t ack[fcp::kHelloAckLen];
-  fcp::build_hello_ack(
-      fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, fcp::kLocalFlagsM1},
-      s.handshake_nonce(), PeerDraw(), ack);
-  Bytes ack_plain(fcp::kFecHdrLen + sizeof(ack));
+  const Bytes ack = BuildAck(s.handshake_nonce(), PeerDraw());
+  Bytes ack_plain(fcp::kFecHdrLen + ack.size());
   fcp::pack_hdr(
       fcp::FecHdr{0, 0, fcp::pack_type_k(0, 0, static_cast<uint8_t>(fcp::SymbolType::kOob))},
       ack_plain.data());
-  std::memcpy(ack_plain.data() + fcp::kFecHdrLen, ack, sizeof(ack));
+  std::memcpy(ack_plain.data() + fcp::kFecHdrLen, ack.data(), ack.size());
   const Bytes ack_wire = seal(ack_plain);
   s.on_wire(ack_wire.data(), ack_wire.size(), 4);
 
@@ -993,15 +1118,12 @@ void TestQueuedGuardrailUsesObservedMinRtt() {
     s.on_wire(wire.data(), wire.size(), 10);
   };
 
-  uint8_t ack[fcp::kHelloAckLen];
-  fcp::build_hello_ack(
-      fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, fcp::kLocalFlagsM1},
-      s.handshake_nonce(), PeerDraw(), ack);
-  Bytes ack_plain(fcp::kFecHdrLen + sizeof(ack));
+  const Bytes ack = BuildAck(s.handshake_nonce(), PeerDraw());
+  Bytes ack_plain(fcp::kFecHdrLen + ack.size());
   fcp::pack_hdr(
       fcp::FecHdr{0, 0, fcp::pack_type_k(0, 0, static_cast<uint8_t>(fcp::SymbolType::kOob))},
       ack_plain.data());
-  std::memcpy(ack_plain.data() + fcp::kFecHdrLen, ack, sizeof(ack));
+  std::memcpy(ack_plain.data() + fcp::kFecHdrLen, ack.data(), ack.size());
   feed(ack_plain);
   CHECK(s.established());
 
@@ -1065,15 +1187,12 @@ void TestStaleReportNeverFeedsStrategy() {
     s.on_wire(wire.data(), wire.size(), 10);
   };
 
-  uint8_t ack[fcp::kHelloAckLen];
-  fcp::build_hello_ack(
-      fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, fcp::kLocalFlagsM1},
-      s.handshake_nonce(), PeerDraw(), ack);
-  Bytes ack_plain(fcp::kFecHdrLen + sizeof(ack));
+  const Bytes ack = BuildAck(s.handshake_nonce(), PeerDraw());
+  Bytes ack_plain(fcp::kFecHdrLen + ack.size());
   fcp::pack_hdr(
       fcp::FecHdr{0, 0, fcp::pack_type_k(0, 0, static_cast<uint8_t>(fcp::SymbolType::kOob))},
       ack_plain.data());
-  std::memcpy(ack_plain.data() + fcp::kFecHdrLen, ack, sizeof(ack));
+  std::memcpy(ack_plain.data() + fcp::kFecHdrLen, ack.data(), ack.size());
   feed(ack_plain);
   CHECK(s.established());
 
@@ -1617,12 +1736,12 @@ void TestPinnedHandshakeNonce() {
 
   fcp::SessionConfig cfg = MakeConfig(fcp::Direction::kC2S, fcp::Direction::kS2C);
   std::memcpy(cfg.handshake_nonce, pinned, sizeof(pinned));
-  // #78: pin the fixed 36B v7 HELLO shape -- the TLV offer would append a block.
+  // #78: no capability TLVs, so the block is empty -- but it is still there.
   cfg.stream_ack_v2 = false;
   const Bytes h1 = hello_plain(cfg);
   const Bytes h2 = hello_plain(cfg);
   // The plaintext carries the FEC header in front of the HELLO.
-  CHECK_EQ(h1.size(), fcp::kFecHdrLen + fcp::kHelloLen);
+  CHECK_EQ(h1.size(), fcp::kFecHdrLen + fcp::kHelloLen + fcp::kTlvBlockLenBytes);
   // The pinned draw is on the wire, verbatim, at its fixed offset.
   CHECK(std::memcmp(h1.data() + fcp::kFecHdrLen + fcp::kHelloMagicLen, pinned,
                     sizeof(pinned)) == 0);
@@ -1804,6 +1923,7 @@ int main() {
   TestInvalidLocalCaps();
   TestPinnedKClampedToNegotiatedP();
   TestPeerSilenceIsDetected();
+  TestKeepaliveIsPacedWhileSending();
   TestStatelessResetKillsTheSession();
   TestHandshakeTimeout();
   TestPreNegotiationCache();

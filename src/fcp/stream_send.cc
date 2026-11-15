@@ -196,8 +196,6 @@ void Stream::ack_dup_burst(uint32_t cum, int64_t now_ms) {
   // cheap either way; the 30% window cut is not, so only a second burst with
   // the first repair still unacked (cum has not moved) is taken as loss.
   if (fast_retx_armed_) {
-    loss_epoch_ = true;  // the peer's buffer is stuck behind a hole
-    loss_epoch_dup_ = true;
     ++dup_loss_events_;
     if (using_bbr()) {
       bbr_.on_loss();  // a probe that cannot fill must not wait for its target
@@ -400,8 +398,19 @@ void Stream::fill_holes(uint32_t sack_start, int64_t now_ms) {
         // connection (0.16 MB/s). Only dup-ACK evidence and RTOs count.
         bbr_.on_sent(now_ms, seg.wire_len(), in_flight_);
       }
+      // A synchronous host can ACK from inside send_, which pops the segments
+      // this ACK confirms off the front of tx_. Every index above is stale
+      // afterwards, including this loop's, so relocate by offset before the
+      // next round instead of trusting i + 1.
+      const uint32_t filled = seg.offset;
       emit_seg(seg);
       sent_any = true;
+      if (state_ == StreamState::kClosed) {
+        return;
+      }
+      while (i < tx_.size() && seq_after(tx_[i].offset, filled)) {
+        ++i;
+      }
     }
   }
 
@@ -439,8 +448,17 @@ void Stream::fill_holes(uint32_t sack_start, int64_t now_ms) {
     if (using_bbr()) {
       bbr_.on_sent(now_ms, seg.wire_len(), in_flight_);
     }
+    // Same reentrancy hazard as the first pass: the host may ACK from inside
+    // send_ and shift tx_ under this scan.
+    const uint32_t filled = seg.offset;
     emit_seg(seg);
     sent_any = true;
+    if (state_ == StreamState::kClosed) {
+      return;
+    }
+    while (i < tx_.size() && seq_after(tx_[i].offset, filled)) {
+      ++i;
+    }
   }
 }
 
@@ -487,7 +505,6 @@ void Stream::retransmit_timeouts(int64_t now_ms) {
     budget = budget >= seg.wire_len() ? budget - seg.wire_len() : 0;
     seg.sent_ms = now_ms;
     seg.retrans = true;
-    loss_epoch_ = true;
     ++retransmits_;
     ++retx_rto_;
     if (using_bbr()) {
@@ -596,26 +613,18 @@ void Stream::probe_zero_window(int64_t now_ms) {
                kStreamDataHdrLen;
   }
   if (next_len == 0 || peer_rwnd_ >= next_len) {
-    // Not stuck (or nothing to send): the ladder resets here, before the
-    // in-flight gate below, so a peer that reopens its window and closes it
-    // again is probed at 1x instead of inheriting an old 16x deadline.
-    probe_backoff_ = 1;
-    return;
+    return;  // not stuck, or nothing to send
   }
   if (in_flight_ != 0) {
     return;  // something is already outstanding; its ack or RTO moves us
   }
-  // F-3: back off like a TCP persist timer. Without this the probe rate is
-  // pinned to probe_ms for as long as the peer answers each probe with the
-  // same closed window — one full segment every probe_ms indefinitely, from a
-  // path that should be ~silent. The cap (16x) keeps a recovering peer's
-  // wake-up under a couple of seconds after the first few probes.
-  const int64_t interval = cfg_.probe_ms * probe_backoff_;
-  if (last_probe_ms_ != 0 && now_ms - last_probe_ms_ < interval) {
+  // Fixed cadence (see StreamConfig::probe_ms): no persist backoff. A probe is
+  // one segment and the answer is the same closed window, so backing off only
+  // lengthens the blind spot; the old x16 ladder reached 16 s.
+  if (last_probe_ms_ != 0 && now_ms - last_probe_ms_ < cfg_.probe_ms) {
     return;
   }
   last_probe_ms_ = now_ms;
-  probe_backoff_ = std::min<int64_t>(probe_backoff_ * 2, 16);
   probe_credit_ = true;
   ++probes_sent_;
   pump(now_ms);

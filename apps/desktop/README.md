@@ -67,13 +67,15 @@ cmake -S . -B build -DFCP_BUILD_PROXY=ON -DFCP_BUILD_GUI=ON \
 
 ## 行为约定
 
-* **参数**：`--host --port --listen --local-port --mtu --fec-budget
-  --window=:4096 --log=debug --stats=500 --log-file=<数据目录>/log/`，
-  `k >= 0` 时再加 `--k`。PSK 走环境变量
-  `FCP_PSK`（CLI 未给 `--key*` 参数时默认读它），不出现在命令行。
+* **参数**：`--peer=<主机>:<端口> --bind=<监听>:<本地端口>
+  --mtu=<MTU> --window=:4096 --key=<32 位十六进制>
+  --log-level=debug --stats=500 --log-file=<数据目录>/log/`。
+  没有旧参数兼容层：FEC 冗余由控制器按丢包自适应、发送速率交给
+  pacing/拥塞控制器，任何未列出的参数都按 unknown argument 退出；
+  密钥只有 `--key=` 一种入口（`--key-file` / `--key-env` / `FCP_PSK` 都会硬报错）。
 * **校验顺序**：密钥 32 位十六进制 → UDP 端口 → 本地端口 →
-  MTU 576..9000 → k -1..7 → FEC 0..1 → 监听地址非空 → 服务器地址非空。
-  高级设置折叠时按默认值提交（127.0.0.1 / 1400 / -1 / 0.5）。
+  MTU 576..9000 → 握手并发 → 监听地址非空 → 服务器地址非空。
+  高级设置折叠时按默认值提交（127.0.0.1 / 1400 / 4）。
 * **设置**：`QSettings`（Windows 注册表 `HKCU\Software\FCP\FCP Client`，
   Linux `~/.config/FCP/FCP Client.conf`）。取消"记住设置"会清空已存配置。
 * **托盘**：关窗和最小化只 `hide()`，sidecar 继续跑；真正退出走托盘菜单。

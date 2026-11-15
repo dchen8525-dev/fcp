@@ -11,11 +11,11 @@ HTTP 正向代理）送过丢包、高 RTT 的链路。基于 KCP，叠加 Reed�
 
 - **自适应 FEC**：默认 `10:3` 集合几何，冗余随丢包率与字节预算闭环调整
 - **BBR v2**（默认，可切 v1 或退回 epoch 控制器），ACK 合并、亚节拍 pacing
-- **向上 PMTUD**：从 `--mtu` 探到 1500 或 `--pmtu-max`，依赖 DF
+- **向上 PMTUD**：从 `--mtu` 探到内建上限 1500（`--mtu` 更高时随之抬高），依赖 DF
 - **一个本地端口三种入口**：SOCKS5、HTTP CONNECT（HTTPS）、absolute-form HTTP 正向代理，
   按首字节/方法自动分流；系统代理的 HTTP 与 HTTPS 栏可填同一个地址
 - **免安装客户端**：Windows 单文件 exe、Linux AppImage；服务端是 deb + systemd
-- **可观测**：`--log=stats`、`--trace` 每会话控制器轨迹、桌面端实时曲线与链路测速
+- **可观测**：`--stats` 周期统计、`--metrics` 每会话控制器指标、桌面端实时曲线与链路测速
 
 ## 下载
 
@@ -30,11 +30,11 @@ HTTP 正向代理）送过丢包、高 RTT 的链路。基于 KCP，叠加 Reed�
 ## 快速开始（CLI）
 
 ```bash
-# 服务端（PSK 是 32 位十六进制；-k 只把路径放进命令行）
-fcp-server -k /etc/fcp/psk -b :40000 --log=verbose
+# 服务端（PSK 是 32 位十六进制；--key 是唯一的密钥入口）
+fcp-server --key=<32位十六进制> -b :40000 --log-level=debug
 
 # 客户端：本地 127.0.0.1:1080 起一个三协议入口
-fcp-client -H <服务器IP>:40000 -k /etc/fcp/psk
+fcp-client --peer=<服务器IP>:40000 --key=<同一个值>
 curl --socks5-hostname 127.0.0.1:1080 https://example.com   # SOCKS5
 curl -x http://127.0.0.1:1080 https://example.com           # HTTPS 走 CONNECT
 curl -x http://127.0.0.1:1080 http://example.com/            # HTTP 走正向代理

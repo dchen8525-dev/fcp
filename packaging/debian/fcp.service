@@ -10,23 +10,22 @@ Type=simple
 # 让 systemd 每次启动分配一个无特权用户，并把下面 LogsDirectory/StateDirectory
 # 建给它 —— 下面那段"目录归服务用户所有"的说明在此之前并不成立，因为没配
 # User= 时服务是以 root 跑的，目录自然归 root。
-# 代价：默认 --port=4460 无需特权端口，若运维把它改到 1024 以下会启动失败。
+# 代价：默认 UDP 端口 4460 无需特权端口，若运维把它改到 1024 以下会启动失败。
 DynamicUser=yes
-# 参数全部来自 /etc/fcp/fcp.env（包内的 conffile）。密钥只要在里面写一行
-# `FCP_PSK=HEX32`：本 unit 以 DynamicUser 运行，systemd 以 root 读取
-# EnvironmentFile 后注入进程环境，而 fcp-server 在未给 --key* 参数时默认读
-# FCP_PSK —— 进程 argv 里没有密钥，ps 看不到，服务用户也读不了 root 的
-# 0600 文件所以 --key-file 在此不适用。显式 FCP_ARGS=--key-env=FCP_PSK
-# 依旧等价可用。
-# 未配置 FCP_PSK 时服务会以 "… FCP_PSK environment variable is required"
-# 退出，这是有意的：装了包不等于配好了密钥，见 部署运维指南.md §3/§4。
+# 参数全部来自 /etc/fcp/fcp.env（包内的 conffile）。密钥只有一种写法：
+# 在 FCP_KEY_ARGS 里写 `--key=HEX32`（postinst 首次安装会自动生成）。
+# 密钥因此出现在进程 argv 里：root 和本机用户默认能从 /proc/<pid>/cmdline
+# 读到。DynamicUser 限制了服务权限，但隐藏不了 argv；多用户主机应给 /proc
+# 挂 hidepid=2，或只在受信任的主机上部署。
+# 未配置密钥时服务会以 "--key is required …" 退出，这是有意的：装了包不等于
+# 配好了密钥，见 部署运维指南.md §3/§4。
 EnvironmentFile=-/etc/fcp/fcp.env
-ExecStart=/usr/bin/fcp-server $FCP_ARGS
+ExecStart=/usr/bin/fcp-server $FCP_KEY_ARGS $FCP_ARGS
 Restart=on-failure
 RestartSec=3
 
 # trace 与日志目录由 systemd 创建并归服务用户所有：
-#   LogsDirectory   -> /var/log/fcp   （--trace 前缀与默认
+#   LogsDirectory   -> /var/log/fcp   （--metrics 前缀与默认
 #                       --log-file=/var/log/fcp/server.log 都写这里）
 #   StateDirectory  -> /var/lib/fcp
 LogsDirectory=fcp
@@ -41,10 +40,10 @@ StateDirectoryMode=0750
 LimitNOFILE=65536
 
 # 服务端只需要 UDP 出站与本地 TCP 出站拨号，不需要任何特权。
-# AF_NETLINK 是 getifaddrs() 的依赖：自动 --mtu 默认要枚举本机接口，裸的
+# AF_NETLINK 是 getifaddrs() 的依赖：--mtu 自动取值要枚举本机接口，裸的
 # AF_INET/AF_INET6 白名单会让 socket(NETLINK_ROUTE) 返回 EAFNOSUPPORT，默认
 # 静默退化成不按接口下调（文档承诺的行为只在手工运行时成立）。
-# AF_UNIX 留给 NSS（nss-resolve 等）解析 --host，否则某些主机上 DNS 会失败。
+# AF_UNIX 留给 NSS（nss-resolve 等）解析目标主机名，否则某些主机上 DNS 会失败。
 NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes

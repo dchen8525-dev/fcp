@@ -475,13 +475,11 @@ void TestPumpAfterFillCloses() {
   CHECK_EQ(h.closes.size(), 1u);
 }
 
-// BBR pacing: the token bucket releases only what it has banked. The second
-// segment fits the initial two-segment bucket, the third must wait; the host is
-// told when the bucket will cover it, and a later tick releases the rest.
+// BBR pacing: the opening bucket is pre-charged with the start window, so one
+// pump puts the whole start window on the wire; after that the steady-state
+// cap applies and the host is told when the bucket will cover the next segment.
 void TestPaceTokenBucketAndNextWake() {
   StreamConfig c = SmallCfg();
-  c.auto_window = true;
-  c.bbr = true;
   c.send_window_bytes = 256 * 1024;
   c.window_min_bytes = 64 * 1024;
   c.window_max_bytes = 1024 * 1024;
@@ -494,17 +492,16 @@ void TestPaceTokenBucketAndNextWake() {
   const std::vector<uint8_t> src = MakeBytes(500, 11);
   CHECK_EQ(st.write(src.data(), src.size()), src.size());
   st.on_tick(h.now);
-  CHECK_EQ(h.count_data(), 2u);  // the bucket admits two segments only
+  // The whole 500-byte payload is inside the start window's opening allowance.
+  CHECK_EQ(h.count_data(), 5u);
 
   const int64_t soon = st.next_wake_ms(h.now);
-  CHECK(soon > h.now);
-  CHECK(soon <= h.now + 5);
+  CHECK(soon >= h.now);
   // Far enough ahead the predicted bucket easily covers the next segment, so
   // only the tail-probe deadline remains.
   CHECK_EQ(st.next_wake_ms(h.now + 100), h.now + 300);
 
   h.tick(1);
-  CHECK_EQ(h.count_data(), 5u);
 
   bool saw_tlp = false;
   for (int i = 0; i < 16 && !saw_tlp; ++i) {
@@ -519,79 +516,42 @@ void TestPaceTokenBucketAndNextWake() {
   CHECK_EQ(h.closes.size(), 1u);
 }
 
-// window_ceiling_bytes lets the ceiling follow the measured BDP; the receive
-// capacity is raised to match so the peer's growth is not clamped by this
-// end's buffer. Without a BDP estimate the configured MAX stays the ceiling.
-void TestWindowCeilingRefresh() {
+// The window ceiling is derived (2 x the floor), not a BDP tracker: a session
+// that proves a huge BDP is still clamped, and the receive capacity it
+// advertises follows the same ceiling.
+void TestWindowCeilingIsTwiceTheFloor() {
   StreamConfig c = SmallCfg();
-  c.auto_window = true;
-  c.bbr = true;
   c.send_window_bytes = 256 * 1024;
   c.window_min_bytes = 64 * 1024;
-  c.window_max_bytes = 256 * 1024;
-  c.window_ceiling_bytes = 4 * 1024 * 1024;
   c.rcv_buf_bytes = 256 * 1024;
-  c.initial_bw_bps = 20ull * 1000 * 1000;
+  c.initial_bw_bps = 20ull * 1000 * 1000;  // BDP 2 MiB, above the ceiling
   c.initial_min_rtt_ms = 100;
   Harness h;
   Stream& st = h.make(c);
   st.on_tick(h.now);
-  CHECK(st.send_window() > 256u * 1024);
-  CHECK(st.send_window() <= 4u * 1024 * 1024);
+  CHECK(st.send_window() >= 64u * 1024);
+  CHECK(st.send_window() <= 2u * 64u * 1024);  // clamped by the derived ceiling
   h.feed(MakeData(100, MakeBytes(100, 12), false));
   const std::vector<uint8_t> ack = h.last_ack();
   CHECK(!ack.empty());
-  CHECK(rd32(ack.data() + 5) > 256u * 1024);  // the raised rcv cap
+  // The advertised capacity is max(rcv_buf, the window ceiling): the buffer may
+  // be larger than the window without clamping the peer.
+  CHECK_EQ(rd32(ack.data() + 5), 256u * 1024 - 100u);
 
-  // No prior and no sample: bdp_bytes() is 0, so the ceiling never moves.
-  StreamConfig pinned = c;
-  pinned.initial_bw_bps = 0;
-  pinned.initial_min_rtt_ms = 0;
+  // No prior and no sample: BBR starts at the configured window and stays in
+  // the same bounds.
+  StreamConfig cold = c;
+  cold.initial_bw_bps = 0;
+  cold.initial_min_rtt_ms = 0;
   Harness g;
-  Stream& pst = g.make(pinned);
+  Stream& pst = g.make(cold);
   pst.on_tick(g.now);
-  CHECK_EQ(pst.send_window(), 256u * 1024);
+  CHECK(pst.send_window() >= 64u * 1024);
+  CHECK(pst.send_window() <= 2u * 64u * 1024);
   g.feed(MakeData(100, MakeBytes(100, 13), false));
   const std::vector<uint8_t> pack = g.last_ack();
   CHECK(!pack.empty());
   CHECK_EQ(rd32(pack.data() + 5), 256u * 1024 - 100u);
-}
-
-// window_queue_ms == 0 disables the delay brake: a limited epoch with an ACK
-// advance must still run the growth law (with no credible sample, the additive
-// one-segment step) instead of cutting.
-void TestDisabledQueueBrakeStillGrows() {
-  StreamConfig c = SmallCfg();
-  c.auto_window = true;
-  c.bbr = false;
-  c.send_window_bytes = 16 * 1024;
-  c.window_min_bytes = 4096;
-  c.window_max_bytes = 16 * 1024;
-  c.loss_floor_bytes = 4096;
-  c.window_queue_ms = 0;
-  c.rcv_buf_bytes = 16 * 1024;
-  c.initial_srtt_ms = 100;
-  c.rto_min_ms = 100;
-  Harness h;
-  Stream& st = h.make(c);
-  h.feed(MakeAck(0, 16 * 1024, 0, 0));  // confirms the peer's window
-
-  const std::vector<uint8_t> src = MakeBytes(16 * 1024, 14);
-  CHECK_EQ(st.write(src.data(), src.size()), src.size());
-  h.tick(25);  // the exact window fills: the epoch is limited
-  CHECK_EQ(st.in_flight(), 16u * 1024);
-
-  h.tick(75);   // first epoch boundary establishes the baseline
-  h.tick(100);  // no ACK yet: a limited epoch with nothing acked does nothing
-  h.tick(100);  // an RTO fires, cuts to 70% of 16 KiB
-  CHECK_EQ(st.send_window(), 11469u);
-  CHECK_EQ(st.loss_floor(), 4096u);
-
-  h.feed(MakeAck(100, 16 * 1024, 0, 0));  // one segment acked, still limited
-  h.tick(200);  // disabled brake: one additive segment instead of a cut
-  CHECK_EQ(st.send_window(), 11575u);
-  CHECK(st.retx_rto() >= 1u);
-  CHECK(!st.closed());
 }
 
 // ACK-v2 covers the fin: with the peer's fin already delivered the stream
@@ -698,8 +658,6 @@ void TestReceiveReadCallbackEdges() {
 // than a pacing wait because the window still admits nothing.
 void TestZeroWindowProbeBypassesPacer() {
   StreamConfig c = SmallCfg();
-  c.auto_window = true;
-  c.bbr = true;
   c.send_window_bytes = 256 * 1024;
   c.window_min_bytes = 64 * 1024;
   c.window_max_bytes = 1024 * 1024;
@@ -771,8 +729,7 @@ int main() {
   TestClosedFromInsideAckRotation();
   TestPumpAfterFillCloses();
   TestPaceTokenBucketAndNextWake();
-  TestWindowCeilingRefresh();
-  TestDisabledQueueBrakeStillGrows();
+  TestWindowCeilingIsTwiceTheFloor();
   TestAckV2FinCompletion();
   TestSackBlockValidationBranches();
   TestReceiveReadCallbackEdges();

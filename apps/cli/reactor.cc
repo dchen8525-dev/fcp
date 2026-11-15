@@ -55,6 +55,10 @@ constexpr uint32_t kSocketDeadStreakTrigger = 3;
 constexpr uint32_t kRebuildFailureLimit = 3;
 constexpr int64_t kRebuildBackoffBaseMs = 1000;
 constexpr int64_t kRebuildBackoffMaxMs = 30000;
+// Acceptable backlog of pending connections while accept() keeps failing on a
+// resource limit (EMFILE/ENFILE/ENOMEM). The listener is removed from the
+// select set for this long so the loop cannot spin at full speed re-failing.
+constexpr int64_t kAcceptBackoffMs = 250;
 
 #ifdef _WIN32
 int SockErr() { return static_cast<int>(WSAGetLastError()); }
@@ -544,10 +548,7 @@ bool Reactor::start(std::string* error) {
     }
   }
   // One-line config echo for support tickets. Never prints key material: the
-  // PSK lives in a file or an environment variable and stays there (C-18).
-  if (opt_.psk_from_default_env) {
-    note("key: environment variable FCP_PSK (implicit; no --key* argument given)");
-  }
+  // PSK is the inline --key value and is not echoed anywhere (C-18).
   {
     const EngineConfig& ec = base_config_;
     std::string where = opt_.role == EngineRole::kClient
@@ -558,19 +559,20 @@ bool Reactor::start(std::string* error) {
     std::snprintf(
         echo, sizeof(echo),
         "config: %s mtu=%u pmtud=%s pmtu_max=%u fec=%u:%u p_max=%u k=%d budget=%.2f "
-        "window=%s:%zuK bbr=v%d probe=%s ackx%u idle=%.0fs stall=%lldms rate=%.1fMbps",
+        "window=%s:%zuK cc=%s ackx%u idle=%.0fs stall=%lldms rate=%.1fMbps",
         where.c_str(), static_cast<unsigned>(ec.mtu), ec.pmtud ? "on" : "off",
         static_cast<unsigned>(ec.pmtu_max_mtu), static_cast<unsigned>(ec.d),
         static_cast<unsigned>(ec.p), static_cast<unsigned>(ec.p_max), ec.pinned_k,
-        ec.fec_budget, ec.auto_window ? "auto" : "fixed",
-        ec.send_window_bytes / 1024, ec.bbr_version, ec.window_probe ? "on" : "off",
+        ec.fec_budget, "auto",
+        ec.send_window_bytes / 1024,
+        ec.bbr_version == 1 ? "bbr1" : "bbr2",
         static_cast<unsigned>(ec.ack_every), ec.idle_timeout_ms / 1000.0,
         static_cast<long long>(opt_.role == EngineRole::kClient ? opt_.stall_ms : 0),
         static_cast<double>(shaper_bytes_per_sec()) * 8.0 / 1e6);
     note(echo);
   }
   // The "startup" line names bytes/s as Mbps because it is what the shaper
-  // was handed; --rate-limit halves that do not apply to this role read 0.
+  // was handed; the direction this role does not send reads 0.
   char startup[128];
   std::snprintf(startup, sizeof(startup),
                 "startup: udp=%dms listen=%dms workers=%dms total=%dms",
@@ -645,8 +647,8 @@ void Reactor::run() {
     sel_connect_.clear();
     sel_write_.clear();
     sel_except_.clear();
-    const int nfds = build_sets(&read_set, &write_set, &except_set, &sel_read_, &sel_connect_,
-                                &sel_write_, &sel_except_);
+    const int nfds = build_sets(now, &read_set, &write_set, &except_set, &sel_read_,
+                                &sel_connect_, &sel_write_, &sel_except_);
 
     timeval tv{};
     // Sub-tick deadline: a pending coalesced ACK or the pacer releasing the
@@ -809,7 +811,8 @@ int64_t Reactor::wait_ms(int64_t now_ms, int64_t wake_ms) const {
   return std::max<int64_t>(1, std::min(wait, static_cast<int64_t>(kReactorTickMs)));
 }
 
-int Reactor::build_sets(fd_set* read_set, fd_set* write_set, fd_set* except_set,
+int Reactor::build_sets(int64_t now_ms, fd_set* read_set, fd_set* write_set,
+                        fd_set* except_set,
                         std::unordered_map<Sock, uint64_t>* read_conn,
                         std::unordered_map<Sock, uint64_t>* connect_conn,
                         std::unordered_map<Sock, uint64_t>* write_conn,
@@ -883,7 +886,7 @@ int Reactor::build_sets(fd_set* read_set, fd_set* write_set, fd_set* except_set,
       ++skipped_this_pass_;
     }
   }
-  if (listener_ != kBadSock) {
+  if (listener_ != kBadSock && now_ms >= accept_backoff_until_ms_) {
     if (fits(listener_) && nread < FD_SETSIZE) {
       ++nread;
       FD_SET(listener_, read_set);
@@ -941,8 +944,16 @@ void Reactor::drain_udp(int64_t now_ms) {
     const int n = ::recvfrom(udp_, reinterpret_cast<char*>(udp_buf_.data()),
                              static_cast<int>(udp_buf_.size()), 0,
                              reinterpret_cast<sockaddr*>(&from), &from_len);
-    if (n <= 0) {
+    if (n < 0) {
       return;
+    }
+    if (n == 0) {
+      // A zero-length UDP datagram is legal: recvfrom succeeds with 0, it does
+      // not mean the socket is drained. Returning here left the socket readable
+      // and re-entered once per tick, so a flood of empty datagrams could keep
+      // the reactor one datagram behind indefinitely. There is nothing to route
+      // (drain_datagram ignores len 0); consume it and keep draining.
+      continue;
     }
     drain_datagram(from, udp_buf_.data(), static_cast<size_t>(n), now_ms);
   }
@@ -1053,6 +1064,30 @@ void Reactor::accept_local(int64_t now_ms) {
     socklen_t peer_len = sizeof(peer);
     const Sock s = ::accept(listener_, reinterpret_cast<sockaddr*>(&peer), &peer_len);
     if (s == kBadSock) {
+      const int err = SockErr();
+      if (WouldBlock(err) || Interrupted(err)) {
+        return;  // backlog drained, or a signal interrupted the syscall
+      }
+      // Descriptor/memory exhaustion is not a per-connection failure: the
+      // listener stays readable, select returns immediately, and the loop would
+      // spin a core failing accept() forever while every other connection
+      // starves. Stop watching the listener briefly; the tick retries, and the
+      // queued connections are served once the pressure eased.
+#ifdef _WIN32
+      const bool exhausted = err == WSAEMFILE;
+#else
+      const bool exhausted =
+          err == EMFILE || err == ENFILE || err == ENOBUFS || err == ENOMEM;
+#endif
+      if (exhausted) {
+        accept_backoff_until_ms_ = now_ms + kAcceptBackoffMs;
+        if (accept_error_log_ms_ == 0 || now_ms - accept_error_log_ms_ >= 2000) {
+          accept_error_log_ms_ = now_ms;
+          note("accept: " + ErrText(err) + " (resource limit); pausing accepts for " +
+                   std::to_string(kAcceptBackoffMs) + "ms",
+               Severity(LogLevel::kWarn));
+        }
+      }
       return;
     }
     // P5' N3: a blocking accepted socket would stall the single-threaded
@@ -1071,6 +1106,19 @@ void Reactor::read_socket(Sock sock, uint64_t conn, bool target, int64_t now_ms)
   uint8_t buf[kReactorMaxReadBytes];
   for (int i = 0; i < 16; ++i) {
     if (!engine_.has_connection(conn)) {
+      return;
+    }
+    // A-11 (same rule as except_event): the descriptor is a snapshot from the
+    // poll set built before this pass, and an earlier branch may have closed it
+    // -- a peer fin / refusal tearing the conn down, then accept() handing the
+    // freed number to a brand-new connection. Reading through the stale number
+    // would steal the new owner's bytes and feed them to a conn that no longer
+    // owns the socket. Only read while the table still maps this conn to the
+    // very same descriptor; re-checked every round because a host callback
+    // inside the loop can close it too.
+    const auto& table = target ? targets_ : locals_;
+    const auto live = table.find(conn);
+    if (live == table.end() || live->second != sock) {
       return;
     }
     const bool wants = target ? engine_.wants_target_read(conn) : engine_.wants_local_read(conn);
@@ -1671,6 +1719,20 @@ void Reactor::maybe_rebuild_udp(int64_t now_ms) {
     last_rebuild_ms_ = now_ms;
     next_rebuild_allowed_ms_ = now_ms + kRebuildBackoffBaseMs;
     char msg[256];
+    if (rebuild_source_changed_) {
+      // The port survived but the source IP did not: the server's peer key is
+      // IP:port, so every session on the old source is unroutable there. Fail
+      // the applications now (they retry through the new socket) instead of
+      // letting the server's liveness timer hold them for 135 s.
+      std::snprintf(msg, sizeof(msg),
+                    "udp rebuilt #%u: original source address is gone, new "
+                    "source IP has a different peer key; existing sessions "
+                    "cannot survive, failing them now",
+                    udp_rebuilds_);
+      note(msg, Severity(LogLevel::kWarn));
+      fail_fast_locals(now_ms);
+      return;
+    }
     std::snprintf(msg, sizeof(msg),
                   "udp rebuilt #%u: local port preserved, sessions kept",
                   udp_rebuilds_);
@@ -1704,8 +1766,10 @@ bool Reactor::rebuild_udp_socket(std::string* error) {
     return false;
   }
   bool df_ok = false;
+  rebuild_source_changed_ = false;
   if (!RebuildConnectedUdp(&udp_, peers_[0].addr, /*tune_buffers=*/true,
-                           base_config_.pmtud, &df_ok, error)) {
+                           base_config_.pmtud, &df_ok, error,
+                           &rebuild_source_changed_)) {
     return false;
   }
   // open_udp() applied engine_.set_pmtud(false) once at startup when DF was
@@ -1911,19 +1975,14 @@ void Reactor::flush_wire_deferred(int64_t now_ms, bool force) {
 }
 
 void Reactor::check_stall(int64_t now_ms) {
-  if (opt_.role != EngineRole::kClient || opt_.stall_ms <= 0) {
+  if (opt_.role != EngineRole::kClient) {
     return;
   }
   const ProxyEngine::Counters& c = engine_.counters();
-  if (c.live == 0 && stall_since_ms_ == 0) {
-    // 空闲隧道两个方向都冻结，这不是死路径。把基线刷到当下：否则空闲几分钟
-    // 后第一条新连接发出的 OPEN 会让 TX 看起来"还在动"，而 last_rx 还停在
-    // 上一段活跃期，看门狗就把整段空窗报成 half-open（0.0.6 实测：16:32 起
-    // 空闲 6 分钟，16:38 新连接一到就误报 371.8s，1.3s 后"恢复"）。
-    stall_last_rx_ms_ = now_ms;
-    stall_last_tx_ms_ = now_ms;
-    return;
-  }
+  // Keep the shared activity clocks current even when the watchdog itself is
+  // disabled (--stall-ms=0). check_high_loss() reads stall_last_tx_ms_ to decide
+  // whether its sample describes live traffic; frozen at 0 those clocks
+  // silently suppressed the high-loss warning for the whole run.
   const bool rx_moved = c.bytes_rx != stall_seen_rx_bytes_;
   const bool tx_moved = c.bytes_tx != stall_seen_tx_bytes_;
   if (rx_moved) {
@@ -1933,6 +1992,18 @@ void Reactor::check_stall(int64_t now_ms) {
   if (tx_moved) {
     stall_seen_tx_bytes_ = c.bytes_tx;
     stall_last_tx_ms_ = now_ms;
+  }
+  if (opt_.stall_ms <= 0) {
+    return;  // explicitly disabled: the clocks above still serve check_high_loss
+  }
+  if (c.live == 0 && stall_since_ms_ == 0) {
+    // 空闲隧道两个方向都冻结，这不是死路径。把基线刷到当下：否则空闲几分钟
+    // 后第一条新连接发出的 OPEN 会让 TX 看起来"还在动"，而 last_rx 还停在
+    // 上一段活跃期，看门狗就把整段空窗报成 half-open（0.0.6 实测：16:32 起
+    // 空闲 6 分钟，16:38 新连接一到就误报 371.8s，1.3s 后"恢复"）。
+    stall_last_rx_ms_ = now_ms;
+    stall_last_tx_ms_ = now_ms;
+    return;
   }
   if (stall_since_ms_ != 0) {
     // Recovery needs inbound on two consecutive ticks: `bytes_rx` grows on
@@ -2289,7 +2360,7 @@ void Reactor::print_stats(int64_t now_ms) {
       wire_deferred_bytes_,
       static_cast<unsigned long long>(wire_over_budget_));
   // stdout 是给 GUI/脚本的机器通道：sidecar 逐行解析这一行算出采样图与
-  // 连接时长，因此与 --log 等级无关、永远输出（--log=off 时也不静默，
+  // 连接时长，因此与 --log 等级无关、永远输出（--log-level=off 时也不静默，
   // 那是"人读通道"的开关）。
   std::printf("%s\n", row);
   std::fflush(stdout);
@@ -2334,8 +2405,8 @@ void Reactor::open_log_file() {
 
 void Reactor::note(const std::string& line, int severity) {
   // 启动/配置/stall 这类内部行没有标签，级别由调用点给（默认 info）。
-  // 与 log_line 同一把阈值尺：--log=off / --log=error 时低级别行不出场，
-  // stderr 与文件都不写（否则 --log=off 下启动横幅还会漏出来）。
+  // 与 log_line 同一把阈值尺：--log-level=off / --log-level=error 时低级别行不出场，
+  // stderr 与文件都不写（否则 --log-level=off 下启动横幅还会漏出来）。
   if (!Wanted(severity, Severity(opt_.log_level))) {
     return;
   }

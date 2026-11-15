@@ -7,8 +7,8 @@
 // agrees with the recording — the calibration loop of spec §14.1 without
 // touching a live link.
 //
-// usage: fcp-replay --trace=FILE [--d=N] [--p-max=N] [--target=F]
-//                   [--budget=F] [--initial-k=N] [--k=N|--pinned=N]
+// usage: fcp-replay --trace=FILE [--d=N] [--p-max=N]
+//                   [--budget=F] [--initial-k=N] [--k=N]
 //                   [--dump] [--require-exact]
 
 #include <cerrno>
@@ -28,7 +28,7 @@
 namespace {
 
 // Range-checked numbers come from cli_parse.h, the same code the proxy
-// CLI and fcp-bench use; --k/--pinned below only differ in which flag they name.
+// CLI and fcp-bench use.
 using fcp::tools::ParseDouble;
 using fcp::tools::ParseLong;
 
@@ -91,8 +91,8 @@ const std::string* Find(const std::map<std::string, std::string>& opts,
   return it == opts.end() ? nullptr : &it->second;
 }
 
-// Both are probabilities / ratios: target is compared against a CDF in
-// [0,1], and a budget above 1 is the same dead setting the proxy CLI rejects
+// Both are ratios in [0,1]: a budget above 1 is the same dead setting the
+// proxy CLI rejects
 // (the controller clamps it to 1). A non-finite value must never reach the
 // replay either.
 constexpr double kRatioMin = 0.0;
@@ -104,10 +104,9 @@ void Usage(const char* argv0) {
       "  --trace=FILE      JSONL controller trace (SessionConfig::trace)\n"
       "  --d=N             group size override (1..255)\n"
       "  --p-max=N         parity ceiling override (0..7)\n"
-      "  --target=F        recovery target override (default 0.8)\n"
       "  --budget=F        byte-budget ratio override (0 = off)\n"
       "  --initial-k=N     warm-up k override (-1 = cold)\n"
-      "  --k=N             pinned parity override (-1 = adaptive; --pinned still works)\n"
+      "  --k=N             pinned parity override (-1 = adaptive)\n"
       "  --dump            print the per-report trajectory\n"
       "  --require-exact   exit 1 unless replay matches the recording\n",
       argv0);
@@ -118,9 +117,8 @@ void Usage(const char* argv0) {
 // trace's recorded value while the operator believed it was overridden.
 bool KnownOption(const std::string& name) {
   return name == "help" || name == "trace" || name == "d" || name == "p-max" ||
-         name == "target" || name == "budget" || name == "initial-k" ||
-         name == "pinned" || name == "k" || name == "dump" ||
-         name == "require-exact";
+         name == "budget" || name == "initial-k" ||
+         name == "k" || name == "dump" || name == "require-exact";
 }
 
 // Split argv into "--name=value" pairs plus the three bare flags. -h/--help
@@ -215,24 +213,11 @@ bool ApplyOverrides(const std::map<std::string, std::string>& opts,
       {"p-max", 0, 7, &snapshot->p_max, nullptr},
       {"initial-k", -1, 7, nullptr, &snapshot->initial_k},
   };
-  // --k is the name the engine, the proxy CLI and fcp-bench all use for the
-  // pinned parity. --pinned predates them and keeps working; giving both is one
-  // setting twice, and a silent last-one-wins would hide a stale script.
-  const std::string* pinned = Find(opts, "pinned");
-  const std::string* k = Find(opts, "k");
-  if (pinned != nullptr && k != nullptr) {
-    std::fprintf(stderr, "--k and --pinned are the same setting; give one of them\n");
-    return false;
-  }
-  const char* pinned_name = "pinned";
-  if (pinned == nullptr) {
-    pinned = k;
-    pinned_name = "k";
-  }
-  if (pinned != nullptr) {
+  // --k is the only name for pinned parity (same flag as the engine, the proxy
+  // CLI and fcp-bench).
+  if (const std::string* k = Find(opts, "k")) {
     long n = 0;
-    const std::string flag = std::string("--") + pinned_name;
-    if (!ParseLong(flag.c_str(), pinned->c_str(), -1, 7, &n)) {
+    if (!ParseLong("--k", k->c_str(), -1, 7, &n)) {
       return false;
     }
     snapshot->pinned = static_cast<int>(n);
@@ -251,12 +236,6 @@ bool ApplyOverrides(const std::map<std::string, std::string>& opts,
       *f.u8 = static_cast<uint8_t>(n);
     } else {
       *f.i32 = static_cast<int>(n);
-    }
-  }
-  if (const std::string* v = Find(opts, "target")) {
-    if (!ParseDouble("--target", v->c_str(), kRatioMin, kRatioMax,
-                     &snapshot->target_recovery)) {
-      return false;
     }
   }
   if (const std::string* v = Find(opts, "budget")) {
@@ -379,9 +358,9 @@ int main(int argc, char** argv) {
                   ? 0LL
                   : static_cast<long long>(entries.back().now_ms -
                                            entries.front().now_ms));
-  std::printf("config d=%u pmax=%u target=%.3f budget=%.3f ik=%d pinned=%d\n",
-              snapshot.d, snapshot.p_max, snapshot.target_recovery,
-              snapshot.budget, snapshot.initial_k, snapshot.pinned);
+  std::printf("config d=%u pmax=%u budget=%.3f ik=%d pinned=%d\n",
+              snapshot.d, snapshot.p_max, snapshot.budget, snapshot.initial_k,
+              snapshot.pinned);
   std::printf("k final=%u max=%u capped=%zu hist", steps.back().k, s.k_max,
               s.capped);
   for (int k = 0; k < 8; ++k) {

@@ -134,11 +134,22 @@ void Stream::insert_chunk(uint32_t offset, const uint8_t* data, size_t len) {
   if (len == 0) {
     return;
   }
-  if (oob_.size() >= oob_max_chunks()) {
-    // The chunk ceiling is the receiver's, not the sender's: dropping here
-    // means a retransmission later, never silent data loss (the cumulative ack
-    // does not move past the missing range). A byte ceiling alone is not
-    // enough -- a peer can put one byte in each chunk.
+  // The chunk ceiling is the receiver's, not the sender's: dropping means a
+  // retransmission later, never silent data loss (the cumulative ack does not
+  // move past the missing range). A byte ceiling alone is not enough -- a peer
+  // can put one byte in each chunk.
+  //
+  // A plain drop at the ceiling is not safe for the one chunk that reaches at
+  // or below the current head: that is the only arrival that can let
+  // deliver_prefix() advance, and until it does the table cannot shrink. Drop
+  // it and the retransmission is dropped the same way -- a hole-filling
+  // deadlock that lasts until the stream idle timeout. Accept it and cut the
+  // furthest run instead: those bytes are still unacknowledged, so the sender
+  // retransmits them, while the head segment was exactly what the receiver
+  // was waiting on.
+  const size_t max_chunks = oob_max_chunks();
+  const bool reaches_head = oob_.empty() || seq_dist(offset, oob_.front().offset) <= 0;
+  if (oob_.size() >= max_chunks && !reaches_head) {
     ++oob_drops_;
     return;
   }
@@ -207,6 +218,14 @@ void Stream::insert_chunk(uint32_t offset, const uint8_t* data, size_t len) {
   in.bytes = std::move(bytes);
   oob_bytes_ += in.bytes.size();
   oob_.insert(oob_.begin() + static_cast<std::ptrdiff_t>(first), std::move(in));
+
+  // The head-reaching insertion above may have pushed the count past the
+  // ceiling (it can also reduce it, when it merges). Cut the furthest runs:
+  // like the byte trim below, they will be retransmitted.
+  while (oob_.size() > max_chunks) {
+    oob_bytes_ -= oob_.back().bytes.size();
+    oob_.pop_back();
+  }
 
   // Whatever no longer fits is cut from the tail; the sender retransmits it.
   // The limit counts the host's un-taken backlog too, so the receive side never

@@ -97,15 +97,20 @@ void TestSeedStillConverges() {
   fcp::FecStrategy st(cfg);
 
   uint32_t id = 0;
-  Feed(&st, &id, 0.002);
+  // A step down needs kFecDropStreak consecutive low reports, so the seeded
+  // k=3 walks down 3 -> 2 -> 1 over four samples rather than one per sample.
+  for (uint32_t i = 0; i < fcp::kFecDropStreak; ++i) {
+    Feed(&st, &id, 0.002);
+  }
   CHECK_EQ(st.k(), 2u);
-  Feed(&st, &id, 0.002);
-  CHECK_EQ(st.k(), 1u);
-  Feed(&st, &id, 0.002);
-  CHECK_EQ(st.k(), 1u);
-  Feed(&st, &id, 0.002);
   CHECK(st.state() == fcp::FecState::kOn);
-  Feed(&st, &id, 0.002);
+  CHECK(st.k() < 3u);  // the seed stepped down from k=3
+  CHECK(st.pinned() == false);  // a seed is not a pin
+  // The clean streak that retires the session runs alongside the step-down:
+  // five consecutive clean reports turn FEC off outright, so k ends at 0.
+  for (uint32_t i = 0; i < 5; ++i) {
+    Feed(&st, &id, 0.002);
+  }
   CHECK(st.state() == fcp::FecState::kOff);
   CHECK_EQ(st.k(), 0u);
   // The seed is history, not a constraint.
@@ -268,23 +273,21 @@ void TestApplyPrewarm() {
 
   // A converged window seeds the autotuner's start only...
   fcp::StreamConfig warm;
-  warm.auto_window = true;
   fcp::apply_prewarm(fcp::PeerProfile{0, -1, 512 * 1024}, nullptr, &warm);
   CHECK_EQ(warm.send_window_bytes, 512u * 1024);
   // ...never an explicit --window, and never a fixed window.
   fcp::StreamConfig explicit_start;
-  explicit_start.auto_window = true;
   explicit_start.send_window_explicit = true;
   explicit_start.send_window_bytes = 128 * 1024;
   fcp::apply_prewarm(fcp::PeerProfile{0, -1, 512 * 1024}, nullptr, &explicit_start);
   CHECK_EQ(explicit_start.send_window_bytes, 128u * 1024);
   fcp::StreamConfig fixed;
-  fixed.auto_window = false;
+  fixed.send_window_explicit = true;  // no fixed mode any more; pin the start
+  fixed.send_window_bytes = 128 * 1024;
   fcp::apply_prewarm(fcp::PeerProfile{0, -1, 512 * 1024}, nullptr, &fixed);
-  CHECK_EQ(fixed.send_window_bytes, fcp::kDefaultSendWindowBytes);
+  CHECK_EQ(fixed.send_window_bytes, 128u * 1024);
   // An unknown window leaves the default alone.
   fcp::StreamConfig unknown;
-  unknown.auto_window = true;
   fcp::apply_prewarm(fcp::PeerProfile{0, -1, 0}, nullptr, &unknown);
   CHECK_EQ(unknown.send_window_bytes, fcp::kDefaultSendWindowBytes);
 
@@ -292,26 +295,17 @@ void TestApplyPrewarm() {
   // minimum RTT let the next connection start in PROBE_BW instead of slow
   // starting a page of short-lived flows one at a time.
   fcp::StreamConfig ctrl;
-  ctrl.auto_window = true;  // BBR is the StreamConfig default
   fcp::apply_prewarm(fcp::PeerProfile{0, -1, 0, 20u * 1000u * 1000u, 100}, nullptr,
                      &ctrl);
   CHECK_EQ(ctrl.initial_bw_bps, 20u * 1000u * 1000u);
   CHECK_EQ(ctrl.initial_min_rtt_ms, 100);
   // An explicit --window start is the operator's operating point: no prior.
   fcp::StreamConfig pinned;
-  pinned.auto_window = true;
   pinned.send_window_explicit = true;
   fcp::apply_prewarm(fcp::PeerProfile{0, -1, 0, 20u * 1000u * 1000u, 100}, nullptr,
                      &pinned);
   CHECK_EQ(pinned.initial_bw_bps, 0u);
   CHECK_EQ(pinned.initial_min_rtt_ms, 0);
-  // The epoch controller has no rate model to seed.
-  fcp::StreamConfig epoch;
-  epoch.auto_window = true;
-  epoch.bbr = false;
-  fcp::apply_prewarm(fcp::PeerProfile{0, -1, 0, 20u * 1000u * 1000u, 100}, nullptr,
-                     &epoch);
-  CHECK_EQ(epoch.initial_bw_bps, 0u);
 }
 
 // The point of the whole exercise: the first set of a brand-new session
@@ -480,7 +474,6 @@ void TestTicketRejectsMalformed() {
 // may hand this end a start above the ceiling it was configured with.
 void TestWindowPriorCappedByOwnCeiling() {
   fcp::StreamConfig cfg;
-  cfg.auto_window = true;
   cfg.window_max_bytes = 4096u * 1024u;
   // 16 GiB is the widest value the ticket's 24-bit KiB field can carry. Written
   // as a size_t literal: `16u * 1024 * 1024 * 1024` wraps to 0 in 32-bit
@@ -491,14 +484,12 @@ void TestWindowPriorCappedByOwnCeiling() {
 
   // Below the ceiling the prior is taken as-is.
   fcp::StreamConfig small;
-  small.auto_window = true;
   small.window_max_bytes = 4096u * 1024u;
   fcp::apply_prewarm(fcp::PeerProfile{0, -1, 512u * 1024u, 0, 0}, nullptr, &small);
   CHECK_EQ(small.send_window_bytes, 512u * 1024u);
 
   // An explicit --window still wins outright.
   fcp::StreamConfig pinned;
-  pinned.auto_window = true;
   pinned.send_window_explicit = true;
   pinned.send_window_bytes = 64u * 1024u;
   pinned.window_max_bytes = 4096u * 1024u;

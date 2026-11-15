@@ -72,8 +72,8 @@ void derive_direction_keys(const uint8_t session_key[16],
                            uint8_t key_c2s[16], uint8_t key_s2c[16]);
 
 // #84 (key update): the per-epoch direction key for epoch >= 1. Epoch 0 keeps
-// the #26② derivation byte-for-byte, so v7 golden vectors and v7 peers are
-// untouched. The PRF is the same AES-128 the envelope already verifies (the
+// the #26② derivation byte-for-byte, so the golden vectors stay stable. The
+// PRF is the same AES-128 the envelope already verifies (the
 // derive_session_key construction is the precedent); the input block binds the
 // direction label and the epoch, so every epoch of every direction lands on a
 // distinct key.
@@ -106,6 +106,11 @@ class Envelope {
   // the #26② key, which keeps the v7 wire behavior byte-identical until the
   // first roll (rolling itself is only enabled for TLV-negotiated peers).
   static constexpr uint64_t kEpochSpan = 1ull << 24;
+  // Absolute end of the key-update epoch space: epoch numbers 0..65535, each
+  // kEpochSpan packets wide. With rolling enabled this replaces the single-key
+  // 2^32 packet budget as the hard ceiling; the per-key invocation count is
+  // bounded by kEpochSpan instead.
+  static constexpr uint64_t kEpochSpaceEnd = 65536ull * kEpochSpan;
   // quic-go exercises the key-update mechanism almost immediately
   // (FirstKeyUpdateInterval = 100 packets): the first roll is cheap and a
   // latent bug in the rollover surfaces in the first seconds, not mid-transfer
@@ -175,11 +180,20 @@ class Envelope {
   bool open_reset(const uint8_t* wire, size_t len, std::vector<uint8_t>* plain);
 
   // #84: enables epoch rolling (send side) and multi-epoch receive keys. Only
-  // meaningful on the data envelope, only after rekey(), and only for a
-  // TLV-negotiated peer — a v7 peer keeps the byte-identical epoch-0 behavior.
-  // The receive side follows the peer's rolls by reading the epoch out of the
-  // nonce's high bits; no negotiation beyond the capability bit is needed.
-  void set_key_update(bool enabled) { key_update_ = enabled; }
+  // meaningful on the data envelope and only after rekey(). The receive side
+  // follows the peer's rolls by reading the epoch out of the nonce's high
+  // bits; no extra negotiation is needed.
+  void set_key_update(bool enabled) {
+    key_update_ = enabled;
+    // #84: install_keys() arms the single-key 2^32 budget, which is the right
+    // ceiling only while no roll happens. Rolling bounds each key's invocations
+    // to kEpochSpan, so the session's own bound becomes the u16 epoch space --
+    // leaving 2^32 in place disconnected a key-update session after 2^32
+    // packets even though every one of its keys had sealed far less, and the
+    // receive ceiling then rejected the peer's legitimate later epochs too.
+    counter_ceiling_ = enabled ? kEpochSpaceEnd : kNonceLimit;
+    send_limit_ = enabled ? kEpochSpaceEnd : kNonceLimit;
+  }
   bool key_update() const { return key_update_; }
   uint64_t send_epoch() const { return send_nonce_ / kEpochSpan; }
 

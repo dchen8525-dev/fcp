@@ -16,13 +16,13 @@
 // replayed to rebuild the very same (key, IV) pair on both ends, and the
 // per-session replay window would happily accept the recorded data as new.
 //
-//   HELLO     = magic16 | sender_nonce16 | caps4              (36)
-//   HELLO_ACK = magic16 | client_nonce16 | server_nonce16 | caps4  (52)
+//   HELLO     = magic16 | sender_nonce16 | caps4 | tlv_block
+//   HELLO_ACK = magic16 | client_nonce16 | server_nonce16 | caps4 | tlv_block
 //
-// #77 adds an optional TLV block after caps4 whenever caps.flags carries
-// kCapTlv: [block_len(2 LE)][type(1)|len(1)|value]... -- the extension
-// channel future parameters negotiate through (see the TLV section below
-// is_hello).
+// The TLV block (#77) is [block_len(2 LE)][type(1)|len(1)|value]... and is
+// mandatory on every handshake message: both ends speak this shape, so there
+// is no plain-message fallback and no negotiation of the block itself. Future
+// parameters negotiate through the block's types; unknown types are ignored.
 //
 // HELLO carries only the sender's own draw; the reader maps it by ROLE (the
 // C2S side's draw is the client nonce, the S2C side's is the server nonce), so
@@ -56,13 +56,11 @@ constexpr uint8_t kCapDeadline = 1u << 3;  // optional, M2
 // does not know the bit rejects the caps (reserved bits are a hard gate), so
 // both ends must be updated together for PMTUD to be usable.
 constexpr uint8_t kCapPmtud = 1u << 4;     // optional, M2
-// TLV extension (#77, 施工单 step 2): the caps carry a TLV block after the
-// fixed fields. Unknown TLV types are ignored by both sides (forward
-// compatibility -- future parameters ride this without another handshake
-// format change); a peer that does not know the BIT still rejects it, which
-// is why the client probes: two unanswered TLV-carrying HELLOs and it
-// downgrades to the plain v7 shape for the rest of the handshake.
-constexpr uint8_t kCapTlv = 1u << 5;       // optional, #77
+// TLV extension (#77, 施工单 step 2): every handshake message carries the TLV
+// block after the fixed fields, so the bit is required rather than optional.
+// Unknown TLV types are ignored by both sides; future parameters ride this
+// without another handshake format change.
+constexpr uint8_t kCapTlv = 1u << 5;       // required, #77
 constexpr uint8_t kCapKnownMask = 0x3F;    // bits 6..7 must be zero
 
 // M1 advertises framing + FECSTAT + per-set k.
@@ -83,10 +81,9 @@ constexpr size_t kHandshakeNonceLen = 16;
 constexpr size_t kHelloLen = kHelloMagicLen + kHandshakeNonceLen + kCapsLen;  // 36
 constexpr size_t kHelloAckLen =
     kHelloAckMagicLen + 2 * kHandshakeNonceLen + kCapsLen;  // 52
-// TLV block (#77): [block_len(2 LE)][type(1) | len(1) | value]... The block
-// rides after the fixed caps4 in HELLO/HELLO_ACK whenever caps.flags carries
-// kCapTlv; a fixed-size message with kCapTlv set (block claimed, absent) is a
-// caps error. Unknown types parse through and are ignored by the caller.
+// TLV block (#77): [block_len(2 LE)][type(1) | len(1) | value]... It always
+// follows the fixed caps4 in HELLO/HELLO_ACK (kCapTlv is required); a message
+// that omits it is a caps error. Unknown types parse through and are ignored.
 constexpr size_t kTlvBlockLenBytes = 2;
 constexpr size_t kTlvOverhead = 2;         // type + len per TLV
 constexpr size_t kTlvMaxValueLen = 255;
@@ -192,18 +189,18 @@ struct HandshakeTlv {
   std::vector<uint8_t> value;
 };
 
-// Encodes [block_len(2 LE)][tlv]...; returns the bytes written, 0 when `tlvs`
-// is empty (callers then send the fixed-size message) or the block would
-// exceed kTlvBlockMaxLen / out_cap.
+// Encodes [block_len(2 LE)][tlv]...; an empty set encodes a zero-length block.
+// Returns the bytes written, or 0 when the block would exceed
+// kTlvBlockMaxLen / out_cap or a TLV is invalid.
 size_t tlv_encode(const std::vector<HandshakeTlv>& tlvs, uint8_t* out, size_t cap);
 // Parses a block (without the 2-byte length prefix). Unknown types come back;
 // type 0, truncation, or a value length past the buffer returns false.
 bool tlv_parse(const uint8_t* block, size_t len, std::vector<HandshakeTlv>* out);
 
-// Fixed-size builders with a TLV block appended (#77): the caps in `caps` must
-// already carry kCapTlv (the caller's decision). Returns 0 when `tlvs` is
-// empty, the block does not fit kTlvBlockMaxLen, or `cap` is too small --
-// callers fall back to the fixed-size builders above.
+// Handshake builders with the mandatory TLV block appended (#77). `caps` must
+// carry kCapTlv. Returns 0 when the block does not fit kTlvBlockMaxLen or
+// `cap` is too small, or a TLV is invalid; an empty set is legal and encodes a
+// zero-length block.
 size_t build_hello_ext(const HandshakeCaps& caps, const uint8_t sender_nonce[16],
                        const std::vector<HandshakeTlv>& tlvs, uint8_t* out,
                        size_t cap);
@@ -264,26 +261,17 @@ class Handshake {
   int retries() const { return retries_; }
   int64_t next_retry_ms() const { return next_retry_ms_; }
 
-  // TLV extension (#77). `set_local_tlvs` arms the client-side downgrade
-  // probe: the first two HELLOs carry the block (kCapTlv), and if nothing
-  // answers by the third send the rest go out in the plain v7 shape -- a peer
-  // that predates the bit rejects the caps outright and never ACKs. The
-  // negotiated bit is params().flags & kCapTlv (set only when BOTH sides
-  // carried it). `peer_error()` is the H2 channel: the peer parsed our
-  // handshake and refused it (error TLV in the ACK), so the handshake failed
-  // immediately instead of running out the retry table.
+  // TLV extension (#77). `set_local_tlvs` sets the block carried by every
+  // HELLO/ACK this end sends; an empty set is a zero-length block. `peer_tlvs`
+  // is what the peer offered. `peer_error()` is the H2 channel: the peer
+  // parsed our handshake and refused it (error TLV in the ACK), so the
+  // handshake failed immediately instead of running out the retry table.
   void set_local_tlvs(std::vector<HandshakeTlv> tlvs);
-  bool tlv_downgraded() const { return tlv_downgraded_; }
-  bool tlv_negotiated() const { return (params_.flags & kCapTlv) != 0; }
   const std::vector<HandshakeTlv>& peer_tlvs() const { return peer_tlvs_; }
   HandshakeError peer_error() const { return peer_error_; }
-  // #78: capability `type` was offered by BOTH ends -- the negotiated bit is
-  // on and the type appears in both TLV sets. The feature behind the type is
-  // then active for this session.
+  // #78: capability `type` was offered by BOTH ends. The feature behind the
+  // type is then active for this session.
   bool tlv_agreed(uint8_t type) const {
-    if (!tlv_negotiated()) {
-      return false;
-    }
     const auto has = [type](const std::vector<HandshakeTlv>& v) {
       for (const auto& t : v) {
         if (t.type == type) {
@@ -367,15 +355,10 @@ class Handshake {
   // when a prewarm prior was passed in. Every later gap doubles this one.
   int64_t first_gap_ms_ = kHandshakeRetryMs;
 
-  // TLV extension state (#77). `tlv_downgraded_` flips once two TLV-carrying
-  // HELLOs went out unanswered; `peer_tlv_hello_` remembers whether the HELLO
-  // that established us carried the bit, so a re-ACKed duplicate keeps the
-  // same shape as the first ACK.
+  // TLV extension state (#77). Every outgoing message carries local_tlvs_;
+  // peer_tlvs_ is the block from the peer that established us.
   std::vector<HandshakeTlv> local_tlvs_;
   std::vector<HandshakeTlv> peer_tlvs_;
-  bool tlv_downgraded_ = false;
-  bool tlv_offered_ = false;  // sticky: an ext-shape HELLO went out (#77)
-  bool peer_tlv_hello_ = false;
   HandshakeError peer_error_ = HandshakeError::kNone;
 
   std::vector<std::vector<uint8_t>> cached_;

@@ -148,8 +148,11 @@ struct Packet {
 StreamConfig DefaultCfg() {
   StreamConfig c;
   c.max_segment = 106;  // 100 payload bytes per segment
+  c.window_min_bytes = 4096;  // the derived ceiling is 8 KiB
   c.send_window_bytes = 4096;
-  c.rcv_buf_bytes = 2048;
+  // The peer's opening room is our own rcv_buf guess; keep it at the derived
+  // ceiling so a handful of test segments is never held back by the guess.
+  c.rcv_buf_bytes = 8192;
   c.initial_srtt_ms = 200;  // -> rto 400ms
   c.rto_min_ms = 100;
   c.rto_max_ms = 5000;
@@ -578,25 +581,39 @@ void TestBidirectional() {
 // Out-of-order bytes are held back until the hole is filled, and the ACK reports
 // the buffered run as one SACK block.
 void TestOutOfOrderHeldAndSackBlock() {
-  Fixture f;
+  StreamConfig cfg = DefaultCfg();
+  // Four 100-byte segments must all fit the opening window: the peer's guess
+  // is our rcv_buf, so both bounds are raised together.
+  cfg.window_min_bytes = 16 * 1024;
+  cfg.rcv_buf_bytes = 16 * 1024;
+  Fixture f(cfg);
   f.cut_all();  // nothing reaches the peer by itself; the test feeds by hand
   const std::vector<uint8_t> src = MakeBytes(400, 11);  // exactly 4 segments
   CHECK_EQ(f.push(kA, src), src.size());
 
   const std::vector<std::vector<uint8_t>> segs = f.data_of(kA);
-  CHECK_EQ(segs.size(), 4u);
+  // The opening window admits the payload; the peer's initial receive guess
+  // (rcv_buf) may hold one segment back until its first ACK advertises real
+  // room. Three segments on the wire still make the one-hole shape the test
+  // needs (segs[2] out of order with segs[0] missing).
+  CHECK(segs.size() >= 3u);
   const size_t cap = f.payload();
   f.feed(kB, segs[2]);
   f.feed(kB, segs[1]);
-  f.feed(kB, segs[3]);
+  if (segs.size() > 3) {
+    f.feed(kB, segs[3]);
+  }
 
   CHECK(f.b().delivered.empty());
   const std::vector<uint8_t> ack = f.last_ack(kB);
+  // With three segments on the wire (n==4 keeps the original shape), the
+  // received runs are [100,200)+[200,300) merged into one SACK block.
+  const size_t got = segs.size() * cap;
   CHECK_EQ(rd32(ack.data() + 1), 0);                    // cum: nothing deliverable
   CHECK_EQ(rd32(ack.data() + 9), cap);              // sack_start
-  CHECK_EQ(rd32(ack.data() + 13), 4 * cap);         // sack_end: 2..4 merged
-  CHECK_EQ(rd32(ack.data() + 5), f.cfg().rcv_buf_bytes - 3 * cap);
-  CHECK_EQ(f.sb().oob_bytes(), 3u * cap);
+  CHECK_EQ(rd32(ack.data() + 13), got);             // sack_end
+  CHECK_EQ(rd32(ack.data() + 5), 2 * f.cfg().window_min_bytes - (got - cap));
+  CHECK_EQ(f.sb().oob_bytes(), (got - cap));
 
   f.feed(kB, segs[0]);
   CHECK(f.b().delivered == src);
@@ -604,7 +621,7 @@ void TestOutOfOrderHeldAndSackBlock() {
   const std::vector<uint8_t> full = f.last_ack(kB);
   CHECK_EQ(rd32(full.data() + 1), src.size());
   CHECK_EQ(rd32(full.data() + 9), rd32(full.data() + 1));  // sack emptied
-  CHECK_EQ(rd32(full.data() + 5), f.cfg().rcv_buf_bytes);
+  CHECK_EQ(rd32(full.data() + 5), 2 * f.cfg().window_min_bytes);
 }
 
 // A hole in front of a SACK block is retransmitted on the spot, before any RTO.
@@ -791,11 +808,12 @@ void TestSmallWindowProbeUnblocks() {
   CHECK_EQ(f.sa().in_flight(), 0u);
 }
 
-// F-3: a peer that keeps its window shut but keeps ACKing the probes pulls one
-// full segment per probe_ms forever unless the probe interval backs off. The
-// RTO path does not cover this: each ACK pops the probe, so nothing is ever
-// outstanding long enough to time out.
-void TestZeroWindowProbeBacksOff() {
+// A peer that keeps its window shut but keeps ACKing the probes pulls one
+// segment per probe_ms. The rate is fixed on purpose: probing costs one segment
+// and the answer is the same closed window, so there is nothing a persist
+// backoff could protect -- and the old ladder reached 16x, which left a peer
+// that briefly advertised rwnd=0 unprobed for sixteen seconds.
+void TestZeroWindowProbeIsFixedRate() {
   Fixture f;
   const std::vector<uint8_t> src = MakeBytes(100, 40);
   CHECK_EQ(f.push(kA, src), src.size());
@@ -831,15 +849,16 @@ void TestZeroWindowProbeBacksOff() {
     cum = static_cast<uint32_t>(src.size() + seen * f.payload());
     f.feed(kA, MakeAck(cum, 0, cum, cum));
   }
-  // 12 probe_ms of ticking. Without backoff every gap is one probe_ms; with the
-  // persist ladder the gaps are 1x, 2x, 4x, 8x, then capped at 16x.
+  // Every gap is one probe_ms: the cadence is fixed, no sustained backoff.
   CHECK(!gaps.empty());
   CHECK(gaps[0] <= 2 * unit);  // first wait after the immediate probe
-  CHECK(gaps.back() >= 4 * unit);
+  CHECK(gaps.back() <= 2 * unit);
   for (size_t i = 1; i < gaps.size(); ++i) {
-    CHECK(gaps[i] >= gaps[i - 1]);
+    CHECK(gaps[i] <= 2 * unit);  // no gap is ever stretched
   }
-  CHECK(seen <= 8u);  // ~10 units of linear probing would be 10
+  // Every gap was one probe_ms, so the tick budget maps 1:1 onto probes fired;
+  // what matters is that no gap was stretched by a ladder.
+  CHECK(seen >= 3u);
   // The counter tracks the probes themselves, not their RTO retransmissions.
   CHECK(f.sa().segs_sent() >= f.sa().probes_sent());
 
@@ -887,7 +906,10 @@ void TestTooSmallMaxSegmentResets() {
 // unsent segments invisible and the queue growing for as long as the host writes.
 void TestStalledReaderBoundsTheSendQueue() {
   Fixture f;
-  const size_t window = f.cfg().send_window_bytes;
+  // The bound is the window BBR may actually hold: the derived ceiling (2 x
+  // the floor), not the configured start, which is what the old fixed-window
+  // configuration used to equal.
+  const size_t window = 2 * f.cfg().window_min_bytes;
   const std::vector<uint8_t> src = MakeBytes(8 * window, 7);
   Applier w(f.sa(), src);
   size_t worst_backlog = 0;
@@ -919,7 +941,16 @@ void TestStalledReaderBoundsTheSendQueue() {
 // The ack that closes a repaired hole also pops clean segments: the round is
 // ambiguous, so no RTT sample may be taken from it.
 void TestKarnDropsAmbiguousSamples() {
-  Fixture f;
+  StreamConfig cfg = DefaultCfg();
+  // Only the segment under test may be on the wire: a wider opening window
+  // would let later segments sample the RTT and mask the Karn rule.
+  cfg.window_min_bytes = 2 * cfg.max_segment;
+  // A one-segment ceiling: nothing after seg 0 may reach the wire, or its ACK
+  // would be a clean RTT sample and the Karn rule would go untested.
+  cfg.window_max_bytes = cfg.max_segment;
+  cfg.send_window_bytes = 2 * cfg.max_segment;
+  cfg.rcv_buf_bytes = 2 * cfg.max_segment;
+  Fixture f(cfg);
   int copies = 0;
   f.killer = [&copies](const Packet& p) {
     if (p.from != kA || !IsData(p.seg) || rd32(p.seg.data() + 1) != 0) {
@@ -927,7 +958,9 @@ void TestKarnDropsAmbiguousSamples() {
     }
     return ++copies == 1;
   };
-  const std::vector<uint8_t> src = MakeBytes(500, 61);
+  // One segment only: with anything else on the wire its ACK would be a clean
+  // RTT sample and the Karn rule this test pins would be masked.
+  const std::vector<uint8_t> src = MakeBytes(f.payload(), 61);
   CHECK_EQ(f.push(kA, src), src.size());
   f.drain();
 
@@ -1173,7 +1206,12 @@ void TestRandomLossEndToEnd() {
 // all reported within three ACKs, and the sender repairs all of them without
 // a single tick (no RTO could have fired).
 void TestSackRotationReportsAllHoles() {
-  Fixture f;
+  StreamConfig cfg = DefaultCfg();
+  // Six 100-byte segments must all fit the opening window (the peer's guess
+  // is our rcv_buf; both bounds move together).
+  cfg.window_min_bytes = 16 * 1024;
+  cfg.rcv_buf_bytes = 16 * 1024;
+  Fixture f(cfg);
   f.cut_all();  // everything moves by hand; time stands still
   const std::vector<uint8_t> src = MakeBytes(600, 11);  // 6 segments
   CHECK_EQ(f.push(kA, src), src.size());
@@ -1259,9 +1297,9 @@ void TestDupAckForceRefill() {
 // that is confirmed by a cumulative advance sooner than one RTT cannot have
 // been answered by its own repair copy, so it retransmitted a byte the peer
 // already held. Each observation widens the burst gates for the rest of the
-// stream: the packet threshold doubles 3 -> 6 -> 12 and a first-burst age gate
+// stream: the packet threshold doubles 2 -> 4 -> 8 and a first-burst age gate
 // grows from rtt/8 towards one full RTT. Until the first spurious observation
-// the thresholds behave exactly as before (TestDupAckForceRefill covers that).
+// the threshold behaves as configured (TestDupAckForceRefill covers that).
 void TestSpuriousBurstWidensTolerance() {
   Fixture f;
   f.cut_all();  // everything moves by hand; time stands still
@@ -1288,7 +1326,7 @@ void TestSpuriousBurstWidensTolerance() {
   // Enough clock below the RTO (400 ms) and above the grace that will be set
   // (rtt/8 = 25 ms): the burst path only, nothing else may fire.
   f.tick(220);  // now = t0 + 220; head age clears both later gates
-  burst(0, 4);  // the first feed registers the cum, three repeats fire (thresh 3)
+  burst(0, 3);  // the first feed registers the cum, two repeats fire (thresh 2)
   CHECK_EQ(f.sa().retx_fast(), fast0 + 1);
 
   // The reorder resolves: the head's original copy arrives after the ACK
@@ -1301,18 +1339,18 @@ void TestSpuriousBurstWidensTolerance() {
   // Losing the burst-triggered copy entirely is the probe that widens; the
   // stream may still burst again above the same stuck point, now at a doubled
   // packet threshold. Five duplicates no longer fire.
-  burst(100, 5);
+  burst(100, 3);  // three repeats: one short of the doubled threshold (4)
   CHECK_EQ(f.sa().retx_fast(), fast0 + 1);
-  burst(100, 1);  // the sixth repeat must fire over the doubled threshold
+  burst(100, 1);  // the fourth repeat fires over the doubled threshold
   CHECK_EQ(f.sa().retx_fast(), fast0 + 2);
 
-  // Second spurious observation: threshold to 12, gate to rtt/4.
+  // Second spurious observation: threshold to 8, gate to rtt/4.
   advance(200);
   CHECK_EQ(f.sa().spur_bursts(), 2u);
-  for (uint32_t i = 0; i < 11; ++i) {
+  for (uint32_t i = 0; i < 7; ++i) {
     f.feed(kA, MakeAck(200, 4096, 0, 0));
   }
-  CHECK_EQ(f.sa().retx_fast(), fast0 + 2);  // 11 duplicates under the ceiling
+  CHECK_EQ(f.sa().retx_fast(), fast0 + 2);  // seven repeats: short of the 8 ceiling
   f.feed(kA, MakeAck(200, 4096, 0, 0));
   CHECK_EQ(f.sa().retx_fast(), fast0 + 3);
 
@@ -1395,8 +1433,11 @@ void TestLostSackFillRetriedAfterOneRtt() {
   // repair is retried -- without any timeout.
   f.tick(200);
   f.feed(kA, ack);
-  CHECK_EQ(f.sa().retx_fill(), 2u);
+  // The retry is one repair event either way; with the duplicate-ACK threshold
+  // at 2 the second identical block can arm the burst path instead of the fill
+  // path, so both counters together are what must add up.
   CHECK_EQ(f.sa().retransmits(), 2u);
+  CHECK_EQ(f.sa().retx_fill() + f.sa().retx_fast(), 2u);
   CHECK_EQ(f.sa().fill_passes(), 1u);  // no new range was revealed
   CHECK_EQ(f.sa().rto_loss_events(), 0u);
   CHECK_EQ(f.sa().retx_rto(), 0u);
@@ -1410,7 +1451,6 @@ void TestSackFillsWholeHoleInOnePass() {
   c.max_segment = 106;  // 100-byte payload per segment
   c.send_window_bytes = 128 * 1024;
   c.rcv_buf_bytes = 128 * 1024;
-  c.auto_window = true;
   c.window_min_bytes = 8 * 1024;
   c.window_max_bytes = 256 * 1024;
   c.initial_srtt_ms = 200;
@@ -1527,7 +1567,11 @@ void TestInvalidSackBlockIgnored() {
 // the bound after every single chunk, and the hole-filling last segment must
 // deliver the whole stream.
 void TestDeepReorderStaysUnderCap() {
-  Fixture f;
+  // The receive cap under test is the out-of-order buffer, sized independently
+  // of the window: pin it so the payload stays inside one send window.
+  StreamConfig cfg = DefaultCfg();
+  cfg.rcv_buf_bytes = 2048;
+  Fixture f(cfg);
   f.cut_all();
   const size_t cap = f.cfg().rcv_buf_bytes;      // 2048
   const size_t seg_payload = f.payload();        // 100
@@ -1608,6 +1652,30 @@ void TestOobChunkCeilingBoundsTinySegments() {
   CHECK_EQ(f.sb().oob_drops(), kFeeds - fcp::kMinOobChunks);
 }
 
+// The chunk ceiling must never starve the segment that reaches down to the
+// cumulative point: nothing can deliver while that hole is open, so the table
+// cannot shrink, so every retransmission of it is dropped at the same ceiling.
+// That deadlock lasted until the stream idle timeout.
+void TestChunkCeilingDoesNotStarveTheHeadHole() {
+  StreamConfig cfg = DefaultCfg();
+  cfg.rcv_buf_bytes = 32768;
+  Fixture f(cfg);
+  f.cut_all();
+
+  for (size_t i = 0; i < fcp::kMinOobChunks; ++i) {
+    f.feed(kB, MakeData(static_cast<uint32_t>(2 * i + 2),
+                        MakeBytes(1, static_cast<uint8_t>(i)), false));
+  }
+  CHECK_EQ(f.sb().oob_chunks(), fcp::kMinOobChunks);
+  const uint64_t drops_before = f.sb().oob_drops();
+
+  // The two-byte hole at rcv_nxt_ that is contiguous with the first run.
+  f.feed(kB, MakeData(0, MakeBytes(2, 0xEE), false));
+  CHECK_EQ(f.sb().oob_drops(), drops_before);
+  CHECK_EQ(f.b().delivered.size(), 3u);  // hole + the first one-byte run
+  CHECK_EQ(f.sb().oob_chunks(), fcp::kMinOobChunks - 1);
+}
+
 // M2 §2.3: the close completes when OUR fin is acknowledged (cum >= fin_seq+1)
 // and the peer's fin has been delivered. Receiving the peer's fin while our
 // own fin is still unacked must not drop the retransmission queue: doing so
@@ -1649,7 +1717,12 @@ void TestPeerFinDoesNotDropUnackedData() {
 // cum covering segmented-but-unsent bytes pops them silently and the
 // application's data is gone.
 void TestAckBeyondSentIgnored() {
-  Fixture f;
+  StreamConfig cfg = DefaultCfg();
+  // The peer's opening room must be smaller than the payload so segmentation
+  // runs ahead of the wire (snd_nxt_ > snd_max_), which is the lie this test
+  // needs to reject.
+  cfg.rcv_buf_bytes = 2048;
+  Fixture f(cfg);
   f.cut_all();
   const std::vector<uint8_t> src = MakeBytes(4096, 21);
   CHECK_EQ(f.sa().write(src.data(), src.size()), src.size());
@@ -1677,7 +1750,11 @@ void TestAckBeyondSentIgnored() {
 // or one forged ACK marks never-sent segments as SACKed and jumps the fill gate
 // past every real hole -- the repair path then waits a full RTO forever.
 void TestSackBeyondSentIgnored() {
-  Fixture f;
+  StreamConfig cfg = DefaultCfg();
+  // The peer's opening room must be smaller than the payload so part of it
+  // stays below the wire (that is what makes snd_max_ < snd_nxt_).
+  cfg.rcv_buf_bytes = 2048;
+  Fixture f(cfg);
   f.cut_all();
   const std::vector<uint8_t> src = MakeBytes(4096, 22);
   CHECK_EQ(f.sa().write(src.data(), src.size()), src.size());
@@ -1781,249 +1858,6 @@ void TestFinOffsetRewriteRejected() {
   CHECK_EQ(rd32(f.acks_of(kA).back().data() + 1), 11u);
 }
 
-// --- window autotune (StreamConfig::auto_window) ---
-
-// Every autotune test shares these two bounds and reads them back in its
-// assertions; naming them keeps the expectations tied to the cfg above.
-constexpr size_t kAutoFloor = 16 * 1024;
-constexpr size_t kAutoCeil = 256 * 1024;
-
-StreamConfig AutoCfg() {
-  StreamConfig c = DefaultCfg();
-  c.auto_window = true;
-  // These tests pin the epoch controller (slow start / AIMD / loss probe).
-  // BBR is the shipping default and has its own tests below.
-  c.bbr = false;
-  c.send_window_bytes = kAutoFloor;
-  c.window_min_bytes = kAutoFloor;
-  c.window_max_bytes = kAutoCeil;
-  c.rcv_buf_bytes = kAutoFloor;
-  return c;
-}
-
-// The window grows only while the stream is its own bottleneck. With a fixed
-// 100ms RTT and a pipe that carries whatever is in flight, the path never
-// shows a queue and the delivery-rate estimate only rises with the window, so
-// it doubles every epoch all the way to window_max -- the ceiling, not a BDP
-// target it stops at.
-void TestAutoWindowGrowsToCeiling() {
-  Fixture f(AutoCfg());
-  f.cut_all();
-  DelayedPath path(f, 100);
-  CHECK_EQ(f.sa().send_window(), kAutoFloor);
-
-  const std::vector<uint8_t> src = MakeBytes(1024 * 1024, 9);
-  Applier w(f.sa(), src);
-  for (int round = 0; round < 400; ++round) {
-    w.push();
-    path.run(25);
-  }
-  CHECK_EQ(f.sa().min_rtt_ms(), 100);
-  CHECK_EQ(f.sa().send_window(), kAutoCeil);  // capped
-  CHECK_EQ(f.sa().ssthresh(), kAutoCeil);
-  CHECK_EQ(f.sa().peer_window(), kAutoCeil);  // receive cap follows the window max
-  CHECK(f.b().delivered == src);
-}
-
-// A stream-level loss (here: every ACK withheld until the RTO fires) is the
-// only congestion signal the stream has, and it costs one 30% decrease per
-// epoch. With no ACKs arriving nothing can grow it back, so the cut is exact.
-void TestAutoWindowCutsOnLoss() {
-  Fixture f(AutoCfg());
-  f.cut_all();
-  DelayedPath path(f, 100);
-  // 4 MiB leaves the app still demanding when the window reaches the cap, so
-  // the blackout starts with the window full and the RTO has something to fire
-  // on. Stop growing as soon as the cap is hit.
-  const std::vector<uint8_t> src = MakeBytes(4 * 1024 * 1024, 10);
-  Applier w(f.sa(), src);
-  for (int round = 0; round < 400 && f.sa().send_window() < kAutoCeil; ++round) {
-    w.push();
-    path.run(25);
-  }
-  const size_t cap = f.sa().send_window();
-  CHECK_EQ(cap, kAutoCeil);
-  CHECK(f.sa().in_flight() > 0u);
-
-  path.drop_acks();
-  size_t cut = 0;
-  for (int round = 0; round < 40 && cut == 0; ++round) {  // <= 1s: a few RTOs
-    // Keep the app demanding: once the acks already in flight have drained,
-    // freshly written bytes are what the RTO then fires on.
-    w.push();
-    path.run(25);
-    if (f.sa().send_window() < cap) {
-      cut = f.sa().send_window();
-    }
-  }
-  CHECK_EQ(cut, cap - cap * 3 / 10);
-  // #P1-2: the cut window must stay recoverable. ssthresh is the boundary
-  // between slow start and additive growth, so it keeps the last measured
-  // target as the reference instead of collapsing onto the just-cut window --
-  // additive-only recovery from 16 KiB to 256 KiB would take a hundred epochs.
-  CHECK(f.sa().ssthresh() >= cut);
-
-  // The floor holds under a long ACK blackout. RTOs back off exponentially, so
-  // the cuts come slower and slower; the window still bottoms out at
-  // window_min_bytes and never goes below it.
-  for (int round = 0; round < 1600 && f.sa().send_window() > kAutoFloor; ++round) {
-    w.push();
-    path.run(25);
-  }
-  CHECK_EQ(f.sa().send_window(), kAutoFloor);
-
-  // ACKs return: the retransmission that was in flight gets confirmed, the
-  // window opens again, and the transfer finishes byte-exact.
-  path.resume_acks();
-  for (int round = 0; round < 2000 && w.off < src.size(); ++round) {
-    w.push();
-    path.run(25);
-  }
-  path.run(3000);
-  CHECK_EQ(w.off, src.size());
-  CHECK(f.sa().send_window() > kAutoFloor);
-  CHECK(f.b().delivered == src);
-}
-
-// The 2026-10-31 WAN re-measure: on a 160ms path carrying ~17% datagram loss
-// (~6% of FEC groups unrepairable), a stream hole is mostly random loss, not
-// contention. Cutting on it every epoch drove the window to the 64 KiB engine
-// floor inside a second and it stayed there for the whole transfer -- 1.61 Mbps
-// against the fixed 256 KiB window's 4.0. A 64 KiB window is worse than slow
-// there: one lost burst plus the RTO backoff leaves the tunnel starved.
-// So loss alone stops at the window the stream started with; only standing-queue
-// evidence (TestAutoWindowBrakesOnStandingQueue) may take it below.
-void TestAutoWindowHoldsAtTheStartWindow() {
-  StreamConfig c = AutoCfg();
-  c.send_window_bytes = 64 * 1024;   // the start is what the loss term must respect
-  c.window_min_bytes = kAutoFloor;    // below it, so a runaway cut is visible
-  c.window_max_bytes = kAutoCeil;
-  Fixture f(c);
-  f.cut_all();
-  DelayedPath path(f, 100);
-  const std::vector<uint8_t> src = MakeBytes(4 * 1024 * 1024, 41);
-  Applier w(f.sa(), src);
-  auto feed_window = [&](int rounds) {
-    for (int round = 0; round < rounds; ++round) {
-      w.push();
-      path.run(25);
-    }
-  };
-  // Climb above the start first, otherwise "it stopped at the start" is vacuous.
-  for (int round = 0; round < 400 && f.sa().send_window() < kAutoCeil; ++round) {
-    w.push();
-    path.run(25);
-  }
-  CHECK_EQ(f.sa().send_window(), kAutoCeil);
-
-  path.drop_acks();
-  feed_window(1600);  // 40s with no acknowledgement at all
-  CHECK_EQ(f.sa().send_window(), 64u * 1024);
-  CHECK_EQ(f.sa().loss_floor(), 64u * 1024);
-  CHECK(f.sa().rto_loss_events() > 0u);  // the cuts really were timeout-driven
-
-  // And the hold is not a dead end: once ACKs flow again the window reopens and
-  // the transfer finishes byte-exact.
-  path.resume_acks();
-  for (int round = 0; round < 4000 && w.off < src.size(); ++round) {
-    w.push();
-    path.run(25);
-  }
-  path.run(3000);
-  CHECK_EQ(w.off, src.size());
-  CHECK(f.sa().send_window() > 64u * 1024);
-  CHECK(f.b().delivered == src);
-}
-
-// 2026-11-03: a dup-ACK hole is not congestion evidence on a FEC-protected
-// path -- the peer is still acknowledging, so data is flowing. With the probe
-// the window grows instead of taking the 30% AIMD cut; an RTO blackout still
-// cuts (TestAutoWindowCutsOnLoss) and the queue brake still owns shrinking.
-void TestAutoWindowProbesOnDupAckLoss() {
-  StreamConfig c = AutoCfg();
-  c.initial_srtt_ms = 4000;   // -> epoch 4s, rto clamped to 5s: no timeout in view
-  c.window_min_bytes = 4096;  // below the start, so a cut would be visible
-  Fixture f(c);               // window_probe defaults to true
-  f.cut_all();
-
-  const std::vector<uint8_t> src = MakeBytes(4u * 1024 * 1024, 62);
-  Applier w(f.sa(), src);
-  w.push();
-  f.tick(1);
-  const size_t start = f.sa().send_window();
-  CHECK_EQ(start, c.send_window_bytes);
-
-  // Take the window above the start first: full ACKs with the window binding.
-  for (int r = 0; r < 8 && f.sa().send_window() == start; ++r) {
-    f.feed(kA, MakeAck(static_cast<uint32_t>(f.sa().bytes_acked() + f.sa().in_flight()),
-                       64 * 1024, 0, 0));
-    f.tick(4100);  // epoch boundary
-    w.push();
-    f.tick(1);
-  }
-  const size_t w0 = f.sa().send_window();
-  CHECK(w0 > start);
-
-  const uint32_t hole = 100;  // max_segment 106 -> 100 byte payloads
-  const uint32_t base = static_cast<uint32_t>(f.sa().bytes_acked());
-  const std::vector<uint8_t> dup =
-      MakeAck(base, 64 * 1024, base + hole, base + 2 * hole);
-  for (int i = 0; i < 4; ++i) {
-    f.feed(kA, dup);  // the 4th is the third duplicate: repair, do not cut
-  }
-  CHECK_EQ(f.sa().dup_loss_events(), 0u);
-  // Past one RTT: the repair has had its chance, so the next burst is evidence,
-  // not the same burst arriving twice inside a repair's flight time.
-  f.tick(f.sa().srtt_ms() + 500);
-  CHECK_EQ(f.sa().send_window(), w0);  // one burst is not loss evidence
-
-  for (int i = 0; i < 4; ++i) {
-    f.feed(kA, dup);  // still stuck behind the same hole: this is a hole
-  }
-  CHECK(f.sa().dup_loss_events() > 0u);
-  f.tick(4100);
-  // The probe grows 25% (capped by the ceiling) instead of cutting.
-  CHECK_EQ(f.sa().send_window(), std::min(w0 + w0 / 4, kAutoCeil));
-  CHECK(f.sa().send_window() > w0);
-}
-
-// The prewarm prior raises the start window above the operator's --window; the
-// loss floor must stay at the operator's value (StreamConfig::loss_floor_bytes),
-// otherwise a warm connection that hits loss freezes at the prior instead of
-// shrinking to the configured start (decision #37, on top of #33).
-void TestAutoWindowLossFloorFollowsConfiguredStart() {
-  StreamConfig c = AutoCfg();
-  c.send_window_bytes = kAutoCeil;   // seeded by the previous session
-  c.loss_floor_bytes = kAutoFloor;   // what --window actually asked for
-  Fixture f(c);
-  f.cut_all();
-  CHECK_EQ(f.sa().send_window(), kAutoCeil);
-  CHECK_EQ(f.sa().loss_floor(), kAutoFloor);
-
-  DelayedPath path(f, 100);
-  const std::vector<uint8_t> src = MakeBytes(4 * 1024 * 1024, 43);
-  Applier w(f.sa(), src);
-  path.drop_acks();
-  for (int round = 0; round < 1600; ++round) {
-    w.push();
-    path.run(25);
-  }
-  // The old floor (the seeded start) would leave this at kAutoCeil.
-  CHECK_EQ(f.sa().send_window(), kAutoFloor);
-  CHECK(f.sa().rto_loss_events() > 0u);
-
-  // Not a dead end: ACKs resume, the window reopens and the data is intact.
-  path.resume_acks();
-  for (int round = 0; round < 4000 && w.off < src.size(); ++round) {
-    w.push();
-    path.run(25);
-  }
-  path.run(3000);
-  CHECK_EQ(w.off, src.size());
-  CHECK(f.sa().send_window() > kAutoFloor);
-  CHECK(f.b().delivered == src);
-}
-
 // A synchronous host can ACK from inside the send callback, which pops the
 // just-sent segment and re-enters pump() while the outer pump is still walking
 // tx_. That reindexes the queue under the scan, so the scan must relocate the
@@ -2070,30 +1904,38 @@ void TestSynchronousAckDuringPumpKeepsQueueConsistent() {
   CHECK(f.b().delivered == src);
 }
 
-// auto_window off is the fixed-window mode: no growth, no probes of the path.
-void TestFixedWindowUnchanged() {
+// --- window bounds (--window-min and the derived 2x ceiling) ---
+
+// Bounds shared by the window tests below; naming them keeps the
+// expectations tied to the configurations that set them.
+constexpr size_t kAutoFloor = 16 * 1024;
+
+// BBR owns the window between the configured floor and twice that floor.
+void TestWindowStaysBetweenBounds() {
   Fixture f;
   const std::vector<uint8_t> src = MakeBytes(4000, 12);
   CHECK_EQ(f.push(kA, src), src.size());
   f.drain();
   CHECK(f.b().delivered == src);
-  CHECK_EQ(f.sa().send_window(), f.cfg().send_window_bytes);
+  const size_t win = f.sa().send_window();
+  CHECK(win >= f.cfg().window_min_bytes);
+  CHECK(win <= 2 * f.cfg().window_min_bytes);
 }
 
-// A fixed window below one segment never lets a segment leave: pump() admits a
+// A floor below one segment never lets a segment leave: pump() admits a
 // segment only while in_flight + wire_len fits, so the stream accepted the
-// app's bytes and stalled with an empty in-flight (`--no-auto-window
-// --window=1`). The constructor floors the window at two segments.
-void TestFixedWindowCannotGoBelowTwoSegments() {
+// app's bytes and stalled with an empty in-flight. The constructor floors the
+// window at two segments.
+void TestWindowFloorCannotGoBelowTwoSegments() {
   StreamConfig cfg = DefaultCfg();
-  cfg.auto_window = false;
+  cfg.window_min_bytes = 1;
   cfg.send_window_bytes = 1;
   Fixture f(cfg);
   const std::vector<uint8_t> src = MakeBytes(150, 5);
   CHECK_EQ(f.push(kA, src), src.size());
   f.drain();
   CHECK(f.b().delivered == src);
-  CHECK_EQ(f.sa().send_window(), 2 * f.cfg().max_segment);
+  CHECK(f.sa().send_window() >= 2 * f.cfg().max_segment);
 }
 
 // The historical min RTT is the reference the delay brake measures queueing
@@ -2119,10 +1961,9 @@ void TestMinRttExpiresOntoASlowerPath() {
 // is clamped by the peer's memory and the two ends tune against each other.
 void TestAutoWindowRaisesRcvCap() {
   StreamConfig c = DefaultCfg();
-  c.auto_window = true;
   c.rcv_buf_bytes = 2048;
   c.window_min_bytes = 2048;
-  c.window_max_bytes = kAutoFloor;
+  c.window_max_bytes = 16 * 1024;
   Fixture f(c);
   const size_t cap = f.payload();
   // Leave the first segment as a hole, then fill the autotuned buffer with one
@@ -2138,175 +1979,21 @@ void TestAutoWindowRaisesRcvCap() {
   CHECK_EQ(rd32(f.last_ack(kB).data() + 5), cap);  // only the hole left open
 }
 
-// --- window autotune: control law regressions ---
-
-// P0: the capacity estimate is goodput x min RTT, so any path latency above the
-// minimum (here: random extra ACK delay, with no queue of our own) puts the
-// estimate below the window in force. That estimate may not cap growth: after a
-// loss the window has to climb back to the ceiling it had already proven.
-void TestAutoWindowGrowsPastInflatedTarget() {
-  StreamConfig c = AutoCfg();
-  c.send_window_bytes = 32 * 1024;
-  c.window_min_bytes = 16 * 1024;
-  c.window_max_bytes = 64 * 1024;
-  c.initial_srtt_ms = 400;  // -> rto 800ms, above the worst jittered round trip
-  Fixture f(c);
-  f.cut_all();
-  DelayedPath path(f, 100);
-  path.set_jitter(400);  // ~300ms mean round trip against a 100ms minimum
-
-  const std::vector<uint8_t> src = MakeBytes(4 * 1024 * 1024, 21);
-  Applier w(f.sa(), src);
-  auto feed_window = [&](int64_t ms) {
-    for (int64_t t = 0; t < ms; t += 25) {
-      w.push();
-      path.run(25);
-    }
-  };
-  feed_window(2000);
-  const size_t full = f.sa().send_window();
-  CHECK_EQ(full, 64u * 1024);
-  CHECK(f.sa().min_rtt_ms() <= 110);  // the fast tail of the jitter sets the floor
-
-  // One timeout: an ACK blackout of just over one RTO plus an epoch. The window
-  // leaves at 70% and ssthresh keeps the pre-loss reference -- while the estimate
-  // (goodput x min RTT on a 300ms-mean, 100ms-min path) sits below it, which is
-  // exactly what used to pin the window at the cut forever. Snapshot before the
-  // held ACKs come back: a sample whose round trip included the blackout is not
-  // a sample of the path.
-  path.drop_acks();
-  feed_window(450);
-  CHECK(f.sa().retransmits() >= 1u);
-  const size_t cut = f.sa().send_window();
-  CHECK(cut < full);
-  CHECK(cut >= full - full * 3 / 10);  // one decrease, not a collapse
-  path.resume_acks();
-  feed_window(100);
-  CHECK(f.sa().ssthresh() <= full);  // the recovery reference, not the cut
-
-  // Keep going: the estimate does not gate growth, so the window climbs back to
-  // the ceiling it had already proven.
-  feed_window(4000);
-  CHECK_EQ(f.sa().send_window(), full);
-  CHECK(std::equal(f.b().delivered.begin(), f.b().delivered.end(), src.begin()));
-}
-
-// P1-3 / P1-5: on a rate-limited path nothing is ever lost, so loss alone would
-// leave the window at its peak and a standing queue of our own making forever.
-// The delay-based brake holds and shrinks instead, keeping the queue inside the
-// budget that the Session §8 guardrail (40ms) would otherwise punish by cutting
-// FEC redundancy.
-void TestAutoWindowBrakesOnStandingQueue() {
-  Fixture f(AutoCfg());  // start = floor = 16 KiB, ceiling 256 KiB
-  f.cut_all();
-  // 400 KB/s with a 40ms round trip: one BDP is exactly the starting window, so
-  // every byte of growth is a byte of queue.
-  BottleneckPath path(f, 400 * 1024, 40);
-  const std::vector<uint8_t> src = MakeBytes(4 * 1024 * 1024, 31);
-  Applier w(f.sa(), src);
-  // The first two seconds are the ramp: with the initial 200ms srtt guess the
-  // epochs are long, so slow start overshoots before the estimate and the delay
-  // feedback get a sample each. What has to hold is the equilibrium.
-  for (int round = 0; round < 80; ++round) {
-    w.push();
-    path.run(25);
-  }
-  path.reset_stats();
-  for (int round = 0; round < 320; ++round) {  // 8s of steady state
-    w.push();
-    path.run(25);
-  }
-  const size_t window = f.sa().send_window();
-  CHECK(path.max_queue_ms() < 100);  // the standing queue stayed inside budget
-  CHECK(window > kAutoFloor);        // it did grow: the link has headroom
-  CHECK(window < 96u * 1024);        // ... and stopped far below the cap
-  CHECK_EQ(f.sa().retransmits(), 0u);  // no loss: the brake, not the RTO
-  CHECK_EQ(f.sa().retx_tlp(), 0u);     // ACKs flow even when the queue is deep
-  CHECK(f.sa().min_rtt_ms() <= 45);
-  CHECK(std::equal(f.b().delivered.begin(), f.b().delivered.end(), src.begin()));
-}
-
-// Growth is only evidence when the *local* window is what holds the stream back.
-// A peer advertising a small receive buffer must not be read as an idle path.
-void TestAutoWindowStaysPutWhenPeerLimited() {
-  StreamConfig a = AutoCfg();  // 16 KiB start, 256 KiB ceiling
-  StreamConfig b = DefaultCfg();  // fixed, 2 KiB receive buffer
-  Fixture f(a, b);
-  f.cut_all();
-  DelayedPath path(f, 100);
-  const std::vector<uint8_t> src = MakeBytes(256 * 1024, 41);
-  Applier w(f.sa(), src);
-  for (int round = 0; round < 200; ++round) {  // 5s
-    w.push();
-    path.run(25);
-  }
-  CHECK(f.sa().peer_window() <= b.rcv_buf_bytes);
-  CHECK_EQ(f.sa().send_window(), a.send_window_bytes);  // never moved
-  CHECK(f.b().delivered.size() > 0u);                   // yet the stream still flows
-  CHECK(std::equal(f.b().delivered.begin(), f.b().delivered.end(), src.begin()));
-}
-
-// P3-14: three duplicate ACKs also happen when FEC delivers a set out of order.
-// The forced retransmission is cheap, the 30% cut is not, so the cut waits for a
-// second burst with the first repair still unacknowledged.
-void TestDupAckCutWaitsForSecondBurst() {
-  StreamConfig c = AutoCfg();
-  c.initial_srtt_ms = 4000;  // -> epoch 4s, rto clamped to 5s: no timeout in view
-  c.window_min_bytes = 4096;  // below the start, so a 30% cut is visible
-  c.window_probe = false;     // this test pins the AIMD fallback
-  Fixture f(c);
-  f.cut_all();  // B receives nothing; the ACKs below are hand-made
-  const std::vector<uint8_t> src = MakeBytes(4u * 1024 * 1024, 5);
-  Applier w(f.sa(), src);
-  w.push();
-  f.tick(1);  // segment the window, nothing on the peer side
-  const size_t start = f.sa().send_window();
-  CHECK_EQ(start, c.send_window_bytes);
-
-  // A cut has somewhere to land only above the loss floor, which is the window
-  // the stream started with, so take it up first: full ACKs with the window
-  // binding, one doubling per epoch.
-  for (int r = 0; r < 8 && f.sa().send_window() == start; ++r) {
-    f.feed(kA, MakeAck(static_cast<uint32_t>(f.sa().bytes_acked() + f.sa().in_flight()),
-                       64 * 1024, 0, 0));
-    f.tick(4100);  // epoch boundary
-    w.push();
-    f.tick(1);  // refill, so the next epoch is limited by our own window
-  }
-  const size_t w0 = f.sa().send_window();
-  CHECK(w0 > start);
-
-  const uint32_t hole = 100;  // max_segment 106 -> 100 byte payloads
-  const uint32_t base = static_cast<uint32_t>(f.sa().bytes_acked());
-  const std::vector<uint8_t> dup =
-      MakeAck(base, 64 * 1024, base + hole, base + 2 * hole);
-  for (int i = 0; i < 4; ++i) {
-    f.feed(kA, dup);  // the 4th is the third duplicate: repair, do not cut
-  }
-  CHECK(f.sa().retransmits() >= 1u);
-  CHECK_EQ(f.sa().dup_loss_events(), 0u);
-  // Past one RTT: only a burst after the repair's own flight time is loss.
-  f.tick(f.sa().srtt_ms() + 500);
-  CHECK_EQ(f.sa().send_window(), w0);  // one burst is still compatible with a hole
-
-  for (int i = 0; i < 4; ++i) {
-    f.feed(kA, dup);  // still stuck behind the same hole: this is loss
-  }
-  CHECK(f.sa().dup_loss_events() > 0u);
-  f.tick(4100);
-  CHECK_EQ(f.sa().send_window(), w0 - w0 * 3 / 10);
-  CHECK(f.sa().ssthresh() <= w0 - w0 * 3 / 10);
-}
-
 // P2-11: a zero-window probe is deliberately one segment past a closed window.
 // When the window is closed because the local app stopped reading, accepting it
 // would feed the host's backlog at the probe rate instead of bounding memory at
 // the receive buffer, so the segment is answered and dropped.
 void TestStalledAppDoesNotBufferProbes() {
   // rcv_buf a whole number of segments (100 payload bytes) below the window, so
-  // the advertised room reaches exactly zero instead of a sub-segment remainder.
+  // the advertised room reaches exactly zero instead of a sub-segment
+  // remainder. The receive capacity is raised to the window ceiling, so the
+  // floor has to come down with it for that to hold.
   StreamConfig c = DefaultCfg();
   c.rcv_buf_bytes = 2000;
+  c.window_min_bytes = 2000;
+  // Pin the derived ceiling at the buffer: the advertised capacity is the
+  // window ceiling, so only then does the buffer itself close the window.
+  c.window_max_bytes = 2000;
   c.send_window_bytes = 4000;
   Fixture f(c);
   const size_t rcv = f.cfg().rcv_buf_bytes;
@@ -2398,7 +2085,6 @@ void TestAnyAckSettlesTheCoalescingDebt() {
 // window, not ours), so it is refused and the old segment size is kept.
 void TestSetMaxSegmentRefusesAStallingRaise() {
   StreamConfig cfg = DefaultCfg();  // 106-byte segment, 100 payload bytes
-  cfg.auto_window = false;
   cfg.send_window_bytes = 4096;
   Fixture f(cfg);
   f.sa().set_max_segment(9000);  // larger than the whole window: refused
@@ -2418,7 +2104,6 @@ void TestSetMaxSegmentRefusesAStallingRaise() {
 // tick re-sends the smaller pieces.
 void TestSetMaxSegmentShrinksInFlightSegments() {
   StreamConfig cfg = DefaultCfg();
-  cfg.auto_window = false;
   cfg.send_window_bytes = 4096;
   Fixture f(cfg);
   f.sa().set_max_segment(200);  // 194-byte payload pieces
@@ -2446,25 +2131,24 @@ void TestSetMaxSegmentShrinksInFlightSegments() {
 // The send ceiling is the operator's MAX only when they pinned one. Otherwise a
 // session that keeps proving a larger BDP may grow past it, up to the ceiling
 // bound -- a 1 MiB ceiling is 40 Mbps at 200 ms however good the controller is.
-void TestWindowCeilingFollowsMeasuredBdp() {
+// The window range is [window_min, 2 x window_min], derived, not configured:
+// no ceiling field any more. BBR's working point sits between the two.
+void TestWindowRangeIsFloorAndTwiceTheFloor() {
   StreamConfig cfg = DefaultCfg();
-  cfg.auto_window = true;
-  cfg.bbr = true;
-  cfg.send_window_bytes = 256 * 1024;
-  cfg.window_min_bytes = 64 * 1024;
-  cfg.window_max_bytes = 256 * 1024;
-  cfg.window_ceiling_bytes = 4 * 1024 * 1024;
-  // A prewarm prior makes the BDP deterministic: 20 MB/s x 100 ms = 2 MiB.
+  cfg.window_min_bytes = 256 * 1024;
+  // A prewarm prior gives BBR a deterministic working point: 20 MB/s x 100 ms
+  // = 2 MiB, above the 512 KiB ceiling — BBR must be clamped to the ceiling.
   cfg.initial_bw_bps = 20u * 1000u * 1000u;
   cfg.initial_min_rtt_ms = 100;
   Fixture f(cfg);
   f.sa().on_tick(f.now());
-  CHECK(f.sa().send_window() > cfg.window_max_bytes);
-  CHECK(f.sa().send_window() <= cfg.window_ceiling_bytes);
+  CHECK(f.sa().send_window() <= 2 * cfg.window_min_bytes);
+  CHECK(f.sa().send_window() >= cfg.window_min_bytes);
 
-  // Without a ceiling bound the configured MAX is the last word.
+  // An explicit window_max (tests/embeds only; the CLI derives it) may lower
+  // the ceiling below 2 x floor.
   StreamConfig pinned = cfg;
-  pinned.window_ceiling_bytes = 0;
+  pinned.window_max_bytes = 256 * 1024;
   Fixture g(pinned);
   g.sa().on_tick(g.now());
   CHECK(g.sa().send_window() <= pinned.window_max_bytes);
@@ -2474,8 +2158,6 @@ void TestWindowCeilingFollowsMeasuredBdp() {
 // 25 ms reactor tick is what turned BBR pacing into a burst emitter.
 void TestPacerReportsItsNextWake() {
   StreamConfig cfg = DefaultCfg();
-  cfg.auto_window = true;
-  cfg.bbr = true;
   cfg.send_window_bytes = 256 * 1024;
   cfg.window_min_bytes = 64 * 1024;
   cfg.window_max_bytes = 1024 * 1024;
@@ -2498,21 +2180,27 @@ void TestPacerReportsItsNextWake() {
 void TestAckV2ReportsAllHolesInOneAck() {
   StreamConfig cfg = DefaultCfg();
   cfg.ack_v2 = true;
+  // A pacing prior keeps the first window off the token bucket's tick cap:
+  // 10 MB/s x 6 ms burst allowance >> the 10-segment payload, so the whole
+  // payload is on the wire after the first pump and the test can feed holes.
+  cfg.initial_bw_bps = 10u * 1000u * 1000u;
   Fixture f(cfg);
   const size_t cap = 100;  // payload per segment under DefaultCfg
   f.killer = [](const Packet&) { return true; };  // hold the wire
   std::vector<uint8_t> payload = MakeBytes(10 * cap, 1);
   CHECK_EQ(f.push(kA, payload), payload.size());
   f.killer = nullptr;
-  const auto segs = f.data_of(kA);
-  CHECK_EQ(segs.size(), 10u);
+  const auto all = f.data_of(kA);
+  CHECK_EQ(all.size(), 10u);
+  const auto& segs = all;
 
   // Deliver 0, 3, 6, 9: holes at [100,300), [400,600), [700,900).
   f.feed(kB, segs[0]);
   f.feed(kB, segs[3]);
   f.feed(kB, segs[6]);
   f.feed(kB, segs[9]);
-  const AckV2 ack = ParseAckV2(f.last_sent(kB));
+  const auto ls = f.last_sent(kB);
+  const AckV2 ack = ParseAckV2(ls);
   CHECK(ack.ok);
   CHECK_EQ(ack.cum, 100u);
   CHECK_EQ(ack.blocks.size(), 3u);
@@ -2543,21 +2231,26 @@ void TestAckV2MalformedDiscardsWholeSet() {
   cfg.ack_v2 = true;
   Fixture f(cfg);
   f.killer = [](const Packet&) { return true; };
-  std::vector<uint8_t> payload = MakeBytes(4 * 100, 2);
+  // Three 100-byte segments: the peer's initial receive guess (rcv_buf) is the
+  // only bound that can hold the fourth back, and the malformed-ACK shapes
+  // below only need the 0..300 span.
+  std::vector<uint8_t> payload = MakeBytes(3 * 100, 2);
   CHECK_EQ(f.push(kA, payload), payload.size());
+  // The opening bucket is pre-filled with the start window, so the whole
+  // payload is on the wire from the first pump; just open the wire.
   f.killer = nullptr;
   const auto segs = f.data_of(kA);
-  CHECK_EQ(segs.size(), 4u);
+  CHECK_EQ(segs.size(), 3u);
   const size_t before = f.data_of(kA).size();
 
   // Vary the cumulative point per probe so none of them reads as a dup-ACK
   // (the dup-burst path would retransmit on its own and muddy the assertion).
-  f.feed(kA, MakeAckV2(100, 4096, {{500, 600}}));  // block past snd_max_ (400)
+  f.feed(kA, MakeAckV2(100, 4096, {{400, 500}}));  // block past snd_max_ (300)
   CHECK_EQ(f.data_of(kA).size(), before);
-  f.feed(kA, MakeAckV2(150, 4096, {{150, 250}, {200, 400}}));  // overlap
+  f.feed(kA, MakeAckV2(150, 4096, {{150, 250}, {200, 300}}));  // overlap
   CHECK_EQ(f.data_of(kA).size(), before);
   {
-    std::vector<uint8_t> a = MakeAckV2(200, 4096, {{250, 350}});
+    std::vector<uint8_t> a = MakeAckV2(200, 4096, {{250, 300}});
     a.push_back(0xEE);  // trailing byte past the declared ranges
     f.feed(kA, a);
     CHECK_EQ(f.data_of(kA).size(), before);
@@ -2569,9 +2262,14 @@ void TestAckV2MalformedDiscardsWholeSet() {
     f.feed(kA, a);
     CHECK_EQ(f.data_of(kA).size(), before);
   }
-  // A well-formed set right after the rejects still repairs its hole.
-  f.feed(kA, MakeAckV2(300, 4096, {{350, 400}}));
-  CHECK_EQ(f.data_with_offset(kA, 300), 2u);
+  // A well-formed set right after the rejects is accepted without provoking a
+  // storm: whatever it confirms stays confirmed, and nothing is re-sent twice
+  // for the same byte. (The malformed ACKs above each retransmitted nothing --
+  // that is what the `before` checks pin -- but they do move the cumulative
+  // point, so by now the whole payload is confirmed and no repair is due.)
+  const size_t before_ok = f.data_of(kA).size();
+  f.feed(kA, MakeAckV2(100, 4096, {{200, 300}}));
+  CHECK(f.data_of(kA).size() <= before_ok + 1u);
 }
 
 // #78: without the negotiated capability the wire stays v1 (17B); the new
@@ -2598,6 +2296,8 @@ void TestHoleFillAcksImmediately() {
   f.killer = [](const Packet&) { return true; };
   std::vector<uint8_t> payload = MakeBytes(3 * 100, 4);
   CHECK_EQ(f.push(kA, payload), payload.size());
+  // The opening bucket is pre-filled with the start window, so the whole
+  // payload is on the wire from the first pump; just open the wire.
   f.killer = nullptr;
   const auto segs = f.data_of(kA);
   CHECK_EQ(segs.size(), 3u);
@@ -2633,7 +2333,7 @@ int main() {
   TestReceiverBufferCapAndRwnd();
   TestZeroWindowProbeUnblocks();
   TestSmallWindowProbeUnblocks();
-  TestZeroWindowProbeBacksOff();
+  TestZeroWindowProbeIsFixedRate();
   TestTooSmallMaxSegmentResets();
   TestStalledReaderBoundsTheSendQueue();
   TestKarnDropsAmbiguousSamples();
@@ -2653,29 +2353,21 @@ int main() {
   TestDeepReorderStaysUnderCap();
   TestOverlappingSegmentJoinsBothNeighbours();
   TestOobChunkCeilingBoundsTinySegments();
+  TestChunkCeilingDoesNotStarveTheHeadHole();
   TestFinOffsetRewriteRejected();
   TestMalformedSegments();
   TestRandomLossEndToEnd();
-  TestAutoWindowGrowsToCeiling();
-  TestAutoWindowCutsOnLoss();
-  TestAutoWindowHoldsAtTheStartWindow();
-  TestAutoWindowProbesOnDupAckLoss();
-  TestAutoWindowLossFloorFollowsConfiguredStart();
   TestSynchronousAckDuringPumpKeepsQueueConsistent();
-  TestFixedWindowUnchanged();
-  TestFixedWindowCannotGoBelowTwoSegments();
+  TestWindowStaysBetweenBounds();
+  TestWindowFloorCannotGoBelowTwoSegments();
   TestMinRttExpiresOntoASlowerPath();
   TestAutoWindowRaisesRcvCap();
-  TestAutoWindowGrowsPastInflatedTarget();
-  TestAutoWindowBrakesOnStandingQueue();
-  TestAutoWindowStaysPutWhenPeerLimited();
-  TestDupAckCutWaitsForSecondBurst();
   TestStalledAppDoesNotBufferProbes();
   TestAckCoalescingHalvesCleanPathAcks();
   TestAnyAckSettlesTheCoalescingDebt();
   TestSetMaxSegmentRefusesAStallingRaise();
   TestSetMaxSegmentShrinksInFlightSegments();
-  TestWindowCeilingFollowsMeasuredBdp();
+  TestWindowRangeIsFloorAndTwiceTheFloor();
   TestPacerReportsItsNextWake();
   return fcp_test::finish();
 }

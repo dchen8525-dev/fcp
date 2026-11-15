@@ -8,9 +8,11 @@
 // lands in EngineConfig/ReactorOptions verbatim, and defaults survive an
 // option-less command line.
 //
-// 0.0.1 has exactly one spelling per setting (--fec=D:P, --window=START[:MAX],
-// --log=LEVEL/-v) and the removed aliases must stay removed: a silently
-// accepted dead flag reads as "configured" in a script.
+// Like fcp-node, the CLI has exactly one spelling per setting now
+// (--key, --peer, -b/--bind, --mtu, --fec=D:P, --log-level). The
+// removed spellings are rejected with the replacement named: a silently
+// accepted dead flag reads as "configured" in a script while the run uses a
+// default nobody chose.
 
 #include <cstdio>
 #include <cstring>
@@ -54,19 +56,9 @@ bool TryParse(EngineRole role, const std::vector<std::string>& args,
   return fcp::parse_proxy_args(role, argv.argc(), argv.data(), out, error);
 }
 
-// Ok/Fail prefill the required options (--key on both roles, --host on the
+// Ok/Fail prefill the required options (--key on both roles, --peer on the
 // client) so the range tests can pass only the option under test. Tests that
 // deliberately probe a missing requirement call TryParse directly.
-bool Ok(EngineRole role, const std::vector<std::string>& args,
-        ProxyArgs* out, std::string* error) {
-  std::vector<std::string> all = {"--key=" + std::string(kGoodKey)};
-  if (role == EngineRole::kClient) {
-    all.push_back("--host=10.0.0.1");
-  }
-  all.insert(all.end(), args.begin(), args.end());
-  return TryParse(role, all, out, error);
-}
-
 std::string TempPath(const char* leaf) {
   // The file is only needed for the key-file tests, which remove it again; the
   // build directory is writable on every platform the suite runs on.
@@ -82,6 +74,16 @@ bool WriteFile(const std::string& path, const std::string& text) {
   return std::fclose(f) == 0 && n == text.size();
 }
 
+bool Ok(EngineRole role, const std::vector<std::string>& args,
+        ProxyArgs* out, std::string* error) {
+  std::vector<std::string> all = {"--key=" + std::string(kGoodKey)};
+  if (role == EngineRole::kClient) {
+    all.push_back("--peer=10.0.0.1");
+  }
+  all.insert(all.end(), args.begin(), args.end());
+  return TryParse(role, all, out, error);
+}
+
 void TestKeyValidation() {
   ProxyArgs a;
   std::string error;
@@ -93,149 +95,153 @@ void TestKeyValidation() {
   CHECK(!TryParse(EngineRole::kServer, {"--key=000102030405060708090a0b0c0d0e0f0"}, &a, &error));
   CHECK(!TryParse(EngineRole::kServer, {"--key="}, &a, &error));
   CHECK(!TryParse(EngineRole::kServer, {"--key=000102030405060708090a0b0c0d0e0g"}, &a, &error));
-  // Missing entirely names every source, not just --key.
+  // Missing entirely names the one source that is left.
   CHECK(!TryParse(EngineRole::kServer, {}, &a, &error));
-  CHECK(error.find("--key-file") != std::string::npos);
-  CHECK(error.find("--key-env") != std::string::npos);
-}
-
-void TestKeyFile() {
-  ProxyArgs a;
-  std::string error;
-  const std::string path = TempPath("psk");
-  // Trailing newline (what `openssl rand -hex 16 > psk` writes) is accepted.
-  CHECK(WriteFile(path, "0f1e2d3c4b5a69788796a5b4c3d2e1f0\r\n"));
-  CHECK(TryParse(EngineRole::kServer, {"--key-file=" + path}, &a, &error));
-  CHECK_EQ(a.ec.key[0], 0x0f);
-  CHECK_EQ(a.ec.key[15], 0xf0);
-
-  // Both spellings at once is ambiguous, and the key must not leak into argv.
+  CHECK(error.find("--key is required") != std::string::npos);
+  // The same spelling twice is still a duplicate.
   CHECK(!TryParse(EngineRole::kServer,
-                  {"--key=" + std::string(kGoodKey), "--key-file=" + path}, &a, &error));
-  CHECK(error.find("alternatives") != std::string::npos);
-  // The same spelling twice is a plain duplicate, not an ambiguity.
-  CHECK(!TryParse(EngineRole::kServer,
-                  {"--key-file=" + path, "--key-file=" + path}, &a, &error));
+                  {"--key=" + std::string(kGoodKey), "--key=" + std::string(kGoodKey)}, &a,
+                  &error));
   CHECK(error.find("more than once") != std::string::npos);
-
-  // A file with anything but 32 hex digits is a loud error, not a zero key.
-  CHECK(WriteFile(path, "not a key"));
-  CHECK(!TryParse(EngineRole::kServer, {"--key-file=" + path}, &a, &error));
-  CHECK(!TryParse(EngineRole::kServer, {"--key-file=" + path + ".missing"}, &a, &error));
-
-  // A valid key with a second key after it must not be silently truncated to
-  // the first one: pointing at the wrong (multi-key) file has to fail.
-  CHECK(WriteFile(path, "0f1e2d3c4b5a69788796a5b4c3d2e1f0\n"
-                        "11223344556677889900aabbccddeeff\n"));
-  CHECK(!TryParse(EngineRole::kServer, {"--key-file=" + path}, &a, &error));
-  // ...and a file far larger than one key is rejected without parsing it.
-  CHECK(WriteFile(path, std::string(5000, 'a')));
-  CHECK(!TryParse(EngineRole::kServer, {"--key-file=" + path}, &a, &error));
-  CHECK(error.find("larger than") != std::string::npos);
-  std::remove(path.c_str());
 }
 
-bool SetEnv(const char* name, const char* value) {
-#ifdef _WIN32
-  return _putenv_s(name, value) == 0;
-#else
-  return setenv(name, value, 1) == 0;
-#endif
-}
-
-bool UnsetEnv(const char* name) {
-#ifdef _WIN32
-  return _putenv_s(name, "") == 0;
-#else
-  return unsetenv(name) == 0;
-#endif
-}
-
-// --key-env is the source the packaged systemd unit can actually use: a
-// DynamicUser cannot read a root-owned 0600 key file, but EnvironmentFile is
-// read by the manager and handed to the service as environment.
-void TestKeyEnv() {
+// Old spellings are gone with no compatibility shim: they now fail as plain
+// unknown options, and --help is not a license to ignore them.
+void TestUnknownOldSpellings() {
   ProxyArgs a;
   std::string error;
-  UnsetEnv("FCP_TEST_PSK");
+  const std::string key = "--key=" + std::string(kGoodKey);
+  const char* kOld[] = {"--key-file=/tmp/psk", "-k/tmp/psk", "--host=10.0.0.1",
+                        "--port=5000",           "--k=3",          "--p-max=6",
+                        "--rate-limit=8",        "--log=debug",    "-v",
+                        "--version",             "-V"};
+  for (const char* arg : kOld) {
+    CHECK(!TryParse(EngineRole::kServer, {key, arg}, &a, &error));
+    CHECK(error.find("unknown argument") != std::string::npos);
+    CHECK(error.find(arg) != std::string::npos);
+  }
+  CHECK(!TryParse(EngineRole::kServer, {"--help", "--version"}, &a, &error));
+  CHECK(error.find("unknown argument") != std::string::npos);
+  CHECK(!TryParse(EngineRole::kClient, {key, "--host=x"}, &a, &error));
+  CHECK(error.find("unknown argument") != std::string::npos);
+}
 
-  CHECK(!TryParse(EngineRole::kServer, {"--key-env=FCP_TEST_PSK"}, &a, &error));
-  CHECK(error.find("not set") != std::string::npos);
+// The old autotune notes ("receive capacity follows the MAX", ":MAX lowered
+// the start") are gone with the ceiling: one knob, one derived ceiling, no
+// silent overrides left to explain. A clean default command line stays quiet.
+void TestAutotuneNotes() {
+  ProxyArgs a;
+  std::string error;
+  const auto ok = [&](const std::vector<std::string>& args) {
+    return Ok(EngineRole::kServer, args, &a, &error);
+  };
+  CHECK(ok({}));
+  CHECK(a.notes.empty());
+  CHECK(ok({"--window-min=512"}));
+  CHECK(a.notes.empty());
+}
+// Address semantics after #91: one spelling per concept, the port travels
+// inside the address. --peer is client-only, -b/--bind is the local side.
+void TestRoleRequirements() {
+  ProxyArgs a;
+  std::string error;
+  const std::string key = "--key=" + std::string(kGoodKey);
 
-  CHECK(SetEnv("FCP_TEST_PSK", "0f1e2d3c4b5a69788796a5b4c3d2e1f0"));
-  CHECK(TryParse(EngineRole::kServer, {"--key-env=FCP_TEST_PSK"}, &a, &error));
-  CHECK_EQ(a.ec.key[0], 0x0f);
-  CHECK_EQ(a.ec.key[15], 0xf0);
+  // The client needs somewhere to connect; the server does not.
+  CHECK(!TryParse(EngineRole::kClient, {key}, &a, &error));
+  CHECK(error.find("--peer") != std::string::npos);
+  CHECK(TryParse(EngineRole::kServer, {key}, &a, &error));
+  CHECK_EQ(a.ro.bind_addr, std::string("0.0.0.0"));
+  CHECK_EQ(a.ro.bind_port, 4460);
 
-  // Same value checks as --key, and the secret must not appear in the reason.
-  CHECK(SetEnv("FCP_TEST_PSK", "not a key"));
-  CHECK(!TryParse(EngineRole::kServer, {"--key-env=FCP_TEST_PSK"}, &a, &error));
-  CHECK(error.find("not a key") == std::string::npos);
+  // Client: peer + local proxy bind, both address-shaped.
+  CHECK(TryParse(EngineRole::kClient,
+                 {key, "--peer=203.0.113.7:5000", "-b", "127.0.0.1:1180"},
+                 &a, &error));
+  CHECK_EQ(a.ro.remote_host, std::string("203.0.113.7"));
+  CHECK_EQ(a.ro.remote_port, 5000);
+  CHECK_EQ(a.ro.listen_addr, std::string("127.0.0.1"));
+  CHECK_EQ(a.ro.listen_port, 1180);
 
-  // All three sources share one slot; two of them is ambiguous, one twice is
-  // a duplicate, and an empty variable name is not a source at all.
+  // Server: UDP bind, address carries its port.
+  CHECK(TryParse(EngineRole::kServer, {key, "--bind=192.168.1.1:5001"}, &a, &error));
+  CHECK_EQ(a.ro.bind_addr, std::string("192.168.1.1"));
+  CHECK_EQ(a.ro.bind_port, 5001);
+
+  // Role-specific options are errors on the other side.
   CHECK(!TryParse(EngineRole::kServer,
-                  {"--key=" + std::string(kGoodKey), "--key-env=FCP_TEST_PSK"}, &a, &error));
-  CHECK(error.find("alternatives") != std::string::npos);
+                  {key, "--peer=10.0.0.1:40000"}, &a, &error));
   CHECK(!TryParse(EngineRole::kServer,
-                  {"--key-env=FCP_TEST_PSK", "--key-env=FCP_TEST_PSK"}, &a, &error));
-  CHECK(error.find("more than once") != std::string::npos);
-  CHECK(!TryParse(EngineRole::kServer, {"--key-env="}, &a, &error));
-  UnsetEnv("FCP_TEST_PSK");
+                  {key, "-b", "127.0.0.1:1080", "--stall-ms=1000"}, &a, &error));
+  CHECK(error.find("--stall-ms") != std::string::npos);
+  CHECK(TryParse(EngineRole::kClient, {key, "--peer=10.0.0.1:40000", "--speedtest"},
+                 &a, &error));  // the bare one-shot form is client-only
+  CHECK(!TryParse(EngineRole::kServer,
+                  {key, "--speedtest=5"}, &a, &error));
+  CHECK(error.find("one-shot") != std::string::npos);  // =SECONDS names a run
 }
-
-// 无任何 --key* 参数时默认读 FCP_PSK 环境变量：这是 deb 包的 /etc/fcp/fcp.env
-// 只写一行 `FCP_PSK=…` 的依据（unit 是 DynamicUser，systemd 以 root 读
-// EnvironmentFile 后注入进程环境，进程无参数、ps 里也没有密钥）。
-void TestKeyDefaultsToFcpPskEnv() {
+void TestShortAndCompoundAddresses() {
   ProxyArgs a;
   std::string error;
-  UnsetEnv("FCP_PSK");
+  const std::string key = "--key=" + std::string(kGoodKey);
 
-  // 什么来源都没有 → 报错原因必须点到 FCP_PSK，运维不用翻 --help。
-  CHECK(!TryParse(EngineRole::kServer, {}, &a, &error));
-  CHECK(error.find("FCP_PSK") != std::string::npos);
+  // Separate, attached and =value forms of a value option (-b only: -H/-l/-m
+  // are gone with #91; --peer has no short form).
+  CHECK(TryParse(EngineRole::kServer, {key, "-b", "127.0.0.1:1180"}, &a, &error));
+  CHECK_EQ(a.ro.bind_addr, std::string("127.0.0.1"));
+  CHECK_EQ(a.ro.bind_port, 1180);
+  CHECK(TryParse(EngineRole::kClient, {key, "--peer=198.51.100.9:4700"}, &a, &error));
+  CHECK_EQ(a.ro.remote_host, std::string("198.51.100.9"));
+  CHECK_EQ(a.ro.remote_port, 4700);
+  CHECK(TryParse(EngineRole::kServer, {key, "--mtu=1500"}, &a, &error));
+  CHECK_EQ(a.ec.mtu, 1500);
 
-  // 设置了就直接生效，等价于 --key-env=FCP_PSK；config 回显要标出来源。
-  CHECK(SetEnv("FCP_PSK", kGoodKey));
-  CHECK(TryParse(EngineRole::kServer, {}, &a, &error));
-  CHECK_EQ(a.ec.key[0], 0x00);
-  CHECK_EQ(a.ec.key[15], 0x0f);
-  CHECK(a.ro.psk_from_default_env);
+  // Attached-value form works for the surviving short option (-b).
+  CHECK(TryParse(EngineRole::kServer, {key, "-b:1180"}, &a, &error));
+  CHECK_EQ(a.ro.bind_addr, std::string("0.0.0.0"));
+  CHECK_EQ(a.ro.bind_port, 1180);
 
-  // 空变量不是"已配置"——与未设置走同一条响亮失败路径。
-  CHECK(SetEnv("FCP_PSK", ""));
-  CHECK(!TryParse(EngineRole::kServer, {}, &a, &error));
+  // -b :PORT keeps the default address; the server needs nothing else but keys.
+  CHECK(TryParse(EngineRole::kServer, {key, "-b", ":40000"}, &a, &error));
+  CHECK_EQ(a.ro.bind_addr, std::string("0.0.0.0"));
+  CHECK_EQ(a.ro.bind_port, 40000);
 
-  // 显式来源优先：给了 --key-env=别的名字，FCP_PSK 的有无都不干扰，
-  // 也不算隐式来源。
-  UnsetEnv("FCP_PSK");
-  CHECK(SetEnv("FCP_TEST_PSK2", kGoodKey));
-  CHECK(TryParse(EngineRole::kServer, {"--key-env=FCP_TEST_PSK2"}, &a, &error));
-  CHECK(!a.ro.psk_from_default_env);
-  UnsetEnv("FCP_TEST_PSK2");
+  // -k was --key-file: both are gone, and the short form must not become a
+  // way to put the PSK back into `ps`.
+  CHECK(!TryParse(EngineRole::kServer, {"-k", "some-path"}, &a, &error));
+  CHECK(error.find("unknown") != std::string::npos);
 
-  // FCP_PSK 内容坏了要报错，且原因里不回显值本身。
-  CHECK(SetEnv("FCP_PSK", "not a key"));
-  CHECK(!TryParse(EngineRole::kServer, {}, &a, &error));
-  CHECK(error.find("not a key") == std::string::npos);
-  UnsetEnv("FCP_PSK");
-}
+  // The address carries its own port; repeating it via a separate spelling is
+  // impossible now -- there is no --port to conflict with.
+  CHECK(TryParse(EngineRole::kClient, {key, "--peer=host.example"}, &a, &error));
+  CHECK_EQ(a.ro.remote_host, std::string("host.example"));
+  CHECK_EQ(a.ro.remote_port, 4460);
+  // Several colons are an IPv6 literal (unsupported: the tunnel socket is
+  // AF_INET), not host:port -- it must not be split into ":" plus port 1.
+  CHECK(TryParse(EngineRole::kClient, {key, "--peer=::1:4000"}, &a, &error));
+  CHECK_EQ(a.ro.remote_host, std::string("::1:4000"));
+  CHECK_EQ(a.ro.remote_port, 4460);
 
-// --log-file=PATH：路径或目录名原样进 ReactorOptions；重复给两次按"同一参数
-// 只能出现一次"的组规则响亮报错。
-void TestLogFileFlag() {
-  ProxyArgs a;
-  std::string error;
+  // A non-numeric suffix is not a port: the whole value stays the address.
+  CHECK(TryParse(EngineRole::kClient, {key, "--peer=host.example:abc"}, &a, &error));
+  CHECK_EQ(a.ro.remote_host, std::string("host.example:abc"));
+  CHECK_EQ(a.ro.remote_port, 4460);
+  // Several colons are an IPv6 literal (unsupported: the tunnel socket is
+  // AF_INET), not host:port -- it must not be split into ":" plus port 1.
+  CHECK(TryParse(EngineRole::kClient, {key, "--peer=::1:4000"}, &a, &error));
+  CHECK_EQ(a.ro.remote_host, std::string("::1:4000"));
+  CHECK_EQ(a.ro.remote_port, 4460);  // several colons: kept whole, default port
 
-  CHECK(Ok(EngineRole::kServer, {}, &a, &error));
-  CHECK(a.ro.log_file.empty());
-  CHECK(Ok(EngineRole::kClient, {"--log-file=/var/log/fcp"}, &a, &error));
-  CHECK_EQ(a.ro.log_file, "/var/log/fcp");
-  CHECK(Ok(EngineRole::kServer, {"--log-file=C:\\logs\\server.log"}, &a, &error));
-  CHECK_EQ(a.ro.log_file, "C:\\logs\\server.log");
-  CHECK(!Ok(EngineRole::kClient, {"--log-file=a", "--log-file=b"}, &a, &error));
-  CHECK(error.find("more than once") != std::string::npos);
+  // Short-option errors name the short spelling and the value it needs.
+  CHECK(!TryParse(EngineRole::kServer, {key, "-b"}, &a, &error));
+  CHECK(error.find("-b") != std::string::npos);
+  CHECK(!TryParse(EngineRole::kClient, {key, "-vx"}, &a, &error));
+  CHECK(error.find("takes no value") != std::string::npos ||
+        error.find("unknown") != std::string::npos);
+  CHECK(!TryParse(EngineRole::kClient, {key, "-z"}, &a, &error));
+  CHECK(error.find("unknown") != std::string::npos);
+  CHECK(!TryParse(EngineRole::kClient, {key, "--mtu=70000"}, &a, &error));
+  CHECK(error.find("--mtu") != std::string::npos);
 }
 
 void TestNumericRanges() {
@@ -264,45 +270,22 @@ void TestNumericRanges() {
   CHECK(!ok({"--p=3"}));
   CHECK(error.find("unknown") != std::string::npos);
 
-  // --k: -1 is adaptive, 0..7 pins, 8 rejects.
-  CHECK(ok({"--k=-1"}));
-  CHECK_EQ(a.ec.pinned_k, -1);
-  CHECK(ok({"--k=3"}));
-  CHECK_EQ(a.ec.pinned_k, 3);
-  CHECK(!ok({"--k=8"}));
+  // --k and --fec-budget are gone (controller adaptive; decision #91 + the
+  // FEC formula change): every spelling is an unknown argument.
+  CHECK(!ok({"--k=3"}));
+  CHECK(!ok({"--fec-budget=0.5"}));
+  CHECK(error.find("unknown") != std::string::npos);
 
-  // --fec-budget: domain is [0,1]; non-finite and junk reject.
-  CHECK(!ok({"--fec-budget=1.5"}));  // used to silently disable the cap
-  CHECK(!ok({"--fec-budget=-0.1"}));
-  CHECK(!ok({"--fec-budget=abc"}));
-  CHECK(!ok({"--fec-budget=nan"}));
-  CHECK(!ok({"--fec-budget=inf"}));
-  CHECK(ok({"--fec-budget=0"}));
-  CHECK_EQ(a.ec.fec_budget, 0.0);
-  CHECK(ok({"--fec-budget=1"}));
-
-  // --window: the autotune domain is [64, 4096] KiB for both fields.
-  CHECK(!ok({"--window=63"}));
-  CHECK(!ok({"--window=4097"}));
-  CHECK(ok({"--window=64"}));
-  CHECK_EQ(a.ec.send_window_bytes, 64u * 1024);
-  CHECK(!ok({"--window=256:63"}));
-  CHECK(!ok({"--window=63:1024"}));
-  // START above MAX passes the field range but fails the cross-field check.
-  CHECK(!ok({"--window=1024:256"}));
-  CHECK(error.find("above MAX") != std::string::npos);
-  CHECK(ok({"--window=4096:4096"}));
-  CHECK(!ok({"--window=8192"}));  // autotune start above the 4096 ceiling
-  // A fixed window below two segments cannot put one segment on the wire, so
-  // the stream would accept the app's bytes and never send them.
-  CHECK(!ok({"--no-auto-window", "--window=1"}));
-  CHECK(error.find("two segments") != std::string::npos);
-  CHECK(!ok({"--no-auto-window", "--window=2"}));
-  CHECK(ok({"--no-auto-window", "--window=4"}));
-  CHECK(!ok({"--window=256:1024:2048"}));
-  CHECK(!ok({"--window=256:"}));
-  CHECK(!ok({"--window:"}));
-  CHECK(!ok({"--window"}));  // a value option given bare
+  // --window-min: one knob, 1..1048576 KiB, floored by two segments at this
+  // --mtu (default 1400 -> 2672 B, so 1 KiB is refused and 4 KiB accepted).
+  CHECK(!ok({"--window-min=1"}));
+  CHECK(ok({"--window-min=4"}));
+  CHECK_EQ(a.ec.window_min_bytes, 4u * 1024);
+  CHECK(!ok({"--window-min=1048577"}));
+  CHECK(!ok({"--window-min=512:1024"}));
+  CHECK(!ok({"--window-min=:"}));
+  CHECK(!ok({"--window-min:"}));
+  CHECK(!ok({"--window-min"}));  // a value option given bare
   // Every parse failure must come with a message, not an empty line.
   CHECK(!error.empty());
 
@@ -316,12 +299,11 @@ void TestNumericRanges() {
   const auto okc = [&](const std::vector<std::string>& args) {
     return Ok(EngineRole::kClient, args, &a, &error);
   };
-  CHECK(!okc({"--port=0"}));
-  CHECK(!okc({"--port=65536"}));
-  CHECK(okc({"--port=65535"}));
-  CHECK_EQ(a.ro.remote_port, 65535);
-  CHECK(!okc({"--local-port=0"}));
-  CHECK(!ok({"--port=0"}));
+  // The port travels inside the address (--peer=IP:P); --port is gone.
+  CHECK(!okc({"--port=65535"}));
+  CHECK(error.find("unknown") != std::string::npos);
+  CHECK(!okc({"--local-port=1180"}));
+  CHECK(error.find("unknown") != std::string::npos);
 
   // Full-string parse: trailing junk after the number is not a number.
   CHECK(!ok({"--mtu=1400x"}));
@@ -361,242 +343,69 @@ void TestFecAliases() {
   CHECK(!ok({"--fec=10:3", "--fec=10:4"}));
   CHECK(error.find("more than once") != std::string::npos);
 
-  // --p-max is the controller's ceiling, not dead config: a pinned k above
-  // either bound would be clamped by the local session before negotiation, so
-  // it is an error -- the operator would otherwise measure a k they did not
-  // configure.
-  CHECK(ok({"--p-max=7"}));
-  CHECK_EQ(a.ec.p_max, 7);
-  CHECK(!ok({"--p-max=8"}));
-  CHECK(ok({"--p-max=7", "--fec=10:7", "--k=7"}));
-  CHECK_EQ(a.ec.pinned_k, 7);
-  CHECK(!ok({"--k=4"}));  // default p=3 caps it even though --p-max is 6
-  CHECK(error.find("--k=4") != std::string::npos);
-  CHECK(!ok({"--fec=10:7", "--k=7"}));  // --p-max still the default 6
-  CHECK(!ok({"--p-max=5", "--fec=10:5", "--k=6"}));
-  CHECK(ok({"--p-max=5", "--fec=10:5", "--k=5"}));
-  CHECK(ok({"--k=0"}));  // pinning OFF is always representable
-  CHECK(ok({"--p-max=0"}));
-  CHECK(!ok({"--p-max=0", "--k=1"}));
+  // --p-max and --k are gone: P from --fec is the only ceiling, the
+  // controller adapts k. Every spelling is an unknown argument.
+  CHECK(!ok({"--p-max=7"}));
+  CHECK(!ok({"--k=4"}));
+  CHECK(error.find("unknown") != std::string::npos);
 }
 
+// --window-min: one knob. The ceiling is derived (2x the floor), so there is
+// no START/MAX pair, no ":MAX", and no fixed-window mode to spell out.
 void TestWindowForms() {
   ProxyArgs a;
   std::string error;
   const auto ok = [&](const std::vector<std::string>& args) {
     return Ok(EngineRole::kServer, args, &a, &error);
   };
-
-  // Compound: start and ceiling together.
-  CHECK(ok({"--window=512:2048"}));
+  if (!ok({"--window-min=512"})) {
+    std::fprintf(stderr, "DBG window-min error: %s\n", error.c_str());
+  }
+  CHECK(ok({"--window-min=512"}));
+  CHECK_EQ(a.ec.window_min_bytes, 512u * 1024);
   CHECK_EQ(a.ec.send_window_bytes, 512u * 1024);
-  CHECK_EQ(a.ec.window_max_bytes, 2048u * 1024);
-  CHECK(a.ec.auto_window);
+  CHECK(a.ec.window_explicit);  // the prewarm prior must not replace it
 
-  // A single value sets the start only; the ceiling stays at its default.
-  CHECK(ok({"--window=512"}));
-  CHECK_EQ(a.ec.send_window_bytes, 512u * 1024);
-  CHECK_EQ(a.ec.window_max_bytes, 1024u * 1024);
-
-  // ":MAX" pins the ceiling and leaves the start implicit, so the prewarm
-  // prior can still replace it (this is what the GUI passes).
-  CHECK(ok({"--window=:2048"}));
-  CHECK_EQ(a.ec.window_max_bytes, 2048u * 1024);
-  CHECK_EQ(a.ec.send_window_bytes, 256u * 1024);
-  CHECK(!a.ec.window_explicit);
-  CHECK_EQ(a.ec.window_ceiling_bytes, 0u);  // a pinned MAX is a decision
-  // --window-cap is gone: one spelling, no alias to keep in sync.
+  // Removed spellings are unknown arguments.
+  CHECK(!ok({"--window=512"}));
+  CHECK(!ok({"--window=512:2048"}));
+  CHECK(!ok({"--window=:2048"}));
+  CHECK(!ok({"--no-auto-window"}));
+  CHECK(!ok({"--auto-window"}));
   CHECK(!ok({"--window-cap=2048"}));
-  CHECK(error.find("unknown") != std::string::npos);
-  CHECK(!ok({"--window=512", "--window=1024"}));
+  CHECK(error.find("unknown argument") != std::string::npos);
+
+  // Floor bounds: must cover two segments at this --mtu (default 1400 ->
+  // payload 1336 x 2 = 2672 B, so 1 KiB is refused and 4 KiB is accepted).
+  CHECK(!ok({"--window-min=1"}));
+  CHECK(ok({"--window-min=4"}));
+  CHECK_EQ(a.ec.window_min_bytes, 4u * 1024);
+
+  // Repeats and non-numeric values are the usual loud failures.
+  CHECK(!ok({"--window-min=512", "--window-min=1024"}));
   CHECK(error.find("more than once") != std::string::npos);
-  CHECK(!ok({"--window=:"}));  // no field at all
+  CHECK(!ok({"--window-min=abc"}));
   CHECK(!error.empty());
 
-  // Below the engine's autotune floor used to be silently raised.
-  CHECK(!ok({"--window=32"}));
-
-  // --no-auto-window keeps a single fixed --window, but a MAX is dead config.
-  CHECK(ok({"--no-auto-window", "--window=512"}));
-  CHECK(!a.ec.auto_window);
-  CHECK(!ok({"--no-auto-window", "--window=512:2048"}));
-  CHECK(!ok({"--no-auto-window", "--window=:2048"}));
-  // The fixed window keeps its old 1 GiB range; only autotune is 64..4096.
-  CHECK(ok({"--no-auto-window", "--window=8192"}));
-  CHECK_EQ(a.ec.send_window_bytes, 8192u * 1024);
-  CHECK(a.ec.window_explicit);  // the prewarm prior must not replace it
-  // The receive capacity follows the fixed window: otherwise the peer's sender
-  // is clamped at the 256 KiB default while our own window is 8 MiB.
-  CHECK_EQ(a.ec.rcv_buf_bytes, 8192u * 1024);
-  // An explicit --rcv-buf still wins (memory-constrained hosts).
-  CHECK(ok({"--no-auto-window", "--window=8192", "--rcv-buf=512"}));
-  CHECK_EQ(a.ec.rcv_buf_bytes, 512u * 1024);
-  // A small fixed window leaves the default 256 KiB receive buffer alone.
-  CHECK(ok({"--no-auto-window", "--window=128"}));
-  CHECK_EQ(a.ec.rcv_buf_bytes, 256u * 1024);
-  CHECK(!ok({"--window=8192"}));  // autotune start must fit under MAX 4096
-
-  // --auto-window is the default spelled out, so it is gone too: there is no
-  // way to make autotune "more on", and a dead flag reads as configured.
-  CHECK(!ok({"--auto-window"}));
-  CHECK(error.find("unknown") != std::string::npos);
-
-  // --rcv-buf survives as the fixed-mode receive buffer (removing it outright
-  // would take away the only way to size the receive side of a fixed window),
-  // but it is dead config under autotune.
-  CHECK(!ok({"--rcv-buf=256"}));
-  CHECK(error.find("--no-auto-window") != std::string::npos);
-  CHECK(ok({"--no-auto-window", "--rcv-buf=512"}));
-  CHECK_EQ(a.ec.rcv_buf_bytes, 512u * 1024);
-  CHECK(!ok({"--no-auto-window", "--rcv-buf=0"}));
+  // Default: 2 MiB floor, ceiling derived per stream (2 x), nothing explicit.
+  ProxyArgs d;
+  CHECK(Ok(EngineRole::kServer, {}, &d, &error));
+  CHECK_EQ(d.ec.window_min_bytes, 2u * 1024 * 1024);
+  CHECK_EQ(d.ec.send_window_bytes, 2u * 1024 * 1024);
+  CHECK(!d.ec.window_explicit);
 }
-
-void TestAutotuneNotes() {
-  ProxyArgs a;
-  std::string error;
-  const auto ok = [&](const std::vector<std::string>& args) {
-    return Ok(EngineRole::kServer, args, &a, &error);
-  };
-
-  // Nothing is raised when the ceiling equals the fixed-mode buffer: the note
-  // only exists to say that autotune overrides the configured 256 KiB.
-  CHECK(ok({}));
-  CHECK_EQ(a.notes.size(), 1u);
-  CHECK(a.notes[0].find("receive capacity") != std::string::npos);
-  CHECK(ok({"--window=256:256"}));
-  CHECK(a.notes.empty());
-
-  // A start above the ceiling is a mistake, not a note: the old code clamped
-  // it silently, which is exactly the class of flag this rewrite removed.
-  CHECK(!ok({"--window=4096:1024"}));
-  CHECK(error.find("above MAX") != std::string::npos);
-  CHECK(!ok({"--window=2048"}));  // start 2048 > default MAX 1024
-  CHECK(ok({"--window=2048:2048"}));
-
-  // Fixed mode never notes anything: nothing is overridden.
-  CHECK(ok({"--no-auto-window"}));
-  CHECK(a.notes.empty());
-}
-
-void TestRoleRequirements() {
+void TestLogFileFlag() {
   ProxyArgs a;
   std::string error;
 
-  // The client needs somewhere to connect; the server does not.
-  CHECK(!TryParse(EngineRole::kClient, {"--key=" + std::string(kGoodKey)}, &a, &error));
-  CHECK(error.find("--host") != std::string::npos);
-  CHECK(TryParse(EngineRole::kServer, {"--key=" + std::string(kGoodKey)}, &a, &error));
-  CHECK_EQ(a.ro.bind_addr, std::string("0.0.0.0"));
-  CHECK_EQ(a.ro.bind_port, 4460);
-
-  CHECK(TryParse(EngineRole::kClient,
-                 {"--key=" + std::string(kGoodKey), "--host=203.0.113.7",
-                  "--port=5000", "--listen=127.0.0.1", "--local-port=1180"},
-                 &a, &error));
-  CHECK_EQ(a.ro.remote_host, std::string("203.0.113.7"));
-  CHECK_EQ(a.ro.remote_port, 5000);
-  CHECK_EQ(a.ro.listen_addr, std::string("127.0.0.1"));
-  CHECK_EQ(a.ro.listen_port, 1180);
-
-  // Server-side flags land in the reactor options verbatim.
-  CHECK(TryParse(EngineRole::kServer,
-                 {"--key=" + std::string(kGoodKey), "--bind=192.168.1.1", "--port=5001"},
-                 &a, &error));
-  CHECK_EQ(a.ro.bind_addr, std::string("192.168.1.1"));
-  CHECK_EQ(a.ro.bind_port, 5001);
-
-  // Role-specific options are errors on the other side: they used to be
-  // accepted and quietly ignored, which reads as "configured" in a script.
-  CHECK(!Ok(EngineRole::kServer, {"--local-port=1080"}, &a, &error));
-  CHECK(!TryParse(EngineRole::kServer,
-                  {"--key=" + std::string(kGoodKey), "--listen=127.0.0.1"}, &a, &error));
-  CHECK(!TryParse(EngineRole::kServer,
-                  {"--key=" + std::string(kGoodKey), "--host=10.0.0.1"}, &a, &error));
-  CHECK(!TryParse(EngineRole::kClient,
-                  {"--key=" + std::string(kGoodKey), "--host=10.0.0.1", "--bind=0.0.0.0"},
-                  &a, &error));
-  // An explicit empty address is a typo, not "use the default".
-  CHECK(!Ok(EngineRole::kServer, {"--bind="}, &a, &error));
-  CHECK(!Ok(EngineRole::kClient, {"--listen="}, &a, &error));
-  CHECK(!Ok(EngineRole::kClient, {"--host="}, &a, &error));
-
-  // The role has to reach BOTH halves. EngineConfig::role defaults to kClient,
-  // so a server that only fills ReactorOptions still prints "server: fcp on"
-  // and yet runs a client-side engine: it never births a session from a peer's
-  // datagram and silently drops every HELLO as unknown_salt. This is exactly
-  // what a 0.0.1 deb on a live host did.
-  CHECK_EQ(static_cast<int>(a.ec.role), static_cast<int>(EngineRole::kClient));
-  CHECK_EQ(static_cast<int>(a.ro.role), static_cast<int>(EngineRole::kClient));
-  CHECK(Ok(EngineRole::kClient, {}, &a, &error));
-  CHECK_EQ(static_cast<int>(a.ec.role), static_cast<int>(EngineRole::kClient));
-  CHECK(TryParse(EngineRole::kServer, {"--key=" + std::string(kGoodKey)}, &a, &error));
-  CHECK_EQ(static_cast<int>(a.ec.role), static_cast<int>(EngineRole::kServer));
-  CHECK_EQ(static_cast<int>(a.ro.role), static_cast<int>(EngineRole::kServer));
-}
-
-// Short spellings and ADDR:PORT. Both are pure ergonomics: the same options,
-// one argument shorter. They must land in exactly the same fields as the long
-// form (there is one ApplyValue, reached after the rewrite), and combining the
-// two port sources has to fail rather than silently pick one.
-void TestShortAndCompoundAddresses() {
-  ProxyArgs a;
-  std::string error;
-  const std::string key = "--key=" + std::string(kGoodKey);
-
-  // Separate, attached and =value forms of a value option.
-  CHECK(TryParse(EngineRole::kClient,
-                 {key, "-H", "198.51.100.9:4700", "-l", "127.0.0.1:1180", "-m", "1500"},
-                 &a, &error));
-  CHECK_EQ(a.ro.remote_host, std::string("198.51.100.9"));
-  CHECK_EQ(a.ro.remote_port, 4700);
-  CHECK_EQ(a.ro.listen_addr, std::string("127.0.0.1"));
-  CHECK_EQ(a.ro.listen_port, 1180);
-  CHECK_EQ(a.ec.mtu, 1500);
-
-  CHECK(TryParse(EngineRole::kClient, {key, "-H=203.0.113.7", "-p5000"}, &a, &error));
-  CHECK_EQ(a.ro.remote_host, std::string("203.0.113.7"));
-  CHECK_EQ(a.ro.remote_port, 5000);
-
-  // -b :PORT keeps the default address; the server needs nothing else but keys.
-  CHECK(TryParse(EngineRole::kServer, {key, "-b", ":40000"}, &a, &error));
-  CHECK_EQ(a.ro.bind_addr, std::string("0.0.0.0"));
-  CHECK_EQ(a.ro.bind_port, 40000);
-
-  // -k is --key-file (a path, not the key itself): the short form must not
-  // become a way to put the PSK back into `ps`.
-  const std::string path = TempPath("short_key");
-  CHECK(WriteFile(path, kGoodKey));
-  CHECK(TryParse(EngineRole::kServer, {"-k", path}, &a, &error));
-  std::remove(path.c_str());
-
-  // One port, one source.
-  CHECK(!TryParse(EngineRole::kClient, {key, "-H", "10.0.0.1:5000", "-p", "6000"}, &a,
-                  &error));
-  CHECK(error.find("twice") != std::string::npos);
-  CHECK(!TryParse(EngineRole::kClient,
-                  {key, "--host=10.0.0.1", "-l", "127.0.0.1:1180", "--local-port=1190"},
-                  &a, &error));
-  CHECK(error.find("twice") != std::string::npos);
-
-  // A non-numeric suffix is not a port: the whole value stays the address.
-  CHECK(TryParse(EngineRole::kClient, {key, "-H", "host.example"}, &a, &error));
-  CHECK_EQ(a.ro.remote_host, std::string("host.example"));
-  CHECK_EQ(a.ro.remote_port, 4460);
-  // Several colons are an IPv6 literal (unsupported: the tunnel socket is
-  // AF_INET), not host:port -- it must not be split into ":" plus port 1.
-  CHECK(TryParse(EngineRole::kClient, {key, "--host=::1", "--port=4000"}, &a, &error));
-  CHECK_EQ(a.ro.remote_host, std::string("::1"));
-  CHECK_EQ(a.ro.remote_port, 4000);
-
-  // Short-option errors name the short spelling and the value it needs.
-  CHECK(!TryParse(EngineRole::kServer, {key, "-k"}, &a, &error));
-  CHECK(error.find("-k") != std::string::npos);
-  CHECK(!TryParse(EngineRole::kClient, {key, "--host=10.0.0.1", "-vx"}, &a, &error));
-  CHECK(error.find("takes no value") != std::string::npos);
-  CHECK(!TryParse(EngineRole::kClient, {key, "--host=10.0.0.1", "-z"}, &a, &error));
-  CHECK(error.find("unknown") != std::string::npos);
-  CHECK(!TryParse(EngineRole::kClient, {key, "--host=10.0.0.1", "-m", "70000"}, &a, &error));
-  CHECK(error.find("--mtu") != std::string::npos);
+  CHECK(Ok(EngineRole::kServer, {}, &a, &error));
+  CHECK(a.ro.log_file.empty());
+  CHECK(Ok(EngineRole::kClient, {"--log-file=/var/log/fcp"}, &a, &error));
+  CHECK_EQ(a.ro.log_file, "/var/log/fcp");
+  CHECK(Ok(EngineRole::kServer, {"--log-file=C:\\logs\\server.log"}, &a, &error));
+  CHECK_EQ(a.ro.log_file, "C:\\logs\\server.log");
+  CHECK(!Ok(EngineRole::kClient, {"--log-file=a", "--log-file=b"}, &a, &error));
+  CHECK(error.find("more than once") != std::string::npos);
 }
 
 void TestDefaultsSurvive() {
@@ -608,9 +417,9 @@ void TestDefaultsSurvive() {
   CHECK_EQ(a.ec.p, 3);
   CHECK_EQ(a.ec.pinned_k, -1);
   CHECK_EQ(a.ec.fec_budget, 0.80);
-  CHECK_EQ(a.ec.send_window_bytes, 256u * 1024);
+  CHECK_EQ(a.ec.send_window_bytes, 2u * 1024 * 1024);
+  CHECK_EQ(a.ec.window_min_bytes, 2u * 1024 * 1024);
   CHECK_EQ(a.ec.rcv_buf_bytes, 256u * 1024);
-  CHECK(a.ec.auto_window);
   CHECK_EQ(a.ec.max_sessions, 256u);
   CHECK_EQ(a.ec.idle_timeout_ms, 300000);
   CHECK_EQ(a.ec.dial_timeout_ms, 5000);
@@ -620,26 +429,12 @@ void TestDefaultsSurvive() {
   CHECK_EQ(a.ro.stats_ms, 0);
   CHECK_EQ(a.ro.connect_timeout_ms, 5000);
   CHECK(a.ec.trace_prefix.empty());
-  // Wire-side defaults: coalesced ACKs. The BDP-following ceiling scales with
-  // --max-sessions so the documented 512 MiB worst case does not move: 256
-  // sessions get no extra room over the 1 MiB MAX, 64 sessions get 4 MiB.
+  // Wire-side defaults: coalesced ACKs. The ceiling is derived per stream
+  // (2 x --window-min), so --max-sessions now only bounds the count.
   CHECK_EQ(static_cast<int>(a.ec.ack_every), 2);
-  CHECK_EQ(a.ec.window_ceiling_bytes, 0u);
   ProxyArgs few;
   CHECK(Ok(EngineRole::kServer, {"--max-sessions=64"}, &few, &error));
-  CHECK_EQ(few.ec.window_ceiling_bytes, 4u * 1024 * 1024);
-
-  // Pinning the ceiling is a decision: the default does not raise it, and the
-  // ACK ratio is independent of the window mode.
-  ProxyArgs pinned;
-  CHECK(Ok(EngineRole::kClient, {"--window=:2048"}, &pinned, &error));
-  CHECK_EQ(pinned.ec.window_max_bytes, 2048u * 1024);
-  CHECK_EQ(pinned.ec.window_ceiling_bytes, 0u);
-  CHECK_EQ(static_cast<int>(pinned.ec.ack_every), 2);
-  ProxyArgs fixed;
-  CHECK(Ok(EngineRole::kClient, {"--no-auto-window", "--window=4096"}, &fixed, &error));
-  CHECK_EQ(fixed.ec.window_ceiling_bytes, 0u);
-  CHECK_EQ(static_cast<int>(fixed.ec.ack_every), 2);
+  CHECK_EQ(few.ec.window_min_bytes, 2u * 1024 * 1024);
 
   // Upward PMTUD is on with the built-in 1500 ceiling; --no-pmtud turns it
   // off; the positive spelling never existed.
@@ -670,16 +465,17 @@ void TestMetaFlagsWinOverBadValues() {
   ProxyArgs a;
   std::string error;
 
-  // --help/--version short-circuit before any value is parsed: the package
-  // self-test runs the bare flag, but scripts append it to a long line and a
-  // stale value elsewhere in that line must not turn a diagnostic into a usage
-  // error. In particular no PSK is required.
-  CHECK(TryParse(EngineRole::kServer, {"--version", "--mtu=abc"}, &a, &error));
-  CHECK(a.version);
-  CHECK(TryParse(EngineRole::kServer, {"--mtu=abc", "--help"}, &a, &error));
+  // --help short-circuits before any value is parsed: scripts append it to a
+  // long line and a stale value elsewhere in that line must not turn a
+  // diagnostic into a usage error. In particular no PSK is required.
+  CHECK(TryParse(EngineRole::kServer, {"--help", "--stall-ms=abc"}, &a, &error));
   CHECK(a.help);
-  CHECK(TryParse(EngineRole::kServer, {"--key-file=/nonexistent", "--version"}, &a, &error));
-  CHECK(a.version);
+  CHECK(TryParse(EngineRole::kServer, {"--stall-ms=abc", "--help"}, &a, &error));
+  CHECK(a.help);
+  // Removed spellings are checked first on purpose, so --version explains
+  // itself instead of being swallowed by the usage text (fcp-node contract).
+  CHECK(!TryParse(EngineRole::kServer, {"--help", "--version"}, &a, &error));
+  CHECK(error.find("--version") != std::string::npos);
 
   // Everything else fails loudly, and every failure carries a message (an
   // empty one would print a blank line before the usage block).
@@ -693,14 +489,16 @@ void TestFlagsAndValues() {
   ProxyArgs a;
   std::string error;
   CHECK(Ok(EngineRole::kServer,
-           {"--no-prewarm", "-v", "--trace=/tmp/calib", "--connect-timeout=2500"},
+           {"--no-prewarm", "--metrics=/tmp/calib", "--dial-timeout=2500"},
            &a, &error));
   CHECK(!a.ec.prewarm);
-  CHECK_EQ(Severity(a.ro.log_level), Severity(LogLevel::kDebug));  // -v = debug 别名
+  CHECK_EQ(Severity(a.ro.log_level), Severity(LogLevel::kDebug));  // default
   CHECK_EQ(a.ec.trace_prefix, std::string("/tmp/calib"));
+  // One dial budget feeds the reactor's per-address connect timer too.
+  CHECK_EQ(a.ec.dial_timeout_ms, 2500);
   CHECK_EQ(a.ro.connect_timeout_ms, 2500);
   CHECK(Ok(EngineRole::kServer,
-           {"-v", "--max-sessions=512", "--idle=1000", "--no-prewarm"}, &a, &error));
+           {"--max-sessions=512", "--idle=1000", "--no-prewarm"}, &a, &error));
   CHECK_EQ(Severity(a.ro.log_level), Severity(LogLevel::kDebug));
   CHECK(!a.ec.prewarm);
   CHECK_EQ(a.ec.max_sessions, 512u);
@@ -712,34 +510,34 @@ void TestFlagsAndValues() {
   CHECK_EQ(a.ro.stats_ms, 0);
   CHECK(!Ok(EngineRole::kServer, {"--stats=-1"}, &a, &error));
   CHECK(!Ok(EngineRole::kServer, {"--stats=abc"}, &a, &error));
-  CHECK(!Ok(EngineRole::kServer, {"-v", "--log=off"}, &a, &error));
-  CHECK(error.find("more than once") != std::string::npos);
 
-  // Outside help/version, a value error always has a message.
+  // Outside help, a value error always has a message.
   CHECK(!Ok(EngineRole::kServer, {"--mtu=abc"}, &a, &error));
   CHECK(error.find("--mtu") != std::string::npos);
-  CHECK(!Ok(EngineRole::kServer, {"--log=chatty"}, &a, &error));
-  CHECK(error.find("--log") != std::string::npos);
+  CHECK(!Ok(EngineRole::kServer, {"--log-level=chatty"}, &a, &error));
+  CHECK(error.find("--log-level") != std::string::npos);
 
-  // --log=LEVEL 四个阈值 + verbose 别名；周期统计归 --stats，两者互不干扰。
-  CHECK(Ok(EngineRole::kServer, {"--log=off"}, &a, &error));
+  // --log-level=LEVEL 四个阈值（verbose 别名已删除）；周期统计归 --stats。
+  CHECK(Ok(EngineRole::kServer, {"--log-level=off"}, &a, &error));
   CHECK_EQ(Severity(a.ro.log_level), Severity(LogLevel::kOff));
   CHECK_EQ(a.ro.stats_ms, 0);  // --log 不再影响统计
-  CHECK(Ok(EngineRole::kServer, {"--log=off", "--stats=5000"}, &a, &error));
+  CHECK(Ok(EngineRole::kServer, {"--log-level=off", "--stats=5000"}, &a, &error));
   CHECK_EQ(a.ro.stats_ms, 5000);
-  CHECK(Ok(EngineRole::kServer, {"--log=error"}, &a, &error));
+  CHECK(Ok(EngineRole::kServer, {"--log-level=error"}, &a, &error));
   CHECK_EQ(Severity(a.ro.log_level), Severity(LogLevel::kError));
-  CHECK(Ok(EngineRole::kServer, {"--log=warn"}, &a, &error));
+  CHECK(Ok(EngineRole::kServer, {"--log-level=warn"}, &a, &error));
   CHECK_EQ(Severity(a.ro.log_level), Severity(LogLevel::kWarn));
-  CHECK(Ok(EngineRole::kServer, {"--log=info"}, &a, &error));
+  CHECK(Ok(EngineRole::kServer, {"--log-level=info"}, &a, &error));
   CHECK_EQ(Severity(a.ro.log_level), Severity(LogLevel::kInfo));
-  CHECK(Ok(EngineRole::kServer, {"--log=debug"}, &a, &error));
+  CHECK(Ok(EngineRole::kServer, {"--log-level=debug"}, &a, &error));
   CHECK_EQ(Severity(a.ro.log_level), Severity(LogLevel::kDebug));
-  CHECK(Ok(EngineRole::kServer, {"--log=verbose", "--stats=1500"}, &a, &error));
+  CHECK(!Ok(EngineRole::kServer, {"--log-level=verbose"}, &a, &error));
+  CHECK(error.find("--log-level") != std::string::npos);
+  CHECK(Ok(EngineRole::kServer, {"--log-level=debug", "--stats=1500"}, &a, &error));
   CHECK_EQ(Severity(a.ro.log_level), Severity(LogLevel::kDebug));
   CHECK_EQ(a.ro.stats_ms, 1500);
-  CHECK(!Ok(EngineRole::kServer, {"--log=chatty"}, &a, &error));
-  CHECK(!Ok(EngineRole::kServer, {"--log=debug", "--log=off"}, &a, &error));
+  CHECK(!Ok(EngineRole::kServer, {"--log-level=chatty"}, &a, &error));
+  CHECK(!Ok(EngineRole::kServer, {"--log-level=debug", "--log-level=off"}, &a, &error));
 
   // 阈值判定的唯一实现：启动期提示（cli main）、汇集点与文件存档共用。
   // 这组断言盯的正是"note()/启动提示绕过 --log"那类回归。
@@ -755,13 +553,13 @@ void TestFlagsAndValues() {
   CHECK(TryParse(EngineRole::kClient, {"-h"}, &a, &error));
   CHECK(a.help);
 
-  // --version does the same: an installed package must answer
-  // `fcp-server --version` without being handed a PSK.
-  CHECK(TryParse(EngineRole::kServer, {"--version"}, &a, &error));
-  CHECK(a.version);
-  CHECK(!a.help);
-  CHECK(TryParse(EngineRole::kServer, {"-V"}, &a, &error));
-  CHECK(a.version);
+  // --version/-V are gone; -h is the single place to ask, and its first line
+  // carries the release version. Old spellings are plain unknown options.
+  CHECK(!TryParse(EngineRole::kServer, {"--version"}, &a, &error));
+  CHECK(error.find("unknown argument") != std::string::npos);
+  CHECK(error.find("--version") != std::string::npos);
+  CHECK(!TryParse(EngineRole::kServer, {"-V"}, &a, &error));
+  CHECK(error.find("unknown argument") != std::string::npos);
 
     // Positional junk is a usage error, not a silently ignored token.
   CHECK(!TryParse(EngineRole::kServer, {"stray"}, &a, &error));
@@ -778,29 +576,30 @@ void TestSpeedTestFlags() {
   // Server: the bare flag enables the frame-layer responder on the FCP port.
   CHECK(Ok(EngineRole::kServer, {"--speedtest"}, &a, &error));
   CHECK(a.ro.speedtest);
-  // --speedtest-seconds belongs to the client's one-shot run only.
-  CHECK(!Ok(EngineRole::kServer, {"--speedtest", "--speedtest-seconds=8"}, &a, &error));
+  // A duration belongs to the client's one-shot run only.
+  CHECK(!Ok(EngineRole::kServer, {"--speedtest=8"}, &a, &error));
   CHECK(error.find("client") != std::string::npos);
 
   // Client: --speedtest switches to one bench run and leaves the proxy alone.
   CHECK(Ok(EngineRole::kClient, {"--speedtest"}, &a, &error));
   CHECK(a.speedtest);
   CHECK_EQ(a.speedtest_seconds, 8);
-  CHECK(Ok(EngineRole::kClient, {"--speedtest", "--speedtest-seconds=12"}, &a, &error));
+  CHECK(Ok(EngineRole::kClient, {"--speedtest=12"}, &a, &error));
   CHECK_EQ(a.speedtest_seconds, 12);
 
-  // Seconds without the mode flag would be silently ignored.
-  CHECK(!Ok(EngineRole::kClient, {"--speedtest-seconds=12"}, &a, &error));
-  // Bare flags take no value, and the old --speedtest-port spelling is gone.
-  CHECK(!Ok(EngineRole::kClient, {"--speedtest=1"}, &a, &error));
+  // The optional value is attached with '=' only; the old separate spelling
+  // is now a removed option, not a silent second way to say the same thing.
+  CHECK(!Ok(EngineRole::kClient, {"--speedtest="}, &a, &error));
+  CHECK(error.find("value after '='") != std::string::npos);
   CHECK(!Ok(EngineRole::kServer, {"--speedtest-port=9001"}, &a, &error));
   // Range guards: the run takes 2 x N seconds, so the window is bounded.
-  CHECK(!Ok(EngineRole::kClient, {"--speedtest", "--speedtest-seconds=2"}, &a, &error));
-  CHECK(!Ok(EngineRole::kClient, {"--speedtest", "--speedtest-seconds=31"}, &a, &error));
-  CHECK(!Ok(EngineRole::kClient, {"--speedtest", "--speedtest-seconds=abc"}, &a, &error));
+  CHECK(!Ok(EngineRole::kClient, {"--speedtest=1"}, &a, &error));
+  CHECK(!Ok(EngineRole::kClient, {"--speedtest=2"}, &a, &error));
+  CHECK(!Ok(EngineRole::kClient, {"--speedtest=31"}, &a, &error));
+  CHECK(!Ok(EngineRole::kClient, {"--speedtest=abc"}, &a, &error));
 }
 
-void TestStallAndRateFlags() {
+void TestStallFlag() {
   ProxyArgs a;
   std::string error;
 
@@ -817,80 +616,25 @@ void TestStallAndRateFlags() {
   CHECK(!Ok(EngineRole::kClient, {"--stall-ms=-1"}, &a, &error));
   CHECK(!Ok(EngineRole::kClient, {"--stall-ms=abc"}, &a, &error));
 
-  // --rate-limit=UP[:DOWN] Mbps; the client shapes its upload.
-  CHECK(Ok(EngineRole::kClient, {"--rate-limit=8"}, &a, &error));
-  CHECK_EQ(a.ro.rate_up_bytes, 1000000);  // 8 Mbps = 1 MB/s
-  CHECK_EQ(a.ro.rate_down_bytes, 0);
-  CHECK(Ok(EngineRole::kClient, {"--rate-limit=8:20"}, &a, &error));
-  CHECK_EQ(a.ro.rate_up_bytes, 1000000);
-  // The DOWN half is the server's setting; the client locally unshaped.
-  CHECK(!Ok(EngineRole::kClient, {"--rate-limit=0:20"}, &a, &error));
-  CHECK(error.find("UP") != std::string::npos);
-  CHECK(!Ok(EngineRole::kClient, {"--rate-limit="}, &a, &error));
-  CHECK(!Ok(EngineRole::kClient, {"--rate-limit=8:"}, &a, &error));
-  CHECK(!Ok(EngineRole::kClient, {"--rate-limit=8:20:5"}, &a, &error));
-  CHECK(!Ok(EngineRole::kClient, {"--rate-limit=abc:20"}, &a, &error));
-  CHECK(!Ok(EngineRole::kClient, {"--rate-limit=100001"}, &a, &error));
-  // One second of budget must cover one full datagram: below that the shaper
-  // passes everything through and the link runs unshaped behind a rate line.
-  CHECK(!Ok(EngineRole::kClient, {"--rate-limit=0.0000001"}, &a, &error));
-  CHECK(error.find("too small to shape") != std::string::npos);
-  CHECK(!Ok(EngineRole::kClient, {"--rate-limit=0.01"}, &a, &error));  // 1250 B/s < mtu 1400
-  CHECK(error.find("one datagram") != std::string::npos);
-  // Just above the floor shapes for real.
-  CHECK(Ok(EngineRole::kClient, {"--rate-limit=0.05"}, &a, &error));  // 6250 B/s
-  CHECK_EQ(a.ro.rate_up_bytes, 6250);
-  // The one-shot bench measures raw throughput; shaping is meaningless there.
-  CHECK(!Ok(EngineRole::kClient, {"--speedtest", "--rate-limit=8"}, &a, &error));
-  CHECK(error.find("--speedtest") != std::string::npos);
-
-  // The server enforces the DOWN half (it serves the download).
-  CHECK(Ok(EngineRole::kServer, {"--rate-limit=0:5"}, &a, &error));
-  CHECK_EQ(a.ro.rate_down_bytes, 625000);
-  CHECK_EQ(a.ro.rate_up_bytes, 0);
-  CHECK(!Ok(EngineRole::kServer, {"--rate-limit=5:0"}, &a, &error));
-  CHECK(error.find("DOWN") != std::string::npos);
-  // A server bar one half ("=5") shapes nothing: DOWN is its half.
-  CHECK(!Ok(EngineRole::kServer, {"--rate-limit=5"}, &a, &error));
-  CHECK(error.find("shapes nothing") != std::string::npos);
+  // --rate-limit is gone; there is no compatibility shim.
+  CHECK(!Ok(EngineRole::kClient, {"--rate-limit=8"}, &a, &error));
+  CHECK(error.find("unknown argument") != std::string::npos);
+  CHECK(error.find("--rate-limit") != std::string::npos);
 }
 
-void TestBbrFlags() {
+void TestCcFlag() {
   ProxyArgs a;
   std::string error;
 
-  // BBR owns the adaptive window by default; v2 is the shipping version
-  // (it learns the path's own loss floor before treating loss as congestion).
+  // BBR is the only adaptive-window controller; --cc was removed with the
+  // epoch controller, so every spelling of it is now an unknown argument.
   CHECK(Ok(EngineRole::kServer, {}, &a, &error));
-  CHECK(a.ec.bbr);
   CHECK_EQ(a.ec.bbr_version, 2);
-
-  // v1 stays selectable for comparison.
-  CHECK(Ok(EngineRole::kServer, {"--bbr-version=1"}, &a, &error));
-  CHECK_EQ(a.ec.bbr_version, 1);
-  CHECK(!Ok(EngineRole::kServer, {"--bbr-version=3"}, &a, &error));
-  CHECK(error.find("--bbr-version") != std::string::npos);
-  CHECK(!Ok(EngineRole::kServer, {"--bbr-version=v2"}, &a, &error));
-
-  // The epoch controller is the fallback; a version with no controller to
-  // apply it to is a mistake, not a silent no-op.
-  CHECK(Ok(EngineRole::kServer, {"--no-bbr"}, &a, &error));
-  CHECK(!a.ec.bbr);
-  CHECK(!Ok(EngineRole::kServer, {"--no-bbr", "--bbr-version=1"}, &a, &error));
-  CHECK(!Ok(EngineRole::kServer, {"--bbr"}, &a, &error));  // removed: BBR is the default
-  CHECK(error.find("unknown") != std::string::npos);
-
-  // A fixed window has no controller either; --bbr-version is then only
-  // noted, because --no-auto-window is the deliberate flag.
-  CHECK(Ok(EngineRole::kServer,
-           {"--no-auto-window", "--window=512", "--bbr-version=1"}, &a, &error));
-  bool noted = false;
-  for (const std::string& n : a.notes) {
-    if (n.find("--bbr-version") != std::string::npos) {
-      noted = true;
-    }
-  }
-  CHECK(noted);
+  CHECK(!Ok(EngineRole::kServer, {"--cc=bbr2"}, &a, &error));
+  CHECK(error.find("--cc") != std::string::npos);
+  CHECK(!Ok(EngineRole::kServer, {"--cc=epoch"}, &a, &error));
+  // The window-probe switch went with the same controller.
+  CHECK(!Ok(EngineRole::kServer, {"--no-window-probe"}, &a, &error));
 }
 
 void TestBenchCodec() {
@@ -1163,7 +907,12 @@ void TestEnvironmentDefaults() {
   CHECK(explicit_fits.notes.empty());
 
   fcp::ResourceLimits unknown;  // -1 = platform has no equivalent (Windows)
-  fcp::EngineConfig ec;         // auto window, 256 sessions, 1 MiB ceiling
+  fcp::EngineConfig ec;         // auto window, 2 MiB floor, derived ceiling
+  // The 512 MiB budget promise does not exist any more (the ceiling is derived
+  // per stream, not budgeted through --max-sessions), so this test picks a
+  // floor that keeps the worst case under the 128 MiB address space used below.
+  ec.window_min_bytes = 64 * 1024;
+  ec.rcv_buf_bytes = 64 * 1024;
   CHECK(fcp::ResourceNotes(fcp::EngineRole::kServer, ec, unknown).empty());
 
   fcp::ResourceLimits fds;
@@ -1185,10 +934,11 @@ void TestEnvironmentDefaults() {
   CHECK_EQ(notes.size(), 1u);
   CHECK(notes[0].find("address-space") != std::string::npos);
 
-  // A small fixed window fits the same limit.
-  ec.auto_window = false;
-  ec.send_window_bytes = 64 * 1024;
-  ec.rcv_buf_bytes = 64 * 1024;
+  // A small window floor fits the same limit: floor 4 KiB, ceiling 8 KiB,
+  // symbols bounded by rcv+send, bookkeeping 64 KiB -> ~22 MiB over 256
+  // sessions, under the 3/4 threshold the estimator applies to 128 MiB.
+  ec.window_min_bytes = 4 * 1024;
+  ec.rcv_buf_bytes = 4 * 1024;
   CHECK(fcp::ResourceNotes(fcp::EngineRole::kServer, ec, mem).empty());
 }
 
@@ -1196,9 +946,7 @@ void TestEnvironmentDefaults() {
 
 int main() {
   TestKeyValidation();
-  TestKeyFile();
-  TestKeyEnv();
-  TestKeyDefaultsToFcpPskEnv();
+  TestUnknownOldSpellings();
   TestNumericRanges();
   TestFecAliases();
   TestWindowForms();
@@ -1208,9 +956,9 @@ int main() {
   TestMetaFlagsWinOverBadValues();
   TestFlagsAndValues();
   TestSpeedTestFlags();
-  TestStallAndRateFlags();
+  TestStallFlag();
   TestLogFileFlag();
-  TestBbrFlags();
+  TestCcFlag();
   TestBenchCodec();
   TestEnvironmentDefaults();
   TestShortAndCompoundAddresses();

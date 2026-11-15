@@ -29,6 +29,47 @@ void Feed(fcp::FecStrategy* st, uint32_t* set_id, double loss, bool queued = fal
   st->on_report(LossReport(++*set_id, loss), queued);
 }
 
+// The controller's answer has one formula, ceil(d x loss x 1.5), with no dead
+// band: every reported loss maps to a k, so the machine always has an opinion.
+// Before this, the binomial rule froze k for whole sessions on a path whose
+// sampled loss sat on one step (16.5% loss, k never moved).
+void TestControllerUsesHeadroomFormula() {
+  CHECK_EQ(fcp::k_for(0.02, 10, 6), 1);  // 0.3 -> floor
+  CHECK_EQ(fcp::k_for(0.10, 10, 6), 2);  // 1.5
+  CHECK_EQ(fcp::k_for(0.165, 10, 6), 3);  // 2.475
+  CHECK_EQ(fcp::k_for(0.20, 10, 6), 3);  // 3.0 exactly
+  CHECK_EQ(fcp::k_for(0.30, 10, 6), 5);  // 4.5
+
+  // A fresh run enters ON at that answer.
+  fcp::FecStrategy st;
+  uint32_t id = 0;
+  Feed(&st, &id, 0.10);
+  CHECK(st.state() == fcp::FecState::kOn);
+  CHECK_EQ(st.k(), 2);
+}
+
+// A step down needs kFecDropStreak consecutive low reports: one loss event must
+// not walk k back down, or a path sitting on a step boundary flaps every report.
+void TestStepDownNeedsSustainedEvidence() {
+  fcp::FecStrategy st;
+  uint32_t id = 0;
+  for (int i = 0; i < 6; ++i) {
+    Feed(&st, &id, 0.20);  // drive k up to the 20% answer
+  }
+  CHECK(st.k() >= 3);
+
+  // One low report: not enough.
+  const uint8_t before = st.k();
+  Feed(&st, &id, 0.01);
+  CHECK_EQ(st.k(), before);
+
+  // kFecDropStreak consecutive low reports step it down by exactly one.
+  for (uint32_t i = 1; i < fcp::kFecDropStreak; ++i) {
+    Feed(&st, &id, 0.01);
+  }
+  CHECK_EQ(st.k(), static_cast<uint8_t>(before - 1));
+}
+
 // ON at 20% (k = 4) then five clean reports -> OFF.
 void DriveToOff(fcp::FecStrategy* st, uint32_t* set_id) {
   Feed(st, set_id, 0.20);
@@ -53,7 +94,7 @@ void TestOffToOn() {
   id = 0;
   Feed(&st2, &id, 0.20);
   CHECK(st2.state() == fcp::FecState::kOn);
-  CHECK_EQ(st2.k(), 4);  // no per-report step limit on entry
+  CHECK_EQ(st2.k(), 3);  // no per-report step limit on entry
 
   fcp::FecStrategy st3;
   id = 0;
@@ -84,18 +125,23 @@ void TestTwoReportEntry() {
 void TestPerReportStep() {
   fcp::FecStrategy st;
   uint32_t id = 0;
-  Feed(&st, &id, 0.20);  // k = 4
-  CHECK_EQ(st.k(), 4);
-  Feed(&st, &id, 0.02);
+  Feed(&st, &id, 0.20);  // k = 3
   CHECK_EQ(st.k(), 3);
-  Feed(&st, &id, 0.02);
+  // Down needs kFecDropStreak consecutive reports; each streak steps one.
+  for (uint32_t i = 0; i < fcp::kFecDropStreak; ++i) {
+    Feed(&st, &id, 0.02);
+  }
   CHECK_EQ(st.k(), 2);
-  Feed(&st, &id, 0.02);
+  for (uint32_t i = 0; i < fcp::kFecDropStreak; ++i) {
+    Feed(&st, &id, 0.02);
+  }
   CHECK_EQ(st.k(), 1);
-  Feed(&st, &id, 0.02);
-  CHECK_EQ(st.k(), 1);
+  for (uint32_t i = 0; i < fcp::kFecDropStreak; ++i) {
+    Feed(&st, &id, 0.02);
+  }
+  CHECK_EQ(st.k(), 1);  // floor
 
-  // Increase is also capped at one per report.
+  // Increase is capped at one per report.
   fcp::FecStrategy st2;
   id = 0;
   Feed(&st2, &id, 0.02);  // k = 1
@@ -108,29 +154,31 @@ void TestPerReportStep() {
 void TestQueuedGuard() {
   fcp::FecStrategy st;
   uint32_t id = 0;
-  Feed(&st, &id, 0.20);  // k = 4
+  Feed(&st, &id, 0.20);  // k = 3
   Feed(&st, &id, 0.20, true);
-  CHECK_EQ(st.k(), 4);  // 1 queued report: no grow, target equal
+  CHECK_EQ(st.k(), 3);  // 1 queued report: no grow, target equal
   Feed(&st, &id, 0.20, true);
-  CHECK_EQ(st.k(), 4);
+  CHECK_EQ(st.k(), 3);
   Feed(&st, &id, 0.20, true);
-  CHECK_EQ(st.k(), 3);  // 3 queued reports: forced k - 1
+  CHECK_EQ(st.k(), 2);  // 3 queued reports: forced k - 1
 
   // A report without queueing resets the streak.
   Feed(&st, &id, 0.20);
-  CHECK_EQ(st.k(), 4);
+  CHECK_EQ(st.k(), 3);  // target 3 is above 2, so it grows back
   Feed(&st, &id, 0.20, true);
-  Feed(&st, &id, 0.20, true);
-  CHECK_EQ(st.k(), 4);
   Feed(&st, &id, 0.20, true);
   CHECK_EQ(st.k(), 3);
+  Feed(&st, &id, 0.20, true);
+  CHECK_EQ(st.k(), 2);
 
   // Decreasing while queued is allowed (only growth is blocked).
   fcp::FecStrategy st2;
   id = 0;
-  Feed(&st2, &id, 0.20);  // k = 4
+  Feed(&st2, &id, 0.20);  // k = 3
+  // Queued reports step down immediately (only growth is blocked), so the
+  // streak gate does not apply on this path.
   Feed(&st2, &id, 0.02, true);
-  CHECK_EQ(st2.k(), 3);
+  CHECK_EQ(st2.k(), 2);
 
   // The floor is 1.
   fcp::FecStrategy st3;
@@ -217,7 +265,7 @@ void TestUntrustedSample() {
   // Exactly 10% is still trusted.
   st.on_report(Report(++id, 1000, 800, 300, 30), false);
   CHECK(st.state() == fcp::FecState::kOn);
-  CHECK_EQ(st.k(), 4);
+  CHECK_EQ(st.k(), 3);
 
   // sets_expected = 0 with any unknown set is untrusted (denominator floor 1).
   fcp::FecStrategy st2;
@@ -258,6 +306,7 @@ void TestSmallSample() {
   CHECK_EQ(st.small_sample_reports(), 1u);
   st.on_report(Report(++id, 256, 200), false);
   CHECK(st.state() == fcp::FecState::kOn);
+  // 56/256 = 21.9% -> ceil(10 x 0.219 x 1.5) = 4
   CHECK_EQ(st.k(), 4);
 }
 
@@ -459,9 +508,11 @@ void TestLedgerFlagDropClearsPEff() {
   // and k must step down toward k_for(0.01).
   st.on_report(LedgerReport(++id, 0.01, 200, bursty_fail, 2, false), false);
   CHECK(!st.ledger_active());
+  CHECK_EQ(st.k(), 3);  // step-down needs kFecDropStreak reports
+  for (uint32_t i = 0; i < fcp::kFecDropStreak; ++i) {
+    st.on_report(LedgerReport(++id, 0.01, 200, bursty_fail, 2, false), false);
+  }
   CHECK_EQ(st.k(), 2);
-  st.on_report(LedgerReport(++id, 0.01, 200, bursty_fail, 2, false), false);
-  CHECK_EQ(st.k(), 1);
 }
 
 // --- M3 byte budget / kCapped (M3控制设计.md §2) ---
@@ -488,15 +539,13 @@ fcp::FecstatPacket BudgetReport(uint32_t set_id, double loss, uint32_t parity_by
 void TestBudgetEntersCapped() {
   fcp::FecStrategy st(BudgetConfig(0.20));
   uint32_t id = 0;
-  Feed(&st, &id, 0.20);  // k = 4, no byte signal on the entry report
-  CHECK_EQ(st.k(), 4);
+  Feed(&st, &id, 0.20);  // k = 3, no byte signal on the entry report
+  CHECK_EQ(st.k(), 3);
 
   st.on_report(BudgetReport(++id, 0.20, kParityAtK4), false);
   CHECK(st.state() == fcp::FecState::kCapped);
-  CHECK_EQ(st.k(), 3);  // budget wins over k_target (= 4 at 20% loss)
+  CHECK_EQ(st.k(), 2);  // budget wins over k_target (= 3 at 20% loss)
 
-  st.on_report(BudgetReport(++id, 0.20, kParityAtK4), false);
-  CHECK_EQ(st.k(), 2);
   st.on_report(BudgetReport(++id, 0.20, kParityAtK4), false);
   CHECK_EQ(st.k(), 1);
   // Floor: §14.11 — congestion pressure never returns k to 0.
@@ -513,15 +562,15 @@ void TestBudgetRecoveryHysteresis() {
   Feed(&st, &id, 0.20);
   st.on_report(BudgetReport(++id, 0.20, kParityAtK4), false);
   CHECK(st.state() == fcp::FecState::kCapped);
-  CHECK_EQ(st.k(), 3);
+  CHECK_EQ(st.k(), 2);
 
   st.on_report(BudgetReport(++id, 0.20, 28000), false);  // ratio 20% — not over
   CHECK(st.state() == fcp::FecState::kOn);
-  CHECK_EQ(st.k(), 3);  // hysteresis report moves nothing
+  CHECK_EQ(st.k(), 2);  // hysteresis report moves nothing
 
   st.on_report(BudgetReport(++id, 0.20, 28000), false);
   CHECK(st.state() == fcp::FecState::kOn);
-  CHECK_EQ(st.k(), 4);  // k_for(0.20) = 4, normal stepping restored
+  CHECK_EQ(st.k(), 3);  // k_for(0.20) = 3, normal stepping restored
 }
 
 // The red line: after convergence the measured ratio respects the budget.
@@ -550,7 +599,7 @@ void TestBudgetZeroDisables() {
   Feed(&st, &id, 0.20);
   st.on_report(BudgetReport(++id, 0.20, 100000000), false);  // ratio 700x
   CHECK(st.state() == fcp::FecState::kOn);
-  CHECK_EQ(st.k(), 4);
+  CHECK_EQ(st.k(), 3);
 }
 
 // Degenerate budget below the k=1 floor's own ratio: the walk-down stops at 1
@@ -558,11 +607,11 @@ void TestBudgetZeroDisables() {
 void TestBudgetFloorStaysOne() {
   fcp::FecStrategy st(BudgetConfig(0.05));
   uint32_t id = 0;
-  Feed(&st, &id, 0.20);  // k = 4
+  Feed(&st, &id, 0.20);  // k = 3
   // The budget sheds one parity per report, so reach the floor first.
-  for (int i = 0; i < 3; ++i) {
+  for (int i = 0; i < 2; ++i) {
     st.on_report(BudgetReport(++id, 0.20, 1400000), false);  // ratio 10x > 5%
-    CHECK_EQ(st.k(), static_cast<uint8_t>(3 - i));
+    CHECK_EQ(st.k(), static_cast<uint8_t>(2 - i));
     CHECK(st.state() == fcp::FecState::kCapped);
   }
   for (int i = 0; i < 5; ++i) {
@@ -657,7 +706,7 @@ void TestCappedFloorReachesOff() {
   s.parity_bytes_rx = 20000;  // peer measured 0.20 redundancy
   st.on_report(s, false);
   CHECK(st.state() == fcp::FecState::kOn);
-  CHECK_EQ(st.k(), 4);
+  CHECK_EQ(st.k(), 3);
 
   // Over budget: one parity per report, down to the floor.
   for (int i = 0; i < 3; ++i) {
@@ -724,6 +773,8 @@ int main() {
   TestBudgetZeroDisables();
   TestBudgetFloorStaysOne();
   TestCappedFloorReachesOff();
+  TestControllerUsesHeadroomFormula();
+  TestStepDownNeedsSustainedEvidence();
   TestFecStateName();
   return fcp_test::finish();
 }

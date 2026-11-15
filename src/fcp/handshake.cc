@@ -19,12 +19,12 @@ constexpr size_t kHelloFlagsOff = kHelloMagicLen + kHandshakeNonceLen + kCapsLen
 constexpr size_t kHelloAckFlagsOff =
     kHelloAckMagicLen + 2 * kHandshakeNonceLen + kCapsLen - 1;
 
-// A handshake message is either the fixed size, or the fixed size plus a
-// length-consistent TLV block when the caps carry kCapTlv (#77). Anything
-// else is not a handshake message -- junk must keep out of the key schedule.
-// A fixed-size message WITH kCapTlv set still passes here: the block it
-// claims is missing, and on_oob() reports that as kBadCaps (the H2 error-ACK
-// path needs the message to reach the caps check, not die in dispatch).
+// A handshake message is the fixed size plus a length-consistent TLV block.
+// Anything else is not a handshake message -- junk must keep out of the key
+// schedule. A fixed-size message that claims kCapTlv still passes here: the
+// block it claims is missing, and on_oob() reports that as kBadCaps (the H2
+// error-ACK path needs the message to reach the caps check, not die in
+// dispatch). A message without kCapTlv is rejected by caps_valid().
 bool handshake_msg_ok(const uint8_t* data, size_t len, size_t fixed_len,
                       const char* magic) {
   if (data == nullptr || len < fixed_len ||
@@ -46,6 +46,10 @@ bool handshake_msg_ok(const uint8_t* data, size_t len, size_t fixed_len,
 
 bool caps_valid(const HandshakeCaps& caps) {
   if (caps.ver != kCapsVersion || caps.data < 1 || caps.parity > kMaxParityField) {
+    return false;
+  }
+  // The TLV block is part of the one supported handshake shape.
+  if ((caps.flags & kCapTlv) == 0) {
     return false;
   }
   if (static_cast<uint16_t>(caps.data) + caps.parity > kMaxCodeLen) {
@@ -222,7 +226,7 @@ Handshake::Handshake(uint8_t local_d, uint8_t local_p, SendFn send,
                      size_t max_cached_bytes, int64_t rtt_seed_ms)
     : local_d_(local_d),
       local_p_(local_p),
-      local_flags_(local_flags),
+      local_flags_(static_cast<uint8_t>(local_flags | kCapTlv)),
       send_(std::move(send)),
       role_(role),
       max_cached_segments_(max_cached_segments),
@@ -272,13 +276,6 @@ void Handshake::on_tick(int64_t now_ms) {
     fail(HandshakeError::kNoAck);
     return;
   }
-  // #77 downgrade probe: two TLV-carrying HELLOs went out unanswered (this
-  // tick fires the third). A peer that predates the bit rejects kCapTlv as a
-  // reserved flag and never ACKs, so finish the schedule in the plain v7
-  // shape.
-  if (!local_tlvs_.empty() && !tlv_downgraded_ && retries_ >= 2) {
-    tlv_downgraded_ = true;
-  }
   send_hello();
   ++retries_;
   // Exponential backoff (#27①, #76): the gap after send n is
@@ -297,27 +294,19 @@ HandshakeStatus Handshake::on_oob(const uint8_t* data, size_t len) {
       return HandshakeStatus::kConsumed;
     }
     const uint8_t* sender_nonce = data + kHelloMagicLen;
-    // #77: split the optional TLV block first. A kCapTlv HELLO with a
-    // missing/malformed block is rejected through the error-ACK channel; a
-    // valid block rides along into negotiate().
+    // #77: split the TLV block first. A HELLO with a missing/malformed block
+    // is rejected through the error-ACK channel; a valid block rides along
+    // into negotiate().
     std::vector<HandshakeTlv> tlvs;
     const bool tlv_ok = hello_tlvs(data, len, /*is_ack=*/false, &tlvs);
     const HandshakeCaps peer = parse_caps(data + kHelloMagicLen + kHandshakeNonceLen);
-    // #77: "the peer knows the TLV bit" is caps-level, not framing-level --
-    // a fixed-size HELLO that claims the block also goes through the error
-    // channel (it is exactly the malformed case worth explaining).
-    const bool knows_tlv = (peer.flags & kCapTlv) != 0;
     if (!caps_valid(peer) || !tlv_ok) {
-      if (knows_tlv) {
-        send_error_ack(HandshakeError::kBadCaps, sender_nonce);
-      }
+      send_error_ack(HandshakeError::kBadCaps, sender_nonce);
       fail(HandshakeError::kBadCaps);
       return HandshakeStatus::kProtocolFailure;
     }
     if (!nonce_valid(sender_nonce)) {
-      if (knows_tlv) {
-        send_error_ack(HandshakeError::kBadNonce, sender_nonce);
-      }
+      send_error_ack(HandshakeError::kBadNonce, sender_nonce);
       fail(HandshakeError::kBadNonce);
       return HandshakeStatus::kProtocolFailure;
     }
@@ -346,11 +335,7 @@ HandshakeStatus Handshake::on_oob(const uint8_t* data, size_t len) {
     } else {
       std::memcpy(peer_nonce_, sender_nonce, kHandshakeNonceLen);
       have_peer_nonce_ = true;
-      // #77: the re-ACKed duplicate keeps the same shape as the first ACK.
-      peer_tlv_hello_ = knows_tlv;
-      if (knows_tlv) {
-        peer_tlvs_ = std::move(tlvs);
-      }
+      peer_tlvs_ = std::move(tlvs);
     }
     if (!negotiate(peer)) {
       return HandshakeStatus::kProtocolFailure;
@@ -396,7 +381,7 @@ HandshakeStatus Handshake::on_oob(const uint8_t* data, size_t len) {
       }
     }
     const HandshakeCaps peer = parse_caps(s_nonce + kHandshakeNonceLen);
-    if (!caps_valid(peer) || !tlv_ack) {
+    if (!tlv_ack || !caps_valid(peer)) {
       fail(HandshakeError::kBadCaps);
       return HandshakeStatus::kProtocolFailure;
     }
@@ -413,9 +398,7 @@ HandshakeStatus Handshake::on_oob(const uint8_t* data, size_t len) {
       std::memcpy(peer_nonce_, peer_draw, kHandshakeNonceLen);
       have_peer_nonce_ = true;
     }
-    if (peer.flags & kCapTlv) {
-      peer_tlvs_ = std::move(tlvs);
-    }
+    peer_tlvs_ = std::move(tlvs);
     if (!negotiate(peer)) {
       return HandshakeStatus::kProtocolFailure;
     }
@@ -426,25 +409,17 @@ HandshakeStatus Handshake::on_oob(const uint8_t* data, size_t len) {
 }
 
 bool Handshake::negotiate(const HandshakeCaps& peer) {
+  // local_flags_ always carries kCapTlv (the constructor ORs it in), and
+  // caps_valid() already rejected a peer without it.
   const uint8_t flags = static_cast<uint8_t>(local_flags_ & peer.flags);
   const uint8_t required = static_cast<uint8_t>(kCapFraming | kCapFecstat);
   if ((flags & required) != required) {
     fail(HandshakeError::kMissingCapability);
     return false;
   }
-  // #77: kCapTlv survives only when both ends actually used the extension on
-  // this exchange. The plain flags-AND cannot express that, because
-  // local_flags_ never carries the bit -- the outgoing HELLO/ACK ORs it in
-  // from the TLV state instead. The peer's bit alone is proof enough of the
-  // other side (the server echoes the bit only for a TLV HELLO, and the
-  // client's ACK can only carry it if our HELLO offered), but requiring our
-  // own side too keeps the negotiation symmetric.
-  const bool both_tlv = (peer.flags & kCapTlv) != 0 &&
-                        (role_ == HandshakeRole::kClient ? tlv_offered_
-                                                         : peer_tlv_hello_);
   params_.d = std::min(local_d_, peer.data);
   params_.p = std::min(local_p_, peer.parity);
-  params_.flags = static_cast<uint8_t>(flags | (both_tlv ? kCapTlv : 0));
+  params_.flags = flags;
   params_.mode = params_.p == 0 ? SessionMode::kFramedStats : SessionMode::kFramedRepair;
   state_ = HandshakeState::kEstablished;
   error_ = HandshakeError::kNone;
@@ -466,62 +441,41 @@ void Handshake::send_hello() {
   if (!send_) {
     return;
   }
-  // #77: offer the TLV block until the downgrade probe flips (see on_tick);
-  // the offered caps are derived, local_flags_ itself never carries the bit.
-  const bool offer = !local_tlvs_.empty() && !tlv_downgraded_;
-  const uint8_t flags = offer ? static_cast<uint8_t>(local_flags_ | kCapTlv)
-                              : static_cast<uint8_t>(local_flags_ & ~kCapTlv);
-  const HandshakeCaps caps{kCapsVersion, local_d_, local_p_, flags};
-  if (offer) {
-    tlv_offered_ = true;
-    std::vector<uint8_t> msg(kHelloLen + kTlvBlockLenBytes + kTlvBlockMaxLen);
-    const size_t n =
-        build_hello_ext(caps, local_nonce_, local_tlvs_, msg.data(), msg.size());
-    if (n != 0) {
-      send_(msg.data(), n);
-      return;
-    }
-    // Unencodable block: a programming error in the caller's TLVs. Fall
-    // through to the plain shape rather than sending caps that claim a block
-    // the message does not carry.
+  const HandshakeCaps caps{kCapsVersion, local_d_, local_p_, local_flags_};
+  std::vector<uint8_t> msg(kHelloLen + kTlvBlockLenBytes + kTlvBlockMaxLen);
+  size_t n = build_hello_ext(caps, local_nonce_, local_tlvs_, msg.data(), msg.size());
+  if (n == 0) {
+    // Unencodable local TLVs are a programming error. Keep the handshake
+    // alive with the mandatory empty block; the capability types are lost.
+    n = build_hello_ext(caps, local_nonce_, {}, msg.data(), msg.size());
   }
-  uint8_t msg[kHelloLen];
-  build_hello(caps, local_nonce_, msg);
-  send_(msg, sizeof(msg));
+  if (n != 0) {
+    send_(msg.data(), n);
+  }
 }
 
 void Handshake::send_hello_ack() {
   if (!send_ || !have_peer_nonce_) {
     return;
   }
-  // #77: the ACK echoes the kCapTlv bit exactly when the establishing HELLO
-  // carried it (the re-ACKed duplicate keeps the same shape). The block may
-  // be empty -- the bit then just says "this end speaks TLV".
-  const bool offer = peer_tlv_hello_;
-  const uint8_t flags = offer ? static_cast<uint8_t>(local_flags_ | kCapTlv)
-                              : static_cast<uint8_t>(local_flags_ & ~kCapTlv);
-  const HandshakeCaps caps{kCapsVersion, local_d_, local_p_, flags};
-  if (offer) {
-    std::vector<uint8_t> msg(kHelloAckLen + kTlvBlockLenBytes + kTlvBlockMaxLen);
-    const size_t n = build_hello_ack_ext(caps, client_nonce(), server_nonce(),
-                                         local_tlvs_, msg.data(), msg.size());
-    if (n != 0) {
-      send_(msg.data(), n);
-      return;
-    }
+  const HandshakeCaps caps{kCapsVersion, local_d_, local_p_, local_flags_};
+  std::vector<uint8_t> msg(kHelloAckLen + kTlvBlockLenBytes + kTlvBlockMaxLen);
+  size_t n = build_hello_ack_ext(caps, client_nonce(), server_nonce(), local_tlvs_,
+                                 msg.data(), msg.size());
+  if (n == 0) {
+    n = build_hello_ack_ext(caps, client_nonce(), server_nonce(), {}, msg.data(),
+                            msg.size());
   }
-  uint8_t msg[kHelloAckLen];
-  build_hello_ack(caps, client_nonce(), server_nonce(), msg);
-  send_(msg, sizeof(msg));
+  if (n != 0) {
+    send_(msg.data(), n);
+  }
 }
 
 void Handshake::send_error_ack(HandshakeError error, const uint8_t client_nonce[16]) {
   if (!send_ || role_ != HandshakeRole::kServer) {
     return;
   }
-  const HandshakeCaps caps{
-      kCapsVersion, local_d_, local_p_,
-      static_cast<uint8_t>((local_flags_ & ~kCapTlv) | kCapTlv)};
+  const HandshakeCaps caps{kCapsVersion, local_d_, local_p_, local_flags_};
   std::vector<HandshakeTlv> tlvs;
   tlvs.push_back(
       HandshakeTlv{kTlvTypeError, std::vector<uint8_t>{static_cast<uint8_t>(error)}});

@@ -50,9 +50,11 @@ int speedtestSelftest() {
     return fail(error);
   }
 
-  QString key = qEnvironmentVariable("FCP_SPEEDTEST_KEY");
+  // FCP_PSK was removed with the 0.0.20 CLI cleanup; the self-test harness now
+  // has its own variable instead of piggy-backing on a deleted interface.
+  const QString key = qEnvironmentVariable("FCP_SPEEDTEST_KEY");
   if (key.isEmpty()) {
-    key = qEnvironmentVariable("FCP_PSK");
+    return fail(QStringLiteral("FCP_SPEEDTEST_KEY is required for the speedtest self-test"));
   }
   bool ok = false;
   int seconds = envOrDefault("FCP_SPEEDTEST_SECONDS", QStringLiteral("8")).toInt(&ok);
@@ -64,18 +66,15 @@ int speedtestSelftest() {
   QProcess process;
   process.setProgram(binary);
   process.setArguments({
-      QStringLiteral("--host=%1").arg(envOrDefault("FCP_SPEEDTEST_HOST",
-                                                   QStringLiteral("127.0.0.1"))),
-      QStringLiteral("--port=%1").arg(envOrDefault("FCP_SPEEDTEST_PORT",
-                                                   QStringLiteral("4460"))),
-      QStringLiteral("--speedtest-seconds=%1").arg(seconds),
-      QStringLiteral("--speedtest"),
+      QStringLiteral("--peer=%1:%2").arg(envOrDefault("FCP_SPEEDTEST_HOST",
+                                                      QStringLiteral("127.0.0.1")),
+                                         envOrDefault("FCP_SPEEDTEST_PORT",
+                                                      QStringLiteral("4460"))),
+      QStringLiteral("--key=%1").arg(key),
+      QStringLiteral("--speedtest=%1").arg(seconds),
       QStringLiteral("--log-file=%1/log/").arg(
           QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation)),
   });
-  QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-  env.insert(QStringLiteral("FCP_PSK"), key);
-  process.setProcessEnvironment(env);
   process.setStandardInputFile(QProcess::nullDevice());
 
   process.start();

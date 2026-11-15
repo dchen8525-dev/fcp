@@ -314,8 +314,9 @@ void TestCeilingAtConfiguredMtuIsInert() {
 // Full-size data dropped at a size the probes did prove -- the size-based
 // path-policing case (isolated probes pass, bulk at the raised size is
 // black-holed, ICMP can't-fragment suppressed). Probes proved the rung, so
-// the loss ledger never sees it; the only evidence is silence: >= 256 data
-// symbols over >= 6 s with zero FECSTAT. That state is unrecoverable by ARQ
+// the loss ledger never sees it; the only evidence is silence: a stream dense
+// enough for the peer's 2s report cadence, held >= 6 s with zero FECSTAT. That
+// state is unrecoverable by ARQ
 // (retransmissions leave at the same dead size), so the watchdog falls back
 // in-session: the send bound reverts to the configured base, the dead size
 // enters the ledger, and a clamp keeps the search from re-climbing into the
@@ -338,7 +339,11 @@ void TestFullSizeDataDropFallsBackToBase() {
   // peer keeps proving it receives nothing new by sending no FECSTAT).
   h.data_max_wire = 1400;
   h.now = 2100;
-  for (uint32_t set = 0; set < 300; ++set) {
+  // Enough symbols for the peer's 2s report cadence over the whole silence
+  // window (the watchdog judges silence against that cadence, not against a
+  // fixed 256-symbol count: 300 symbols over 6s is only 50/s and would not
+  // have produced a 2s-cadence report at all).
+  for (uint32_t set = 0; set < 3000; ++set) {
     Bytes seg(1423, 0);
     h.a->on_kcp_output(seg.data(), seg.size(), h.now);
   }

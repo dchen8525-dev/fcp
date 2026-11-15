@@ -219,10 +219,20 @@ void TestEnvelopeEpochReceiveEdges() {
                            sizeof(payload));
   CHECK(!server.open(future.data(), future.size(), &plain));
 
-  // nonce 256 * kEpochSpan == kNonceLimit: rejected by the top-level ceiling.
+  // 256 * kEpochSpan == kNonceLimit is a far-future epoch here, so the epoch
+  // window refuses it. (The old 2^32 absolute ceiling no longer applies once
+  // rolling is on; the checks below pin that.)
   Bytes past_ceiling = EpochWire(session_key, fcp::Direction::kC2S, 256, 0, payload,
                                  sizeof(payload));
   CHECK(!server.open(past_ceiling.data(), past_ceiling.size(), &plain));
+
+  // Key update retires the 2^32 packet ceiling: rolling already bounds each
+  // key's invocations, and the session's own bound is the u16 epoch space.
+  // Leaving 2^32 in place disconnected the session there and made the receive
+  // side reject the peer's legitimate later epochs.
+  Bytes wide;
+  CHECK(client.seal_at(fcp::Envelope::kNonceLimit, payload, sizeof(payload), &wide));
+  CHECK(!client.seal_at(fcp::Envelope::kEpochSpaceEnd, payload, sizeof(payload), &wide));
 
   // A receiver that never saw epoch 0 still accepts its first roll (the
   // frozen previous window is empty) and a late epoch-0 packet under it.

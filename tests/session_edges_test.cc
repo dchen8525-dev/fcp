@@ -113,6 +113,20 @@ struct Recorder {
 
 // ---- frame construction / sealing helpers ----
 
+// Defined with the other handshake builders further down; EstablishClient and
+// the stats-mode test run before that definition.
+Bytes MakeAckOf(const Bytes& c_nonce, const Bytes& s_nonce, uint8_t ver,
+                uint8_t data, uint8_t parity, uint8_t flags);
+
+// A peer HELLO in the one supported shape: mandatory empty TLV block.
+Bytes HelloBytes(uint8_t flags = fcp::kLocalFlagsM1) {
+  Bytes out(fcp::kHelloLen + fcp::kTlvBlockLenBytes);
+  const uint8_t f = static_cast<uint8_t>(flags | fcp::kCapTlv);
+  CHECK(fcp::build_hello_ext(fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, f},
+                             PeerDraw(), {}, out.data(), out.size()) != 0);
+  return out;
+}
+
 Bytes OobPlain(const uint8_t* body, size_t len) {
   Bytes plain(fcp::kFecHdrLen);
   fcp::pack_hdr(
@@ -169,11 +183,12 @@ std::unique_ptr<fcp::Envelope> DataPeer(fcp::Direction peer_send,
 void EstablishClient(fcp::Session& s, uint8_t ack_flags, uint8_t parity = 3) {
   CHECK_EQ(s.start(0), fcp::Session::StartStatus::kOk);
   s.on_tick(0);
-  uint8_t ack[fcp::kHelloAckLen];
-  fcp::build_hello_ack(fcp::HandshakeCaps{fcp::kCapsVersion, 10, parity, ack_flags},
-                       s.handshake_nonce(), PeerDraw(), ack);
+  const Bytes ack = MakeAckOf(Bytes(s.handshake_nonce(),
+                                    s.handshake_nonce() + fcp::kHandshakeNonceLen),
+                              Bytes(PeerDraw(), PeerDraw() + fcp::kHandshakeNonceLen),
+                              1, 10, parity, ack_flags);
   fcp::Envelope boot(kKey, kSalt, fcp::Direction::kS2C, fcp::Direction::kC2S);
-  const Bytes plain = OobPlain(ack, sizeof(ack));
+  const Bytes plain = OobPlain(ack.data(), ack.size());
   Bytes wire;
   CHECK(boot.seal(plain.data(), plain.size(), &wire));
   CHECK(s.on_wire(wire.data(), wire.size(), 0));
@@ -384,7 +399,7 @@ void TestPrewarmAndStreamTlv() {
     (void)rb;
   }
 
-  // Both ends without the ACK-v2 offer and without a ticket: no TLV at all.
+  // Both ends without the ACK-v2 offer and without a ticket: empty TLV block.
   {
     Link link;
     fcp::SessionConfig ca = MakeConfig(fcp::Direction::kC2S, fcp::Direction::kS2C);
@@ -494,10 +509,8 @@ void TestBootstrapAndResetEdges() {
     EstablishClient(s, fcp::kLocalFlagsM1);
 
     fcp::Envelope boot(kKey, kSalt, fcp::Direction::kS2C, fcp::Direction::kC2S);
-    uint8_t hello[fcp::kHelloLen];
-    fcp::build_hello(fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, fcp::kLocalFlagsM1},
-                     PeerDraw(), hello);
-    Bytes plain = OobPlain(hello, sizeof(hello));
+    const Bytes hello = HelloBytes();
+    Bytes plain = OobPlain(hello.data(), hello.size());
     Bytes wire;
     CHECK(boot.seal_at(10, plain.data(), plain.size(), &wire));
     CHECK(s.on_wire(wire.data(), wire.size(), 100));  // bootstrap re-ACK path
@@ -540,10 +553,8 @@ void TestBootstrapAndResetEdges() {
     CHECK(fails >= 70u);
 
     fcp::Envelope boot(kKey, kSalt, fcp::Direction::kS2C, fcp::Direction::kC2S);
-    uint8_t hello[fcp::kHelloLen];
-    fcp::build_hello(fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, fcp::kLocalFlagsM1},
-                     PeerDraw(), hello);
-    Bytes plain = OobPlain(hello, sizeof(hello));
+    const Bytes hello = HelloBytes();
+    Bytes plain = OobPlain(hello.data(), hello.size());
     Bytes wire;
     CHECK(boot.seal_at(51, plain.data(), plain.size(), &wire));
     CHECK(!s.on_wire(wire.data(), wire.size(), 1000));  // budget exhausted
@@ -566,10 +577,8 @@ void TestBootstrapAndResetEdges() {
     EstablishClient(s, fcp::kLocalFlagsM1);
 
     fcp::Envelope boot(kKey, kSalt, fcp::Direction::kS2C, fcp::Direction::kC2S);
-    uint8_t hello[fcp::kHelloLen];
-    fcp::build_hello(fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, fcp::kLocalFlagsM1},
-                     PeerDraw(), hello);
-    Bytes plain = OobPlain(hello, sizeof(hello));
+    const Bytes hello = HelloBytes();
+    Bytes plain = OobPlain(hello.data(), hello.size());
     Bytes wire;
     CHECK(boot.seal_at(5000, plain.data(), plain.size(), &wire));
     CHECK(s.on_wire(wire.data(), wire.size(), 100));
@@ -615,10 +624,8 @@ void TestBootstrapAndResetEdges() {
                    nullptr, [&rec](const std::string& l) { rec.logs.push_back(l); });
     CHECK_EQ(s.start(0), fcp::Session::StartStatus::kOk);
     s.on_tick(0);
-    uint8_t hello[fcp::kHelloLen];
-    fcp::build_hello(fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, fcp::kLocalFlagsM1},
-                     PeerDraw(), hello);
-    Bytes plain = OobPlain(hello, sizeof(hello));
+    const Bytes hello = HelloBytes();
+    Bytes plain = OobPlain(hello.data(), hello.size());
     fcp::Envelope boot(kKey, kSalt, fcp::Direction::kC2S, fcp::Direction::kS2C);
     Bytes wire;
     CHECK(boot.seal(plain.data(), plain.size(), &wire));
@@ -1078,10 +1085,8 @@ void TestSessionTableEdges() {
 void TestEnsureConfiguredRefusals() {
   auto feed_hello = [](fcp::Session& s, fcp::Direction peer_send,
                         fcp::Direction peer_recv) {
-    uint8_t hello[fcp::kHelloLen];
-    fcp::build_hello(fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, fcp::kLocalFlagsM1},
-                     PeerDraw(), hello);
-    Bytes plain = OobPlain(hello, sizeof(hello));
+    const Bytes hello = HelloBytes();
+    Bytes plain = OobPlain(hello.data(), hello.size());
     fcp::Envelope boot(kKey, kSalt, peer_send, peer_recv);
     Bytes wire;
     CHECK(boot.seal(plain.data(), plain.size(), &wire));
@@ -1293,9 +1298,11 @@ void TestPmtuBlackholeAndClamp() {
   CHECK_EQ(a.path_mtu(), 2600u);
   CHECK_EQ(a.pmtu_probes_acked(), 2u);
 
-  // Bulk at the raised size disappears while probes still answer; 300 symbols
-  // over 6+ seconds with no feedback is the watchdog condition.
-  for (uint32_t sn = 0; sn < 300; ++sn) {
+  // Bulk at the raised size disappears while probes still answer; a stream
+  // dense enough for the peer's 2s report cadence with no feedback is the
+  // watchdog condition (the count alone is not enough: a slow flow's first
+  // forced report is legitimately up to 60s away).
+  for (uint32_t sn = 0; sn < 4000; ++sn) {
     const Bytes seg = Segment(sn);
     a.on_kcp_output(seg.data(), seg.size(), 14000);
   }
@@ -1354,18 +1361,21 @@ struct HPeer {
 
 Bytes MakeHelloOf(const Bytes& nonce, uint8_t ver = 1, uint8_t data = 10,
                   uint8_t parity = 3, uint8_t flags = fcp::kLocalFlagsM1) {
-  Bytes out(fcp::kHelloLen);
-  fcp::build_hello(fcp::HandshakeCaps{ver, data, parity, flags}, nonce.data(),
-                   out.data());
+  Bytes out(fcp::kHelloLen + fcp::kTlvBlockLenBytes);
+  const uint8_t f = static_cast<uint8_t>(flags | fcp::kCapTlv);
+  CHECK(fcp::build_hello_ext(fcp::HandshakeCaps{ver, data, parity, f},
+                             nonce.data(), {}, out.data(), out.size()) != 0);
   return out;
 }
 
 Bytes MakeAckOf(const Bytes& c_nonce, const Bytes& s_nonce, uint8_t ver = 1,
                 uint8_t data = 10, uint8_t parity = 3,
                 uint8_t flags = fcp::kLocalFlagsM1) {
-  Bytes out(fcp::kHelloAckLen);
-  fcp::build_hello_ack(fcp::HandshakeCaps{ver, data, parity, flags}, c_nonce.data(),
-                       s_nonce.data(), out.data());
+  Bytes out(fcp::kHelloAckLen + fcp::kTlvBlockLenBytes);
+  const uint8_t f = static_cast<uint8_t>(flags | fcp::kCapTlv);
+  CHECK(fcp::build_hello_ack_ext(fcp::HandshakeCaps{ver, data, parity, f},
+                                 c_nonce.data(), s_nonce.data(), {}, out.data(),
+                                 out.size()) != 0);
   return out;
 }
 
@@ -1420,8 +1430,10 @@ void TestHandshakeEdgeCases() {
     c.hs.start(0);
     c.hs.on_tick(0);
     const uint8_t flags = static_cast<uint8_t>(fcp::kLocalFlagsM1 | fcp::kCapTlv);
-    const Bytes ack = MakeAckOf(c.nonce, Bytes(fcp::kHandshakeNonceLen, 0x22),
-                                1, 10, 3, flags);
+    Bytes ack(fcp::kHelloAckLen);
+    fcp::build_hello_ack(fcp::HandshakeCaps{fcp::kCapsVersion, 10, 3, flags},
+                         c.nonce.data(),
+                         Bytes(fcp::kHandshakeNonceLen, 0x22).data(), ack.data());
     CHECK(c.hs.on_oob(ack.data(), ack.size()) ==
           fcp::HandshakeStatus::kProtocolFailure);
     CHECK(c.hs.error() == fcp::HandshakeError::kBadCaps);
@@ -1499,14 +1511,15 @@ void TestHandshakeEdgeCases() {
     CHECK(server.error() == fcp::HandshakeError::kBadCaps);
   }
 
-  // An unencodable local TLV falls back to the plain HELLO / ACK shape.
+  // An unencodable local TLV degrades to the mandatory empty block; the
+  // handshake still happens and only the capability types are lost.
   {
     HPeer c(10, 3, fcp::HandshakeRole::kClient, 0x11);
     c.hs.set_local_tlvs({{0, {1}}});
     c.hs.start(0);
     c.hs.on_tick(0);
     CHECK_EQ(c.sent.size(), 1u);
-    CHECK_EQ(c.sent[0].size(), fcp::kHelloLen);
+    CHECK_EQ(c.sent[0].size(), fcp::kHelloLen + fcp::kTlvBlockLenBytes);
     CHECK(fcp::is_hello(c.sent[0].data(), c.sent[0].size()));
 
     HPeer peer(10, 3, fcp::HandshakeRole::kClient, 0x33);
@@ -1522,7 +1535,7 @@ void TestHandshakeEdgeCases() {
     CHECK(s.hs.on_oob(peer.sent[0].data(), peer.sent[0].size()) ==
           fcp::HandshakeStatus::kConsumed);
     CHECK(s.hs.established());
-    CHECK_EQ(s.sent.back().size(), fcp::kHelloAckLen);
+    CHECK_EQ(s.sent.back().size(), fcp::kHelloAckLen + fcp::kTlvBlockLenBytes);
     CHECK(fcp::is_hello_ack(s.sent.back().data(), s.sent.back().size()));
   }
 
@@ -1658,11 +1671,12 @@ void TestStatsModeSession() {
                  nullptr, [&rec](const std::string& l) { rec.logs.push_back(l); });
   CHECK_EQ(s.start(0), fcp::Session::StartStatus::kOk);
   s.on_tick(0);
-  uint8_t ack[fcp::kHelloAckLen];
-  fcp::build_hello_ack(fcp::HandshakeCaps{fcp::kCapsVersion, 10, 0, fcp::kLocalFlagsM1},
-                       s.handshake_nonce(), PeerDraw(), ack);
+  const Bytes ack = MakeAckOf(Bytes(s.handshake_nonce(),
+                                    s.handshake_nonce() + fcp::kHandshakeNonceLen),
+                              Bytes(PeerDraw(), PeerDraw() + fcp::kHandshakeNonceLen),
+                              1, 10, 0, fcp::kLocalFlagsM1);
   fcp::Envelope boot(kKey, kSalt, fcp::Direction::kS2C, fcp::Direction::kC2S);
-  const Bytes plain = OobPlain(ack, sizeof(ack));
+  const Bytes plain = OobPlain(ack.data(), ack.size());
   Bytes wire;
   CHECK(boot.seal(plain.data(), plain.size(), &wire));
   CHECK(s.on_wire(wire.data(), wire.size(), 0));

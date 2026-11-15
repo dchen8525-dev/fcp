@@ -81,6 +81,8 @@ void FrameTx::on_kcp_output(const uint8_t* seg, size_t len, int64_t now_ms) {
 
 void FrameTx::on_tick(int64_t now_ms) { maybe_flush(now_ms); }
 
+void FrameTx::flush() { close_set(CloseReason::kIdle); }
+
 void FrameTx::abort() {
   if (n_ == 0) {
     return;

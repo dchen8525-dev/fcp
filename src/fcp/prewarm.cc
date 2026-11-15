@@ -161,14 +161,19 @@ void apply_prewarm(const PeerProfile& profile, SessionConfig* session, StreamCon
     // own ceiling (#87): the wire clamp admits up to 16 GiB, which describes no
     // link this end is willing to buffer for, and the entry may have come from
     // the peer's ticket rather than from a local measurement.
-    if (profile.window_bytes > 0 && stream->auto_window &&
+    if (profile.window_bytes > 0 &&
         !stream->send_window_explicit) {
+      // window_max_bytes is derived (2 x the floor) and tests may leave it 0;
+      // the prior is capped at whichever ceiling this end will actually honour.
+      const size_t cap = stream->window_max_bytes > 0
+                             ? stream->window_max_bytes
+                             : 2 * stream->window_min_bytes;
       stream->send_window_bytes =
-          std::min(profile.window_bytes, stream->window_max_bytes);
+          std::min(profile.window_bytes, cap);
     }
     // The controller priors are only meaningful for the controller they came
     // from, and only when the operator did not pin the start.
-    if (stream->auto_window && stream->bbr && !stream->send_window_explicit) {
+    if (!stream->send_window_explicit) {
       if (profile.bw_bps > 0) {
         stream->initial_bw_bps = profile.bw_bps;
       }

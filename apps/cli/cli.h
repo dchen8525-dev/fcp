@@ -27,7 +27,6 @@ struct ProxyArgs {
   EngineConfig ec;
   ReactorOptions ro;
   bool help = false;
-  bool version = false;  // --version：打印发布版本后退出（安装包自检/排障用）
   // Client only: --speedtest turns this process into a one-shot frame-layer
   // bench (bench.h) instead of a proxy. The server side enables its responder
   // through ro.speedtest.
@@ -36,9 +35,6 @@ struct ProxyArgs {
   // An explicit --mtu wins over the interface-derived default applied just
   // before startup; parsing must not distinguish the two otherwise.
   bool mtu_explicit = false;
-  // The PSK came in through --key, so it is visible in the process command
-  // line. run_proxy warns about it; --key-file/--key-env do not set this.
-  bool key_in_argv = false;
   std::vector<std::string> notes;
 };
 

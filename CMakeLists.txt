@@ -87,7 +87,7 @@ add_library(fcp STATIC
 
 target_include_directories(fcp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-# version.h 的 kProductVersion（CLI --version）；PUBLIC 让宿主与测试都拿到。
+# version.h 的 kProductVersion（CLI -h 首行）；PUBLIC 让宿主与测试都拿到。
 target_compile_definitions(fcp PUBLIC FCP_PRODUCT_VERSION="${FCP_VERSION}")
 
 # AES-NI intrinsics. MSVC enables them for x64 by default; GCC/Clang need -maes.

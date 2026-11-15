@@ -12,7 +12,7 @@ name: release
 #
 # 门禁顺序是"测试在前、打包在后"：linux-deb 跑完整 ctest（Linux Release），
 # coverage 单独跑覆盖率门禁，windows-tests 在 MSVC 上编译并跑同一套 ctest；
-# 三条门禁红了都没有任何产物。客户端 job 另做冒烟：sidecar `--version` 与
+# 三条门禁红了都没有任何产物。客户端 job 另做冒烟：sidecar `-h` 首行与
 # VERSION 比对、AppImage 离屏启动 6 秒。
 #
 # 手工触发（workflow_dispatch）：只产出 artifacts、不发 Release，
@@ -144,9 +144,11 @@ jobs:
           sudo dpkg -i "$deb"
 
           echo "== 版本自检"
-          fcp-server --version | tee /tmp/ver.txt
+          # --version/-V 已随 0.0.20 的 CLI 清理删除；-h 首行就是
+          # "fcp-client|fcp-server <版本>"，退出码 0。
+          fcp-server -h | head -n1 | tee /tmp/ver.txt
           grep -qF "fcp-server ${version}" /tmp/ver.txt
-          fcp-client --version | grep -qF "fcp-client ${version}"
+          fcp-client -h | head -n1 | grep -qF "fcp-client ${version}"
 
           echo "== dpkg 记录的文件清单"
           # 先打清单再逐条检查：落点类失败（第五次跑挂在文档路径上）只有
@@ -162,11 +164,11 @@ jobs:
           sudo ls -ld /etc/fcp
           sudo stat -c '%n  mode=%a  owner=%U:%G  size=%s' /etc/fcp/fcp.env
 
-          echo "== 首次安装自动生成的 FCP_PSK"
-          # postinst 在未配置 PSK 的新装上生成并写入一行 FCP_PSK；冒烟后面
-          # 还能用自选密钥，是因为它显式覆盖 fcp.env，两不相扰。
-          check "/etc/fcp/fcp.env 里已自动生成 FCP_PSK" \
-            sudo sh -c "grep -qE '^FCP_PSK=[0-9a-fA-F]{32}' /etc/fcp/fcp.env"
+          echo "== 首次安装自动生成的密钥"
+          # postinst 在未配置密钥的新装上生成并写入 FCP_KEY_ARGS=--key=…；
+          # 冒烟后面还能用自选密钥，是因为它显式覆盖 fcp.env，两不相扰。
+          check "/etc/fcp/fcp.env 里已自动生成 FCP_KEY_ARGS" \
+            sudo sh -c "grep -qE '^FCP_KEY_ARGS=--key=[0-9a-fA-F]{32}' /etc/fcp/fcp.env"
 
           echo "== 包内文件落点"
           # 每一步都带一行回显：第四次跑时这里直接 exit 1，日志里只看到
@@ -189,12 +191,12 @@ jobs:
           if [ "$(systemctl is-system-running 2>/dev/null || true)" = "running" ] ||
              [ "$(systemctl is-system-running 2>/dev/null || true)" = "degraded" ]; then
             key="$(openssl rand -hex 16)"
-            # Exercise the operator story exactly as documented: the conffile
-            # lists FCP_PSK and nothing else (the unit is DynamicUser=yes,
-            # which cannot read a root-owned 0600 key file, and the CLI picks
-            # the FCP_PSK variable up implicitly when no --key* argument is
-            # given). A --key-only smoke test would not catch that.
-            printf 'FCP_PSK=%s\nFCP_ARGS=--bind=127.0.0.1 --port=45000 --log=debug --stats=5000 --speedtest\n' \
+            # Exercise the operator story exactly as documented: the key is an
+            # inline --key= in FCP_KEY_ARGS (the only remaining channel after
+            # --key-file/--key-env/FCP_PSK were removed), and the port lives
+            # in the --bind address. A --key-only smoke test would not catch
+            # the unit's $FCP_KEY_ARGS/$FCP_ARGS expansion.
+            printf 'FCP_KEY_ARGS=--key=%s\nFCP_ARGS=--bind=127.0.0.1:45000 --log-level=debug --stats=5000 --speedtest\n' \
               "$key" | sudo tee /etc/fcp/fcp.env >/dev/null
             sudo systemctl start fcp
             sleep 2
@@ -371,7 +373,7 @@ jobs:
 
       # 无头环境无法做更强的 GUI 断言；这里验证引导器能把载荷解到缓存、
       # Qt 运行库齐全、sidecar 可执行、产物已生成。
-      - name: 冒烟（引导器自检 + sidecar --version）
+      - name: 冒烟（引导器自检 + sidecar -h 版本行）
         shell: pwsh
         run: |
           $exe = Get-ChildItem dist\fcp-client-gui-*-windows-amd64.exe | Select-Object -First 1
@@ -391,8 +393,15 @@ jobs:
               throw "缓存里缺少 $rel"
             }
           }
-          & build\release-win\apps\cli\Release\fcp-client.exe --version
-          if ($LASTEXITCODE -ne 0) { throw "sidecar --version 退出码 $LASTEXITCODE" }
+          # --version 已随 0.0.20 的 CLI 清理删除；-h 首行是
+          # "fcp-client <版本>"，退出码 0。
+          $sidecar = "build\release-win\apps\cli\Release\fcp-client.exe"
+          $ver_line = (& $sidecar -h | Select-Object -First 1)
+          if ($LASTEXITCODE -ne 0) { throw "sidecar -h 退出码 $LASTEXITCODE" }
+          if ($ver_line -notmatch '^fcp-client \S+') {
+            throw "sidecar -h 首行不像版本行：$ver_line"
+          }
+          Write-Host $ver_line
 
       - uses: actions/upload-artifact@v4
         with:

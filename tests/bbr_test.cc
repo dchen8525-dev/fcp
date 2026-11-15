@@ -212,6 +212,64 @@ void TestV2InherentLossDoesNotCollapseInflightHi() {
   CHECK(b.inflight_lo() > 0u);
 }
 
+// 2026-11 调优回归：被拒绝的轮次不得抬升路径丢包地板。
+//
+// CN-VPS 实测（268ms / 22-30% 丢包）的会话以 hi=111579 收尾，而 BBR 自己的
+// 带宽估计是 24 Mbps —— 111 KiB 的窗口在 268ms 的路径上填不满，所以是这个
+// 上限而不是链路决定了吞吐。成形方式是自证：上限按 0.875 x peak 落下，随后
+// 每一轮都被判 lossy，而 lossy 分支又把这一轮的丢包率写进 loss_base，下次
+// 阈值抬得更高、上限再落一档。
+//
+// 本用例钉住的是"上限不再被同一份丢包反复压低"：在途低于上限、丢包恒定的
+// 轮次跑二十轮之后，上限必须稳定住，不许一轮一档地往 min_cwnd 走。
+void TestV2RefusedRoundDoesNotRaiseTheLossFloor() {
+  fcp::Bbr b(V2Cfg());
+  int64_t now = 0;
+  for (int i = 0; i < 6; ++i) {
+    OneRound(&b, &now, 100 * 1024, 101, 64 * 1024);
+  }
+  // Persistent 30% loss with in flight far below the 1 MiB ceiling: the peak
+  // is the working point, so this is the path's floor, not congestion.
+  auto drive = [&]() {
+    for (int i = 0; i < 20; ++i) {
+      b.on_sent(now, 100 * 1024, 64 * 1024);
+      b.on_lost(30 * 1024);
+      now += 101;
+      b.on_acked(now, 100 * 1024, 101, true, 64 * 1024);
+    }
+  };
+  drive();
+  const size_t hi_after = b.inflight_hi();
+  // Once the floor has been learned from the unconstrained working point, the
+  // ceiling must stop moving: another identical stretch leaves it where it is.
+  drive();
+  CHECK_EQ(b.inflight_hi(), hi_after);
+  // And it is still a ceiling the path could fill, not the 16 KiB floor: the
+  // first refused round was allowed its one legitimate cut (0.875 x peak), and
+  // nothing after it moved the bound further down.
+  CHECK(b.inflight_hi() >= 48u * 1024u);
+}
+
+// The other side of the same coin: when the ceiling DID constrain the round
+// (in flight reached it), the loss is genuine congestion evidence and the
+// ceiling still moves down. Without this, the fix above would make v2 blind
+// to real congestion.
+void TestV2ConstrainedLossyRoundStillCutsTheCeiling() {
+  fcp::Bbr b(V2Cfg());
+  int64_t now = 0;
+  for (int i = 0; i < 6; ++i) {
+    OneRound(&b, &now, 100 * 1024, 101, 64 * 1024);
+  }
+  const size_t hi_before = b.inflight_hi();
+  // In flight at the ceiling, then a round that loses 40% of what it sent.
+  const size_t at_ceiling = hi_before;
+  b.on_sent(now, 100 * 1024, at_ceiling);
+  b.on_lost(40 * 1024);
+  now += 101;
+  b.on_acked(now, 100 * 1024, 101, true, 32 * 1024);
+  CHECK(b.inflight_hi() < hi_before);
+}
+
 void TestAppLimitedSamplesDoNotRaiseTheEstimate() {
   fcp::Bbr b(TestCfg());
   int64_t now = 0;
@@ -271,6 +329,8 @@ int main() {
   TestV2LossShrinksInflightBounds();
   TestV2ProbeUpRaisesInflightHiAfterLoss();
   TestV2InherentLossDoesNotCollapseInflightHi();
+  TestV2RefusedRoundDoesNotRaiseTheLossFloor();
+  TestV2ConstrainedLossyRoundStillCutsTheCeiling();
   TestAppLimitedSamplesDoNotRaiseTheEstimate();
   TestPrewarmPriorStartsAtTheProvenPoint();
   TestColdStartStillRunsStartup();

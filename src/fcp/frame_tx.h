@@ -99,6 +99,13 @@ class FrameTx {
   void set_srtt_ms(int64_t srtt_ms);
 
   void on_kcp_output(const uint8_t* seg, size_t len, int64_t now_ms);
+  // Close the open set now instead of waiting for D segments or T_flush.
+  // Control segments (ACK / RST) go through here: a repair group only closes
+  // on a full set or the flush timer (≈srtt, capped at 200 ms), so leaving an
+  // ACK inside one caps acknowledgement at D symbols per flush — about
+  // 68 KB/s no matter how fast the path is, and every SACK range then reaches
+  // the peer a whole round late.
+  void flush();
   void on_tick(int64_t now_ms);
 
   // Abnormal termination: the open set is dropped without parity, exactly as

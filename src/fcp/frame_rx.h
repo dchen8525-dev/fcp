@@ -193,7 +193,9 @@ class FrameRx {
   RxSet* get_or_create(uint32_t set_id, int64_t now_ms);
   bool note_k(RxSet* set, uint8_t k);
   void prune_retired();
-  void store_symbol(RxSet* set, uint8_t index, const uint8_t* symbol, size_t len);
+  // Returns false when the session-wide byte budget refuses the symbol; the
+  // caller then leaves the index unmarked so the ARQ retransmission can retry.
+  bool store_symbol(RxSet* set, uint8_t index, const uint8_t* symbol, size_t len);
   // Bytes this set currently holds; subtracted from symbol_bytes_ when a set is
   // erased (release_set, capacity eviction).
   size_t symbols_bytes_of(const RxSet& set) const;

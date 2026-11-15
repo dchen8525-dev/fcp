@@ -31,14 +31,16 @@ double binom_cdf(unsigned max_losses, unsigned trials, double p) {
   return std::min(sum, 1.0);
 }
 
-uint8_t k_for(double loss, uint8_t d, uint8_t p_max, double target) {
+uint8_t k_for(double loss, uint8_t d, uint8_t p_max) {
   p_max = std::min(p_max, kMaxParity);
-  for (uint8_t k = 1; k <= p_max; ++k) {
-    if (binom_cdf(k, static_cast<unsigned>(d) + k, loss) >= target) {
-      return k;
-    }
+  if (p_max == 0 || !(loss > 0.0)) {
+    return p_max == 0 ? 0 : 1;
   }
-  return p_max;
+  const double want = std::ceil(static_cast<double>(d) * std::min(loss, 1.0) * kFecHeadroom);
+  if (!(want >= 1.0)) {
+    return 1;  // loss too small to round up: one parity already covers it
+  }
+  return static_cast<uint8_t>(std::min<double>(want, static_cast<double>(p_max)));
 }
 
 const char* fec_state_name(FecState state) {
@@ -78,7 +80,6 @@ double binom_p_for_cdf(unsigned max_losses, unsigned trials, double q) {
 FecStrategy::FecStrategy(const FecStrategyConfig& config)
     : d_(config.d),
       p_max_(std::min(config.p_max, kMaxParity)),
-      target_recovery_(config.target_recovery),
       // A pinned k above P' would ask FrameTx for more parity than negotiated.
       pinned_k_(config.pinned_k < 0
                     ? -1
@@ -213,7 +214,7 @@ void FecStrategy::on_report(const FecstatPacket& stat, bool window_queued) {
   if (have_p_eff_ && last_p_eff_ > p_use) {
     p_use = last_p_eff_;
   }
-  const uint8_t k_target = k_for(p_use, d_, p_max_, target_recovery_);
+  const uint8_t k_target = k_for(p_use, d_, p_max_);
   if (window_queued) {
     ++queued_streak_;
     if (queued_streak_ >= 3) {
@@ -225,8 +226,17 @@ void FecStrategy::on_report(const FecstatPacket& stat, bool window_queued) {
     queued_streak_ = 0;
     if (k_target > k_) {
       ++k_;
+      low_streak_ = 0;
     } else if (k_target < k_) {
-      --k_;
+      // One loss event must not walk k back down: a FECSTAT reports 2 s of
+      // traffic, and a path sitting on a step boundary would otherwise flap
+      // every report. kFecDropStreak consecutive low samples = 8 s of evidence.
+      if (++low_streak_ >= kFecDropStreak) {
+        --k_;
+        low_streak_ = 0;
+      }
+    } else {
+      low_streak_ = 0;
     }
   }
 
@@ -241,9 +251,10 @@ void FecStrategy::on_report(const FecstatPacket& stat, bool window_queued) {
 
 void FecStrategy::enter_on(double loss) {
   state_ = FecState::kOn;
-  k_ = k_for(loss, d_, p_max_, target_recovery_);
+  k_ = k_for(loss, d_, p_max_);
   clean_streak_ = 0;
   queued_streak_ = 0;
+  low_streak_ = 0;
   consec_ge_08_ = 0;
   cooldown_reports_ = 0;
 }
@@ -253,6 +264,7 @@ void FecStrategy::enter_off() {
   k_ = 0;
   clean_streak_ = 0;
   queued_streak_ = 0;
+  low_streak_ = 0;
   consec_ge_08_ = 0;
   cooldown_reports_ = 3;
 }

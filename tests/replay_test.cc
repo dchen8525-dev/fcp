@@ -180,7 +180,7 @@ void TestRoundTrip() {
   e.stat.ledger_groups = 180u;
   e.stat.ledger_fail_ppm = 172222u;
   e.stat.ledger_meta = 2u | (105u << 16);  // dominant k=2, kl=1.05 nat
-  e.snapshot = fcp::TraceConfigSnapshot{10, 4, 0.80, 0.50, 2, -1};
+  e.snapshot = fcp::TraceConfigSnapshot{10, 4, 0.50, 2, -1};
   e.k_after = 3;
   e.state_after = fcp::FecState::kOn;
   e.last_loss = 0.0966;
@@ -202,9 +202,11 @@ void TestRoundTrip() {
   CHECK_EQ(back.stat.ledger_meta, e.stat.ledger_meta);
   CHECK_EQ(back.snapshot.d, 10);
   CHECK_EQ(back.snapshot.p_max, 4);
-  CHECK(std::fabs(back.snapshot.target_recovery - 0.80) < 1e-12);
   CHECK(std::fabs(back.snapshot.budget - 0.50) < 1e-12);
   CHECK_EQ(back.snapshot.initial_k, 2);
+  CHECK_EQ(back.snapshot.pinned, -1);
+  CHECK_EQ(back.snapshot.initial_k, 2);
+  CHECK_EQ(back.snapshot.pinned, -1);
   CHECK_EQ(back.snapshot.pinned, -1);
   CHECK_EQ(back.k_after, 3);
   CHECK(back.state_after == fcp::FecState::kOn);
@@ -380,19 +382,19 @@ void TestTraceCodecFuzz() {
 
 // Adversarial recheck: doubles must survive the text format bit-for-bit. %.9g
 // collapsed nextafter(0.8) onto 0.8, so a replayed candidate could read a
-// different target_recovery/budget than the recording and branch differently
+// different budget than the recording and branch differently
 // right at a threshold — the opposite of what replay is for.
 void TestTraceDoubleRoundTrip() {
   fcp::TraceEntry e;
   e.stat = fcp::MakeFecstatPacket(kSalt);
-  e.snapshot.target_recovery = std::nextafter(0.8, 1.0);
+  e.snapshot.initial_k = 5;
   e.snapshot.budget = std::nextafter(0.5, 0.0);
   e.last_loss = std::nextafter(0.0966, 1.0);
   std::string line;
   fcp::encode_trace_line(e, &line);
   fcp::TraceEntry back;
   CHECK(fcp::decode_trace_line(line, &back));
-  CHECK(back.snapshot.target_recovery == e.snapshot.target_recovery);
+
   CHECK(back.snapshot.budget == e.snapshot.budget);
   CHECK(back.last_loss == e.last_loss);
 }

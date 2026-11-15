@@ -194,6 +194,17 @@ void FrameRx::on_datagram(const uint8_t* plaintext, size_t len, int64_t now_ms) 
   if (type == SymbolType::kData) {
     const uint8_t index = hdr.index;
     if (set.orig_mask.test(index)) {
+      // The mask is set on receipt, but the symbol budget may have refused to
+      // store the symbol (store_symbol); the slot is then empty (every symbol
+      // is at least 2 bytes, checked above). Treating this retransmission as a
+      // late duplicate made the hole permanent: the set could never decode,
+      // and the stream waited on an ARQ retransmission that was being thrown
+      // away. Give the ARQ its one chance to fill the FEC slot instead.
+      if (set.symbols[index].empty() &&
+          store_symbol(&set, index, symbol, symbol_len)) {
+        try_decode(&set, now_ms);
+        return;
+      }
       ++late_dup_;
       emit_event(RxEvent::kDataDuplicate, 0);
       return;
@@ -220,7 +231,7 @@ void FrameRx::on_datagram(const uint8_t* plaintext, size_t len, int64_t now_ms) 
   }
 
   // Parity: n = index - j, and this is the only source of n.
-  if (set.parity_mask.test(hdr.index)) {
+  if (set.parity_mask.test(hdr.index) && !set.symbols[hdr.index].empty()) {
     return;  // duplicate fragment: no store, no re-decode
   }
   // n must cover every data index already accepted. hdr.cc only checks the
@@ -236,9 +247,13 @@ void FrameRx::on_datagram(const uint8_t* plaintext, size_t len, int64_t now_ms) 
   set.n = n_new;
   set.n_known = true;
   set.saw_parity = true;
-  set.parity_mask.set(hdr.index);
-  store_symbol(&set, hdr.index, symbol, symbol_len);
-  try_decode(&set, now_ms);
+  // Same retry rule as data: a budget-dropped parity fragment must not be
+  // marked stored, or its retransmission is discarded as a duplicate and the
+  // set loses the fragment that could have decoded it.
+  if (store_symbol(&set, hdr.index, symbol, symbol_len)) {
+    set.parity_mask.set(hdr.index);
+    try_decode(&set, now_ms);
+  }
 }
 
 std::vector<uint32_t> FrameRx::active_set_ids() const {
@@ -449,22 +464,24 @@ size_t FrameRx::symbols_bytes_of(const RxSet& set) const {
   return bytes;
 }
 
-void FrameRx::store_symbol(RxSet* set, uint8_t index, const uint8_t* symbol, size_t len) {
+bool FrameRx::store_symbol(RxSet* set, uint8_t index, const uint8_t* symbol, size_t len) {
   std::vector<uint8_t>& slot = set->symbols[index];
   const size_t old = slot.size();
   if (symbol_bytes_ - old + len > kMaxRxSymbolBytes) {
     // The session's symbol budget is full. Dropping is the right failure: the
     // peer's ARQ retransmits, and evicting a set here could free state that a
     // reentrant host callback is still walking. Counting it keeps the loss
-    // visible instead of turning it into a silent FEC-only slowdown.
+    // visible instead of turning it into a silent FEC-only slowdown. The caller
+    // must not record the index as stored: the retransmission is the recovery.
     ++symbol_budget_drops_;
-    return;
+    return false;
   }
   symbol_bytes_ = symbol_bytes_ - old + len;
   slot.assign(symbol, symbol + len);
   ++set->symbol_count;
   set->has_any_symbol = true;
   set->symbol_max = std::max(set->symbol_max, len);
+  return true;
 }
 
 void FrameRx::deliver_payload(const uint8_t* payload, size_t len, bool recovered, bool late,

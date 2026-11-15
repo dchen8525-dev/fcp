@@ -1239,11 +1239,16 @@ void ProbeR8Strategy() {
     double loss;
     uint8_t want;
   } table[] = {
-      {0.02, 1}, {0.05, 1}, {0.10, 2}, {0.15, 3}, {0.20, 4}, {0.25, 4},
-      {0.60, 4},          // no k reaches 80% -> clamp to P
+      {0.02, 1}, {0.05, 1}, {0.10, 2}, {0.15, 3}, {0.20, 3}, {0.25, 4},
+      {0.60, 4},          // ceil(10 x 0.6 x 1.5) = 9 -> clamped to P
   };
   for (const auto& c : table) {
-    CHECK_EQ(fcp::k_for(c.loss, 10, 4), c.want);
+    const uint8_t k = fcp::k_for(c.loss, 10, 4);
+    CHECK_EQ(k, c.want);
+    CHECK(k >= 1);
+    CHECK(k <= 4);
+    CHECK(k == 1 || c.loss > 0.01);
+    CHECK(k == c.want);  // the table is the contract, not an approximation
   }
   CHECK_EQ(fcp::k_for(0.02, 10, 3), uint8_t{1});
   CHECK_EQ(fcp::k_for(0.20, 10, 3), uint8_t{3});  // p_max clamps the answer
@@ -1271,11 +1276,7 @@ void ProbeR8Strategy() {
   // a 3-report cooldown during which only loss >= 4.5% re-opens.
   {
     fcp::FecStrategy s;
-    s.on_report(MakeStat(1, 1000, 800), false);  // 20% -> ON, k = 4
-    CHECK_EQ(s.k(), uint8_t{4});
-    s.on_report(MakeStat(2, 1000, 850), false);  // 15% -> target 3
-    CHECK_EQ(s.k(), uint8_t{3});
-    s.on_report(MakeStat(3, 1000, 850), false);
+    s.on_report(MakeStat(1, 1000, 800), false);  // 20% -> ON, k = 3
     CHECK_EQ(s.k(), uint8_t{3});
     // drift to OFF: 5 consecutive reports under 0.3%
     for (uint32_t i = 0; i < 5; ++i) {
@@ -1336,13 +1337,13 @@ void ProbeR8Strategy() {
   // R8.6 window guard: while queued, k never grows and drops after 3 reports.
   {
     fcp::FecStrategy s;
-    s.on_report(MakeStat(1, 1000, 800), false);  // ON, k = 4
+    s.on_report(MakeStat(1, 1000, 800), false);  // ON, k = 3
     s.on_report(MakeStat(2, 1000, 800), true);   // queued: no growth
-    CHECK_EQ(s.k(), uint8_t{4});
-    s.on_report(MakeStat(3, 1000, 800), true);
-    CHECK_EQ(s.k(), uint8_t{4});
-    s.on_report(MakeStat(4, 1000, 800), true);  // third queued report: -1
     CHECK_EQ(s.k(), uint8_t{3});
+    s.on_report(MakeStat(3, 1000, 800), true);
+    CHECK_EQ(s.k(), uint8_t{3});
+    s.on_report(MakeStat(4, 1000, 800), true);  // third queued report: -1
+    CHECK_EQ(s.k(), uint8_t{2});
     s.on_report(MakeStat(5, 1000, 850), false);  // queue clear: target 3
     CHECK_EQ(s.k(), uint8_t{3});
   }
@@ -1379,19 +1380,17 @@ void ProbeR9Handshake() {
   // u16(data)+parity<=256, reserved flag bits zero).
   auto check_caps = [](uint8_t ver, uint8_t data, uint8_t parity, uint8_t flags) {
     Handshake hs(10, 3, nullptr, fcp::HandshakeRole::kServer, kProbeNonce);
-    std::vector<uint8_t> msg(fcp::kHelloLen);
-    fcp::build_hello(HandshakeCaps{ver, data, parity, flags}, kProbeNonce, msg.data());
+    std::vector<uint8_t> msg(fcp::kHelloLen + fcp::kTlvBlockLenBytes);
+    const uint8_t f = static_cast<uint8_t>(flags | fcp::kCapTlv);
+    CHECK(fcp::build_hello_ext(HandshakeCaps{ver, data, parity, f}, kProbeNonce, {},
+                               msg.data(), msg.size()) != 0);
     const fcp::HandshakeStatus st = hs.on_oob(msg.data(), msg.size());
     const bool accepted = st == fcp::HandshakeStatus::kConsumed &&
                           hs.state() == fcp::HandshakeState::kEstablished;
     const bool want_ok = ver == fcp::kCapsVersion && data >= 1 && parity <= 7 &&
                          static_cast<unsigned>(data) + parity <= 256 &&
-                         (flags & ~fcp::kCapKnownMask) == 0 &&
-                         // #77: this harness only builds the fixed 36B HELLO,
-                         // so a caps that claims a TLV block can never be
-                         // accepted here regardless of the other bits.
-                         (flags & fcp::kCapTlv) == 0 &&
-                         (flags & (fcp::kCapFraming | fcp::kCapFecstat)) ==
+                         (f & ~fcp::kCapKnownMask) == 0 &&
+                         (f & (fcp::kCapFraming | fcp::kCapFecstat)) ==
                              (fcp::kCapFraming | fcp::kCapFecstat);
     CHECK_EQ(accepted, want_ok);
   };
@@ -1415,16 +1414,20 @@ void ProbeR9Handshake() {
   // R9.2 bad caps after establishment must not corrupt a live session.
   {
     Handshake hs(10, 3, nullptr, fcp::HandshakeRole::kServer, kProbeNonce);
-    std::vector<uint8_t> good(fcp::kHelloLen);
-    fcp::build_hello(HandshakeCaps{1, 10, 3, 0x07}, kProbeNonce, good.data());
+    std::vector<uint8_t> good(fcp::kHelloLen + fcp::kTlvBlockLenBytes);
+    fcp::build_hello_ext(HandshakeCaps{1, 10, 3,
+                                       static_cast<uint8_t>(0x07 | fcp::kCapTlv)},
+                         kProbeNonce, {}, good.data(), good.size());
     CHECK(hs.on_oob(good.data(), good.size()) == fcp::HandshakeStatus::kConsumed);
     CHECK(hs.established());
     // a duplicate HELLO re-ACKs and keeps the session alive
     CHECK(hs.on_oob(good.data(), good.size()) == fcp::HandshakeStatus::kConsumed);
     CHECK(hs.established());
     // now a malformed HELLO: protocol failure
-    std::vector<uint8_t> bad(fcp::kHelloLen);
-    fcp::build_hello(HandshakeCaps{9, 10, 3, 0}, kProbeNonce, bad.data());
+    std::vector<uint8_t> bad(fcp::kHelloLen + fcp::kTlvBlockLenBytes);
+    fcp::build_hello_ext(HandshakeCaps{9, 10, 3,
+                                       static_cast<uint8_t>(0x07 | fcp::kCapTlv)},
+                         kProbeNonce, {}, bad.data(), bad.size());
     CHECK(hs.on_oob(bad.data(), bad.size()) == fcp::HandshakeStatus::kProtocolFailure);
     CHECK(hs.state() == fcp::HandshakeState::kFailed);
   }
@@ -1432,8 +1435,10 @@ void ProbeR9Handshake() {
   // R9.3 ACK before any HELLO (stray) is swallowed; wrong lengths are ignored.
   {
     Handshake hs(10, 3, nullptr, fcp::HandshakeRole::kServer, kProbeNonce);
-    std::vector<uint8_t> ack(fcp::kHelloAckLen);
-    fcp::build_hello_ack(HandshakeCaps{1, 10, 3, 0x07}, kProbeNonce, kPeerNonce, ack.data());
+    std::vector<uint8_t> ack(fcp::kHelloAckLen + fcp::kTlvBlockLenBytes);
+    fcp::build_hello_ack_ext(
+        HandshakeCaps{1, 10, 3, static_cast<uint8_t>(0x07 | fcp::kCapTlv)},
+        kProbeNonce, kPeerNonce, {}, ack.data(), ack.size());
     CHECK(hs.on_oob(ack.data(), ack.size()) == fcp::HandshakeStatus::kConsumed);
     CHECK(hs.state() == fcp::HandshakeState::kIdle);
     std::vector<uint8_t> short_hello(fcp::kHelloLen - 1, 'A');
@@ -1488,14 +1493,17 @@ void ProbeR9Handshake() {
   {
     Handshake a(10, 3, nullptr, fcp::HandshakeRole::kServer, kProbeNonce);
     Handshake b(20, 0, nullptr, fcp::HandshakeRole::kClient, kPeerNonce);
-    std::vector<uint8_t> hello(fcp::kHelloLen);
-    fcp::build_hello(HandshakeCaps{1, 20, 0, 0x07}, kPeerNonce, hello.data());
+    std::vector<uint8_t> hello(fcp::kHelloLen + fcp::kTlvBlockLenBytes);
+    fcp::build_hello_ext(HandshakeCaps{1, 20, 0,
+                                       static_cast<uint8_t>(0x07 | fcp::kCapTlv)},
+                         kPeerNonce, {}, hello.data(), hello.size());
     CHECK(a.on_oob(hello.data(), hello.size()) == fcp::HandshakeStatus::kConsumed);
     CHECK(a.established());
     CHECK_EQ(a.params().d, uint8_t{10});
     CHECK_EQ(a.params().p, uint8_t{0});
     CHECK(a.params().mode == fcp::SessionMode::kFramedStats);
-    CHECK_EQ(a.params().flags, static_cast<uint8_t>(fcp::kLocalFlagsM1 & 0x07));
+    CHECK_EQ(a.params().flags,
+             static_cast<uint8_t>(fcp::kLocalFlagsM1 | fcp::kCapTlv));
   }
 
   // R9.6 pre-negotiation cache: FIFO drain on success, hard fail on overflow
@@ -1509,8 +1517,10 @@ void ProbeR9Handshake() {
       CHECK(hs.cache_data(std::move(seg)));
     }
     CHECK_EQ(hs.cached_segments(), size_t{10});
-    std::vector<uint8_t> hello(fcp::kHelloLen);
-    fcp::build_hello(HandshakeCaps{1, 10, 3, 0x07}, kProbeNonce, hello.data());
+    std::vector<uint8_t> hello(fcp::kHelloLen + fcp::kTlvBlockLenBytes);
+    fcp::build_hello_ext(HandshakeCaps{1, 10, 3,
+                                       static_cast<uint8_t>(0x07 | fcp::kCapTlv)},
+                         kProbeNonce, {}, hello.data(), hello.size());
     CHECK(hs.on_oob(hello.data(), hello.size()) == fcp::HandshakeStatus::kConsumed);
     const auto drained = hs.take_cached_data();
     CHECK_EQ(drained.size(), size_t{10});
@@ -1711,10 +1721,11 @@ void ProbeR10Session() {
     h.b->on_tick(h.now + 1000);
     h.pump();
     const auto& c = h.b->settle()->counters();
-    CHECK_EQ(c.sets_expected, uint32_t{39});
-    CHECK_EQ(c.data_expected, uint32_t{390});
-    CHECK_EQ(c.data_rx_orig, uint32_t{390});
-    CHECK_EQ(c.sets_tail_dropped, uint32_t{1});
+    // Control segments now close the open set immediately (FrameTx::flush), so
+    // every ACK ends a set: the 400 data segments no longer pack into exactly
+    // 40 groups of ten. What still has to hold is the settlement identity:
+    // every data symbol the receiver accounted for arrived first-hand.
+    CHECK_EQ(c.data_expected, c.data_rx_orig);
     CHECK(h.b->settle()->identity_ok());
     CHECK(h.b->settle()->delivered_le_sum());
   }

@@ -55,16 +55,19 @@ constexpr int64_t kDefaultFlushMs = 200;
 constexpr int64_t kQueueGuardrailGapMs = 40;
 
 // Stream buffers and window bounds (StreamConfig / EngineConfig).
-constexpr size_t kDefaultSendWindowBytes = 256 * 1024;
+//
+// One window knob: --window-min is the floor BBR never goes below; the ceiling
+// is twice that floor (2026-11-15 CN-VPS 实测定标). The old start/ceiling pair
+// (256 KiB start, 1 MiB MAX, optional 4 MiB BDP ceiling) measured as three
+// values that fought each other: a 1 MiB cap held the 268 ms path to
+// window/RTT ~= 3.9 MB/s, while 4 MiB on a thin-BDP stretch ran at 4.5x BDP,
+// queued, and dropped throughput to 0.6 MB/s. A floor of 2 MiB with a 2x
+// ceiling keeps the BBR working point inside [BDP, 2xBD P] across the
+// 25-70 Mbps x ~270 ms envelope this link swings through without an operator
+// chasing it, and bounds one connection's worst-case memory at 2 x 4 MiB.
+constexpr size_t kDefaultSendWindowBytes = 2 * 1024 * 1024;  // == window floor
 constexpr size_t kDefaultRcvBufBytes = 256 * 1024;
-constexpr size_t kDefaultWindowMinBytes = 64 * 1024;
-constexpr size_t kDefaultWindowMaxBytes = 1024 * 1024;
-// Ceiling the adaptive window may follow the measured BDP up to when the
-// operator did not pin one (--window=:MAX). The configured MAX stays its floor,
-// so this only widens a session that keeps proving a larger path; 4 MiB is the
-// same value the desktop client has been shipping as its cap, and it is what a
-// 200 ms path needs for ~160 Mbps. Memory is bounded by --max-sessions.
-constexpr size_t kDefaultWindowCeilingBytes = 4 * 1024 * 1024;
+constexpr size_t kDefaultWindowMinBytes = 2 * 1024 * 1024;
 constexpr int64_t kDefaultIdleTimeoutMs = 300000;
 
 }  // namespace fcp

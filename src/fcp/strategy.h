@@ -20,17 +20,38 @@ namespace fcp {
 // WAN calibration 2026-11-07 (see docs/决策记录.md): the international path
 // runs a constant ~12% loss with evening bursts to 50%+; k=1..3 parity could
 // not cover it and the ceiling capped the controller below the binomial
-// target. 6 lets the adaptive machine reach k_for(15%, d=10) without --p-max.
+// target. 6 keeps direct EngineConfig users (no --fec) at the historical
+// ceiling; the CLI mirrors p_max to --fec's P, so P is the only ceiling there.
 constexpr uint8_t kDefaultPmax = 6;
-// Target probability that a group needs no KCP retransmission (§8).
-constexpr double kTargetRecovery = 0.80;
+// The controller's target: k must cover the expected number of lost shards per
+// group with this much headroom, i.e. k = ceil(headroom x d x loss).
+//
+// This replaced the binomial rule (smallest k with P(group needs no KCP
+// retransmission) >= target) for two reasons, both measured rather than
+// argued. First, the binomial answer has a dead band: on a path losing 16.5%
+// of datagrams the sampled loss lands on the same step repeatedly, and
+// whichever side of the target it falls on, k does not move -- the controller
+// becomes decorative for the whole session. Second, the binomial rule is
+// worst-case-shaped: it buys coverage of the full distribution, so at 20% loss
+// it asks for k=4 where the mean-plus-variance answer is k=3, paying 40%
+// redundancy for failure modes FEC cannot fix anyway (a group that loses more
+// than k shards is lost regardless).
+//
+// 1.5 x the mean is the multiplier that covers bursty loss without paying for
+// the worst case every group: at d=10 that is k=1/2/3/3 for 2/10/20/30% loss.
+constexpr double kFecHeadroom = 1.5;
+// Consecutive low-loss reports before k steps down. A FECSTAT is 2 s, so four
+// samples is 8 s of evidence against one loss event -- enough that a path
+// sitting on a step boundary does not flap k every report.
+constexpr uint32_t kFecDropStreak = 4;
 // P(X <= max_losses) for X ~ Binomial(trials, p).
 // p is clamped to [0, 1]; trials == 0 returns 1.
 double binom_cdf(unsigned max_losses, unsigned trials, double p);
 
-// Smallest k in 1..p_max with binom_cdf(k, d + k, loss) >= target.
-// Returns p_max when no k reaches the target (including loss >= 1).
-uint8_t k_for(double loss, uint8_t d, uint8_t p_max, double target = kTargetRecovery);
+// k the controller asks for at a measured shard-loss rate: ceil(d x loss x
+// kFecHeadroom), floored at 1 and capped at p_max. One formula, no dead band:
+// every sample maps to a target, so the controller always has an opinion.
+uint8_t k_for(double loss, uint8_t d, uint8_t p_max);
 
 // Inverse of binom_cdf along its (monotonically decreasing) loss argument:
 // the p with binom_cdf(max_losses, trials, p) == q. Bisection; q >= 1 -> 0,
@@ -59,7 +80,6 @@ const char* fec_state_name(FecState state);
 struct FecStrategyConfig {
   uint8_t d = kDefaultD;  // 对抗分析第九轮：与 SessionConfig 的 d 同一处定义
   uint8_t p_max = kDefaultPmax;
-  double target_recovery = kTargetRecovery;
   int pinned_k = -1;  // --fec-parity-pinned; >= 0 bypasses the state machine
   // Link warm-up (M2代理设计.md §5): -1 starts OFF like every M1 session,
   // >= 1 starts ON at that k. Reports still drive the machine, so a warmed
@@ -93,7 +113,6 @@ class FecStrategy {
 
   // Diagnostics for the §11 log line.
   double last_loss() const { return last_loss_; }
-  double target_recovery() const { return target_recovery_; }
   uint32_t untrusted_reports() const { return untrusted_reports_; }
   uint32_t stale_reports() const { return stale_reports_; }
   uint32_t small_sample_reports() const { return small_sample_reports_; }
@@ -114,7 +133,6 @@ class FecStrategy {
 
   uint8_t d_;
   uint8_t p_max_;
-  double target_recovery_;
   int pinned_k_;
   int initial_k_;
   double budget_ratio_;  // clamped at construction; <= 0 means off
@@ -129,6 +147,10 @@ class FecStrategy {
   unsigned consec_ge_08_ = 0;
   unsigned clean_streak_ = 0;
   unsigned queued_streak_ = 0;
+  // Consecutive reports whose k target sits below the current k (see
+  // kFecDropStreak). Counted separately from clean_streak_ (which measures
+  // going OFF) because a step down and a full stop are different evidence.
+  unsigned low_streak_ = 0;
   unsigned cooldown_reports_ = 0;
 
   uint32_t untrusted_reports_ = 0;

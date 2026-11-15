@@ -43,7 +43,7 @@ namespace fcp {
 
 // #29a/#35: one JSONL controller-trace sink per session, written to
 // `<prefix>.<cid>.jsonl`; the parent directory chain is created on demand and
-// an unopenable path disables recording. Shared by the CLI (--trace) and the
+// an unopenable path disables recording. Shared by the CLI (--metrics) and the
 // Qt client (settings proxy/trace_prefix). `log` routes the diagnostic to the
 // host too: a GUI has no stderr, so a trace that silently records nothing used
 // to be invisible (C-16).
@@ -93,27 +93,11 @@ struct EngineConfig {
   // keeps the prewarm cache from replacing it with the peer's converged value.
   bool window_explicit = false;
   size_t rcv_buf_bytes = kDefaultRcvBufBytes;
-  // Window autotune (StreamConfig::auto_window): the stream's send window
-  // starts at send_window_bytes, grows while the stream is its own bottleneck
-  // between window_min_bytes and window_max_bytes, and holds or shrinks when
-  // its own queue shows up in the RTT. Not a BDP tracker: the measured BDP is
-  // only the recovery reference after a loss.
-  bool auto_window = true;
-  // Congestion controller for the adaptive window: BBR (delivery-rate model +
-  // pacing) is the default; false selects the epoch controller
-  // (StreamConfig::bbr).
-  bool bbr = true;
-  // 1 = BBRv1, 2 = BBRv2 (default).
+  // Window bounds: BBR manages the send window between window_min_bytes
+  // (the --window-min floor) and a ceiling of twice that floor, derived per
+  // stream. The measured BDP shapes where BBR settles, not the bounds.
   int bbr_version = 2;
-  // Loss-epoch rate probe: grow instead of cutting when a lossy epoch still
-  // delivered data and shows no standing queue (epoch controller only).
-  bool window_probe = true;
   size_t window_min_bytes = kDefaultWindowMinBytes;
-  size_t window_max_bytes = kDefaultWindowMaxBytes;
-  // Auto window + BBR: the send ceiling may follow the measured BDP up to this
-  // many bytes, with window_max_bytes as its floor. 0 keeps the ceiling fixed
-  // (the CLI raises it; a Stream configured directly keeps the old behaviour).
-  size_t window_ceiling_bytes = 0;
   // One ACK per this many in-order data segments (StreamConfig::ack_every).
   // 1 = per segment, which is what the unit tests want; the CLI and the desktop
   // turn coalescing on for the wire.
@@ -381,6 +365,12 @@ class ProxyEngine {
     // want_fin; the stream's own close callback sets only want_fin.
     bool closing = false;
     bool want_fin = false;
+    // The peer sent its FIN. The local socket's write half must be shut down to
+    // deliver EOF, but only after every byte already accepted for it has gone
+    // out: shutdown(SHUT_WR) makes later sends fail, and the host treats that
+    // failure as fatal (so a slow reader lost the tail of the response).
+    bool peer_fin = false;
+    bool peer_shutdown_done = false;
     bool established_seen = false;
     // 握手并发限流（EngineConfig::hs_concurrency，仅 client）：hs_slot_held =
     // 会话已 start 且未建立（占一个槽位）；hs_queued = 在队列里等槽位
@@ -479,6 +469,14 @@ class ProxyEngine {
   void release_handshake_slot(Conn& conn);
   void pump_handshake_queue(int64_t now_ms);
   void maybe_fin(Conn& conn);
+  // Deliver the peer's FIN to the local socket's write half, but only once
+  // every byte accepted for that socket has been written. Called from the
+  // stream's EOF callback and from every flush_app pass.
+  void maybe_peer_shutdown(Conn& conn);
+  // The client's OPEN-reply clock: armed at establishment (never at request
+  // parse time, which can precede a long handshake or a queue wait) and long
+  // enough to cover the server's wait-for-OPEN plus its whole dial budget.
+  void arm_open_deadline(Conn& conn, int64_t now_ms);
   // Bytes moved so far, from whichever clocks are running: what the peer
   // acknowledged, what it delivered, and what the application socket accepted.
   uint64_t progress_of(const Conn& conn) const;

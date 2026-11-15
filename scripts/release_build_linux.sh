@@ -48,11 +48,11 @@ ctest --test-dir "$BUILD_DIR" --output-on-failure
 
 # 出厂自检：把包内文件按 install() 规则单独装到一棵临时树里，再跑一次。
 # 这一步与 deb 的内容是同一批文件（同一条 install 规则），目标是提前抓住
-#   * 版本号没注入（--version 输出对不上 tag）；
+#   * 版本号没注入（-h 首行对不上 tag）；
 #   * 二进制起不来（缺动态库、RPATH 写错）——打包器只看文件在不在，不看能不能跑。
 # 放在打包之前：跑不起来的二进制没有打成分发产物的必要。
 # 真正的 dpkg 安装冒烟在工作流里做（需要 root 与 dpkg）。
-echo "== 安装自检（install 规则 + --version）"
+echo "== 安装自检（install 规则 + -h 版本行）"
 # 必须用 DESTDIR 而不是 `--prefix`：conffile 的落点是绝对路径 /etc/fcp，
 # `--prefix` 挪不动绝对路径，会把文件写到真实的 /etc 里（非 root 直接失败，
 # root 下更糟——污染构建机）。DESTDIR 给所有路径（含绝对路径）加前缀；
@@ -60,7 +60,8 @@ echo "== 安装自检（install 规则 + --version）"
 rm -rf "$STAGE_DIR"
 DESTDIR="$STAGE_DIR" cmake --install "$BUILD_DIR" --strip >/dev/null
 for bin in fcp-server fcp-client; do
-  ver="$("$STAGE_DIR/usr/bin/$bin" --version | awk '{print $2}')"
+  # --version 已随 0.0.20 的 CLI 清理删除；-h 首行是 "<角色> <版本>"。
+  ver="$("$STAGE_DIR/usr/bin/$bin" -h | head -n1 | awk '{print $2}')"
   if [ "$ver" != "$VERSION" ]; then
     echo "::error::$bin 报出版本 '$ver'，期望 '$VERSION'" >&2
     exit 1

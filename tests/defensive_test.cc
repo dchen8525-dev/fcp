@@ -152,8 +152,10 @@ void TestFailedHandshakeIgnoresHello() {
 
   // Once failed, a well-formed HELLO is consumed without being interpreted:
   // a second injection must not be able to restart the state machine.
-  Bytes good(fcp::kHelloLen, 0);
-  fcp::build_hello({1, 10, 3, fcp::kLocalFlagsM1}, p.nonce.data(), good.data());
+  Bytes good(fcp::kHelloLen + fcp::kTlvBlockLenBytes, 0);
+  fcp::build_hello_ext(
+      {1, 10, 3, static_cast<uint8_t>(fcp::kLocalFlagsM1 | fcp::kCapTlv)},
+      p.nonce.data(), {}, good.data(), good.size());
   CHECK(p.hs.on_oob(good.data(), good.size()) == fcp::HandshakeStatus::kConsumed);
 }
 
@@ -212,11 +214,12 @@ void TestAckWithoutFramingFails() {
   c.hs.start(0);
   c.hs.on_tick(0);
   Bytes s_nonce(16, 0x78);
-  Bytes ack(fcp::kHelloAckLen, 0);
+  Bytes ack(fcp::kHelloAckLen + fcp::kTlvBlockLenBytes, 0);
   // FECSTAT without FRAMING: the required pair is not met, so negotiate fails
   // on the ACK path instead of leaving a half-configured session.
-  fcp::build_hello_ack({1, 10, 3, fcp::kCapFecstat}, c.nonce.data(), s_nonce.data(),
-                       ack.data());
+  fcp::build_hello_ack_ext(
+      {1, 10, 3, static_cast<uint8_t>(fcp::kCapFecstat | fcp::kCapTlv)},
+      c.nonce.data(), s_nonce.data(), {}, ack.data(), ack.size());
   CHECK(c.hs.on_oob(ack.data(), ack.size()) ==
         fcp::HandshakeStatus::kProtocolFailure);
   CHECK(c.hs.error() == fcp::HandshakeError::kMissingCapability);

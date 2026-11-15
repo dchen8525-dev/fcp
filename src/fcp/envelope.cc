@@ -94,7 +94,7 @@ void derive_direction_keys(const uint8_t session_key[16],
 void derive_epoch_direction_key(const uint8_t session_key[16], Direction dir,
                                 uint16_t epoch, uint8_t out[16]) {
   // #84: epoch >= 1 keys live in a fresh domain so the #26② epoch-0 keys stay
-  // byte-identical (v7 golden vectors, v7 peers). The PRF is the AES-128 the
+  // byte-identical (golden vectors). The PRF is the AES-128 the
   // envelope already relies on; the input block binds direction + epoch:
   //   out = AES128(session_key, label(2) | epoch(2 LE) | 0x00 x 12)
   // with "c2" / "s2" as the direction labels — same family as

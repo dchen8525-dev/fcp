@@ -126,10 +126,13 @@ inline std::vector<std::string> SplitFields(const std::string& value) {
   }
 }
 
-// One spelling of one option.
+// One spelling of one option. `optional_value` is for flags that carry a
+// default when bare and a setting when given with '=' (--speedtest[=SEC]): the
+// option is still a flag, so `--speedtest 12` must not swallow the next token.
 struct Alias {
   const char* name;
   bool takes_value;
+  bool optional_value = false;
 };
 
 // Where a matched argument landed: which alias matched, what was given.
@@ -143,7 +146,7 @@ struct Match {
 // Longest-prefix matching, so `--key-env` is never reported as `--key`.
 // A registered value-option given bare is an error rather than an empty value:
 // `--window` with no `=` would otherwise mean 0 KiB. `arg` must start with
-// "--"; the caller rewrites the short spellings (-h/-V/-v) first.
+// "--"; the caller rewrites the short spellings (-h/-b) first.
 inline bool MatchOption(const std::vector<Alias>& aliases, const std::string& arg, Match* out,
                         std::string* error) {
   // Longest match wins, not first-in-list: the list is written in --help order
@@ -175,8 +178,14 @@ inline bool MatchOption(const std::vector<Alias>& aliases, const std::string& ar
     *error = name + " requires a value";
     return false;
   }
-  if (!best->takes_value && has_value) {
+  if (!best->takes_value && has_value && !best->optional_value) {
     *error = name + " takes no value; got '" + arg + "'";
+    return false;
+  }
+  // `--flag=` names the option but supplies no value: for an optional-value
+  // flag that is a typo, not "use the default".
+  if (best->optional_value && has_value && arg.size() == best_len + 1) {
+    *error = name + " requires a value after '='";
     return false;
   }
   out->name = best->name;

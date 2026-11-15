@@ -1,7 +1,7 @@
 // sidecar 管理：启动/停止 fcp-client，解析 stats 与 @speedtest 输出。
 //
 // 这里没有任何 UI 依赖，MainWindow 只接信号。两个子进程：
-//   * 代理：`fcp-client --host=... ...`（PSK 走 FCP_PSK 环境变量），stdout 里 `stats`
+//   * 代理：`fcp-client --peer=... --key=... ...`（密钥只有一个入口），stdout 里 `stats`
 //     行进统计信号，其余行进日志；stderr 全是日志。
 //   * 测速：第二个 fcp-client（`--speedtest`），输出 `@speedtest {json}`。
 //
@@ -35,13 +35,14 @@ struct ProxyConfig {
   // 引擎内建常量（kDefaultPmtuMaxMtu），不再暴露给用户，接口 MTU 更小
   // 时由引擎自己收窄。
   bool pmtud = true;
-  int k = -1;
-  double fec_budget = 0.5;
-  double rate_up_mbps = 0.0;  // 上行限速（--rate-limit=UP[:DOWN]，客户端只发 UP）
+  // FEC parity (--k) and the byte budget (--fec-budget) were removed with the
+  // 0.0.20 CLI cleanup; the controller adapts both from measured loss.
+  // 发送限速不再作为参数暴露（--rate-limit 已删除）；pacing 与拥塞控制器
+  // 负责发送速率。
   // --hs-concurrency=N，客户端同时在飞的握手数（0 = 不限）。默认 4 与 CLI 一致。
   // HTTP 正向代理是每请求一条连接，浏览器并发加载会顶到这个闸门，故暴露给用户。
   int hs_concurrency = 4;
-  QString trace;
+  QString metrics;
 };
 
 struct SpeedTestConfig {

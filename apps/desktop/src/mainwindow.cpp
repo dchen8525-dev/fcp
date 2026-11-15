@@ -9,12 +9,14 @@
 #include <QDateTime>
 #include <QDir>
 #include <QFrame>
+#include <QGraphicsDropShadowEffect>
 #include <QGridLayout>
 #include <QHBoxLayout>
 #include <QIcon>
 #include <QJsonValue>
 #include <QLabel>
 #include <QLineEdit>
+#include <QTimer>
 #include <QMenu>
 #include <QPainter>
 #include <QPainterPath>
@@ -29,11 +31,8 @@
 #include <QStackedWidget>
 #include <QSystemTrayIcon>
 #include <QTextDocument>
-#include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
-
-#include <cmath>
 
 #ifdef Q_OS_WIN
 #ifndef WIN32_LEAN_AND_MEAN
@@ -50,16 +49,18 @@
 namespace fcp {
 namespace {
 
-constexpr const char* kAccent = "#0f9d76";
-constexpr const char* kAccentDark = "#0b8563";
-constexpr const char* kMuted = "#5b6b63";
-constexpr const char* kMuted2 = "#8a9a91";
-constexpr const char* kErr = "#c2410c";
+// 配色与 app.qss 同一套（改一处要同时改另一处）：中性冷灰底 + 纯白卡面，
+// 墨色正文拉开层级，主色只留给关键动作与"正在运行"这唯一的高亮状态。
+constexpr const char* kAccent = "#0e8c80";
+constexpr const char* kAccentDark = "#116b62";
+constexpr const char* kMuted = "#52616b";
+constexpr const char* kMuted2 = "#8b98a3";
+constexpr const char* kErr = "#b42318";
 // 日志窗按级别上色：正文颜色即级别，DEBUG 最淡、ERROR 最重。
-constexpr const char* kLogDebug = "#8a9a91";
-constexpr const char* kLogInfo = "#5b6b63";
-constexpr const char* kLogWarn = "#a56a12";
-constexpr const char* kLogError = "#b91c1c";
+constexpr const char* kLogDebug = "#8b98a3";
+constexpr const char* kLogInfo = "#52616b";
+constexpr const char* kLogWarn = "#9a6700";
+constexpr const char* kLogError = "#b42318";
 
 QLabel* makeLabel(const QString& text, const char* role = nullptr) {
   auto* label = new QLabel(text);
@@ -205,9 +206,13 @@ QWidget* makeField(const QString& text, QWidget* input, const QString& note = {}
   head->setSpacing(6);
   head->addWidget(makeLabel(text, "fieldLabel"));
   if (!note.isEmpty()) {
-    head->addWidget(makeLabel(note, "fieldNote"));
+    auto* note_label = makeLabel(note, "fieldNote");
+    note_label->setWordWrap(false);
+    note_label->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    head->addWidget(note_label, 1);
+  } else {
+    head->addStretch();
   }
-  head->addStretch();
   layout->addLayout(head);
   layout->addWidget(input);
   return holder;
@@ -264,8 +269,8 @@ MainWindow::MainWindow(Sidecar* sidecar, QWidget* parent)
     : QMainWindow(parent), sidecar_(sidecar) {
   setWindowTitle(QStringLiteral("FCP"));
   setWindowIcon(QIcon(QStringLiteral(":/assets/fcp.png")));
-  resize(960, 680);
-  setMinimumSize(760, 560);
+  resize(1000, 720);
+  setMinimumSize(820, 600);
 
   auto* central = new QWidget;
   central->setObjectName(QStringLiteral("central"));
@@ -278,7 +283,7 @@ MainWindow::MainWindow(Sidecar* sidecar, QWidget* parent)
 
   auto* stage = new QWidget;
   auto* stage_layout = new QVBoxLayout(stage);
-  stage_layout->setContentsMargins(18, 20, 20, 20);
+  stage_layout->setContentsMargins(26, 26, 26, 26);
   stage_layout->setSpacing(0);
   stage_layout->addWidget(stack_);
   root->addWidget(stage, 1);
@@ -291,13 +296,13 @@ MainWindow::MainWindow(Sidecar* sidecar, QWidget* parent)
   conn_scroll->setWidgetResizable(true);
   conn_scroll->setFrameShape(QFrame::NoFrame);
   conn_scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-  conn_scroll->setWidget(buildConnPage());
+  conn_scroll->setWidget(pageHost(buildConnPage()));
   conn_scroll->viewport()->setAutoFillBackground(false);
   conn_scroll->setStyleSheet(QStringLiteral("QScrollArea{background:transparent;}"));
   stack_->addWidget(conn_scroll);
-  stack_->addWidget(buildStatusPage());
-  stack_->addWidget(buildSpeedPage());
-  stack_->addWidget(buildLogPage());
+  stack_->addWidget(pageHost(buildStatusPage()));
+  stack_->addWidget(pageHost(buildSpeedPage()));
+  stack_->addWidget(pageHost(buildLogPage()));
 
   connect(sidecar_, &Sidecar::proxyStats, this, &MainWindow::onStats);
   connect(sidecar_, &Sidecar::proxyLog, this,
@@ -341,20 +346,40 @@ MainWindow::~MainWindow() = default;
 QFrame* MainWindow::makeCard() {
   auto* card = new QFrame;
   card->setProperty("role", "card");
+  // 真正的投影只能走 QGraphicsEffect（QSS 没有 box-shadow）。参数刻意克制：
+  // 大半径 + 低透明度 = 一圈柔和的环境光，而不是硬阴影。模糊半径 36、偏移
+  // 向下 8px、alpha 20/255，配合卡片 18px 圆角和几乎看不见的边线，读起来是
+  // "高级灰"那种只靠明度差建立层次的效果，而不是描边+投影的双重强调。
+  auto* shadow = new QGraphicsDropShadowEffect(card);
+  shadow->setBlurRadius(36);
+  shadow->setOffset(0, 8);
+  shadow->setColor(QColor(16, 30, 42, 20));
+  card->setGraphicsEffect(shadow);
   return card;
+}
+
+// 卡片带投影后需要四周留出模糊半径的空间，否则会被父控件的边界直接裁掉
+// （QGraphicsEffect 的绘制区域不超出父 widget 的 rect）。
+QWidget* MainWindow::pageHost(QWidget* card) {
+  auto* host = new QWidget;
+  auto* layout = new QVBoxLayout(host);
+  layout->setContentsMargins(4, 4, 4, 10);  // 左/右/上让位模糊，底部让位向下偏移
+  layout->setSpacing(0);
+  layout->addWidget(card);
+  return host;
 }
 
 QWidget* MainWindow::buildRail() {
   auto* rail = new QWidget;
   rail->setObjectName(QStringLiteral("rail"));
-  rail->setFixedWidth(208);
+  rail->setFixedWidth(216);
 
   auto* layout = new QVBoxLayout(rail);
-  layout->setContentsMargins(14, 18, 14, 16);
+  layout->setContentsMargins(16, 22, 16, 18);
   layout->setSpacing(6);
 
   auto* brand = new QHBoxLayout;
-  brand->setContentsMargins(6, 4, 6, 16);
+  brand->setContentsMargins(8, 4, 8, 20);
   brand->setSpacing(10);
   auto* mark = new QLabel;
   mark->setPixmap(QIcon(QStringLiteral(":/assets/fcp.png")).pixmap(32, 32));
@@ -396,14 +421,14 @@ QWidget* MainWindow::buildRail() {
   auto* foot = new QFrame;
   foot->setProperty("role", "railFoot");
   auto* foot_layout = new QVBoxLayout(foot);
-  foot_layout->setContentsMargins(10, 9, 10, 9);
+  foot_layout->setContentsMargins(12, 11, 12, 11);
   foot_layout->setSpacing(5);
 
   auto* state_row = new QHBoxLayout;
   state_row->setContentsMargins(0, 0, 0, 0);
   state_row->setSpacing(8);
   dot_ = new QLabel;
-  dot_->setFixedSize(8, 8);
+  dot_->setFixedSize(10, 10);
   dot_->setStyleSheet(QStringLiteral("background:#c6d3cc;border-radius:4px;"));
   state_text_ = makeLabel(QStringLiteral("未连接"), "muted");
   state_row->addWidget(dot_, 0, Qt::AlignVCenter);
@@ -429,8 +454,8 @@ QWidget* MainWindow::buildRail() {
 QWidget* MainWindow::buildConnPage() {
   auto* card = makeCard();
   auto* layout = new QVBoxLayout(card);
-  layout->setContentsMargins(24, 20, 24, 20);
-  layout->setSpacing(12);
+  layout->setContentsMargins(30, 26, 30, 26);
+  layout->setSpacing(14);
 
   auto* head = new QHBoxLayout;
   head->setContentsMargins(0, 0, 0, 2);
@@ -441,7 +466,8 @@ QWidget* MainWindow::buildConnPage() {
   layout->addLayout(head);
 
   auto* form = new QWidget;
-  form->setMaximumWidth(640);
+  // 表单比卡片窄一档，右侧留白：满宽会让字段贴住卡片内边缘，看起来局促。
+  form->setMaximumWidth(600);
   auto* form_layout = new QVBoxLayout(form);
   form_layout->setContentsMargins(0, 0, 0, 0);
   form_layout->setSpacing(12);
@@ -456,9 +482,10 @@ QWidget* MainWindow::buildConnPage() {
   row->setSpacing(12);
   port_ = new QLineEdit(QStringLiteral("4460"));
   listen_port_ = new QLineEdit(QStringLiteral("1080"));
-  row->addWidget(makeField(QStringLiteral("UDP 端口"), port_));
+  // 两列等宽：任一列的说明文字过长时只在本列内换行，不会把另一列挤出卡片。
+  row->addWidget(makeField(QStringLiteral("UDP 端口"), port_), 1);
   row->addWidget(makeField(QStringLiteral("本地代理端口"), listen_port_,
-                           QStringLiteral("HTTP / HTTPS / SOCKS5")));
+                           QStringLiteral("SOCKS5 / HTTP")), 1);
   form_layout->addLayout(row);
 
   auto* key_row = new QWidget;
@@ -487,7 +514,7 @@ QWidget* MainWindow::buildConnPage() {
   key_toggle_->setObjectName(QStringLiteral("eye"));
   key_toggle_->setToolTip(QStringLiteral("显示 / 隐藏"));
   // 与 app.qss 里 #eye 的文字色一致（emoji 换矢量图标后颜色仍照同一根色）。
-  key_toggle_->setIcon(makeEyeIcon(false, QColor(QStringLiteral("#5b6b63"))));
+  key_toggle_->setIcon(makeEyeIcon(false, QColor(QStringLiteral("#52616b"))));
   key_toggle_->setIconSize(QSize(18, 18));
   key_toggle_->setAutoRaise(true);
   key_toggle_->setCursor(Qt::PointingHandCursor);
@@ -502,7 +529,7 @@ QWidget* MainWindow::buildConnPage() {
   adv_toggle_ = new QPushButton;
   adv_toggle_->setObjectName(QStringLiteral("link"));
   adv_toggle_->setCursor(Qt::PointingHandCursor);
-  adv_toggle_->setText(QStringLiteral("▸  高级设置    MTU 1400 · FEC 0.8 · k 自适应 · 127.0.0.1"));
+  adv_toggle_->setText(QStringLiteral("▸  高级设置    MTU 1400 · 127.0.0.1"));
   form_layout->addWidget(adv_toggle_);
 
   adv_body_ = new QFrame;
@@ -513,33 +540,25 @@ QWidget* MainWindow::buildConnPage() {
   adv_layout->setVerticalSpacing(10);
   listen_ = new QLineEdit(QStringLiteral("127.0.0.1"));
   mtu_ = new QLineEdit(QStringLiteral("1400"));
-  budget_ = new QLineEdit(QStringLiteral("0.8"));
-  k_ = new QLineEdit(QStringLiteral("-1"));
-  rate_ = new QLineEdit(QStringLiteral("0"));
   hs_concurrency_ = new QLineEdit(QStringLiteral("4"));
   pmtud_ = new QCheckBox(QStringLiteral("启用路径 MTU 探测（关闭后固定用上面的 MTU）"));
   pmtud_->setChecked(true);
   adv_layout->addWidget(makeField(QStringLiteral("本地监听地址"), listen_), 0, 0);
   adv_layout->addWidget(makeField(QStringLiteral("MTU"), mtu_), 0, 1);
-  adv_layout->addWidget(
-      makeField(QStringLiteral("FEC 冗余上限"), budget_, QStringLiteral("0–1")), 1, 0);
-  adv_layout->addWidget(
-      makeField(QStringLiteral("固定 k"), k_, QStringLiteral("-1 为自适应")), 1, 1);
-  adv_layout->addWidget(
-      makeField(QStringLiteral("上行限速 (Mbps)"), rate_, QStringLiteral("0 为不限")), 2, 0);
-  adv_layout->addWidget(pmtud_, 2, 1, 1, 1);
+  adv_layout->addWidget(pmtud_, 1, 0, 1, 2);
   adv_layout->addWidget(
       makeField(QStringLiteral("握手并发"), hs_concurrency_,
                 QStringLiteral("0 为不限 · 默认 4")),
-      3, 0);
+      2, 0);
   adv_layout->addWidget(
       makeLabel(QStringLiteral("HTTP 正向代理每请求一条连接，并发页面加载可调大"),
                 "fieldNote"),
-      3, 1);
+      2, 1);
   auto* adv_note = makeLabel(
-      QStringLiteral("不展开时按默认值提交，与显式填写效果相同。"),
+      QStringLiteral("不展开时按默认值提交，与显式填写效果相同。"
+                     "FEC 冗余由控制器按丢包自适应，不再提供固定 k / 预算。"),
       "fieldNote");
-  adv_layout->addWidget(adv_note, 4, 0, 1, 2);
+  adv_layout->addWidget(adv_note, 3, 0, 1, 2);
   adv_body_->setVisible(false);
   form_layout->addWidget(adv_body_);
 
@@ -576,7 +595,7 @@ QWidget* MainWindow::buildConnPage() {
   connect(key_toggle_, &QToolButton::clicked, this, [this] {
     const bool hidden = key_->echoMode() == QLineEdit::Password;
     key_->setEchoMode(hidden ? QLineEdit::Normal : QLineEdit::Password);
-    key_toggle_->setIcon(makeEyeIcon(hidden, QColor(QStringLiteral("#5b6b63"))));
+    key_toggle_->setIcon(makeEyeIcon(hidden, QColor(QStringLiteral("#52616b"))));
   });
   connect(key_, &QLineEdit::textChanged, this, [this] {
     updateKeyState();
@@ -593,8 +612,6 @@ QWidget* MainWindow::buildConnPage() {
     saveSettings();
   });
   connect(mtu_, &QLineEdit::textChanged, this, [this] { saveSettings(); });
-  connect(budget_, &QLineEdit::textChanged, this, [this] { saveSettings(); });
-  connect(k_, &QLineEdit::textChanged, this, [this] { saveSettings(); });
   connect(hs_concurrency_, &QLineEdit::textChanged, this, [this] { saveSettings(); });
   connect(pmtud_, &QCheckBox::toggled, this, [this] { saveSettings(); });
   connect(remember_, &QCheckBox::toggled, this, [this] { saveSettings(); });
@@ -909,9 +926,6 @@ MainWindow::Collected MainWindow::collect() const {
 
   const bool open = advanced_;
   const QString mtu_text = open ? mtu_->text().trimmed() : QStringLiteral("1400");
-  const QString k_text = open ? k_->text().trimmed() : QStringLiteral("-1");
-  const QString budget_text = open ? budget_->text().trimmed() : QStringLiteral("0.8");
-  const QString rate_text = open ? rate_->text().trimmed() : QStringLiteral("0");
   const QString hs_text =
       open ? hs_concurrency_->text().trimmed() : QStringLiteral("4");
   const bool pmtud = open ? pmtud_->isChecked() : true;
@@ -921,27 +935,6 @@ MainWindow::Collected MainWindow::collect() const {
   const int mtu = mtu_text.toInt(&ok);
   if (!ok || mtu < 576 || mtu > 9000) {
     result.error = QStringLiteral("MTU 应在 576..9000");
-    return result;
-  }
-  const int k = k_text.toInt(&ok);
-  if (!ok || k < -1 || k > 7) {
-    result.error = QStringLiteral("k 应在 -1..7");
-    return result;
-  }
-  const double budget = budget_text.toDouble(&ok);
-  if (!ok || !std::isfinite(budget) || budget < 0.0 || budget > 1.0) {
-    result.error = QStringLiteral("FEC 预算应在 0..1");
-    return result;
-  }
-  const double rate = rate_text.toDouble(&ok);
-  // 0 = 不限；0 与 0.1 是 CLI 侧"一秒预算须装下一个完整数据报"的下限
-  //（GUI MTU 上限 9000 < 0.1 Mbps 的 12500 B/s）。
-  if (!ok || !std::isfinite(rate) || rate < 0.0 || rate > 100000.0) {
-    result.error = QStringLiteral("上行限速应在 0..100000 Mbps");
-    return result;
-  }
-  if (rate > 0.0 && rate < 0.1) {
-    result.error = QStringLiteral("上行限速太小无法整形，请用 ≥0.1 Mbps 或 0（不限）");
     return result;
   }
   const int hs_concurrency = hs_text.toInt(&ok);
@@ -962,9 +955,6 @@ MainWindow::Collected MainWindow::collect() const {
   result.config.listen_port = static_cast<quint16>(listen_port);
   result.config.mtu = mtu;
   result.config.pmtud = pmtud;
-  result.config.k = k;
-  result.config.fec_budget = budget;
-  result.config.rate_up_mbps = rate;
   result.config.hs_concurrency = hs_concurrency;
   result.ok = true;
   return result;
@@ -979,8 +969,7 @@ void MainWindow::setRunning(bool running, const QString& hint) {
        {static_cast<QWidget*>(host_), static_cast<QWidget*>(port_),
         static_cast<QWidget*>(listen_port_), static_cast<QWidget*>(key_),
         static_cast<QWidget*>(remember_), static_cast<QWidget*>(listen_),
-        static_cast<QWidget*>(mtu_), static_cast<QWidget*>(budget_),
-        static_cast<QWidget*>(k_), static_cast<QWidget*>(rate_),
+        static_cast<QWidget*>(mtu_),
         static_cast<QWidget*>(hs_concurrency_), static_cast<QWidget*>(pmtud_),
         static_cast<QWidget*>(adv_toggle_), static_cast<QWidget*>(key_toggle_)}) {
     widget->setEnabled(!running);
@@ -991,8 +980,8 @@ void MainWindow::setRunning(bool running, const QString& hint) {
     speed_hint_->setProperty("role", "hint");
     repolish(speed_hint_);
   }
-  dot_->setStyleSheet(QStringLiteral("background:%1;border-radius:4px;")
-                          .arg(running ? kAccent : "#c6d3cc"));
+  dot_->setStyleSheet(QStringLiteral("background:%1;border-radius:5px;")
+                          .arg(running ? kAccent : "#c3ccd4"));
   state_text_->setText(running ? QStringLiteral("已连接") : QStringLiteral("未连接"));
   if (!running) {
     uptime_->setText(QStringLiteral("--"));
@@ -1031,8 +1020,7 @@ void MainWindow::setAdvanced(bool open) {
   adv_body_->setVisible(open);
   adv_toggle_->setText(open
                            ? QStringLiteral("▾  收起高级")
-                           : QStringLiteral(
-                                 "▸  高级设置    MTU 1400 · FEC 0.5 · k 自适应 · 127.0.0.1"));
+                           : QStringLiteral("▸  高级设置    MTU 1400 · 127.0.0.1"));
   syncAddr();
   saveSettings();
 }
@@ -1435,10 +1423,6 @@ void MainWindow::loadSettings() {
     listen_->setText(
         settings.value(QStringLiteral("listen"), QStringLiteral("127.0.0.1")).toString());
     mtu_->setText(settings.value(QStringLiteral("mtu"), QStringLiteral("1400")).toString());
-    budget_->setText(
-        settings.value(QStringLiteral("budget"), QStringLiteral("0.8")).toString());
-    k_->setText(settings.value(QStringLiteral("k"), QStringLiteral("-1")).toString());
-    rate_->setText(settings.value(QStringLiteral("rate"), QStringLiteral("0")).toString());
     hs_concurrency_->setText(
         settings.value(QStringLiteral("hsConcurrency"), QStringLiteral("4")).toString());
     pmtud_->setChecked(settings.value(QStringLiteral("pmtud"), true).toBool());
@@ -1473,9 +1457,6 @@ void MainWindow::saveSettings() {
   settings.setValue(QStringLiteral("listenPort"), listen_port_->text());
   settings.setValue(QStringLiteral("listen"), listen_->text());
   settings.setValue(QStringLiteral("mtu"), mtu_->text());
-  settings.setValue(QStringLiteral("budget"), budget_->text());
-  settings.setValue(QStringLiteral("k"), k_->text());
-  settings.setValue(QStringLiteral("rate"), rate_->text());
   settings.setValue(QStringLiteral("hsConcurrency"), hs_concurrency_->text());
   settings.setValue(QStringLiteral("pmtud"), pmtud_->isChecked());
   settings.setValue(QStringLiteral("key"), key_->text());

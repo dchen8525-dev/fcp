@@ -396,8 +396,13 @@ jobs:
           # --version 已随 0.0.20 的 CLI 清理删除；-h 首行是
           # "fcp-client <版本>"，退出码 0。
           $sidecar = "build\release-win\apps\cli\Release\fcp-client.exe"
-          $ver_line = (& $sidecar -h | Select-Object -First 1)
-          if ($LASTEXITCODE -ne 0) { throw "sidecar -h 退出码 $LASTEXITCODE" }
+          # $LASTEXITCODE 只在下一条语句之前有效：一旦接了管道（| Select-Object）
+          # 就被覆盖，这里会读到空值，成功也被判失败（Windows 客户端 job 第二次
+          # 红的根因）。先取原始退出码，再解析首行。
+          $raw = & $sidecar -h
+          $sidecar_exit = $LASTEXITCODE
+          $ver_line = ([string]($raw | Select-Object -First 1)).Trim()
+          if ($sidecar_exit -ne 0) { throw "sidecar -h 退出码 $sidecar_exit" }
           if ($ver_line -notmatch '^fcp-client \S+') {
             throw "sidecar -h 首行不像版本行：$ver_line"
           }

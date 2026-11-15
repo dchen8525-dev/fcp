@@ -28,12 +28,20 @@ if [ "$1" = "configure" ]; then
     key="$(grep -v '^[[:space:]]*#' "$env_file" |
       grep -oE -- '--key=[0-9a-fA-F]{32}' | head -n1 | cut -d= -f2)"
 
-    # 首次安装且 conffile 里还没有密钥：自动生成一个，装完即可
-    # enable --now，客户端拿同一个值就能连。升级时不动既有配置。
-    if [ -z "$key" ] && [ -z "$2" ]; then
+    # conffile 里还没有密钥就生成一个：没有密钥的服务起来立刻以
+    # "--key is required" 退出，所以填空总是比留空好，首装和升级都一样。
+    #
+    # 升级时也补，是因为"空"只可能来自三种情况，都该填：① 上一版把密钥放在
+    # 另一个变量/路径（0.0.10 的 /etc/fcp-node + FCP_PSK），新 conffile 落地
+    # 时是空模板；② 老 conffile 被 dpkg 保留成不含密钥的版本；③ 运维清空了它
+    # 却忘了填。已配置的机器不受影响——$key 非空就不会进这个分支，运维正在用
+    # 的值不会被覆盖。
+    generated=0
+    if [ -z "$key" ]; then
       key="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
       printf '%s\n' "$key" | grep -qE '^[0-9a-f]{32}$' || key=""
       if [ -n "$key" ]; then
+        generated=1
         if grep -q '^FCP_KEY_ARGS=' "$env_file"; then
           # 空的 FCP_KEY_ARGS= 占位行原位替换，不重复堆行。
           sed -i "s|^FCP_KEY_ARGS=.*|FCP_KEY_ARGS=--key=$key|" "$env_file"
@@ -41,6 +49,22 @@ if [ "$1" = "configure" ]; then
           printf 'FCP_KEY_ARGS=--key=%s\n' "$key" >> "$env_file"
         fi
       fi
+    fi
+
+    # 升级时补了密钥要说清楚：运维本以为配置是他自己定的，静默改掉会让
+    # "为什么我的密钥变了"变成一场排障。
+    if [ "$generated" = "1" ] && [ -n "$2" ]; then
+      cat <<EOF
+
+注意：这次是升级（从 $2），检测到 /etc/fcp/fcp.env 里没有密钥，已自动
+生成一个新的并写入：
+
+  FCP_KEY_ARGS=--key=$key
+
+若上一版用的是别的密钥（例如 0.0.10 的 FCP_PSK，或你另存的旧值），客户端
+需要改成这个新值，或把它换成旧值后 systemctl restart fcp。
+
+EOF
     fi
   fi
 
